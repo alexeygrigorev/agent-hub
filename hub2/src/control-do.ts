@@ -1088,6 +1088,17 @@ export class ControlDO {
     const actor=actorFrom(request);
     if(!actor||!hasScope(actor,'operator:admin'))return error('forbidden',403);
     if(this.db.schemaVersion<6)return error('schema_migration_deferred',503);
+    if(url.pathname==='/api/picker-alerts/draw-diagnostics'){
+      if(actor.kind!=='operator')return error('forbidden',403);
+      if(request.method!=='GET')return error('method_not_allowed',405);
+      const keys=[...url.searchParams.keys()];
+      if(keys.some(key=>key!=='limit'&&key!=='since_receipt_seq')||new Set(keys).size!==keys.length)
+        return error('invalid_picker_diagnostic_query',400);
+      const limit=url.searchParams.get('limit')??'10',since=url.searchParams.get('since_receipt_seq')??'0';
+      if(!/^[1-9][0-9]?$/.test(limit)||!/^(?:0|[1-9][0-9]{0,15})$/.test(since))
+        return error('invalid_picker_diagnostic_query',400);
+      return json(await this.pickerAlerts.drawDiagnostics(Number(limit),Number(since)),200,{'Cache-Control':'no-store'});
+    }
     if(url.pathname==='/api/picker-alerts/counters'&&request.method==='GET'){
       try{
         return json({recipient:'dev@dtcdev.click',...this.pickerAlerts.counters(),coverage:this.pickerObserverDirty

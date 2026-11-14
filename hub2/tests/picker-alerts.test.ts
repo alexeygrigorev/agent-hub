@@ -195,3 +195,90 @@ test('committed draw response, immutable input and collector effects share one t
   assert.throws(()=>f.collector.replayDraw('project-a','a',0,'digest-b'),/picker_draw_conflict/);
   assert.equal(f.collector.counters().total_picks,1);
 });
+
+
+function diagnosticDbImage(sqlite: DatabaseSync) {
+  const names=sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as any[];
+  return JSON.stringify(names.map(row=>[row.name,sqlite.prepare('SELECT * FROM "'+row.name.replaceAll('"','""')+'"').all()]));
+}
+function diagnosticResponse(excluded:unknown=[]) {
+  return {route:{policy_id:'claude-opus-medium',account_id:'SENTINEL_TOKEN_account',quota_remaining:987},
+    diagnostics:{excluded,weights:'SENTINEL_TOKEN_weights',quota:'SENTINEL_TOKEN_quota'},
+    prompt:'SENTINEL_TOKEN_prompt',argv:['SENTINEL_TOKEN_argv'],cwd:'SENTINEL_TOKEN_cwd',
+    env:{TOKEN:'SENTINEL_TOKEN_environment'}};
+}
+test('draw diagnostics read newest bounded committed rows without any state or secret projection',async t=>{
+  const f=fixture();t.after(()=>f.sqlite.close());
+  for(let n=1;n<=12;n++){
+    const facts=pick('SENTINEL_TOKEN_operation_'+n);facts.committed_at=10000+n;
+    f.collector.commitDraw(facts,'d'.repeat(64),diagnosticResponse([
+      {policy_id:'claude-opus-medium',account_id:'SENTINEL_TOKEN_account',reason:'goal_not_advertised'},
+      {policy_id:'SENTINEL_TOKEN_policy',reason:'SENTINEL_TOKEN_reason'}]));
+  }
+  const before=diagnosticDbImage(f.sqlite),changes=f.sqlite.prepare('SELECT total_changes() AS n').get()!.n;
+  const page=await f.collector.drawDiagnostics();assert.equal(page.items.length,10);assert.equal(page.items[0].receipt_seq,12);
+  assert.equal(page.items[9].receipt_seq,3);assert.equal(page.has_more,true);assert.equal(page.absence_authority,false);
+  assert.deepEqual(page.items[0].exclusions,[{policy_id:'claude-opus-medium',reason:'goal_not_advertised'},
+    {policy_id:null,reason:'unknown_reason'}]);
+  assert.equal(page.items[0].status,'unknown_exclusion');assert.equal(page.items[0].committed_at_ms,10012);
+  assert.match(page.items[0].draw_id,/^[0-9a-f]{64}$/);assert.ok(!JSON.stringify(page).includes('SENTINEL_TOKEN'));
+  const since=await f.collector.drawDiagnostics(2,10);assert.deepEqual(since.items.map(row=>row.receipt_seq),[12,11]);
+  assert.equal(since.has_more,false);assert.equal(since.order,'newest_receipt_first');
+  assert.equal(diagnosticDbImage(f.sqlite),before);assert.equal(f.sqlite.prepare('SELECT total_changes() AS n').get()!.n,changes);
+  for(const [limit,since] of [[0,0],[26,0],[1,-1],[1,NaN],[1,Number.MAX_SAFE_INTEGER+1]])
+    await assert.rejects(f.collector.drawDiagnostics(limit,since),/invalid_picker_diagnostic_query/);
+});
+test('draw diagnostics old malformed oversized and missing receipt rows stay explicit unknown',async t=>{
+  const f=fixture();t.after(()=>f.sqlite.close());
+  const insert=(op:string,response:string)=>f.db.run('INSERT INTO picker_draws VALUES(?,?,?,?,?)','project-a',op,0,'d'.repeat(64),response);
+  insert('orphan',JSON.stringify(diagnosticResponse([{policy_id:'codex-luna-max',reason:'codex_reserve'}])));
+  insert('malformed','{"diagnostics":{"excluded":[]},"diagnostics":{"excluded":[]}}');
+  insert('oversized',JSON.stringify({prompt:'SENTINEL_TOKEN'.repeat(10000)}));
+  insert('no-diagnostics',JSON.stringify({old:true}));
+  insert('too-many',JSON.stringify(diagnosticResponse(Array(33).fill({policy_id:'go-muse',reason:'quota_below_minimum'}))));
+  insert('malformed-entry',JSON.stringify(diagnosticResponse([null])));
+  for(const [op,sequence,time] of [['nonpositive',0,1],['corrupt-time',-1,1.5]] as const){
+    insert(op,JSON.stringify(diagnosticResponse([])));
+    f.db.run('INSERT INTO picker_receipts(receipt_seq,project_id,operation_id,attempt,facts_json) VALUES(?,?,?,?,?)',
+      sequence,'project-a',op,0,JSON.stringify({project_id:'project-a',operation_id:op,attempt:0,committed_at:time}));
+  }
+  const before=diagnosticDbImage(f.sqlite),result=await f.collector.drawDiagnostics(25);
+  assert.equal(result.items.length,8,'LEFT JOIN retains orphaned old rows as unknown, not a fabricated empty result');
+  for(const row of result.items){assert.equal(row.receipt_seq,null);if(row.committed_at_ms!==null)assert.equal(row.committed_at_ms,1);}
+  const states=new Map(result.items.map(row=>[row.status,row]));
+  assert.ok(states.has('unknown_receipt_metadata'));assert.equal(states.get('malformed_response')!.exclusions,null);
+  assert.equal(states.get('oversized_response')!.exclusions,null);assert.equal(states.get('diagnostics_unavailable')!.exclusions,null);
+  assert.equal(states.get('oversized_exclusions')!.exclusions,null);
+  assert.deepEqual(states.get('unknown_exclusion')!.exclusions,[{policy_id:null,reason:'malformed_exclusion'}]);
+  assert.ok(!JSON.stringify(result).includes('SENTINEL_TOKEN'));assert.equal(result.absence_authority,false);
+  assert.equal(diagnosticDbImage(f.sqlite),before);
+});
+
+
+test('draw diagnostics finite windows keep recent receipts and key-window orphan unknowns distinct',async t=>{
+  const f=fixture();t.after(()=>f.sqlite.close());
+  for(let n=1;n<=100;n++){
+    const facts=pick('ordered-'+String(n).padStart(3,'0'));facts.committed_at=10000+n;
+    f.collector.commitDraw(facts,'d'.repeat(64),diagnosticResponse([]));
+  }
+  const receiptOnly=pick('old-format-receipt-only');receiptOnly.committed_at=10101;
+  f.collector.record(receiptOnly); // Genuine older producer format lacks a full response row.
+  for(const project of ['a-before-window','z-inside-window'])f.db.run('INSERT INTO picker_draws VALUES(?,?,?,?,?)',
+    project,'orphan',0,'d'.repeat(64),JSON.stringify(diagnosticResponse([])));
+  const before=diagnosticDbImage(f.sqlite),changes=f.sqlite.prepare('SELECT total_changes() AS n').get()!.n;
+  const recent=await f.collector.drawDiagnostics(2);
+  assert.deepEqual(recent.items.map(row=>row.receipt_seq),[101,100]);
+  assert.equal(recent.items[0].status,'missing_response');assert.equal(recent.items[0].exclusions,null);
+  assert.equal(recent.items[0].committed_at_ms,10101);assert.equal(recent.has_more,true);
+  assert.equal(recent.window_size,3);assert.equal(recent.max_candidates,6);
+  assert.deepEqual(recent.windows,['newest_receipt_sequence','descending_composite_draw_key_orphans']);
+  // Filtering never expands the windows or scans back to find enough matches.
+  // Only the lexically-high orphan is in this bounded key window; it is NOT
+  // a chronological newest-orphan claim, nor proof the older orphan is absent.
+  const filtered=await f.collector.drawDiagnostics(1,100000);
+  assert.equal(filtered.items.length,1);assert.equal(filtered.items[0].status,'unknown_receipt_metadata');
+  assert.equal(filtered.items[0].receipt_seq,null);assert.equal(filtered.items[0].committed_at_ms,null);
+  assert.equal(filtered.absence_authority,false);assert.ok(filtered.limitations.includes('orphan_key_window_not_chronological'));
+  assert.ok(filtered.limitations.includes('older_rows_outside_windows_not_searched'));
+  assert.equal(diagnosticDbImage(f.sqlite),before);assert.equal(f.sqlite.prepare('SELECT total_changes() AS n').get()!.n,changes);
+});

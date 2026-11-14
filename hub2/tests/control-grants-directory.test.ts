@@ -310,3 +310,57 @@ test('picker control handler unavailable coverage and actor refusal remain expli
   assert.equal(unavailable.recipient,'dev@dtcdev.click');
  }finally{f.database.close();}
 });
+
+
+function drawDiagnosticDbImage(database: DatabaseSync) {
+ const names=database.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as any[];
+ return JSON.stringify(names.map(row=>[row.name,database.prepare('SELECT * FROM "'+row.name.replaceAll('"','""')+'"').all()]));
+}
+async function seedDrawDiagnostics(f:ReturnType<typeof fixture>){
+ await f.call('/api/model-policy');
+ for(let n=1;n<=2;n++){
+  const project='secret-project',operation='secret-operation-'+n;
+  f.database.prepare('INSERT INTO picker_draws VALUES(?,?,?,?,?)').run(project,operation,0,'d'.repeat(64),
+   JSON.stringify({route:{account_id:'SENTINEL_PRIVATE_ACCOUNT'},diagnostics:{excluded:[{policy_id:'claude-opus-medium',reason:'goal_not_advertised',account_id:'SENTINEL_PRIVATE_ACCOUNT'}]},prompt:'SENTINEL_PRIVATE_PROMPT'}));
+  f.database.prepare('INSERT INTO picker_receipts(project_id,operation_id,attempt,facts_json) VALUES(?,?,?,?)')
+   .run(project,operation,0,JSON.stringify({project_id:project,operation_id:operation,attempt:0,committed_at:1000+n}));
+ }
+}
+test('draw diagnostics actual Control is admin GET only strictly bounded and entirely read only',async t=>{
+ const f=fixture();t.after(()=>f.database.close());await seedDrawDiagnostics(f);
+ const before=drawDiagnosticDbImage(f.database),changes=f.database.prepare('SELECT total_changes() AS n').get()!.n;
+ const queue=(f.control as any).pickerQueue,dirty=(f.control as any).pickerObserverDirty;
+ const response=await f.call('/api/picker-alerts/draw-diagnostics?limit=1&since_receipt_seq=1');
+ assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');
+ const body=await data(response);assert.equal(body.items.length,1);assert.equal(body.items[0].receipt_seq,2);
+ assert.ok(!JSON.stringify(body).includes('SENTINEL_PRIVATE'));assert.ok(!JSON.stringify(body).includes('secret-operation'));
+ const nonadmin={id:'human:viewer',kind:'operator',scopes:['routing:read']};
+ assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,nonadmin)).status,403);
+ assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,{id:'host',kind:'machine',scopes:[]})).status,403);
+ for(const kind of ['machine','agent','service'])assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,{id:'synthetic-nonoperator',kind,scopes:['operator:admin']})).status,403);
+ for(const method of ['POST','HEAD','PUT','DELETE'])assert.equal((await f.call('/api/picker-alerts/draw-diagnostics',method)).status,405);
+ for(const query of ['limit=0','limit=26','limit=01','limit=1e1','limit=1.5','limit=','limit=1&limit=2','since_receipt_seq=-1',
+   'since_receipt_seq=9007199254740992','since_receipt_seq=NaN','since_receipt_seq=','since=1','raw=1'])
+  assert.equal((await f.call('/api/picker-alerts/draw-diagnostics?'+query)).status,400,query);
+ assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
+ assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
+});
+test('draw diagnostics real Worker forwards bounded query and rejects forged unauthenticated access',async t=>{
+ const f=fixture();t.after(()=>f.database.close());await seedDrawDiagnostics(f);
+ const {default:worker}=await import('../src/worker');
+ const token='synthetic-draw-diagnostic-operator-'+ 'x'.repeat(32),env={...f.env,HUB2_DEV_OPERATOR_TOKEN:token};
+ const call=(path:string,method='GET',auth=true,headers:Record<string,string>={})=>worker.fetch(new Request('http://127.0.0.1'+path,
+  {method,headers:{...(auth?{Authorization:'Bearer '+token}:{}),...headers}}),env);
+ // Warm ordinary dev-actor registration before measuring endpoint effects.
+ assert.equal((await call('/api/auth/me')).status,200);
+ const before=drawDiagnosticDbImage(f.database),changes=f.database.prepare('SELECT total_changes() AS n').get()!.n;
+ const queue=(f.control as any).pickerQueue,dirty=(f.control as any).pickerObserverDirty;
+ const response=await call('/api/picker-alerts/draw-diagnostics?limit=1&since_receipt_seq=1');assert.equal(response.status,200);
+ const body=await data(response);assert.equal(body.limit,1);assert.equal(body.since_receipt_seq,1);assert.equal(body.items.length,1);assert.equal(body.items[0].receipt_seq,2);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics','GET',false,{'x-hub2-actor':JSON.stringify(admin)})).status,401);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics','POST')).status,405);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics?limit=0')).status,400);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics/private')).status,404);
+ assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
+ assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
+});

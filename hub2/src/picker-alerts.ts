@@ -64,6 +64,26 @@ function receipt(value: unknown): PickerReceipt {
     committed_at: input.committed_at, picker };
 }
 
+// Diagnostic projection only: these public identifiers never influence routing.
+// Unknown/custom historical IDs and reasons remain explicit unknowns, not raw text.
+const DIAGNOSTIC_POLICIES = new Set(['codex-luna-max','codex-sol-medium','claude-sonnet-medium',
+  'claude-fable-5-2','go-muse','claude-opus-medium','antigravity-hydrogen-medium',
+  'antigravity-argon-medium','zai-glm-5-3-flash','antigravity-carbon-medium']);
+const DIAGNOSTIC_REASONS = new Set(['codex_reserve','quota_below_minimum','goal_not_advertised',
+  'engine_not_advertised','capability_not_advertised','central_host_not_approved',
+  'central_credentials_unavailable','local_credentials_missing','credential_missing','credential_unknown',
+  'credential_expired','credential_refresh_failed','credential_unavailable','credential_ready']);
+const MAX_DRAW_JSON = 65536;
+function storedObject(raw: unknown): Record<string, any> | null {
+  if(typeof raw!=='string')return null;
+  try {
+    const value=JSON.parse(raw);
+    // Stored writers use JSON.stringify. Refuse duplicate keys/nonfinite or
+    // noncanonical corrupt records instead of normalizing them into evidence.
+    return value&&typeof value==='object'&&!Array.isArray(value)&&JSON.stringify(value)===raw ? value : null;
+  } catch { return null; }
+}
+
 /** Control calls this collector while serializing actual draws. */
 export class PickerAlerts {
   constructor(private readonly db: MeteredDb, private readonly state: DurableObjectState) {}
@@ -100,6 +120,82 @@ export class PickerAlerts {
       this.db.run('INSERT INTO picker_draws VALUES(?,?,?,?,?)',facts.project_id,facts.operation_id,facts.attempt,digest,JSON.stringify(response));
       return response;
     });
+  }
+
+  /** Read existing committed responses only. Never replay, draw, lease or repair. */
+  async drawDiagnostics(limit=10, sinceReceiptSeq=0) {
+    if(!Number.isSafeInteger(limit)||limit<1||limit>25
+      ||!Number.isSafeInteger(sinceReceiptSeq)||sinceReceiptSeq<0)
+      throw new HttpError('invalid_picker_diagnostic_query',400);
+    const windowSize=limit+1;
+    // picker_draws is WITHOUT ROWID. Bound both existing-index key windows
+    // BEFORE lookup, JSON inspection or final sorting. Orphan key order is
+    // deliberately not described as chronological or exhaustive history.
+    const rows=this.db.all<{project_id:string;operation_id:string;attempt:number;receipt_seq:number|null;
+      response_json:string|null;facts_json:string|null;has_draw:number}>(`
+      WITH recent_receipts AS MATERIALIZED (
+        SELECT project_id,operation_id,attempt,receipt_seq FROM picker_receipts
+        ORDER BY receipt_seq DESC LIMIT ?
+      ), orphan_key_window AS MATERIALIZED (
+        SELECT project_id,operation_id,attempt FROM picker_draws
+        ORDER BY project_id DESC,operation_id DESC,attempt DESC LIMIT ?
+      ), candidates AS (
+        SELECT r.project_id,r.operation_id,r.attempt,r.receipt_seq
+        FROM recent_receipts r WHERE r.receipt_seq>? OR r.receipt_seq<=0
+        UNION ALL
+        SELECT k.project_id,k.operation_id,k.attempt,NULL AS receipt_seq
+        FROM orphan_key_window k LEFT JOIN picker_receipts r
+          ON r.project_id=k.project_id AND r.operation_id=k.operation_id AND r.attempt=k.attempt
+        WHERE r.receipt_seq IS NULL
+      )
+      SELECT substr(k.project_id,1,181) AS project_id,substr(k.operation_id,1,181) AS operation_id,
+        k.attempt,k.receipt_seq,CASE WHEN d.project_id IS NULL THEN 0 ELSE 1 END AS has_draw,
+        CASE WHEN length(CAST(d.response_json AS BLOB))<=? THEN d.response_json ELSE NULL END AS response_json,
+        CASE WHEN length(CAST(r.facts_json AS BLOB))<=? THEN r.facts_json ELSE NULL END AS facts_json
+      FROM candidates k LEFT JOIN picker_draws d
+        ON d.project_id=k.project_id AND d.operation_id=k.operation_id AND d.attempt=k.attempt
+      LEFT JOIN picker_receipts r
+        ON r.project_id=k.project_id AND r.operation_id=k.operation_id AND r.attempt=k.attempt
+      ORDER BY k.receipt_seq DESC,k.project_id,k.operation_id,k.attempt LIMIT ?`,
+      windowSize,windowSize,sinceReceiptSeq,MAX_DRAW_JSON,MAX_DRAW_JSON,limit+1);
+    const items=await Promise.all(rows.slice(0,limit).map(async row=>{
+      const draw_id=await sha256Hex(JSON.stringify([row.project_id,row.operation_id,row.attempt]));
+      const sequence=typeof row.receipt_seq==='number'&&Number.isSafeInteger(row.receipt_seq)&&row.receipt_seq>0?row.receipt_seq:null;
+      const bound=projectIdentifier(row.project_id)&&identifier(row.operation_id)&&(row.attempt===0||row.attempt===1);
+      const facts=storedObject(row.facts_json),response=storedObject(row.response_json);
+      const time=bound&&facts&&facts.project_id===row.project_id&&facts.operation_id===row.operation_id
+        &&facts.attempt===row.attempt&&Number.isSafeInteger(facts.committed_at)&&facts.committed_at>=0
+        &&facts.committed_at<=Number.MAX_SAFE_INTEGER-600000 ? facts.committed_at as number : null;
+      let status='observed';
+      let exclusions:Array<{policy_id:string|null;reason:string}>|null=null;
+      if(!bound)status='unknown_identity';
+      else if(!row.has_draw)status='missing_response';
+      else if(row.response_json===null)status='oversized_response';
+      else if(!response)status='malformed_response';
+      else if(!response.diagnostics||typeof response.diagnostics!=='object'||Array.isArray(response.diagnostics)
+        ||!Array.isArray(response.diagnostics.excluded))status='diagnostics_unavailable';
+      else if(response.diagnostics.excluded.length>32)status='oversized_exclusions';
+      else {
+        exclusions=response.diagnostics.excluded.map((entry:unknown)=>{
+          if(!entry||typeof entry!=='object'||Array.isArray(entry)){status='unknown_exclusion';return {policy_id:null,reason:'malformed_exclusion'};}
+          const value=entry as Record<string,unknown>;
+          const policy_id=typeof value.policy_id==='string'&&DIAGNOSTIC_POLICIES.has(value.policy_id)?value.policy_id:null;
+          const reason=typeof value.reason==='string'&&DIAGNOSTIC_REASONS.has(value.reason)?value.reason:'unknown_reason';
+          if(policy_id===null||reason==='unknown_reason')status='unknown_exclusion';
+          return {policy_id,reason};
+        });
+      }
+      if(status==='observed'&&(sequence===null||time===null))status='unknown_receipt_metadata';
+      return {draw_id,receipt_seq:sequence,committed_at_ms:time,status,exclusions};
+    }));
+    return {kind:'hub_picker_draw_diagnostics_v1',scope:'committed_successful_draws_only',
+      absence_authority:false,limit,since_receipt_seq:sinceReceiptSeq,order:'newest_receipt_first',
+      window_size:windowSize,max_candidates:2*windowSize,
+      windows:['newest_receipt_sequence','descending_composite_draw_key_orphans'],
+      has_more:rows.length>limit,items,
+      limitations:['direct_picker_calls_not_recorded','not_exhaustive_alert_history',
+        'bounded_recent_page','receipt_sequence_filter_applied_after_window',
+        'orphan_key_window_not_chronological','older_rows_outside_windows_not_searched']};
   }
 
   counters(): PickerAlertCounters {
