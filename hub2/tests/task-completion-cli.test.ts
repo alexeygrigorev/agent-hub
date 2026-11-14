@@ -11,7 +11,7 @@ import {ControlDO} from '../src/control-do';
 import worker from '../src/worker';
 
 const admin={id:'human:cli-node-owner',kind:'operator',scopes:['operator:admin']};
-const criteria=['The feature is implemented','The PR is merged with green checks'];
+const criteria=['The feature is implemented','The PR is merged with green checks (t2b)'];
 test('real Hub host CLI writes merge evidence and session-finished events through Node ProjectDO',async()=>{
   const projectRoot=resolve(fileURLToPath(new URL('../..',import.meta.url)));
   const root=join(projectRoot,'.local','tmp');mkdirSync(root,{recursive:true});
