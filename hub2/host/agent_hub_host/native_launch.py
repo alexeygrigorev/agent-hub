@@ -1083,6 +1083,7 @@ class NativeLauncher:
             if 'CLAUDE_CONFIG_DIR' not in child_env and os.environ.get('CLAUDE_CONFIG_DIR'):
                 child_env['CLAUDE_CONFIG_DIR'] = os.environ['CLAUDE_CONFIG_DIR']
             claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))
+            claude_goal.approve_external_includes(child_env.get('CLAUDE_CONFIG_DIR'), Path(specification['workspace']).resolve())
         tmpdir = Path(child_env["TMPDIR"])
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
