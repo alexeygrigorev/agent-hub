@@ -83,3 +83,37 @@ def goal_store(row, config_dir, expected_thread, objective_hash):
             return proof
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError):
         return None
+
+
+def approve_external_includes(config_dir, workspace):
+    """Pre-accept Claude's "Allow external CLAUDE.md imports?" dialog for a workspace.
+
+    Hub worktrees live under the repo checkout, so an ancestor CLAUDE.md that
+    imports @AGENTS.md is an external import. The dialog swallows the /goal
+    send and the session dies of SIGHUP (exit 129). Best effort: unreadable or
+    non-object config is left untouched.
+    """
+    try:
+        path = (Path(config_dir) / '.claude.json') if config_dir else (Path.home() / '.claude.json')
+        try:
+            config = json.loads(path.read_text('utf-8'))
+        except FileNotFoundError:
+            config = {}
+        projects = config.setdefault('projects', {}) if isinstance(config, dict) else None
+        if not isinstance(projects, dict):
+            return False
+        entry = projects.setdefault(str(workspace), {})
+        if not isinstance(entry, dict):
+            return False
+        if entry.get('hasClaudeMdExternalIncludesApproved') is True:
+            return True
+        entry['hasClaudeMdExternalIncludesApproved'] = True
+        temp = path.with_name(path.name + '.hub-%d.tmp' % os.getpid())
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(config, stream, indent=2)
+        os.replace(temp, path)
+        return True
+    except (OSError, ValueError):
+        return False
