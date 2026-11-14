@@ -1,3 +1,6 @@
+import { stripTypeScriptTypes } from 'node:module';
+import { constants as artifactConstants } from 'node:fs';
+import { isAbsolute as artifactIsAbsolute } from 'node:path';
 import { test } from 'node:test';
 import { open as openFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
@@ -114,7 +117,121 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
   if(child.exitCode!==null || child.signalCode!==null)return;
   await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
 }
+// Exercise the actual private verifier/bounded method, with ONLY in-memory IO.
+// No new production export, server, DB, socket or timer sleep is needed.
+function artifactHarness(options:any={}) {
+  const source=readFileSync(join(ROOT,'hub2/node/alert-evidence.ts'),'utf8');
+  const start=source.indexOf('async function verifyArtifacts('),end=source.indexOf('\nconst FAILURE_REASONS',start);
+  assert.ok(start>=0&&end>start);
+  const helpers=source.slice(source.indexOf('export function canonical('),source.indexOf('// Exhaustive type-checked'))
+    .replace('export function canonical(','function canonical(');
+  const names=Array.from({length:5},(_,i)=>'/synthetic/artifact-'+i);
+  const bytes=new Map(names.map((name,i)=>[name,Buffer.from('immutable source '+i)]));
+  const artifacts=names.map(path=>({path,sha256:sha(bytes.get(path)!)}));
+  const loaded=Object.fromEntries(artifacts.map(a=>[a.path,a.sha256]));
+  const entry:any={producer:'picker_excluded',artifacts,source_id:sha(canonical(artifacts))};
+  const waiting:Array<()=>void>=[],opened:string[]=[],closed:string[]=[];
+  let active=0,maximum=0;
+  const open=async(path:string,flags:number)=>{
+    assert.equal(flags,artifactConstants.O_RDONLY|artifactConstants.O_NOFOLLOW|artifactConstants.O_NONBLOCK);
+    opened.push(path);
+    if(options.openError)throw options.openError;
+    const data=bytes.get(path)!;assert.ok(data);active++;maximum=Math.max(maximum,active);
+    return {
+      async stat(){
+        if(options.statError&&path===names[0])throw options.statError;
+        return {isFile:()=>true,uid:process.geteuid!(),mode:0o100600,nlink:1,size:data.length,...options.metadata};
+      },
+      async read(buffer:Buffer){
+        if(options.delayed&&(!options.delayOnlySecond||path===names[1]))await new Promise<void>(resolve=>waiting.push(resolve));
+        buffer.set(data);return {bytesRead:data.length};
+      },
+      async close(){closed.push(path);active--;if(options.closeError&&path===names[1])throw options.closeError;},
+    };
+  };
+  const body=stripTypeScriptTypes(helpers+source.slice(start,end))+'\nreturn verifyArtifacts;';
+  const verify=new Function('open','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash',body)
+    (open,artifactConstants,artifactIsAbsolute,names.slice(0,3),names,createHash);
+  const bs=source.indexOf('  private async bounded('),be=source.indexOf('\n  private persist()',bs);
+  assert.ok(bs>=0&&be>bs);
+  const bounded=new Function('ownDeadlines',stripTypeScriptTypes('const value = { '+source.slice(bs,be).replace('private async','async')+' };')+'return value;')(new WeakSet()).bounded;
+  const timeout=Number(source.match(/const TIMEOUT_MS = (\d+);/)![1]);
+  return {verify:()=>verify(entry,loaded),entry,loaded,names,bytes,opened,closed,waiting,
+    stats:()=>({active,maximum}),bounded:(work:Promise<void>,trace:any)=>bounded.call({timeoutMs:timeout},work,trace),timeout};
+}
+async function artifactMicrotasks(){for(let i=0;i<40;i++)await Promise.resolve();}
+async function drainArtifactFake(h:any){
+  for(let i=0;i<20;i++){
+    for(const resolve of h.waiting.splice(0))resolve();
+    await artifactMicrotasks();
+    if(h.stats().active===0)return;
+  }
+  assert.fail('owned fake handles did not close');
+}
+
 async function defineTests() {
+  test('artifact concurrency is bounded at two and every invocation rehashes current bytes',async()=>{
+    const h=artifactHarness();await h.verify();
+    assert.equal(h.opened.length,5);assert.equal(h.closed.length,5);
+    assert.equal(h.stats().maximum,2);assert.equal(h.stats().active,0);
+    h.bytes.set(h.names[0],Buffer.from('changed current source'));
+    await assert.rejects(h.verify());await artifactMicrotasks();
+    assert.ok(h.opened.length>5);assert.equal(h.stats().active,0);
+  });
+  test('artifact parallel IO removes a provable serial deadline without changing the actual 150ms bound',async(t)=>{
+    const h=artifactHarness({delayed:true});assert.equal(h.timeout,150);
+    t.mock.timers.enable({apis:['setTimeout']});
+    let outcome:any;
+    const trace:any={stage:'artifacts'};
+    const work=h.verify();
+    const observed=h.bounded(work,trace).then(()=>{outcome='success';},(error:unknown)=>{outcome=error;});
+    let elapsed=0;
+    try{
+      for(let round=0;round<8&&outcome===undefined;round++){
+        await artifactMicrotasks();assert.ok(h.waiting.length>0||outcome!==undefined);
+        const batch=h.waiting.splice(0);
+        t.mock.timers.tick(40);elapsed+=40;
+        for(const resolve of batch)resolve();
+        await artifactMicrotasks();
+      }
+      await observed;
+      assert.equal(outcome,'success');assert.equal(elapsed,120);
+      assert.equal(trace.first,undefined);assert.equal(h.closed.length,5);
+    }finally{await drainArtifactFake(h);t.mock.timers.reset();}
+  });
+  test('artifact rejection is immediate and late sibling closure cannot replace it or start another batch',async()=>{
+    const original=Object.assign(new Error('synthetic rejection'),{code:'EACCES'});
+    const late=Object.assign(new Error('synthetic late close'),{code:'EIO'});
+    const h=artifactHarness({statError:original,delayed:true,delayOnlySecond:true,closeError:late});
+    let rejected:any;
+    const work=h.verify().catch((error:unknown)=>{rejected=error;});
+    try{
+      await artifactMicrotasks();assert.equal(rejected,original);
+      assert.equal(h.opened.length,2);assert.equal(h.stats().active,1);
+    }finally{await drainArtifactFake(h);await work;}
+    assert.equal(rejected,original);assert.equal(h.closed.length,2);assert.equal(h.stats().active,0);
+  });
+  test('artifact parallel verifier retains all descriptor hash membership and source identity refusals',async()=>{
+    for(const metadata of [{mode:0o100666},{nlink:2},{uid:987654},{isFile:()=>false},{size:16*1024*1024+1}]){
+      const h=artifactHarness({metadata});await assert.rejects(h.verify());await artifactMicrotasks();
+      assert.equal(h.stats().active,0);assert.equal(h.opened.length,h.closed.length);
+    }
+    for(const code of ['ELOOP','ENOENT']){
+      const original=Object.assign(new Error('synthetic open rejection'),{code});
+      const h=artifactHarness({openError:original});await assert.rejects(h.verify(),error=>error===original);
+      assert.equal(h.stats().active,0);
+    }
+    for(const kind of ['duplicate','missing','loaded','source']){
+      const h=artifactHarness();
+      if(kind==='duplicate')h.entry.artifacts[1]=h.entry.artifacts[0];
+      if(kind==='missing')h.entry.artifacts.pop();
+      if(kind==='loaded')h.loaded[h.names[0]]='0'.repeat(64);
+      if(kind==='source')h.entry.source_id='0'.repeat(64);
+      await assert.rejects(h.verify());await artifactMicrotasks();assert.equal(h.stats().active,0);
+      if(kind==='duplicate')assert.equal(h.opened.length,0);
+    }
+  });
+
   test('persist diagnostics classify only safe own errno data and never invoke Proxy or getters',async()=>{
     const {classifyPersistFailure,persistDiagnosticFields}=await import('../node/alert-evidence.ts');
     for(const [code,bucket] of Object.entries({EACCES:'permission',EPERM:'permission',ENOENT:'missing',EEXIST:'collision',
