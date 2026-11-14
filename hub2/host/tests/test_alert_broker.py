@@ -46,12 +46,12 @@ class Tests(unittest.TestCase):
         return b.Broker(directory,PINS,collector_factory=Manager,identity=lambda pid:KEY)
 
     def temporary(self):
-        return tempfile.TemporaryDirectory(prefix='resident-',dir=os.environ.get('RUNNER_TEMP') or None)
+        return tempfile.TemporaryDirectory(prefix='b-',dir=os.environ.get('RUNNER_TEMP') or None)
 
     def test_approved_core_bytes_exact(self):
         for name,digest in [('alert_authority.py','e11f786d91efc902716384b4d00e03a9cbb8615ac955a717ac96715fb16c9d18'),
             ('alert_collector.py','1db01dae6b1ef4187281e986a50d00521cd1d2942fef4e8e9e486b242ab84fb8')]:
-            self.assertEqual(hashlib.sha256((Path(b.__file__).parent/name).read_bytes()).hexdigest(),digest)
+            self.assertEqual(hashlib.sha256(Path(importlib.util.find_spec('agent_hub_host.'+name[:-3]).origin).read_bytes()).hexdigest(),digest)
 
     def test_disabled_start_has_no_io(self):
         with patch.object(b,'Broker',side_effect=AssertionError('I/O forbidden')):
@@ -84,6 +84,43 @@ class Tests(unittest.TestCase):
             v=self.broker('/unused')
             with self.assertRaises(b.Refused):v.request({'v':1,'op':op},(123,os.getuid(),0))
             self.assertTrue(all(v.ram.faults.values()))
+
+    def test_unqualified_frames_reject_replay_changed_role_parent_and_peer(self):
+        for change in ({'seq':0},{'role':'canary'},{'parent_id':'b'*32},{'phase':'begin'}):
+            v=self.broker('/unused');peer=(123,os.getuid(),0)
+            self.assertFalse(v.request({'v':1,'op':'hook','frame':frame()},peer)['ok'])
+            next_frame=dict(frame(),seq=1,phase='decision',decision='observation',condition='pass');next_frame.update(change)
+            with self.assertRaises(b.Refused):v.request({'v':1,'op':'hook','frame':next_frame},peer)
+            self.assertEqual(len(v.unqualified_frames),1);self.assertEqual(v.ram.active,{})
+        v=self.broker('/unused');peer=(123,os.getuid(),0);v.request({'v':1,'op':'hook','frame':frame()},peer)
+        v.identity=lambda pid:r.ProcessKey(123,457,BOOT)
+        with self.assertRaises(b.Refused):v.request({'v':1,'op':'hook','frame':dict(frame(),seq=1,phase='terminal')},peer)
+        self.assertEqual(len(v.unqualified_frames),1)
+
+    def test_unqualified_budgets_never_evict_reset_or_gain_counter_credit(self):
+        peer=(123,os.getuid(),0)
+        for limit,maximum in [('MAX_UNQUALIFIED_FRAMES',1),('MAX_UNQUALIFIED_BYTES',1),('MAX_UNQUALIFIED_CONTEXTS',1)]:
+            v=self.broker('/unused')
+            with patch.object(b,limit,maximum):
+                if limit=='MAX_UNQUALIFIED_BYTES':
+                    with self.assertRaises(b.Refused):v.request({'v':1,'op':'hook','frame':frame()},peer)
+                    self.assertEqual(v.unqualified_frames,[])
+                else:
+                    v.request({'v':1,'op':'hook','frame':frame()},peer)
+                    other=dict(frame(),invocation_id='b'*32) if limit=='MAX_UNQUALIFIED_CONTEXTS' else dict(frame(),seq=1,phase='terminal')
+                    with self.assertRaises(b.Refused):v.request({'v':1,'op':'hook','frame':other},peer)
+                    self.assertEqual(len(v.unqualified_frames),1)
+            self.assertTrue(all(v.ram.faults.values()))
+            self.assertTrue(all(n['started']==n['finished']==n['occurrences']==0 for n in v.ram.counts.values()))
+
+    def test_unqualified_terminal_is_final_and_unknown_enum_not_retained(self):
+        v=self.broker('/unused');peer=(123,os.getuid(),0);v.request({'v':1,'op':'hook','frame':frame()},peer)
+        v.request({'v':1,'op':'hook','frame':dict(frame(),seq=1,phase='terminal')},peer)
+        with self.assertRaises(b.Refused):v.request({'v':1,'op':'hook','frame':dict(frame(),seq=2,phase='terminal')},peer)
+        self.assertEqual(len(v.unqualified_frames),2)
+        v=self.broker('/unused')
+        with self.assertRaises(Exception):v.request({'v':1,'op':'hook','frame':dict(frame(),phase='decision',condition='private free text')},peer)
+        self.assertEqual(v.unqualified_frames,[])
 
     def test_changed_peer_birth_and_wrong_uid_refuse(self):
         v=self.broker('/unused');v.identity=lambda pid:r.ProcessKey(pid,456,BOOT)
@@ -272,7 +309,7 @@ class Tests(unittest.TestCase):
 
 
     def test_same_real_serve_runs_ws_when_optional_factory_fails(self):
-        tree=ast.parse((Path(b.__file__).parent/'agent.py').read_text())
+        tree=ast.parse(Path(importlib.util.find_spec('agent_hub_host.agent').origin).read_text())
         bridge=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Bridge')
         serve=next(n for n in bridge.body if isinstance(n,ast.FunctionDef) and n.name=='serve')
         class Thread:
@@ -305,7 +342,7 @@ class Tests(unittest.TestCase):
             self.assertTrue(all(v.ram.faults.values()))
 
     def test_lifecycle_is_outside_ws_reconnection(self):
-        tree=ast.parse((Path(b.__file__).parent/'agent.py').read_text())
+        tree=ast.parse(Path(importlib.util.find_spec('agent_hub_host.agent').origin).read_text())
         bridge=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Bridge')
         serve=next(n for n in bridge.body if isinstance(n,ast.FunctionDef) and n.name=='serve')
         reconnect=next(n for n in bridge.body if isinstance(n,ast.FunctionDef) and n.name=='_serve')

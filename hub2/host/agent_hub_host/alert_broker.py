@@ -22,6 +22,9 @@ REPLY = 8192
 BUDGET = .150
 MAX_REQUESTS = 4096
 MAX_JOBS = 256
+MAX_UNQUALIFIED_FRAMES = 256
+MAX_UNQUALIFIED_BYTES = 262144
+MAX_UNQUALIFIED_CONTEXTS = 128
 CONDITIONS = frozenset(('pass','recovering','failure_below_threshold','recovery','critical',
     'critical_dedup','lock_busy','deploy_gate','metadata_only','error','backup_failed','stale',
     'fresh','recovery_pending','quota_stale','quota_fresh','quota_recovery_pending',
@@ -126,13 +129,17 @@ def exchange(path, request, *, deadline=None):
 
 class Client:
     """Existing API-v1 emit interface, now one bounded Unix exchange per frame."""
-    def __init__(self, path, invocation_id, parent_id, role):
+    def __init__(self, path, invocation_id, parent_id, role, *, deadline=None):
         self.path, self.identity, self.parent_id, self.role = path, invocation_id, parent_id, role
         self.seq, self.dirty = 0, False
+        self.deadline = deadline
 
     def emit(self, phase, *, decision=None, condition=None, flags=None, recipient_class=None):
         try:
             end = time.monotonic() + BUDGET
+            if self.deadline is not None:
+                end = min(end, self.deadline)
+            left(end)
             frame = dict(v=1, invocation_id=self.identity, parent_id=self.parent_id, role=self.role,
                 phase=phase, seq=self.seq, decision=decision, condition=condition, flags=flags or {},
                 recipient_class=recipient_class or ('dev' if decision in ('alert','alert_dedup','recovery') else 'none'),
@@ -198,6 +205,9 @@ class Broker:
         self.node_fd = None
         self.collector = None
         self.events = []
+        self.unqualified_frames = []
+        self.unqualified_bytes = 0
+        self.unqualified_contexts = {}
         self.requests = 0
         self.closed = False
 
@@ -223,6 +233,8 @@ class Broker:
             if value.get('op') == 'hook':
                 require(set(value) == {'v','op','frame'})
                 frame = checked(value['frame'])
+                require(self.identity(peer[0]) == before)
+                self.record_unqualified(frame, before)
                 # No admission endpoint. Unadmitted frames receive negative ACK
                 # from RAM and poison evidence instead of manufacturing counts.
                 reply = self.ram.hook(frame, frame['invocation_id'], before)
@@ -231,12 +243,40 @@ class Broker:
                 reply = self.ram.barrier(value['nonce'], self.drain)
                 reply['manager_observations'] = list(self.events[-8:])
                 reply['manager_metadata_omitted'] = max(0, len(self.events) - 8)
+                reply['unqualified_hook_frames'] = list(self.unqualified_frames[-2:])
+                reply['unqualified_hook_omitted'] = max(0, len(self.unqualified_frames) - 2)
                 reply['limitations'] = ['unqualified_dispatch_and_source_open','system_and_direct_cron_unqualified']
             require(self.identity(peer[0]) == before)
             return reply
         except BaseException:
             self.ram.collector_lost(ram.PRODUCERS)
             raise
+
+    def record_unqualified(self, frame, process):
+        """Positive-only source CLAIMS, never admission or authority counters.
+
+        Strict context/sequence binding prevents mixed/replayed claims. Even
+        successful retention leaves RAM's unadmitted negative ACK unchanged.
+        """
+        context = frame['invocation_id']
+        previous = self.unqualified_contexts.get(context)
+        if previous is None:
+            require(frame['phase'] == 'begin' and frame['seq'] == 0
+                and len(self.unqualified_contexts) < MAX_UNQUALIFIED_CONTEXTS)
+        else:
+            require(previous['process'] == process and previous['role'] == frame['role']
+                and previous['parent'] == frame['parent_id'] and not previous['terminal']
+                and frame['seq'] == previous['seq'] + 1 and frame['phase'] != 'begin')
+        record = {'kind':'unqualified_api_v1_hook','qualification':'none',
+            'broker_epoch':self.ram.epoch,'peer_process':{'pid':process.pid,
+                'birth_ticks':process.birth_ticks,'boot_id':process.boot_id},'frame':dict(frame)}
+        size = len(encode(record, 4096))
+        require(len(self.unqualified_frames) < MAX_UNQUALIFIED_FRAMES
+            and self.unqualified_bytes + size <= MAX_UNQUALIFIED_BYTES)
+        self.unqualified_frames.append(record)
+        self.unqualified_bytes += size
+        self.unqualified_contexts[context] = {'process':process,'role':frame['role'],
+            'parent':frame['parent_id'],'seq':frame['seq'],'terminal':frame['phase']=='terminal'}
 
     def drain(self):
         if self.collector is None or self.closed:
