@@ -115,6 +115,48 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
   await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
 }
 async function defineTests() {
+  test('unavailable reason: first runtime fault is closed, sticky and never changes healthy shape',async t=>{
+    for(const producer of ['credential_monitor','picker_excluded']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{producer,timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+      const healthy=await f.observer.snapshot(NONCE);
+      assert.equal(healthy.complete,true);assert.equal(Object.keys(healthy).length,17);
+      assert.ok(!('unavailable_phase' in healthy));assert.ok(!('unavailable_reason' in healthy));
+      const secret='https://user:password@private.invalid/path TOKEN=synthetic-private-value';
+      f.observer.invalidate(secret);
+      const proof=await f.observer.snapshot(NONCE);
+      assert.equal(proof.available,false);assert.equal(proof.unavailable_phase,'runtime');assert.equal(proof.unavailable_reason,'invalidated');
+      assert.ok(!JSON.stringify(proof).includes(secret));
+      await f.observer.finish(null,'alert');
+      assert.deepEqual(await f.observer.snapshot(NONCE),proof,'later faults cannot rewrite first reason or heal');
+    }
+  });
+  test('unavailable reason: pending and active observations remain transient without false dirty diagnosis',async t=>{
+    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+    let release!:()=>void;const held=new Promise<void>(yes=>release=yes);t.after(()=>release());
+    const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:async(v:any,h:any)=>{await held;await semanticWriter(v,h);}});t.after(()=>f.observer.close());
+    const id=f.observer.begin();
+    const pending=await f.observer.snapshot(NONCE);assert.equal(pending.unavailable_reason,'pending_write');assert.equal(pending.available,false);
+    release();await (f.observer as any).queue;
+    assert.equal((await f.observer.snapshot(NONCE)).unavailable_reason,'active_invocation');
+    await f.observer.finish(id,'observation');
+    const complete=await f.observer.snapshot(NONCE);assert.equal(complete.complete,true);assert.equal(Object.keys(complete).length,17);
+  });
+  test('unavailable reason: real persistence and source faults retain first known stage without raw details',async t=>{
+    for(const fault of ['writer','source']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{producer:'picker_quota_stale',timeoutMs:2000,
+        writer:fault==='writer'?async()=>{throw new Error('TOKEN=synthetic-private-value');}:semanticWriter});t.after(()=>f.observer.close());
+      if(fault==='writer')await f.observer.finish(f.observer.begin(),'observation');
+      else writeFileSync(join(f.installed,'src/model-picker.ts'),'// synthetic source changed');
+      const proof=await f.observer.snapshot(NONCE);
+      assert.equal(proof.unavailable_phase,'runtime');assert.equal(proof.unavailable_reason,
+        fault==='writer'?'persist_failed':'snapshot_source_verification_failed');
+      assert.ok(!JSON.stringify(proof).includes('synthetic-private-value'));
+      f.observer.invalidate();assert.equal((await f.observer.snapshot(NONCE)).unavailable_reason,proof.unavailable_reason);
+    }
+  });
+
   test('diagnostic authorities observe real picker decisions without a marked monitor POST or redraw',async t=>{
     for(const producer of ['picker_excluded','picker_quota_stale']){
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
@@ -477,11 +519,17 @@ async function defineTests() {
     const count=output.match(/Ran (\d+) tests/);assert.ok(count&&Number(count[1])>=28,'required Python cases must execute, not collect zero: '+output);
   });
   test('actual main loads diagnostic opt-ins independently of absent credential or broken sibling',async t=>{
-    for(const fault of ['credential-missing','diagnostic-corrupt']){
+    for(const fault of ['credential-missing','diagnostic-corrupt','diagnostic-late']){
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
       const hub=join(directory,'hub2');mkdirSync(hub);
       cpSync(join(ROOT,'hub2/node'),join(hub,'node'),{recursive:true});cpSync(join(ROOT,'hub2/src'),join(hub,'src'),{recursive:true});
       copyFileSync(join(ROOT,'hub2/production-worker.ts'),join(hub,'production-worker.ts'));
+      if(fault==='diagnostic-late'){
+        const module=join(hub,'node/alert-evidence.ts'),original=readFileSync(module,'utf8');
+        const before="    const producer = options.producer ?? 'credential_monitor';";
+        assert.ok(original.includes(before));
+        writeFileSync(module,original.replace(before,"    if (options.producer === 'picker_excluded') await new Promise(resolve => setTimeout(resolve, 350));\n"+before));
+      }
       const create=(producer:string)=>{
         const diagnostic=producer!=='credential_monitor',state=join(directory,producer);mkdirSync(state,{mode:0o700});
         const names=['node/alert-evidence.ts','node/main.ts','src/worker.ts',...(diagnostic?['src/model-picker.ts','src/routing-pool.ts']:[])];
@@ -507,21 +555,34 @@ async function defineTests() {
       assert.equal((await fetch(base+'/health')).status,200);assert.equal((await fetch(base+'/api/repos',{headers})).status,200);
       const credentialProof=await (await fetch(base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
       assert.equal(credentialProof.complete===true,fault!=='credential-missing');
+      if(fault==='credential-missing'){
+        assert.equal(credentialProof.unavailable_phase,'bootstrap');assert.equal(credentialProof.unavailable_reason,'load_failed');
+      }
       for(const producer of ['picker_excluded','picker_quota_stale']){
         const response=await fetch(base+'/api/model-picker/diagnostic-evidence?producer='+producer+'&nonce='+NONCE,{headers});
         assert.equal(response.headers.get('cache-control'),'no-store');const proof=await response.json() as any;
-        assert.equal(proof.complete===true,!(fault==='diagnostic-corrupt'&&producer==='picker_excluded'));
+        assert.equal(proof.complete===true,!(fault!=='credential-missing'&&producer==='picker_excluded'));
+        if(producer==='picker_excluded'&&fault!=='credential-missing'){
+          assert.equal(proof.unavailable_phase,'bootstrap');
+          assert.equal(proof.unavailable_reason,fault==='diagnostic-late'?'load_after_ingress_cutoff':'load_failed');
+          if(fault==='diagnostic-late'){
+            await new Promise(resolve=>setTimeout(resolve,400));
+            const later=await (await fetch(base+'/api/model-picker/diagnostic-evidence?producer='+producer+'&nonce='+NONCE,{headers})).json();
+            assert.deepEqual(later,proof,'late completion never attaches or rewrites cutoff diagnosis');
+          }
+        }
       }
       assert.equal((await fetch(base+'/api/model-picker/diagnostic-evidence?producer=backup&nonce='+NONCE,{headers})).status,400);
       const primary=await fetch(base+'/api/model-picker/pick',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:'{}'});
       assert.equal(primary.status,503,'optional authority never changes missing-policy behavior');
       const after=await (await fetch(base+'/api/model-picker/diagnostic-evidence?producer=picker_quota_stale&nonce='+NONCE,{headers})).json() as any;
       assert.equal(after.available,false,'uncertain pre-decision invocation cannot become healthy zero');
+      assert.equal(after.unavailable_phase,'runtime');assert.equal(after.unavailable_reason,'invalidated');
       await stop(child);
     }
   });
   test('actual main optional missing/import-broken observer never prevents primary startup/routes',async t=>{
-    for(const fault of ['configured','missing','broken']){
+    for(const fault of ['configured','missing','broken','unconfigured']){
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
       const hub=join(directory,'hub2');mkdirSync(hub);
       cpSync(join(ROOT,'hub2/node'),join(hub,'node'),{recursive:true});cpSync(join(ROOT,'hub2/src'),join(hub,'src'),{recursive:true});
@@ -538,7 +599,7 @@ async function defineTests() {
           enrollment_id:'2'.repeat(32),source_id,release_sha:RELEASE,artifacts});
         privateJson(join(observerDir,'journal.json'),{kind:'hub_credential_monitor_journal_v1',source_id,enrollment_id:'2'.repeat(32),occurrence_count:0,started_total:0,finished_total:0});
       }
-      const vars=join(directory,'vars');writeFileSync(vars,'HUB2_DEV_OPERATOR_TOKEN='+TOKEN+'\nHUB2_ALERT_EVIDENCE_DIR='+observerDir+'\n');
+      const vars=join(directory,'vars');writeFileSync(vars,'HUB2_DEV_OPERATOR_TOKEN='+TOKEN+(fault==='unconfigured'?'':'\nHUB2_ALERT_EVIDENCE_DIR='+observerDir)+'\n');
       const child=spawn(process.execPath,['--experimental-transform-types',join(hub,'node/main.ts'),'--host','127.0.0.1','--port','0','--data-dir',join(directory,'db'),'--dev-vars',vars],{stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});
       t.after(()=>stop(child));let output='',errors='';child.stderr!.on('data',b=>errors+=b);
       const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('main timeout '+errors));},6000);
@@ -548,7 +609,10 @@ async function defineTests() {
       assert.equal((await fetch(base+'/health')).status,200);
       assert.equal((await fetch(base+'/api/repos',{headers})).status,200);
       const proof=await (await fetch(base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
-      if(fault==='configured')assert.equal(proof.complete,true);else assert.equal(proof.available,false);
+      if(fault==='configured')assert.equal(proof.complete,true);else {
+        assert.equal(proof.available,false);assert.equal(proof.unavailable_phase,'bootstrap');
+        assert.equal(proof.unavailable_reason,fault==='unconfigured'?'not_configured':'load_failed');
+      }
       const primary=await fetch(base+'/api/model-picker/pick',{method:'POST',headers:{...headers,'X-Hub-Alert-Producer':'credential_monitor','Content-Type':'application/json'},body:'{}'});
       assert.equal(primary.status,503,'no configured policy has the same primary refusal with optional observer present or absent');
       await stop(child);
