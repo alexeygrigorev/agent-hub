@@ -260,6 +260,15 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
     check(typeof artifact.path === 'string' && isAbsolute(artifact.path) && !paths.has(artifact.path)
       && /^[0-9a-f]{64}$/.test(artifact.sha256));
     paths.add(artifact.path);
+  }
+  // Fresh descriptor-backed verification on EVERY invocation, never a cached or
+  // shared proof. Two files at a time avoid five avoidable serial IO chains,
+  // while bounding simultaneous handles/buffers (at most two 16MiB buffers).
+  // Fail fast on an observed rejection; every started task retains its own
+  // finally-close even after rejection/timeout. No next batch follows a verifier
+  // rejection; an OUTER timeout still does not cancel underlying IO, as before.
+  for (let index = 0; index < entry.artifacts.length; index += 2) {
+    await Promise.all(entry.artifacts.slice(index, index + 2).map(async artifact => {
     const handle = await open(artifact.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const st = await handle.stat();
@@ -269,6 +278,7 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       check(bytesRead === st.size && hash(buffer.subarray(0, bytesRead)) === artifact.sha256);
     } finally { await handle.close(); }
+    }));
   }
   const required = entry.producer === 'credential_monitor' ? requiredArtifacts : diagnosticArtifacts;
   if (entry.producer !== 'credential_monitor') check(entry.artifacts.length === required.length);
