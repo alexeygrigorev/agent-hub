@@ -114,7 +114,6 @@ if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
   echo "== release configuration"
   python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" "$REPO" "$CREDENTIAL_MONITOR_EVIDENCE_ROOT" <<'PY'
 import ctypes
-import hashlib
 import json
 import os
 import re
@@ -126,7 +125,6 @@ import tempfile
 import uuid
 from pathlib import Path
 
-ARTIFACTS = ("hub2/node/alert-evidence.ts", "hub2/node/main.ts", "hub2/src/worker.ts")
 
 path = Path(sys.argv[1])
 mode, schema_mode = sys.argv[2:4]
@@ -366,8 +364,6 @@ def service_environment():
 if mode == "active" and repo_arg and evidence_root_arg:
     try:
         overrides = service_environment()
-        if any(key in overrides for key in OBSERVER_KEYS):
-            raise ValueError("observer_service_override_unhonorable")
         repo, evidence_root = Path(repo_arg), Path(evidence_root_arg)
         owner_uid, owner_gid = original_stat.st_uid, original_stat.st_gid
         ensure_private_evidence_root(evidence_root, owner_uid, owner_gid)
@@ -391,21 +387,36 @@ if mode == "active" and repo_arg and evidence_root_arg:
                    "--checkout", str(repo), "--expected-commit", commit, "--prepare-active-root", str(evidence_root)]
         for producer, key in zip(("credential-monitor", "picker-excluded", "picker-quota-stale"), OBSERVER_KEYS):
             command += ["--current-" + producer, file_observer_value(original_text, key)]
+            if key in overrides:
+                command += ["--blocked-producer", producer.replace("-", "_")]
         staged = subprocess.run(command, env=git_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 timeout=15, check=False, **child_options)
         if staged.returncode or len(staged.stdout) > 16384:
             raise ValueError("node_observer_preparation_unavailable")
         receipt = json.loads(staged.stdout)
-        if (not isinstance(receipt, dict) or receipt.get("kind") != "hub_node_observers_prepared_v1"
+        if (not isinstance(receipt, dict) or receipt.get("kind") != "hub_node_observers_prepared_v2"
                 or receipt.get("release_sha") != commit or receipt.get("activated") is not False
                 or receipt.get("historical_coverage") is not False
-                or set(receipt.get("pointers", {})) != set(OBSERVER_KEYS)):
+                or not isinstance(receipt.get("pointers"), dict)
+                or not set(receipt["pointers"]) <= set(OBSERVER_KEYS)
+                or not isinstance(receipt.get("held"), dict)):
+            raise ValueError("node_observer_preparation_unavailable")
+        roles = dict(zip(("credential_monitor", "picker_excluded", "picker_quota_stale"), OBSERVER_KEYS))
+        reasons = {"service_override", "selected_source_unverified", "current_identity_unverified",
+                   "same_tuple_unqualified", "same_tuple_capacity_reached", "target_ownership_unverified",
+                   "producer_state_unqualified"}
+        if (set(receipt["held"]) != {role for role, key in roles.items() if key not in receipt["pointers"]}
+                or any(reason not in reasons for reason in receipt["held"].values())
+                or any(key in overrides for key in receipt["pointers"])):
             raise ValueError("node_observer_preparation_unavailable")
         for key, value in receipt["pointers"].items():
-            if (not isinstance(value, str) or not value.startswith(str(evidence_root) + "/")
-                    or Path(value).parent != evidence_root or any(ord(c) < 33 or ord(c) == 127 for c in value)):
+            if (not isinstance(value, str) or not os.path.isabs(value)
+                    or (Path(value).parent != evidence_root and value != file_observer_value(original_text, key))
+                    or any(ord(c) < 33 or ord(c) == 127 for c in value)):
                 raise ValueError("node_observer_preparation_unavailable")
         updates.update(receipt["pointers"])
+        for role, reason in receipt["held"].items():
+            print("node_observer_held:" + role + ":" + reason + "; no new coverage authorized", file=sys.stderr)
     except Exception:
         # Do not print exceptions/config/paths. Existing pointers and histories
         # remain; loaded/current/boot checks determine UNKNOWN independently.

@@ -130,8 +130,9 @@ class NodeAutoactivationTests(unittest.TestCase):
     def test_service_override_is_unknown_not_clobbered_or_business_refusal(self):
         calls,error=self.installer(override='HUB2_PICKER_EXCLUDED_EVIDENCE_DIR=/synthetic/override')
         self.assertIn('no new coverage authorized',error)
-        self.assertFalse(any('--prepare-active-root' in c for c in calls))
-        self.assertEqual(self.pointers(),{})
+        self.assertTrue(any('--blocked-producer' in c for c in calls))
+        self.assertEqual(set(self.pointers()),set(m.KEYS.values())-{m.KEYS['picker_excluded']})
+        self.assertIn('node_observer_held:picker_excluded:service_override',error)
         self.assertIn('HUB2_RELEASE_MODE=active',self.config.read_text())
 
     def test_corrupt_current_boundary_never_mints_replacement_zero(self):
@@ -139,7 +140,10 @@ class NodeAutoactivationTests(unittest.TestCase):
         before={str(p) for p in self.root.iterdir()}
         (path/'journal.json').write_text('{}\n')
         self.current['picker_excluded']=str(path)
-        with self.assertRaises(m.Refused):self.prepare()
+        result=self.prepare()
+        self.assertEqual(result['held'],{'picker_excluded':'same_tuple_unqualified'})
+        self.assertNotIn(key,result['pointers'])
+        self.assertEqual(len(result['pointers']),2)
         self.assertEqual(before,{str(p) for p in self.root.iterdir()})
         self.assertEqual((path/'journal.json').read_text(),'{}\n')
 
@@ -174,9 +178,11 @@ class NodeAutoactivationTests(unittest.TestCase):
     def test_symlink_ancestor_and_foreign_target_without_intent_refused(self):
         link=self.base/'alias';link.symlink_to(self.root,target_is_directory=True)
         with self.assertRaises(OSError):m.prepare_active(self.repo,link,self.commit,self.current)
-        first=self.prepare();intent=Path(first['intent']);intent.unlink()  # Fixture simulates foreign unowned publication.
+        first=self.prepare();intent=Path(first['intents']['picker_excluded']);intent.unlink()  # Unowned publication.
         before={str(p) for p in self.root.iterdir()}
-        with self.assertRaises(m.Refused):self.prepare()
+        result=self.prepare()
+        self.assertEqual(result['held'],{'picker_excluded':'target_ownership_unverified'})
+        self.assertEqual(len(result['pointers']),2)
         self.assertEqual(before,{str(p) for p in self.root.iterdir()})
 
     def test_exhausted_record_is_held_not_restaged(self):
@@ -186,14 +192,125 @@ class NodeAutoactivationTests(unittest.TestCase):
         record={'kind':'hub_picker_diagnostic_snapshot_v1','controller_id':'a'*32,'sequence':1,
                 'previous_sha256':hashlib.sha256(m.canonical(initial)).hexdigest(),'journal':j}
         (path/('snapshot-'+'a'*32+'-1.json')).write_bytes(m.canonical(record)+b'\n')
+        (path/('snapshot-'+'a'*32+'-1.json')).chmod(0o600)
         self.current['picker_excluded']=str(path)
-        with self.assertRaises(m.Refused):self.prepare()
+        checked=m.validate_boundary(path,'picker_excluded')
+        self.assertIs(checked['capacity_reached'],True)
+        result=self.prepare()
+        self.assertEqual(result['held'],{'picker_excluded':'same_tuple_capacity_reached'})
+        self.assertEqual(len(result['pointers']),2)
         self.assertEqual(json.loads((path/'journal.json').read_text()),initial)
+        record['journal'].update(started_total=129,finished_total=129)
+        (path/('snapshot-'+'a'*32+'-1.json')).write_bytes(m.canonical(record)+b'\n')
+        (path/('snapshot-'+'a'*32+'-1.json')).chmod(0o600)
+        with self.assertRaises(m.Refused):m.validate_boundary(path,'picker_excluded')
 
     def test_dirty_installed_authority_cannot_borrow_clean_head_provenance(self):
         (self.repo/'hub2/node/main.ts').write_text('unreviewed fixture change')
-        with self.assertRaises(m.Refused):self.prepare()
+        result=self.prepare()
+        self.assertEqual(result['pointers'],{})
+        self.assertEqual(set(result['held']),set(m.PRODUCERS))
         self.assertEqual([p for p in self.root.iterdir() if p.name!='.prepare.lock'],[])
+
+    def change_source(self):
+        target=self.repo/'hub2/src/worker.ts'
+        target.write_text(target.read_text()+' changed selected source')
+        self.git('add','.')
+        self.git('-c','user.name=Offline Fixture','-c','user.email=fixture@example.invalid',
+                 '-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','commit','-qm','real source change')
+        self.commit=self.git('rev-parse','HEAD').strip()
+
+    def test_new_selected_source_advances_despite_held_old_picker_without_modifying_history(self):
+        for fault in ('corrupt_journal','missing_journal','capacity','unknown_snapshot'):
+            with self.subTest(fault=fault):
+                first=self.prepare()
+                self.current={producer:first['pointers'][key] for producer,key in m.KEYS.items()}
+                path=Path(self.current['picker_excluded'])
+                if fault=='corrupt_journal':(path/'journal.json').write_text('{}\n')
+                elif fault=='missing_journal':(path/'journal.json').unlink()
+                elif fault=='unknown_snapshot':(path/'future-checkpoint.json').write_text('{}\n')
+                else:
+                    initial=json.loads((path/'journal.json').read_text());j=dict(initial,started_total=128,finished_total=128)
+                    record={'kind':'hub_picker_diagnostic_snapshot_v1','controller_id':'b'*32,'sequence':1,
+                            'previous_sha256':hashlib.sha256(m.canonical(initial)).hexdigest(),'journal':j}
+                    (path/('snapshot-'+'b'*32+'-1.json')).write_bytes(m.canonical(record)+b'\n')
+                    (path/('snapshot-'+'b'*32+'-1.json')).chmod(0o600)
+                held=self.prepare();self.assertNotIn(m.KEYS['picker_excluded'],held['pointers'])
+                self.assertEqual(held['held']['picker_excluded'], 'same_tuple_capacity_reached' if fault=='capacity' else 'same_tuple_unqualified')
+                before={str(p):p.read_bytes() for d in self.current.values() for p in Path(d).iterdir()}
+                self.change_source();second=self.prepare()
+                self.assertEqual(second['held'],{});self.assertEqual(len(second['pointers']),3)
+                self.assertTrue(all(second['pointers'][key]!=first['pointers'][key] for key in m.KEYS.values()))
+                self.assertTrue(all(Path(p).read_bytes()==data for p,data in before.items()))
+                self.current={producer:second['pointers'][key] for producer,key in m.KEYS.items()}
+
+    def test_missing_foreign_or_corrupt_enrollment_holds_only_its_producer(self):
+        first=self.prepare()
+        for fault in ('missing','foreign','corrupt'):
+            with self.subTest(fault=fault):
+                self.current={producer:first['pointers'][key] for producer,key in m.KEYS.items()}
+                if fault=='missing':self.current['picker_excluded']=str(self.base/'missing')
+                elif fault=='foreign':self.current['picker_excluded']=first['pointers'][m.KEYS['credential_monitor']]
+                else:(Path(self.current['picker_excluded'])/'enrollment.json').write_text('{}\n')
+                self.change_source();second=self.prepare()
+                self.assertEqual(second['held'],{'picker_excluded':'current_identity_unverified'})
+                self.assertEqual(len(second['pointers']),2)
+                self.assertNotEqual(second['pointers'][m.KEYS['credential_monitor']],first['pointers'][m.KEYS['credential_monitor']])
+
+    def test_same_tuple_legacy_path_reused_without_parallel_zero(self):
+        first=self.prepare();key=m.KEYS['credential_monitor'];old=Path(first['pointers'][key])
+        legacy=self.base/'legacy-boundary';old.rename(legacy)
+        self.current['credential_monitor']=str(legacy)
+        before={p.name:p.read_bytes() for p in legacy.iterdir()}
+        result=self.prepare()
+        self.assertEqual(result['pointers'][key],str(legacy));self.assertFalse(old.exists())
+        self.assertEqual(before,{p.name:p.read_bytes() for p in legacy.iterdir()})
+
+    def test_installer_partial_hold_advances_other_producers_and_preserves_old_pointer(self):
+        self.installer();first=self.pointers();path=Path(first[m.KEYS['picker_excluded']])
+        (path/'journal.json').write_text('{}\n')
+        _,error=self.installer()
+        self.assertIn('same_tuple_unqualified',error);self.assertEqual(self.pointers(),first)
+        self.change_source();_,error=self.installer()
+        self.assertEqual(error,'');second=self.pointers()
+        self.assertTrue(all(first[key]!=second[key] for key in m.KEYS.values()))
+        self.assertEqual((path/'journal.json').read_text(),'{}\n')
+
+    def test_new_commit_advances_directly_from_genuine_128_picker_history(self):
+        first=self.prepare();self.current={producer:first['pointers'][key] for producer,key in m.KEYS.items()}
+        path=Path(self.current['picker_excluded']);initial=json.loads((path/'journal.json').read_text())
+        record={'kind':'hub_picker_diagnostic_snapshot_v1','controller_id':'c'*32,'sequence':1,
+                'previous_sha256':hashlib.sha256(m.canonical(initial)).hexdigest(),
+                'journal':dict(initial,started_total=128,finished_total=128)}
+        snapshot=path/('snapshot-'+'c'*32+'-1.json');snapshot.write_bytes(m.canonical(record)+b'\n');snapshot.chmod(0o600)
+        before={str(p):p.read_bytes() for d in first['pointers'].values() for p in Path(d).iterdir()}
+        self.change_source();second=self.prepare()
+        self.assertEqual(set(second['pointers']),set(m.KEYS.values()))
+        self.assertNotEqual(second['pointers'][m.KEYS['credential_monitor']],first['pointers'][m.KEYS['credential_monitor']])
+        self.assertTrue(all(Path(p).read_bytes()==data for p,data in before.items()))
+
+    def test_new_commit_with_corrupt_picker_advances_credential_directly(self):
+        first=self.prepare();self.current={producer:first['pointers'][key] for producer,key in m.KEYS.items()}
+        journal=Path(self.current['picker_excluded'])/'journal.json';journal.write_text('{}\n')
+        self.change_source();second=self.prepare()
+        self.assertEqual(set(second['pointers']),set(m.KEYS.values()))
+        self.assertNotEqual(second['pointers'][m.KEYS['credential_monitor']],first['pointers'][m.KEYS['credential_monitor']])
+        self.assertEqual(journal.read_text(),'{}\n')
+
+    def test_diagnostic_source_fault_does_not_block_credential(self):
+        (self.repo/'hub2/src/model-picker.ts').write_text('unreviewed diagnostic source')
+        result=self.prepare()
+        self.assertEqual(set(result['pointers']),{m.KEYS['credential_monitor']})
+        self.assertEqual(result['held'],{'picker_excluded':'selected_source_unverified',
+                                         'picker_quota_stale':'selected_source_unverified'})
+
+    def test_installer_reuses_trusted_legacy_current_path(self):
+        self.installer();first=self.pointers();key=m.KEYS['credential_monitor']
+        legacy=self.base/'legacy-private';Path(first[key]).rename(legacy)
+        self.config.write_text(self.config.read_text().replace(first[key],str(legacy)))
+        _,error=self.installer()
+        self.assertEqual(error,'');self.assertEqual(self.pointers()[key],str(legacy))
+        self.assertFalse(Path(first[key]).exists())
 
     def test_installer_concurrent_config_write_not_overwritten(self):
         new=b'UNRELATED_SYNTHETIC=concurrent-owner\n'

@@ -228,24 +228,42 @@ def sync_chain(path):
         current = current.parent
 
 
+def validate_enrollment(entry, producer):
+    diagnostic = producer != 'credential_monitor'
+    require(isinstance(entry, dict))
+    require(set(entry) == {'kind', 'producer', 'recipient', 'enrollment_id', 'source_id', 'release_sha', 'artifacts'})
+    require(entry['kind'] == ('hub_picker_diagnostic_enrollment_v1' if diagnostic else 'hub_credential_monitor_enrollment_v1')
+        and entry['producer'] == producer and entry['recipient'] == 'dev@dtcdev.click'
+        and re.fullmatch('[0-9a-f]{32}', entry['enrollment_id'])
+        and re.fullmatch('[0-9a-f]{40}', entry['release_sha'])
+        and hashlib.sha256(canonical(entry['artifacts'])).hexdigest() == entry['source_id'])
+    names = DIAGNOSTIC_ARTIFACTS if diagnostic else ARTIFACTS
+    require(isinstance(entry['artifacts'], list) and len(entry['artifacts']) == len(names))
+    for item, relative in zip(entry['artifacts'], names):
+        require(set(item) == {'path', 'sha256'} and isinstance(item['path'], str)
+            and item['path'].endswith('/' + relative) and absolute(item['path'])
+            and re.fullmatch('[0-9a-f]{64}', item['sha256']))
+
+
+def boundary_identity(path, producer):
+    fd = directory(path, private=True)
+    try:
+        entry = read_private(fd, 'enrollment.json')
+        validate_enrollment(entry, producer)
+        return entry
+    finally:
+        os.close(fd)
+        sync_chain(path)
+
+
 def validate_boundary(path, producer, expected=None):
     fd = directory(path, private=True)
     try:
         entry = read_private(fd, 'enrollment.json')
         journal = read_private(fd, 'journal.json')
         diagnostic = producer != 'credential_monitor'
-        require(set(entry) == {'kind', 'producer', 'recipient', 'enrollment_id', 'source_id', 'release_sha', 'artifacts'})
-        require(entry['kind'] == ('hub_picker_diagnostic_enrollment_v1' if diagnostic else 'hub_credential_monitor_enrollment_v1')
-                and entry['producer'] == producer and entry['recipient'] == 'dev@dtcdev.click'
-                and re.fullmatch('[0-9a-f]{32}', entry['enrollment_id'])
-                and re.fullmatch('[0-9a-f]{40}', entry['release_sha'])
-                and hashlib.sha256(canonical(entry['artifacts'])).hexdigest() == entry['source_id'])
-        names = DIAGNOSTIC_ARTIFACTS if diagnostic else ARTIFACTS
-        require(isinstance(entry['artifacts'], list) and len(entry['artifacts']) == len(names))
-        for item, relative in zip(entry['artifacts'], names):
-            require(set(item) == {'path', 'sha256'} and isinstance(item['path'], str)
-                    and item['path'].endswith('/' + relative) and absolute(item['path'])
-                    and re.fullmatch('[0-9a-f]{64}', item['sha256']))
+        validate_enrollment(entry, producer)
+        require(isinstance(journal, dict))
         require(all(type(journal.get(k)) is int for k in ('occurrence_count', 'started_total', 'finished_total')))
         require(journal == {'kind': 'hub_picker_diagnostic_journal_v1' if diagnostic else 'hub_credential_monitor_journal_v1',
                            **({'producer': producer} if diagnostic else {}), 'source_id': entry['source_id'],
@@ -267,15 +285,17 @@ def validate_boundary(path, producer, expected=None):
             boot, sequence = match[1], int(match[2])
             require(sequence <= 256)
             record = read_private(fd, name)
+            require(isinstance(record, dict))
             require(set(record) == {'kind', 'controller_id', 'sequence', 'previous_sha256', 'journal'}
                     and record['kind'] == ('hub_picker_diagnostic_snapshot_v1' if diagnostic else 'hub_credential_monitor_snapshot_v1')
                     and record['controller_id'] == boot and type(record['sequence']) is int and record['sequence'] == sequence
                     and isinstance(record['previous_sha256'], str) and re.fullmatch('[0-9a-f]{64}', record['previous_sha256']))
             snapshot = record['journal']
+            require(isinstance(snapshot, dict))
             require(set(snapshot) == set(journal)
                     and all(snapshot[k] == journal[k] for k in journal if k not in ('occurrence_count', 'started_total', 'finished_total'))
                     and all(type(snapshot[k]) is int and 0 <= snapshot[k] <= 9007199254740991 for k in ('occurrence_count', 'started_total', 'finished_total'))
-                    and snapshot['occurrence_count'] <= snapshot['finished_total'] <= snapshot['started_total'] < 128)
+                    and snapshot['occurrence_count'] <= snapshot['finished_total'] <= snapshot['started_total'] <= 128)
             chains.setdefault(boot, {})[sequence] = record
         for chain in chains.values():
             previous = hashlib.sha256(canonical(journal)).hexdigest()
@@ -290,7 +310,8 @@ def validate_boundary(path, producer, expected=None):
                 previous = hashlib.sha256(canonical(record)).hexdigest()
         if expected is not None:
             require(all(entry[k] == expected[k] for k in ('producer', 'release_sha', 'source_id', 'artifacts')))
-        return entry
+        return {'enrollment': entry, 'capacity_reached': any(
+            record['journal']['started_total'] == 128 for chain in chains.values() for record in chain.values())}
     finally:
         os.close(fd)
         sync_chain(path)
@@ -315,12 +336,13 @@ def committed_artifact_hash(checkout, commit, relative):
     return hashlib.sha256(data.stdout).hexdigest()
 
 
-def prepare_active(checkout, root, expected_commit, current):
-    """Prepare pointers, never claim activation, boot continuity or healthy coverage."""
-    require(sys.platform == "linux")
+def prepare_active(checkout, root, expected_commit, current, *, blocked=()):
+    """Prepare each producer independently; never reset held same-tuple state."""
+    require(sys.platform == 'linux')
     import fcntl
     checkout, root = absolute(checkout), absolute(root)
-    require(set(current) == set(PRODUCERS) and re.fullmatch('[0-9a-f]{40}', expected_commit))
+    require(set(current) == set(PRODUCERS) and set(blocked) <= set(PRODUCERS)
+            and re.fullmatch('[0-9a-f]{40}', expected_commit))
     fd = directory(root, private=True)
     lock = None
     try:
@@ -329,60 +351,103 @@ def prepare_active(checkout, root, expected_commit, current):
         require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
                 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        os.fsync(lock)
-        sync_chain(root)
+        os.fsync(lock);sync_chain(root)
         require(head(checkout) == expected_commit)
-        specs = {}
+        specs, held, pointers, intents = {}, {}, {}, {}
         for producer in PRODUCERS:
-            paths = DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS
-            artifacts = [artifact(checkout, name) for name in paths]
-            require(all(row['sha256'] == committed_artifact_hash(checkout, expected_commit, name)
-                        for row, name in zip(artifacts, paths)))
-            source_id = hashlib.sha256(canonical(artifacts)).hexdigest()
-            specs[producer] = {'producer': producer, 'release_sha': expected_commit,
-                               'source_id': source_id, 'artifacts': artifacts}
-            # Existing configured authority is never silently discarded to heal
-            # corruption. Its old source hashes may differ after a real deploy.
-            if current[producer]:
-                validate_boundary(absolute(current[producer]), producer)
-        intent = {'kind': 'hub_node_observers_prepare_intent_v1', 'release_sha': expected_commit, 'specs': specs}
-        name = 'intent-' + expected_commit + '-' + hashlib.sha256(canonical(specs)).hexdigest() + '.json'
-        try:
-            previous = read_private(fd, name)
-        except FileNotFoundError:
-            # A target without this already-durable intent is never adopted.
-            for producer, spec in specs.items():
-                target = root / (producer + '-' + expected_commit + '-' + spec['source_id'])
-                require(not os.path.lexists(target))
-            write_new(fd, name, intent)
-        else:
-            require(previous == intent)
-        sync_chain(root)  # Including retry after failed directory durability.
-        pointers = {}
-        for producer in PRODUCERS:
-            spec = specs[producer]
-            target = root / (producer + '-' + expected_commit + '-' + spec['source_id'])
+            if producer in blocked:
+                held[producer] = 'service_override'
+                continue
             try:
-                os.stat(target.name, dir_fd=fd, follow_symlinks=False)
-            except FileNotFoundError:
-                # Intent is durable before exclusive directory publication.
-                stage(checkout, target, expected_commit,
-                      {relative: row['sha256'] for relative, row in zip(
-                          DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS,
-                          spec['artifacts'])}, producer=producer)
-            validate_boundary(target, producer, spec)
-            pointers[KEYS[producer]] = str(target)
-        require(head(checkout) == expected_commit and all(
-            spec['artifacts'] == [artifact(checkout, name) for name in
-                                  (DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS)]
-            for producer, spec in specs.items()))
+                names = DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS
+                artifacts = [artifact(checkout, name) for name in names]
+                require(all(row['sha256'] == committed_artifact_hash(checkout, expected_commit, name)
+                            for row, name in zip(artifacts, names)))
+                specs[producer] = {'producer': producer, 'release_sha': expected_commit,
+                    'source_id': hashlib.sha256(canonical(artifacts)).hexdigest(), 'artifacts': artifacts}
+            except (OSError, ValueError, TypeError, KeyError, Refused, subprocess.SubprocessError):
+                held[producer] = 'selected_source_unverified'
+        # Existing V1 source-bound intent may qualify a lost publication; it
+        # does not authorize adopting a target with no durable ownership record.
+        legacy = {'kind':'hub_node_observers_prepare_intent_v1','release_sha':expected_commit,'specs':specs}
+        legacy_name = 'intent-' + expected_commit + '-' + hashlib.sha256(canonical(specs)).hexdigest() + '.json'
+        for producer, spec in specs.items():
+            try:
+                if current[producer]:
+                    try:
+                        prior = boundary_identity(absolute(current[producer]), producer)
+                    except (OSError, ValueError, TypeError, KeyError, Refused):
+                        held[producer] = 'current_identity_unverified'
+                        continue
+                    same = all(prior[key] == spec[key] for key in ('producer','release_sha','source_id','artifacts'))
+                    if same:
+                        try:
+                            checked = validate_boundary(absolute(current[producer]), producer, spec)
+                        except (OSError, ValueError, TypeError, KeyError, Refused):
+                            held[producer] = 'same_tuple_unqualified'
+                            continue
+                        if checked['capacity_reached']:
+                            held[producer] = 'same_tuple_capacity_reached'
+                            continue
+                        # Existing trusted configured boundary, including a valid
+                        # legacy name, is reused. Never create a second zero.
+                        pointers[KEYS[producer]] = current[producer]
+                        continue
+                    # A genuine new selected source/release tuple is a NEW
+                    # interval. The old enrollment identity is known; its held
+                    # journal/snapshots need not be healthy and remain untouched.
+                target = root / (producer + '-' + expected_commit + '-' + spec['source_id'])
+                intent = {'kind':'hub_node_observer_prepare_intent_v2','producer':producer,
+                          'release_sha':expected_commit,'spec':spec}
+                name = 'intent-' + producer + '-' + expected_commit + '-' + spec['source_id'] + '.json'
+                try:
+                    previous = read_private(fd, name)
+                except FileNotFoundError:
+                    previous = None
+                if previous is not None:
+                    require(previous == intent)
+                exists = os.path.lexists(target)
+                if exists and previous is None:
+                    try:
+                        old_intent = read_private(fd, legacy_name)
+                    except FileNotFoundError:
+                        old_intent = None
+                    if len(specs) != len(PRODUCERS) or old_intent != legacy:
+                        held[producer] = 'target_ownership_unverified'
+                        continue
+                if previous is None:
+                    write_new(fd, name, intent)
+                sync_chain(root)  # File+all ancestor barriers, also on replay.
+                if not exists:
+                    stage(checkout, target, expected_commit,
+                          {relative: row['sha256'] for relative, row in zip(
+                              DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS,
+                              spec['artifacts'])}, producer=producer)
+                checked = validate_boundary(target, producer, spec)
+                if checked['capacity_reached']:
+                    held[producer] = 'same_tuple_capacity_reached'
+                    continue
+                pointers[KEYS[producer]] = str(target)
+                intents[producer] = str(root / name)
+            except (OSError, ValueError, TypeError, KeyError, Refused, subprocess.SubprocessError):
+                held[producer] = 'producer_state_unqualified'
+        require(head(checkout) == expected_commit)
+        for producer, spec in specs.items():
+            if KEYS[producer] not in pointers:
+                continue
+            try:
+                require(spec['artifacts'] == [artifact(checkout, name) for name in
+                    (DIAGNOSTIC_ARTIFACTS if producer != 'credential_monitor' else ARTIFACTS)])
+            except (OSError, ValueError, TypeError, KeyError, Refused):
+                pointers.pop(KEYS[producer], None)
+                held[producer] = 'selected_source_unverified'
         sync_chain(root)
-        return {'kind': 'hub_node_observers_prepared_v1', 'release_sha': expected_commit,
-                'activated': False, 'historical_coverage': False, 'pointers': pointers,
-                'intent': str(root / name)}
+        require(set(held) == set(PRODUCERS) - {producer for producer in PRODUCERS if KEYS[producer] in pointers})
+        return {'kind':'hub_node_observers_prepared_v2','release_sha':expected_commit,
+                'activated':False,'historical_coverage':False,'pointers':pointers,
+                'held':held,'intents':intents}
     finally:
-        if lock is not None:
-            os.close(lock)
+        if lock is not None:os.close(lock)
         os.close(fd)
 
 
@@ -391,6 +456,7 @@ def main():
     parser.add_argument('--checkout', required=True)
     parser.add_argument('--destination')
     parser.add_argument('--prepare-active-root')
+    parser.add_argument('--blocked-producer', choices=PRODUCERS, action='append', default=[])
     parser.add_argument('--producer', choices=PRODUCERS, default='credential_monitor')
     for producer in PRODUCERS:
         parser.add_argument('--current-' + producer.replace('_', '-'), default='')
@@ -402,7 +468,7 @@ def main():
         if args.prepare_active_root:
             require(args.destination is None)
             value = prepare_active(args.checkout, args.prepare_active_root, args.expected_commit,
-                {producer: getattr(args, 'current_' + producer) for producer in PRODUCERS})
+                {producer: getattr(args, 'current_' + producer) for producer in PRODUCERS}, blocked=args.blocked_producer)
         else:
             require(args.destination is not None)
             selected = DIAGNOSTIC_ARTIFACTS if args.producer != 'credential_monitor' else ARTIFACTS

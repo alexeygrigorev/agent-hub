@@ -116,11 +116,23 @@ subprocess.run=_fake_run
         if self.evidence.is_dir():
             self.assertEqual([p for p in self.evidence.iterdir() if p.is_dir()],[])
 
+    def assert_role_held(self,done,text):
+        self.assertEqual(done.returncode,0,done.stderr)
+        self.assertIn('node_observer_held:credential_monitor:',done.stderr)
+        selected=dict(line.split('=',1) for line in self.vars.read_text().splitlines() if '=' in line)
+        # Every original credential assignment survives; the two independent
+        # diagnostic authorities are materialized by the actual preparer child.
+        for line in self.primary_config(text).splitlines():
+            self.assertIn(line,self.vars.read_text().splitlines())
+        self.assertEqual(len([p for p in self.evidence.iterdir() if p.is_dir()]),2)
+        for key in ('HUB2_PICKER_EXCLUDED_EVIDENCE_DIR','HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR'):
+            self.assertTrue((Path(selected[key])/'journal.json').is_file())
+
     def test_invalid_configured_paths_never_heal_into_fresh_zero(self):
         for value in ['0',"'   '",'"   "','"a\u2028b"','/old\nHUB2_ALERT_EVIDENCE_DIR=" "']:
             with self.subTest(value=value):
                 text='SYNTHETIC_PRIVATE=never-print\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n'+KEY+'='+value+'\n'
-                done=self.invoke(text);self.assert_unknown(done,text)
+                done=self.invoke(text);self.assert_role_held(done,text)
 
     def test_enabled_0664_authority_is_still_refused_without_changing_configuration(self):
         (self.repo/configuration_fixture.ARTIFACTS[0]).chmod(0o664)
@@ -148,10 +160,16 @@ subprocess.run=_fake_run
                 elif fault=='hash_race':artifact.write_bytes(original)
                 linked.unlink(missing_ok=True);artifact.chmod(0o600)
 
+    def test_known_environment_override_holds_only_credential_producer(self):
+        for value in ('/fixed','   ',''):
+            with self.subTest(value=value):
+                text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=""\n'
+                done=self.invoke(text,props={'Environment':'"'+KEY+'='+value+'"'})
+                self.assert_role_held(done,text)
+                self.assertIn(':service_override;',done.stderr)
+
     def test_nonempty_or_ambiguous_service_overrides_fail_before_staging(self):
-        cases=[{'Environment':'HUB2_ALERT_EVIDENCE_DIR=/fixed'},
-               {'Environment':'"HUB2_ALERT_EVIDENCE_DIR=   "'},
-               {'PassEnvironment':KEY},{'UnsetEnvironment':KEY},{'UnsetEnvironment':KEY+'=/old'},
+        cases=[{'PassEnvironment':KEY},{'UnsetEnvironment':KEY},{'UnsetEnvironment':KEY+'=/old'},
                {'NeedDaemonReload':'yes'}]
         for props in cases:
             with self.subTest(props=props):
