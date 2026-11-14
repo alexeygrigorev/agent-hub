@@ -805,3 +805,78 @@ test('Codex reserve: seeded draws never select an excluded Codex candidate, incl
   assert.notEqual(route.engine,'codex');
  }
 });
+
+
+// These exercise production routing decisions and their observer/log seam, not
+// evidence enrollment, SMTP delivery, or a fabricated healthy coverage baseline.
+async function quotaClassificationPick(options: {codex?: number; muse?: number; expiredMuse?: boolean; staleCodex?: boolean; policy?: any[]} = {}) {
+ const policy = options.policy ?? JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url),'utf8')).candidates
+   .filter((row:any)=>['codex-luna-max','codex-sol-medium','claude-sonnet-medium','claude-opus-medium','antigravity-hydrogen-medium','go-muse'].includes(row.id));
+ const env = poolEnv({codex:true,claude:true,gemini:true,'shared-go':!options.expiredMuse},
+   {claude:80,gemini:80,...(options.staleCodex?{}:{codex:options.codex??6}),'shared-go':options.muse??4},
+   ['codex','claude','antigravity','go'],policy);
+ const decisions:Record<string,string[]>={picker_excluded:[],picker_quota_stale:[]};
+ env.PICKER_DIAGNOSTIC_EVIDENCE=Object.fromEntries(Object.keys(decisions).map(producer=>[producer,{
+   begin:()=>producer, invalidate:()=>assert.fail('unexpected observer invalidation'),
+   finish:async(identity:unknown,decision:string)=>{assert.equal(identity,producer);decisions[producer].push(decision);},
+ }]));
+ const logs:{level:string;args:any[]}[]=[];
+ const error=console.error,info=console.info;
+ console.error=(...args:any[])=>{logs.push({level:'error',args});};
+ console.info=(...args:any[])=>{logs.push({level:'info',args});};
+ try { return {...await pickModelRouteDetailed(env,{interactive:true},()=>0.5),decisions,logs}; }
+ finally {console.error=error;console.info=info;}
+}
+
+test('quota classification: healthy three-model pool keeps routine exclusions without alert decisions',async()=>{
+ for(const codex of [6,15]) {
+  const result=await quotaClassificationPick({codex});
+  assert.equal(result.diagnostics.pool_degraded,false);
+  assert.deepEqual(new Set(result.diagnostics.pool.map(row=>row.model)),new Set(['sonnet','opus','gemini-4-hydrogen-medium']));
+  assert.deepEqual(new Set(result.diagnostics.excluded.map(row=>row.reason)),new Set(['codex_reserve','quota_below_minimum']));
+  assert.deepEqual(result.decisions,{picker_excluded:['observation'],picker_quota_stale:['observation']});
+  assert.equal(result.logs.length,1);assert.equal(result.logs[0].level,'info');
+  assert.ok(result.logs[0].args[0].includes('observation'));assert.ok(!result.logs[0].args[0].includes('alert='));
+  assert.deepEqual(JSON.parse(result.logs[0].args[1]),result.diagnostics.excluded,'all excluded rows remain visible');
+  assert.notEqual(result.route.engine,'codex');
+ }
+});
+
+test('quota classification: mixed real credential exclusions remain alerting with routine rows intact',async()=>{
+ const result=await quotaClassificationPick({expiredMuse:true});
+ assert.equal(result.diagnostics.pool_degraded,false);
+ assert.ok(result.diagnostics.excluded.some(row=>row.reason==='codex_reserve'));
+ assert.ok(result.diagnostics.excluded.some(row=>row.reason==='credential_expired'));
+ assert.deepEqual(result.decisions.picker_excluded,['alert']);
+ const log=result.logs.find(row=>String(row.args[0]).includes('MODEL_PICKER_EXCLUDED'))!;
+ assert.equal(log.level,'error');assert.ok(log.args[0].includes('alert=dev@dtcdev.click'));
+ assert.deepEqual(JSON.parse(log.args[1]),result.diagnostics.excluded);
+});
+
+test('quota classification: missing quota still alerts stale and excludes Codex without revival',async()=>{
+ const result=await quotaClassificationPick({staleCodex:true});
+ assert.ok(result.diagnostics.warnings?.some(row=>row.account_id==='codex'&&row.reason==='quota_stale'));
+ assert.deepEqual(result.decisions,{picker_excluded:['observation'],picker_quota_stale:['alert']});
+ assert.ok(result.logs.some(row=>row.level==='error'&&String(row.args[0]).includes('QUOTA_STALE alert=dev@')));
+ assert.notEqual(result.route.engine,'codex');assert.equal(result.diagnostics.pool_degraded,false);
+});
+
+test('quota classification: only the two exact routine reasons are non-alerting, including mixed future reasons',async()=>{
+ const {pickerExclusionsNeedAlert}=await import('../src/model-picker.ts');
+ const row=(reason:string)=>({policy_id:'synthetic-boundary',account_id:'synthetic',reason});
+ assert.equal(pickerExclusionsNeedAlert([]),false);
+ for(const reason of ['codex_reserve','quota_below_minimum']) assert.equal(pickerExclusionsNeedAlert([row(reason)]),false);
+ for(const reason of ['credential_expired','local_credentials_missing','central_credentials_unavailable','engine_not_advertised',
+  'goal_not_advertised','future_reason','','CODEX_RESERVE','quota_below_minimum ']) {
+  assert.equal(pickerExclusionsNeedAlert([row(reason)]),true,reason);
+  assert.equal(pickerExclusionsNeedAlert([row('codex_reserve'),row(reason),row('quota_below_minimum')]),true,reason);
+ }
+});
+
+test('quota classification: degraded pool remains degraded after normal reserve filtering',async()=>{
+ const policy=JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url),'utf8')).candidates
+   .filter((row:any)=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id));
+ const result=await quotaClassificationPick({policy});
+ assert.equal(result.diagnostics.pool_degraded,true);assert.equal(result.route.model,'sonnet');
+ assert.deepEqual(result.decisions.picker_excluded,['observation']);
+});
