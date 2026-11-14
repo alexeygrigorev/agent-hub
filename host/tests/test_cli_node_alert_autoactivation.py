@@ -312,6 +312,80 @@ class NodeAutoactivationTests(unittest.TestCase):
         self.assertEqual(error,'');self.assertEqual(self.pointers()[key],str(legacy))
         self.assertFalse(Path(first[key]).exists())
 
+    def test_real_git_checkout_umask_0002_is_distinct_from_head_and_raw_blob_success(self):
+        originals={name:(self.repo/name).read_bytes() for name in m.DIAGNOSTIC_ARTIFACTS}
+        for name in originals:(self.repo/name).unlink()
+        subprocess.run(['/usr/bin/git','-C',str(self.repo),'checkout','--force','HEAD','--',*m.DIAGNOSTIC_ARTIFACTS],
+                       env=self.env,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5,umask=0o002)
+        self.assertEqual(m.head(self.repo),self.commit)
+        for name,data in originals.items():
+            self.assertEqual(stat.S_IMODE((self.repo/name).stat().st_mode),0o664)
+            self.assertEqual((self.repo/name).read_bytes(),data)
+            self.assertEqual(m.committed_artifact_hash(self.repo,self.commit,name),hashlib.sha256(data).hexdigest())
+        held=self.prepare()
+        self.assertEqual(held['pointers'],{})
+        self.assertEqual(held['source_failures'],dict.fromkeys(m.PRODUCERS,'source_file_unsafe_mode'))
+        _,error=self.installer()
+        for producer in m.PRODUCERS:self.assertIn('node_observer_source:'+producer+':source_file_unsafe_mode',error)
+        self.assertEqual(self.pointers(),{})
+        self.assertNotIn(str(self.repo),error)
+        for name in originals:
+            self.assertEqual(stat.S_IMODE((self.repo/name).stat().st_mode),0o664,'diagnostic must NOT normalize permissions')
+            (self.repo/name).chmod(0o644)  # Owned fixture-only positive control, NOT production repair.
+        self.assertEqual(len(self.prepare()['pointers']),3)
+
+    def test_symlink_checkout_head_succeeds_but_source_directory_is_unavailable(self):
+        alias=self.base/'checkout-alias';alias.symlink_to(self.repo,target_is_directory=True)
+        self.assertEqual(m.head(alias),self.commit)
+        result=m.prepare_active(alias,self.root,self.commit,self.current)
+        self.assertEqual(result['pointers'],{})
+        self.assertEqual(result['source_failures'],dict.fromkeys(m.PRODUCERS,'source_directory_unavailable'))
+        self.assertTrue(alias.is_symlink(),'diagnostic must NOT canonicalize or replace checkout aliases')
+
+    def test_exact_source_failure_enums_preserve_all_strict_file_predicates(self):
+        p=self.repo/m.ARTIFACTS[0];raw=p.read_bytes()
+        for fault,expected in (('hash','source_hash_mismatch'),('hardlink','source_file_linked'),
+                               ('fifo','source_file_not_regular'),('symlink','source_file_unavailable')):
+            with self.subTest(fault=fault):
+                extra=self.base/'owned-extra'
+                if fault=='hash':p.write_bytes(raw+b'changed private fixture')
+                elif fault=='hardlink':os.link(p,extra)
+                elif fault=='fifo':p.unlink();os.mkfifo(p,0o600)
+                else:extra.write_bytes(raw);p.unlink();p.symlink_to(extra)
+                result=self.prepare()
+                self.assertEqual(result['source_failures'],dict.fromkeys(m.PRODUCERS,expected))
+                self.assertEqual(result['pointers'],{})
+                if fault in ('fifo','symlink'):p.unlink();p.write_bytes(raw)
+                elif fault=='hash':p.write_bytes(raw)
+                if extra.exists():extra.unlink()
+                p.chmod(0o600)
+        with mock.patch.object(m,'committed_artifact_hash',side_effect=m.Refused('unsafe raw exception must not project')):
+            self.assertEqual(self.prepare()['source_failures'],dict.fromkeys(m.PRODUCERS,'source_git_unverified'))
+        self.assertEqual(len(self.prepare()['pointers']),3)
+
+    def test_installer_rejects_unrecognized_diagnostic_before_printing_or_publishing(self):
+        actual=subprocess.run
+        secret='FORBIDDEN_PRIVATE_EXCEPTION_SOURCE'
+        def forged(argv,**kwargs):
+            result=actual(argv,**kwargs)
+            if '--prepare-active-root' in argv:
+                value=json.loads(result.stdout);value['source_failures']={'credential_monitor':secret}
+                return subprocess.CompletedProcess(argv,0,json.dumps(value).encode())
+            return result
+        calls=[]
+        def run(argv,**kwargs):
+            calls.append(argv)
+            if argv[0]=='/usr/bin/systemctl':
+                text='Environment=\nEnvironmentFiles=\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n' if argv[1]=='show' else ''
+                return subprocess.CompletedProcess(argv,0,text.encode())
+            return forged(argv,**kwargs)
+        block=(ROOT/'deploy/vm/install-hub2-node.sh').read_text().split("<<'PY'",1)[1].split('\nPY\n',1)[0]
+        error=io.StringIO()
+        with mock.patch.object(sys,'argv',['installer',str(self.config),'active','apply',str(self.repo),str(self.root)]),mock.patch('subprocess.run',side_effect=run),contextlib.redirect_stderr(error):
+            exec(compile(block,'actual-installer-diagnostic-block','exec'),{'__name__':'__main__'})
+        self.assertNotIn(secret,error.getvalue());self.assertEqual(self.pointers(),{})
+        self.assertIn('node_observer_preparation_unavailable',error.getvalue())
+
     def test_installer_concurrent_config_write_not_overwritten(self):
         new=b'UNRELATED_SYNTHETIC=concurrent-owner\n'
         with self.assertRaisesRegex(ValueError,'release_configuration_changed'):

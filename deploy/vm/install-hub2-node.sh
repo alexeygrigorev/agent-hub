@@ -409,6 +409,15 @@ if mode == "active" and repo_arg and evidence_root_arg:
                 or any(reason not in reasons for reason in receipt["held"].values())
                 or any(key in overrides for key in receipt["pointers"])):
             raise ValueError("node_observer_preparation_unavailable")
+        source_reasons = {"source_directory_untrusted", "source_directory_unavailable", "source_file_unavailable",
+                          "source_file_not_regular", "source_file_foreign_owner", "source_file_linked",
+                          "source_file_unsafe_mode", "source_file_oversized", "source_file_changed",
+                          "source_git_unverified", "source_hash_mismatch", "source_unclassified"}
+        source_failures = receipt.get("source_failures", {})
+        if (not isinstance(source_failures, dict)
+                or set(source_failures) != {role for role, reason in receipt["held"].items() if reason == "selected_source_unverified"}
+                or any(reason not in source_reasons for reason in source_failures.values())):
+            raise ValueError("node_observer_preparation_unavailable")
         for key, value in receipt["pointers"].items():
             if (not isinstance(value, str) or not os.path.isabs(value)
                     or (Path(value).parent != evidence_root and value != file_observer_value(original_text, key))
@@ -417,6 +426,8 @@ if mode == "active" and repo_arg and evidence_root_arg:
         updates.update(receipt["pointers"])
         for role, reason in receipt["held"].items():
             print("node_observer_held:" + role + ":" + reason + "; no new coverage authorized", file=sys.stderr)
+            if role in source_failures:
+                print("node_observer_source:" + role + ":" + source_failures[role], file=sys.stderr)
     except Exception:
         # Do not print exceptions/config/paths. Existing pointers and histories
         # remain; loaded/current/boot checks determine UNKNOWN independently.
