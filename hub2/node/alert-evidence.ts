@@ -76,12 +76,46 @@ export function persistDiagnosticFields(stage:unknown,error:unknown){
   return {unavailable_persist_stage:typeof stage==='string'&&persistStages.has(stage)?stage:'unspecified',
     unavailable_persist_error:typeof error==='string'&&persistErrors.has(error)?error:'opaque'};
 }
+// Closed per-slot progress only. No artifact paths, stat values or timestamps.
+type ArtifactOperation = 'open' | 'stat' | 'read' | 'hash' | 'close';
+type ArtifactProgress = {slots:Map<number,ArtifactOperation>;completed:number;phase:'validation'|'files'|'proof'|'complete'};
+type ArtifactProgressSnapshot = {phase:'unspecified'}|{slots:{slot:number;operation:ArtifactOperation}[];completed:number;phase:'validation'|'files'|'proof'|'complete'};
+const ARTIFACT_OPERATIONS = new Set<ArtifactOperation>(['open','stat','read','hash','close']);
+function freezeArtifactProgress(progress:ArtifactProgress|undefined):ArtifactProgressSnapshot|undefined{
+  if(!progress)return undefined;
+  // Internal bounded state only. If it cannot be represented exactly, omit
+  // individual slots rather than guessing which operation caused the failure.
+  const rows=[...progress.slots];
+  if(rows.length>2||!Number.isInteger(progress.completed)||progress.completed<0||progress.completed>8
+    ||!['validation','files','proof','complete'].includes(progress.phase)
+    ||rows.some(([slot,operation])=>!Number.isInteger(slot)||slot<0||slot>7||!ARTIFACT_OPERATIONS.has(operation)))
+    return {phase:'unspecified'};
+  return {slots:rows.sort((a,b)=>a[0]-b[0]).map(([slot,operation])=>({slot,operation})),completed:progress.completed,phase:progress.phase};
+}
+function artifactDiagnosticFields(progress:ArtifactProgressSnapshot|undefined){
+  return progress?.phase==='unspecified'?{unavailable_artifact_phase:'unspecified'}:progress?{unavailable_artifact_slots:progress.slots.map(row=>({...row})),
+    unavailable_artifact_completed:progress.completed,unavailable_artifact_phase:progress.phase}:{};
+}
+type PersistTimerLateness = 'on_tick'|'delayed'|'unspecified';
+function persistClock():number|undefined{
+  try{const value=performance.now();return Number.isFinite(value)&&value>=0?value:undefined;}catch{return undefined;}
+}
+function persistTimerLateness(start:number|undefined,budget:number):PersistTimerLateness{
+  const end=persistClock();
+  if(start===undefined||end===undefined||end-start<budget)return 'unspecified';
+  // Diagnostic tolerance only, NEVER a timeout extension or cause attribution.
+  return end-start<=budget+50?'on_tick':'delayed';
+}
+function firstPersistFailure(trace:PersistTrace|undefined,stage:EvidencePersistStage,error:unknown,timer?:PersistTimerLateness){
+  if(trace&&!trace.first)trace.first={stage,error,
+    ...(stage==='artifacts'?{artifacts:freezeArtifactProgress(trace.artifacts)}:{}),...(timer?{timer}:{})};
+}
 const ownDeadlines = new WeakSet<object>();
-type PersistTrace = { stage: EvidencePersistStage; first?: {stage:EvidencePersistStage;error:unknown} };
+type PersistTrace = { stage: EvidencePersistStage; artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
 async function persistStep<T>(trace:PersistTrace|undefined,stage:EvidencePersistStage,work:()=>Promise<T>):Promise<T>{
   if(trace)trace.stage=stage;
   try{return await work();}
-  catch(error){if(trace&&!trace.first)trace.first={stage,error};throw error;}
+  catch(error){firstPersistFailure(trace,stage,error);throw error;}
 }
 export function classifyPersistFailure(error:unknown):EvidencePersistError{
   try{
@@ -252,7 +286,9 @@ class PrivateStore {
   async close() { await Promise.all(this.handles.splice(0).map(handle => handle.close())); }
 }
 
-async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>) {
+async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>, trace?:PersistTrace) {
+  const progress:ArtifactProgress={slots:new Map(),completed:0,phase:'validation'};
+  if(trace)trace.artifacts=progress;
   check(Array.isArray(entry.artifacts) && entry.artifacts.length >= 3 && entry.artifacts.length <= 8);
   const paths = new Set<string>();
   for (const artifact of entry.artifacts) {
@@ -267,23 +303,42 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
   // Fail fast on an observed rejection; every started task retains its own
   // finally-close even after rejection/timeout. No next batch follows a verifier
   // rejection; an OUTER timeout still does not cancel underlying IO, as before.
+  progress.phase='files';
   for (let index = 0; index < entry.artifacts.length; index += 2) {
-    await Promise.all(entry.artifacts.slice(index, index + 2).map(async artifact => {
-    const handle = await open(artifact.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    await Promise.all(entry.artifacts.slice(index, index + 2).map(async (artifact,offset) => {
+    const slot=index+offset;
+    let handle:FileHandle|undefined;
+    progress.slots.set(slot,'open');
     try {
+      handle = await open(artifact.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      progress.slots.set(slot,'stat');
       const st = await handle.stat();
       check(st.isFile() && [0, process.geteuid!()].includes(st.uid) && !(st.mode & 0o022)
         && st.nlink === 1 && st.size <= 16 * 1024 * 1024);
       const buffer = Buffer.alloc(st.size + 1);
+      progress.slots.set(slot,'read');
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      check(bytesRead === st.size && hash(buffer.subarray(0, bytesRead)) === artifact.sha256);
-    } finally { await handle.close(); }
+      check(bytesRead === st.size);
+      progress.slots.set(slot,'hash');
+      check(hash(buffer.subarray(0, bytesRead)) === artifact.sha256);
+    } catch(error) { firstPersistFailure(trace,'artifacts',error);throw error; }
+    finally {
+      if(handle){
+        progress.slots.set(slot,'close');
+        try{await handle.close();}
+        catch(error){firstPersistFailure(trace,'artifacts',error);throw error;}
+      }
+      progress.slots.delete(slot);
+    }
+    progress.completed++;
     }));
   }
+  progress.phase='proof';
   const required = entry.producer === 'credential_monitor' ? requiredArtifacts : diagnosticArtifacts;
   if (entry.producer !== 'credential_monitor') check(entry.artifacts.length === required.length);
   check(required.every(path => paths.has(path) && loaded[path] === entry.artifacts.find(item => item.path === path)?.sha256)
     && hash(canonical(entry.artifacts)) === entry.source_id);
+  progress.phase='complete';
 }
 
 const FAILURE_REASONS = new Set(['invalidated', 'persist_failed', 'capacity_or_counter_limit',
@@ -299,7 +354,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
   private firstFailure: string | undefined;
-  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError} | undefined;
+  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} | undefined;
   private pending = 0;
   private active = new Set<number>();
   private requests = 0;
@@ -339,10 +394,11 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   }
   private async bounded(work: Promise<void>, trace?:PersistTrace) {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const timerStart=trace?persistClock():undefined;
     try { await Promise.race([work, new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         const error=new Error('observer_timeout');ownDeadlines.add(error);
-        if(trace&&!trace.first)trace.first={stage:trace.stage,error};
+        if(trace)firstPersistFailure(trace,trace.stage,error,persistTimerLateness(timerStart,this.timeoutMs));
         reject(error);
       }, this.timeoutMs);
     })]); }
@@ -363,14 +419,14 @@ export class AlertEvidence implements CredentialMonitorEvidence {
           const value = this.nextSnapshot;
           this.nextSnapshot = undefined;
           await this.bounded((async () => {
-            await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded));
+            await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded, trace));
             await this.store.write(value, this.writer, trace);
           })(),trace);
         }
       } catch(error) {
         if(!this.dirty){
           const first=trace.first??{stage:trace.stage,error};
-          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error)};
+          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
         }
         this.invalidate('persist_failed');
       }
@@ -413,7 +469,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
       unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
         (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced'),
-      ...(this.firstFailure==='persist_failed'?persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error):{})});
+      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
     if (this.dirty || this.pending || this.active.size) return unavailable();
     const version = canonical(this.journal);
     try {

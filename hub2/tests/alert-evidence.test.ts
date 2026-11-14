@@ -1,4 +1,5 @@
 import { stripTypeScriptTypes } from 'node:module';
+import { types as utilTypes } from 'node:util';
 import { constants as artifactConstants } from 'node:fs';
 import { isAbsolute as artifactIsAbsolute } from 'node:path';
 import { test } from 'node:test';
@@ -125,39 +126,68 @@ function artifactHarness(options:any={}) {
   assert.ok(start>=0&&end>start);
   const helpers=source.slice(source.indexOf('export function canonical('),source.indexOf('// Exhaustive type-checked'))
     .replace('export function canonical(','function canonical(');
-  const names=Array.from({length:5},(_,i)=>'/synthetic/artifact-'+i);
+  const progress=source.slice(source.indexOf('// Closed per-slot progress'),source.indexOf('const ownDeadlines'));
+  assert.ok(progress.includes('function firstPersistFailure('));
+  const persistence=source.slice(source.indexOf('const ownDeadlines'),source.indexOf('class PrivateStore'))
+    .replace('export function classifyPersistFailure(','function classifyPersistFailure(');
+  const projections=source.slice(source.indexOf('const PERSIST_STAGES'),source.indexOf('// Closed per-slot progress'))
+    .replace('export function persistDiagnosticFields(','function persistDiagnosticFields(');
+  const failures=source.slice(source.indexOf('const FAILURE_REASONS'),source.indexOf('/** One live Node incarnation.'));
+  const methods=source.slice(source.indexOf('  invalidate(reason:'),source.indexOf('  async close() { this.invalidate'))
+    .replaceAll('private async ','async ').replaceAll('private persist(','persist(');
+  const names=Array.from({length:options.artifactCount??5},(_,i)=>'/synthetic/artifact-'+i);
   const bytes=new Map(names.map((name,i)=>[name,Buffer.from('immutable source '+i)]));
   const artifacts=names.map(path=>({path,sha256:sha(bytes.get(path)!)}));
   const loaded=Object.fromEntries(artifacts.map(a=>[a.path,a.sha256]));
-  const entry:any={producer:'picker_excluded',artifacts,source_id:sha(canonical(artifacts))};
+  const entry:any={producer:options.producer??'picker_excluded',artifacts,source_id:sha(canonical(artifacts))};
   const waiting:Array<()=>void>=[],opened:string[]=[],closed:string[]=[];
-  let active=0,maximum=0;
+  let active=0,maximum=0,paused=false;
+  const pause=async(operation:string,path:string)=>{
+    if(!paused&&options.pause?.operation===operation&&path===names[options.pause.slot]){
+      paused=true;await new Promise<void>(resolve=>waiting.push(resolve));
+    }
+  };
   const open=async(path:string,flags:number)=>{
     assert.equal(flags,artifactConstants.O_RDONLY|artifactConstants.O_NOFOLLOW|artifactConstants.O_NONBLOCK);
-    opened.push(path);
+    opened.push(path);await pause('open',path);
     if(options.openError)throw options.openError;
     const data=bytes.get(path)!;assert.ok(data);active++;maximum=Math.max(maximum,active);
     return {
       async stat(){
+        await pause('stat',path);
         if(options.statError&&path===names[0])throw options.statError;
         return {isFile:()=>true,uid:process.geteuid!(),mode:0o100600,nlink:1,size:data.length,...options.metadata};
       },
       async read(buffer:Buffer){
+        await pause('read',path);
         if(options.delayed&&(!options.delayOnlySecond||path===names[1]))await new Promise<void>(resolve=>waiting.push(resolve));
         buffer.set(data);return {bytesRead:data.length};
       },
-      async close(){closed.push(path);active--;if(options.closeError&&path===names[1])throw options.closeError;},
+      async close(){await pause('close',path);closed.push(path);active--;if(options.closeError&&path===names[options.closeSlot??1])throw options.closeError;},
     };
   };
-  const body=stripTypeScriptTypes(helpers+source.slice(start,end))+'\nreturn verifyArtifacts;';
-  const verify=new Function('open','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash',body)
-    (open,artifactConstants,artifactIsAbsolute,names.slice(0,3),names,createHash);
-  const bs=source.indexOf('  private async bounded('),be=source.indexOf('\n  private persist()',bs);
-  assert.ok(bs>=0&&be>bs);
-  const bounded=new Function('ownDeadlines',stripTypeScriptTypes('const value = { '+source.slice(bs,be).replace('private async','async')+' };')+'return value;')(new WeakSet()).bounded;
+  const injectedHash=(algorithm:string)=>{
+    const result=createHash(algorithm);
+    return {update(data:any){
+      if(options.hashError&&Buffer.isBuffer(data)&&data.equals(bytes.get(names[options.hashSlot??0])!))throw options.hashError;
+      if(options.proofError&&typeof data==='string'&&data===canonical(artifacts))throw options.proofError;
+      result.update(data);return result;
+    }};
+  };
+  const body=stripTypeScriptTypes(source.slice(source.indexOf('const LIMIT ='),source.indexOf('type Producer ='))+helpers+projections+progress+persistence+source.slice(start,end)+failures+
+    '\nclass Methods{'+methods+'};')+'\nreturn {verifyArtifacts,methods:Methods.prototype,freezeArtifactProgress,artifactDiagnosticFields,classifyPersistFailure,persistTimerLateness};';
+  const actual=new Function('open','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash','utilTypes','performance',body)
+    (open,artifactConstants,artifactIsAbsolute,names.slice(0,3),names,injectedHash,utilTypes,
+      {now:()=>options.clock?options.clock():0});
   const timeout=Number(source.match(/const TIMEOUT_MS = (\d+);/)![1]);
-  return {verify:()=>verify(entry,loaded),entry,loaded,names,bytes,opened,closed,waiting,
-    stats:()=>({active,maximum}),bounded:(work:Promise<void>,trace:any)=>bounded.call({timeoutMs:timeout},work,trace),timeout};
+  const journal={kind:'hub_picker_diagnostic_journal_v1',producer:'picker_excluded',source_id:entry.source_id,
+    enrollment_id:'2'.repeat(32),occurrence_count:0,started_total:0,finished_total:0};
+  const store={identity:async()=>{},read:async()=>entry,write:async()=>{},verify:async()=>canonical(journal)};
+  const observer=Object.assign(Object.create(actual.methods),{store,enrollment:entry,journal,writer:undefined,timeoutMs:timeout,
+    loaded,boot:'synthetic',dirty:false,pending:0,active:new Set(),requests:0,queue:Promise.resolve()});
+  return {verify:(trace?:any)=>actual.verifyArtifacts(entry,loaded,trace),entry,loaded,names,bytes,opened,closed,waiting,observer,
+    project:actual.artifactDiagnosticFields,freeze:actual.freezeArtifactProgress,lateness:actual.persistTimerLateness,
+    stats:()=>({active,maximum}),bounded:(work:Promise<void>,trace:any)=>actual.methods.bounded.call({timeoutMs:timeout},work,trace),timeout};
 }
 async function artifactMicrotasks(){for(let i=0;i<40;i++)await Promise.resolve();}
 async function drainArtifactFake(h:any){
@@ -170,6 +200,106 @@ async function drainArtifactFake(h:any){
 }
 
 async function defineTests() {
+  test('artifact progress freezes each controlled IO slot at the original deadline',async t=>{
+    t.mock.timers.enable({apis:['setTimeout']});
+    try{
+      for(const operation of ['open','stat','read','close'])for(const slot of [0,1,3,7]){
+        let clock=0;const h=artifactHarness({pause:{operation,slot},clock:()=>clock,...(slot===7?{artifactCount:8,producer:'credential_monitor'}:{})}),trace:any={stage:'artifacts'};
+        const work=h.verify(trace),outcome=h.bounded(work,trace).then(()=>null,(error:unknown)=>error);
+        try{
+          for(let n=0;n<8&&!h.waiting.length;n++)await artifactMicrotasks();
+          assert.equal(h.waiting.length,1,operation+slot);clock=150;t.mock.timers.tick(150);await artifactMicrotasks();
+          assert.ok(await outcome);assert.equal(trace.first.timer,'on_tick');
+          const frozen=JSON.stringify(h.project(trace.first.artifacts));
+          assert.ok(trace.first.artifacts.slots.some((row:any)=>row.slot===slot&&row.operation===operation));
+          assert.ok(trace.first.artifacts.slots.length<=2);assert.ok(trace.first.artifacts.completed<=8);
+          assert.equal(trace.first.artifacts.phase,'files');
+          await drainArtifactFake(h);await work;
+          assert.equal(JSON.stringify(h.project(trace.first.artifacts)),frozen,'late IO must not rewrite first detail');
+          assert.ok(h.stats().maximum<=2);
+        }finally{await drainArtifactFake(h);await work.catch(()=>{});}
+      }
+    }finally{t.mock.timers.reset();}
+  });
+  test('artifact progress actual persist and snapshot keep two-slot deadline after late failed cleanup',async t=>{
+    t.mock.timers.enable({apis:['setTimeout']});let clock=0;
+    const late=Object.assign(new Error('SECRET close path/token'),{code:'EIO'});
+    const options:any={pause:{slot:0,operation:'read'},delayed:true,delayOnlySecond:true,closeError:late,clock:()=>clock};
+    const h=artifactHarness(options),observer=h.observer;
+    try{
+      const identity=observer.begin();await artifactMicrotasks();assert.equal(h.waiting.length,2);
+      clock=400;t.mock.timers.tick(150);await artifactMicrotasks();await observer.finish(identity,'observation');
+      const frozen=JSON.stringify(observer.firstPersist);
+      assert.equal(observer.firstPersist.error,'deadline');assert.equal(observer.firstPersist.timer,'delayed');
+      assert.deepEqual(observer.firstPersist.artifacts.slots,[{slot:0,operation:'read'},{slot:1,operation:'read'}]);
+      await drainArtifactFake(h);await observer.queue;options.closeError=undefined;options.delayed=false;
+      const proof=await observer.snapshot(NONCE);
+      assert.equal(proof.available,false);assert.equal(proof.unavailable_reason,'persist_failed');
+      assert.equal(proof.unavailable_persist_stage,'artifacts');assert.equal(proof.unavailable_persist_error,'deadline');
+      assert.equal(proof.unavailable_persist_timer,'delayed');assert.equal(proof.unavailable_artifact_phase,'files');
+      assert.equal(JSON.stringify(observer.firstPersist),frozen);
+      assert.ok(!JSON.stringify(proof).includes('SECRET'));assert.ok(!JSON.stringify(proof).includes('/synthetic'));
+    }finally{options.closeError=undefined;options.delayed=false;await drainArtifactFake(h);t.mock.timers.reset();}
+  });
+  test('artifact progress preserves the primary operation despite finally replacing its thrown error',async()=>{
+    const primary=Object.assign(new Error('SECRET original'),{code:'EACCES'}),replacement=Object.assign(new Error('SECRET close'),{code:'EIO'});
+    const h=artifactHarness({statError:primary,closeError:replacement,closeSlot:0}),trace:any={stage:'artifacts'};
+    await assert.rejects(h.verify(trace),error=>error===replacement);await artifactMicrotasks();
+    assert.equal(trace.first.error,primary);assert.equal(trace.first.stage,'artifacts');
+    assert.ok(trace.first.artifacts.slots.some((row:any)=>row.slot===0&&row.operation==='stat'));
+    assert.ok(!JSON.stringify(h.project(trace.first.artifacts)).includes('SECRET'));assert.equal(h.stats().active,0);
+    const actual=artifactHarness({statError:primary,closeError:replacement,closeSlot:0});
+    actual.observer.begin();await actual.observer.queue;
+    assert.equal(actual.observer.firstPersist.error,'permission','first stat failure survives finally close replacement');
+    const proof=await actual.observer.snapshot(NONCE);
+    assert.equal(proof.unavailable_persist_error,'permission');
+    assert.ok(proof.unavailable_artifact_slots.some((row:any)=>row.slot===0&&row.operation==='stat'));
+  });
+  test('artifact progress actual method projection distinguishes hash and final proof errors',async()=>{
+    for(const kind of ['hash','proof','membership']){
+      const original=Object.assign(new Error('SECRET failed hash'),{code:'EIO'});
+      const options:any=kind==='hash'?{hashError:original,hashSlot:3}:kind==='proof'?{proofError:original}:{};
+      const h=artifactHarness(options);if(kind==='membership')h.entry.source_id='0'.repeat(64);
+      h.observer.begin();await h.observer.queue;
+      const detail=h.observer.firstPersist;assert.equal(detail.stage,'artifacts');
+      if(kind==='hash')assert.ok(detail.artifacts.slots.some((row:any)=>row.slot===3&&row.operation==='hash'));
+      else {assert.equal(detail.artifacts.phase,'proof');assert.deepEqual(detail.artifacts.slots,[]);assert.equal(detail.artifacts.completed,5);}
+      const proof=await h.observer.snapshot(NONCE);assert.equal(proof.available,false);assert.equal(proof.unavailable_reason,'persist_failed');
+      assert.equal(proof.unavailable_persist_error,kind==='membership'?'error':'io');
+      assert.ok(!JSON.stringify(proof).includes('SECRET'));assert.equal(h.stats().active,0);
+    }
+  });
+  test('artifact progress never replaces an earlier primary invalidation with observer timeout detail',async t=>{
+    t.mock.timers.enable({apis:['setTimeout']});const h=artifactHarness({pause:{slot:0,operation:'open'},clock:()=>150});
+    try{
+      h.observer.begin();await artifactMicrotasks();h.observer.invalidate('picker_pool_failed');
+      t.mock.timers.tick(150);await artifactMicrotasks();await h.observer.queue;
+      await drainArtifactFake(h);const proof=await h.observer.snapshot(NONCE);
+      assert.equal(proof.unavailable_reason,'picker_pool_failed');assert.equal(h.observer.firstPersist,undefined);
+      assert.ok(!Object.keys(proof).some(key=>key.startsWith('unavailable_artifact')||key.startsWith('unavailable_persist')));
+    }finally{await drainArtifactFake(h);t.mock.timers.reset();}
+  });
+  test('artifact progress closed projection refuses bad slots and preserves healthy seventeen fields',async()=>{
+    const h=artifactHarness();
+    for(const progress of [{slots:new Map([[8,'read']]),completed:0,phase:'files'},
+      {slots:new Map([[0,'SECRET/raw/path']]),completed:0,phase:'files'},
+      {slots:new Map([[0,'read'],[1,'read'],[2,'read']]),completed:0,phase:'files'},
+      {slots:new Map(),completed:9,phase:'files'}]){
+      assert.deepEqual(h.project(h.freeze(progress)),{unavailable_artifact_phase:'unspecified'});
+    }
+    const maximum=artifactHarness({artifactCount:8,producer:'credential_monitor'}),trace:any={stage:'artifacts'};
+    await maximum.verify(trace);assert.deepEqual(maximum.freeze(trace.artifacts),{slots:[],completed:8,phase:'complete'});
+    const healthy=await h.observer.snapshot(NONCE);assert.equal(healthy.complete,true);
+    assert.equal(Object.keys(healthy).length,17);assert.ok(!Object.keys(healthy).some(key=>key.startsWith('unavailable_')));
+  });
+  test('artifact progress timer lateness uses coarse closed mock-clock buckets only',()=>{
+    let clock:any=150;const h=artifactHarness({clock:()=>clock});
+    assert.equal(h.lateness(0,150),'on_tick');clock=200;assert.equal(h.lateness(0,150),'on_tick');
+    clock=201;assert.equal(h.lateness(0,150),'delayed');clock=149;assert.equal(h.lateness(0,150),'unspecified');
+    clock=NaN;assert.equal(h.lateness(0,150),'unspecified');clock=150;assert.equal(h.lateness(undefined,150),'unspecified');
+    const bad=artifactHarness({clock:()=>{throw new Error('SECRET clock');}});assert.equal(bad.lateness(0,150),'unspecified');
+  });
+
   test('artifact concurrency is bounded at two and every invocation rehashes current bytes',async()=>{
     const h=artifactHarness();await h.verify();
     assert.equal(h.opened.length,5);assert.equal(h.closed.length,5);
