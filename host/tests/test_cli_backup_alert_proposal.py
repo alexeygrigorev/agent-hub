@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT=Path(__file__).resolve().parents[2]
 PRIVATE=ROOT.parent
@@ -31,7 +32,10 @@ with open(os.environ['MAIL_LOG'],'a') as f:f.write(json.dumps({'body':sys.stdin.
 
 class SourceProposalTests(unittest.TestCase):
  def setUp(self):
-  parent=Path(os.environ.get('TMPDIR') or ROOT/'.local/backup-alert-tests')
+  # The real source loader refuses every world-writable ancestor, including
+  # sticky /tmp. CI's disposable TMPDIR may live there; fixture source belongs
+  # under this checkout, without relaxing the loader's custody checks.
+  parent=ROOT/'.local/backup-alert-tests'
   parent.mkdir(parents=True,exist_ok=True)
   self.tmp=tempfile.TemporaryDirectory(prefix='backup-v2-',dir=parent);self.addCleanup(self.tmp.cleanup)
   self.root=Path(self.tmp.name);self.bin=self.root/'bin';self.bin.mkdir()
@@ -115,6 +119,18 @@ class SourceProposalTests(unittest.TestCase):
      b=self.run_source(tree='base',**options)
      normalize=lambda text:re.sub(r'LAST_ALERT=[1-9][0-9]*','LAST_ALERT=positive',text or '')
      self.assertEqual((r['rc'],len(r['mail']),normalize(r['state'])),(b['rc'],len(b['mail']),normalize(b['state'])))
+
+ def test_world_writable_tmpdir_does_not_disable_source_contract(self):
+  unsafe=self.root/'world-writable-temp';unsafe.mkdir(mode=0o700);unsafe.chmod(0o1777)
+  case=type(self)('test_reviewed_real_client_missing_broker_keeps_business_once')
+  self.addCleanup(case.doCleanups)
+  with mock.patch.dict(os.environ,{'TMPDIR':str(unsafe)}):
+   case.setUp()
+  self.assertFalse(case.root.is_relative_to(unsafe))
+  r=case.run_source(args=['--backup-failed','fixture'])
+  self.assertEqual((r['rc'],len(r['mail'])),(0,1),r)
+  self.assertEqual([e['frame']['phase'] for e in r['events'] if e['kind']=='partial_frame'],
+   ['begin','decision','terminal'],r)
 
  def test_reviewed_real_client_missing_broker_keeps_business_once(self):
   r=self.run_source(client='accepted',args=['--backup-failed','fixture'])
