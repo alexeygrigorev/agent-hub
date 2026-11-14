@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch, launch_reaper, credential_delivery
-from .implement_workspace import prepare_workspace
+from .implement_workspace import prepare_workspace, _identity_and_ref
 from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
@@ -224,7 +224,12 @@ class Bridge:
         launch = offer.get("launch")
         if not isinstance(launch, dict):
             raise ValueError("launch_specification_required")
-        workspace = self.resolve_workspace(launch.get("workspace"))
+        workspace = self.resolve_workspace(
+            launch.get("workspace"),
+            purpose=launch.get("purpose"),
+            intake_id=offer.get("intake_id"),
+            project_id=offer.get("project_id"),
+        )
         engine = launch.get("engine")
         if engine not in self.engines:
             raise ValueError("engine_not_allowed")
@@ -262,7 +267,7 @@ class Bridge:
                 "prompt": prompt, "interactive": bool(launch.get("interactive", False)), "timeout_seconds": timeout,
                 'with_goal':with_goal,'effort':effort,**managed}
 
-    def resolve_workspace(self, value):
+    def resolve_workspace(self, value, *, purpose=None, intake_id=None, project_id=None):
         if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
             raise ValueError("invalid_workspace")
         candidate = Path(value)
@@ -270,6 +275,20 @@ class Bridge:
             try:
                 workspace = candidate.resolve(strict=True)
             except OSError:
+                if (purpose in {None, "implement", "fix"}
+                        and len(candidate.parts) >= 4
+                        and candidate.parts[-3:-1] == (".local", "hub-worktrees")
+                        and re.fullmatch(r"[0-9a-f]{64}", candidate.name)
+                        and isinstance(intake_id, str) and isinstance(project_id, str)):
+                    try:
+                        _, expected_digest, _ = _identity_and_ref(intake_id, project_id)
+                        parent = candidate.parents[2].resolve(strict=True)
+                    except (OSError, ValueError):
+                        raise ValueError(f"workspace_unavailable path={value}") from None
+                    if (candidate.name == expected_digest
+                            and parent.is_dir()
+                            and any(parent.is_relative_to(root) for root in self.roots)):
+                        return parent
                 raise ValueError(f"workspace_unavailable path={value}") from None
             if not workspace.is_dir():
                 raise ValueError(f"workspace_unavailable path={value}")

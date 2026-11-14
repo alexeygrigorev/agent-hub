@@ -59,3 +59,15 @@ export function mergeWorkspaceBinding(requested:unknown,stored:unknown,incoming?
 export function boundWorkspace(launch:JsonRecord,stored:unknown=launch[WORKSPACE_BINDING_FIELD]):unknown {
   return mergeWorkspaceBinding(launch.workspace,stored)?.resolved_workspace??launch.workspace;
 }
+
+/** When a bound workspace is an ephemeral `.local/hub-worktrees/<64-hex>`
+ * worktree beneath an absolute checkout, continuations and verifiers target
+ * that parent checkout so a cleaned-up worktree never fails with
+ * `workspace_unavailable`: `implement` recreates the worktree and `review`
+ * inspects the checkout directly. */
+export function checkoutWorkspace(launch:JsonRecord,stored:unknown=launch[WORKSPACE_BINDING_FIELD]):unknown {
+  const bound=boundWorkspace(launch,stored);
+  if(typeof bound!=='string'||!retainedIntakeWorktree(bound))return bound;
+  const parts=bound.split(/[\\/]/);
+  return parts.slice(0,-3).join(bound.includes('\\')?'\\':'/')||bound;
+}

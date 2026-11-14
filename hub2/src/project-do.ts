@@ -2,7 +2,7 @@ import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
 import { IntakeRelations } from './intake-relations';
 import {listProjectIntakes} from './intake-list';
-import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
+import {boundWorkspace,checkoutWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
@@ -1715,7 +1715,7 @@ export class ProjectDO {
     const prompt=verificationPrompt(intake.id,verifierSessionId,action.original_session_id,attempt,
       action.summary??record.summary??'',Array.isArray(criteria)?criteria.map(String):[]);
     const originalLaunch=this.parse(origin.launch_spec_json) as JsonRecord;
-    const body:JsonRecord={key,workspace:boundWorkspace(originalLaunch,this.workspaceBinding(origin)),prompt,purpose:'review',
+    const body:JsonRecord={key,workspace:checkoutWorkspace(originalLaunch,this.workspaceBinding(origin)),prompt,purpose:'review',
       timeout_seconds:1800,verification_of_session_id:record.session_id,verification_origin_session_id:action.original_session_id,
       verification_attempt:attempt,verification_summary:action.summary??record.summary??'',exclude_policy_ids:[...excluded],
       ...(action.round?{verification_round:action.round}:{})};
@@ -1825,7 +1825,7 @@ export class ProjectDO {
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
-      const body:JsonRecord={key:action.key,workspace:boundWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
+      const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
         ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
