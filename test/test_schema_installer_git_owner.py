@@ -10,7 +10,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-ARTIFACTS = ('hub2/node/alert-evidence.ts', 'hub2/node/main.ts', 'hub2/src/worker.ts')
+ARTIFACTS = ('hub2/node/alert-evidence.ts', 'hub2/node/main.ts', 'hub2/src/worker.ts',
+             'hub2/src/model-picker.ts', 'hub2/src/routing-pool.ts')
 GIT_ENV = {'PATH': os.defpath, 'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1',
            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
 
@@ -22,8 +23,9 @@ class InstallerGitOwnerTests(unittest.TestCase):
         self.block = self.block.replace('overrides = service_environment()', 'overrides = {}')
         parent = ROOT/'.local/tmp'
         parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.temporary = None
+        self.addCleanup(self.cleanup_fixture)  # Registered before creating any privileged fixture resources.
         self.temporary = tempfile.TemporaryDirectory(prefix='installer-git-owner-', dir=parent)
-        self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
         self.uid = os.geteuid() if os.geteuid() else ROOT.stat().st_uid
         self.gid = os.getegid() if os.geteuid() else ROOT.stat().st_gid
@@ -45,11 +47,15 @@ class InstallerGitOwnerTests(unittest.TestCase):
             '-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','commit','-qm','synthetic source')
         self.head = git('rev-parse','HEAD')
         self.vars = self.repo/'.dev.vars'
-        self.before = 'SYNTHETIC_PRIVATE=unchanged\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\nHUB2_SCHEMA_MIGRATIONS=defer\n'
+        self.before = 'SYNTHETIC_PRIVATE=unchanged\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=\nHUB2_SCHEMA_MIGRATIONS=defer\n'
         self.vars.write_text(self.before);self.vars.chmod(0o640)
         self.evidence = self.base/'evidence';self.evidence.mkdir(mode=0o700)
         if os.geteuid()==0:
             for p in [*self.base.rglob('*'), self.base]:os.chown(p,self.uid,self.gid)
+
+    def cleanup_fixture(self):
+        if self.temporary is not None:
+            self.temporary.cleanup()
 
     def root_command(self, args):
         if os.geteuid()==0:return args
