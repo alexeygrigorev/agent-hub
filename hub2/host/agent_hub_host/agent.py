@@ -1241,6 +1241,16 @@ class Bridge:
             frame = {"type": "host.error", "reason": reason, "stage": stage, "detail": detail,
                      "session_id": target.get("session_id"), "operation_id": target.get("operation_id"),
                      "message_id": target.get("id")}
+            if event.get('type') == 'mailbox.deliver':
+                frame['stage'] = 'host_mailbox'
+                frame['message_epoch'] = target.get('epoch')
+                # Quarantine must bind the actual durable running native, not a
+                # session/launch epoch or an ID reported by message input.
+                launches = self.journal.db.execute(
+                    "SELECT native_id FROM launches WHERE session_id=? AND state='running'",
+                    (target.get('session_id'),)).fetchall()
+                if len(launches) == 1:
+                    frame['native_id'] = launches[0]['native_id']
             if stage == 'host_launch' and target.get("epoch") is not None:
                 frame["epoch"] = target.get("epoch")
             socket.send(canonical(frame))

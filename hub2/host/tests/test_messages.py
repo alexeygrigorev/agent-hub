@@ -1,6 +1,7 @@
 import json
 import subprocess
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import test_host
 
@@ -60,6 +61,41 @@ class MailTests(unittest.TestCase):
         row = self.journal.db.execute("SELECT state,receipt FROM native_mail").fetchone()
         self.assertEqual(row["state"], "executing")
         self.assertIsNone(row["receipt"])
+
+
+    def test_mailbox_uncertainty_reports_message_epoch_and_exact_durable_native(self):
+        self.bridge.offer(self.offer())
+        launch = self.journal.db.execute("SELECT * FROM launches").fetchone()
+        message = self.message(); message['epoch'] = launch['epoch'] + 7
+        message['native_id'] = 'caller-forged-native'
+        frames = []
+        class Socket:
+            def send(self, raw): frames.append(json.loads(raw))
+        with patch('agent_hub_host.messages.deliver', side_effect=RuntimeError('native_mail_outcome_uncertain')):
+            self.bridge.dispatch({'type': 'mailbox.deliver', 'message': message}, Socket(), None)
+        self.assertEqual(len(frames), 1)
+        frame = frames[0]
+        self.assertEqual(frame['reason'], 'native_mail_outcome_uncertain')
+        self.assertEqual(frame['stage'], 'host_mailbox')
+        self.assertEqual(frame['message_epoch'], message['epoch'])
+        self.assertNotEqual(frame['message_epoch'], launch['epoch'])
+        self.assertEqual(frame['native_id'], launch['native_id'])
+        self.assertNotEqual(frame['native_id'], message['native_id'])
+        self.assertNotIn('epoch', frame)
+        self.assertEqual((frame['message_id'], frame['operation_id'], frame['session_id']),
+                         (message['id'], message['operation_id'], message['session_id']))
+
+
+    def test_mailbox_fatal_boundary_still_propagates_without_error_frame(self):
+        frames = []
+        class Socket:
+            def send(self, raw): frames.append(raw)
+        error = KeyboardInterrupt()
+        with patch('agent_hub_host.messages.deliver', side_effect=error):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.bridge.dispatch({'type': 'mailbox.deliver', 'message': self.message()}, Socket(), None)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(frames, [])
 
 
 if __name__ == "__main__":
