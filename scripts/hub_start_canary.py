@@ -353,6 +353,247 @@ def valid_native_id(val):
 CLAUDE_EMPTY_BASH_PLACEHOLDER = "(Bash completed with no output)"
 
 
+def zai_native_frame_for_refusal(line):
+    """Recover structural discriminators only to refuse malformed native data.
+
+    Every object remains an ordered list of ALL decoded pairs, including
+    duplicates. Strings stay opaque: assistant text is never parsed as JSON.
+    Neither this recovered tree nor its values can establish execution proof.
+    """
+    class Pairs(list):
+        pass
+
+    def native(root):
+        if not isinstance(root, Pairs):
+            return False
+        for key, item in root:
+            if key != "item" or not isinstance(item, Pairs):
+                continue
+            if any(key == "type" and value == "native_tool_result" for key, value in item):
+                return True
+        return False
+
+    try:
+        # This decoder deliberately preserves duplicate keys; the STRICT
+        # proof decoder independently rejects them, including escaped keys.
+        recovered = json.loads(line, object_pairs_hook=Pairs)
+        return native(recovered)
+    except (ValueError, TypeError, RecursionError):
+        pass
+
+    # Syntax-damaged JSON may still expose unambiguous root/item/type pairs.
+    # Build a refusal-only partial tree; tolerate missing punctuation without
+    # repairing or returning proof frames. Keep duplicate pairs and scopes.
+    clipped = line.lstrip()
+    if clipped and not clipped.startswith(('"', "{", "[")):
+        # An initial item type key can lose its opening quote in a retained
+        # tail. Decode that ONE key only for refusal, never proof recovery.
+        try:
+            key, end = json.decoder.scanstring('"' + clipped, 1, True)
+            if key == "type" and clipped[end - 1:].lstrip().startswith(":"):
+                line = '"' + clipped
+        except ValueError:
+            pass
+    if line.lstrip().startswith('"'):
+        # A clipped item-property suffix can be classified only for refusal.
+        line = '{"item":{' + line
+    root, stack, index, tokens = None, [], 0, 0
+    decoder = json.JSONDecoder()
+
+    def attach(value):
+        if not stack:
+            return
+        container, key = stack[-1]
+        if isinstance(container, Pairs):
+            if key is not None:
+                container.append((key, value))
+                stack[-1][1] = None
+        else:
+            container.append(value)
+
+    try:
+        while index < len(line):
+            tokens += 1
+            if tokens > 4096 or len(stack) > 128:
+                return True  # Recovery budget uncertainty cannot choose fallback.
+            char = line[index]
+            if char.isspace() or char == ":":
+                index += 1
+                continue
+            if char == ",":
+                if stack and isinstance(stack[-1][0], Pairs) and stack[-1][1] is not None:
+                    attach(None)
+                index += 1
+                continue
+            if char in "{[":
+                container = Pairs() if char == "{" else []
+                if root is None and not stack:
+                    root = container
+                attach(container)
+                stack.append([container, None])
+                index += 1
+                continue
+            if char in "}]":
+                if stack:
+                    stack.pop()
+                index += 1
+                continue
+            if char == '"':
+                try:
+                    value, end = json.decoder.scanstring(line, index + 1, True)
+                except ValueError:
+                    break  # Never scan inside an unterminated assistant string.
+                if stack and isinstance(stack[-1][0], Pairs) and stack[-1][1] is None:
+                    stack[-1][1] = value
+                else:
+                    attach(value)
+                index = end
+                continue
+            try:
+                value, end = decoder.raw_decode(line, index)
+            except ValueError:
+                index += 1
+                continue
+            attach(value)
+            index = end
+        return native(root)
+    except (ValueError, TypeError, RecursionError):
+        return True  # Refusal-only recovery failure never becomes proof.
+
+
+def zai_native_return_proof(captured, expected, binding=None):
+    """One owned capture, exact native returned text; never reconstruct stdout.
+
+    The producer has paired the scheduled Bash input with the native return.
+    Provider thread/session IDs are not the aplexer UUID: learn their tuple
+    from this owned stream and refuse drift. No proof frames cross captures.
+    """
+    answer = {"seen": False, "proven": False, "invalidated": False, "binding": binding}
+
+    def identity(value):
+        return (isinstance(value, str) and bool(value) and len(value.encode("utf-8")) <= 256
+                and value == value.strip() and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
+
+    def optional_bool(value):
+        return value is None or type(value) is bool
+
+    def optional_uint(value):
+        return value is None or type(value) is int and 0 <= value <= 2**64 - 1
+
+    try:
+        if not isinstance(captured, str) or len(captured.encode("utf-8")) > 65536:
+            answer.update(seen=True, invalidated=True)
+            return answer
+        events, malformed, native_parse_loss = [], False, False
+        for index, line in enumerate(captured.splitlines()):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line, object_pairs_hook=unique_object)
+            except json.JSONDecodeError:
+                native_parse_loss |= zai_native_frame_for_refusal(line)
+                # Only an unmistakably clipped initial fragment is ignorable.
+                # A fully started malformed object, duplicate-key contradiction
+                # or recognizable native fault is loss, never a repaired tail.
+                initial_fragment = (index == 0 and not line.lstrip().startswith(("{", "["))
+                                    and not zai_native_frame_for_refusal(line))
+                malformed |= not initial_fragment
+                continue
+            except (ValueError, TypeError):
+                native_parse_loss |= zai_native_frame_for_refusal(line)
+                malformed = True
+                continue
+            if not isinstance(event, dict):
+                malformed = True
+                continue
+            events.append(event)
+        native = [event for event in events if isinstance(event.get("item"), dict)
+                  and event["item"].get("type") == "native_tool_result"]
+        # Report parse loss even when this poll contains no complete native
+        # item: an already-established native attempt must not heal later.
+        answer["seen"] = bool(native) or native_parse_loss
+        if malformed or len(events) > 128:
+            answer["invalidated"] = True
+            return answer
+        if not native:
+            return answer
+        if binding is not None and (type(binding) is not tuple or len(binding) != 3
+                                    or not all(identity(value) for value in binding)):
+            answer["invalidated"] = True
+            return answer
+        item_ids, call_ids = set(), set()
+        headers = [event.get("thread_id") for event in events if event.get("type") == "thread.started"]
+        fields = {"kind", "native_event", "native_session_id", "native_turn_id", "call_id", "tool",
+                  "command", "content", "native_success", "exit_code", "status", "timed_out",
+                  "native_truncated", "native_original_bytes", "native_returned_bytes",
+                  "local_truncated", "observation_complete"}
+        for event in native:
+            item = event["item"]
+            if (set(event) != {"type", "item"} or event["type"] != "item.completed"
+                    or set(item) != {"id", "type", "thread_id", "turn_id", "observation"}
+                    or not all(identity(item.get(k)) for k in ("id", "thread_id", "turn_id"))
+                    or item["id"] in item_ids):
+                answer["invalidated"] = True
+                return answer
+            item_ids.add(item["id"])
+            observation = item["observation"]
+            if not isinstance(observation, dict):
+                answer["invalidated"] = True
+                return answer
+            if observation.get("kind") == "invalidated":
+                answer["invalidated"] = True
+                continue
+            if (set(observation) != fields or observation.get("kind") != "result"
+                    or observation["native_event"] not in ("tool_call_result", "tool_call_error")
+                    or not identity(observation["native_session_id"])
+                    or not identity(observation["call_id"])
+                    or observation["native_turn_id"] is not None and not identity(observation["native_turn_id"])
+                    or observation["call_id"] in call_ids
+                    or observation["tool"] != "Bash"
+                    or not isinstance(observation["command"], str) or not observation["command"]
+                    or len(observation["command"].encode("utf-8")) > 8192 or "\0" in observation["command"]
+                    or not isinstance(observation["content"], str)
+                    or len(observation["content"].encode("utf-8")) > 65536
+                    or not all(optional_bool(observation[k]) for k in ("native_success", "timed_out", "native_truncated"))
+                    or type(observation["local_truncated"]) is not bool
+                    or type(observation["observation_complete"]) is not bool
+                    or not all(optional_uint(observation[k]) for k in ("native_original_bytes", "native_returned_bytes"))
+                    or observation["exit_code"] is not None and not (type(observation["exit_code"]) is int
+                                                                 and -(2**31) <= observation["exit_code"] < 2**31)
+                    or observation["status"] not in (None, "completed", "failed", "timed_out", "cancelled", "running", "backgrounded")):
+                answer["invalidated"] = True
+                return answer
+            call_ids.add(observation["call_id"])
+            current = (item["thread_id"], item["turn_id"], observation["native_session_id"])
+            if answer["binding"] is None:
+                answer["binding"] = current
+            if current != answer["binding"] or any(header != current[0] for header in headers):
+                answer["invalidated"] = True
+                return answer
+            if observation["local_truncated"]:
+                answer["invalidated"] = True
+            complete = (observation["observation_complete"] is True
+                        and identity(observation["native_turn_id"])
+                        and observation["native_truncated"] is False
+                        and observation["local_truncated"] is False
+                        and type(observation["native_original_bytes"]) is int
+                        and type(observation["native_returned_bytes"]) is int
+                        and observation["native_returned_bytes"] == len(observation["content"].encode("utf-8"))
+                        and observation["native_original_bytes"] <= observation["native_returned_bytes"])
+            if observation["observation_complete"] is True and not complete:
+                answer["invalidated"] = True
+            if (complete and observation["native_event"] == "tool_call_result"
+                    and observation["native_success"] is True
+                    and type(observation["exit_code"]) is int and observation["exit_code"] == 0
+                    and observation["status"] == "completed" and observation["timed_out"] is False
+                    and observation["content"] == expected):
+                answer["proven"] = True
+        answer["proven"] &= not answer["invalidated"]
+        return answer
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        answer.update(seen=True, proven=False, invalidated=True)
+        return answer
+
 def paired_stream_output_ok(captured, expected, engine):
     """Complete provider frames from ONE capture only; never repair clipped JSON."""
     if len(captured.encode()) > 65536:
@@ -701,6 +942,8 @@ class Canary:
                 "or exit early. For every other runtime, follow this unchanged sequence: " + self.prompt
             )
         self.session = self.native = self.engine = None
+        self._zai_native_seen = self._zai_native_invalidated = False
+        self._zai_native_binding = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
 
@@ -1426,6 +1669,13 @@ class Canary:
             return False
         if eng in ("claude", "antigravity"):
             return paired_stream_output_ok(out, self.marker, eng)
+        if eng == "zai":
+            native = zai_native_return_proof(out, self.marker, getattr(self, "_zai_native_binding", None))
+            if native["invalidated"] or native["seen"] or getattr(self, "_zai_native_seen", False):
+                self._zai_native_seen = True
+                self._zai_native_invalidated = getattr(self, "_zai_native_invalidated", False) or native["invalidated"]
+                self._zai_native_binding = native["binding"]
+                return native["proven"] and not self._zai_native_invalidated
 
         def marker_in(text):
             return isinstance(text, str) and any(line.strip() == self.marker for line in text.splitlines())
