@@ -124,7 +124,7 @@ const router = {
         try {
           if (env.CREDENTIAL_MONITOR_EVIDENCE) return json(await observerBound(
             env.CREDENTIAL_MONITOR_EVIDENCE.snapshot(nonce)), 200, { 'Cache-Control': 'no-store' });
-        } catch { try { env.CREDENTIAL_MONITOR_EVIDENCE?.invalidate(); } catch {} }
+        } catch (caught) { try { env.CREDENTIAL_MONITOR_EVIDENCE?.invalidate(caught instanceof ObserverDeadline ? 'snapshot_route_timeout' : 'snapshot_route_rejected'); } catch {} }
         return json({kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce},
           200, {'Cache-Control':'no-store'});
       }
@@ -137,7 +137,7 @@ const router = {
         const observer = env.PICKER_DIAGNOSTIC_EVIDENCE?.[producer];
         try {
           if (observer) return json(await observerBound(observer.snapshot(nonce)), 200, {'Cache-Control': 'no-store'});
-        } catch { try { observer?.invalidate(); } catch {} }
+        } catch (caught) { try { observer?.invalidate(caught instanceof ObserverDeadline ? 'snapshot_route_timeout' : 'snapshot_route_rejected'); } catch {} }
         return json({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce},
           200, {'Cache-Control': 'no-store'});
       }
@@ -816,11 +816,13 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
 
+class ObserverDeadline extends Error {}
+
 /** Optional observation never becomes a second dispatch/authorization dependency. */
 async function observerBound<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([work, new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('observer_unavailable')), 250);
+    timer = setTimeout(() => reject(new ObserverDeadline('observer_unavailable')), 250);
   })]); } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
@@ -840,11 +842,11 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
     ? env.CREDENTIAL_MONITOR_EVIDENCE : undefined;
   let identity: unknown;
   try { identity = observer?.begin(); }
-  catch { try { observer?.invalidate(); } catch {} observer = undefined; }
+  catch { try { observer?.invalidate('dry_run_begin_failed'); } catch {} observer = undefined; }
   const observed = async (decision: 'alert' | 'observation' | null) => {
     if (!observer) return;
     try { await observerBound(observer.finish(identity, decision)); }
-    catch { try { observer.invalidate(); } catch {} }
+    catch (caught) { try { observer.invalidate(caught instanceof ObserverDeadline ? 'dry_run_finish_timeout' : 'dry_run_finish_failed'); } catch {} }
   };
   try {
     const { route, diagnostics } = await pickModelRouteDetailed(env, {

@@ -115,6 +115,67 @@ async function stop(child:ReturnType<typeof spawn>, signal:any='SIGTERM') {
   await new Promise<void>(resolveDone=>{child.once('exit',()=>resolveDone());child.kill(signal);});
 }
 async function defineTests() {
+  test('first fault actual Node reasons are closed sticky and preserve healthy seventeen keys',async t=>{
+    const reasons=['picker_snapshot_failed','picker_pool_failed','picker_decision_incomplete',
+      'picker_snapshot_no_host','picker_pool_no_host','picker_snapshot_data_unavailable',
+      'picker_snapshot_policy_unavailable','picker_pool_policy_unavailable','picker_begin_failed','picker_finish_failed',
+      'snapshot_route_timeout','snapshot_route_rejected','dry_run_begin_failed','dry_run_finish_timeout','dry_run_finish_failed'];
+    for(const reason of reasons){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+      const healthy=await f.observer.snapshot(NONCE);assert.equal(healthy.complete,true);assert.equal(Object.keys(healthy).length,17);
+      f.observer.invalidate(reason);const first=await f.observer.snapshot(NONCE);
+      assert.equal(first.unavailable_reason,reason);assert.equal(first.unavailable_phase,'runtime');assert.equal(first.available,false);
+      f.observer.invalidate('TOKEN=synthetic-private-error /private/path');
+      assert.deepEqual(await f.observer.snapshot(NONCE),first);assert.ok(!JSON.stringify(first).includes('TOKEN='));
+    }
+  });
+  test('first fault shared predecision pool failure poisons both real witnesses without changing business error',async t=>{
+    const first=temp(),second=temp();t.after(()=>{rmSync(first,{recursive:true,force:true});rmSync(second,{recursive:true,force:true});});
+    const e=await fixture(first,{producer:'picker_excluded',timeoutMs:2000,writer:semanticWriter});
+    const q=await fixture(second,{producer:'picker_quota_stale',timeoutMs:2000,writer:semanticWriter});
+    t.after(()=>e.observer.close());t.after(()=>q.observer.close());
+    e.env.PICKER_DIAGNOSTIC_EVIDENCE.picker_quota_stale=q.observer;
+    e.env.MACHINES={idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({connected:false,engines:[]})})};
+    const response=await e.post(false);assert.equal(response.status,503);assert.equal((await response.json()).error,'no_connected_host');
+    for(const observer of [e.observer,q.observer]){
+      const proof=await observer.snapshot(NONCE);assert.equal(proof.unavailable_reason,'picker_pool_no_host');assert.equal(proof.available,false);
+      observer.invalidate('snapshot_route_rejected');assert.deepEqual(await observer.snapshot(NONCE),proof);
+    }
+  });
+  test('first fault real snapshot routes distinguish rejected promise from original deadline',async t=>{
+    for(const producer of ['credential_monitor','picker_excluded'])for(const mode of ['rejected','timeout']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{producer,timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());
+      let reason:string|undefined;
+      const observer={begin:()=>1,finish:async()=>{},invalidate:(value:string)=>{reason??=value;},snapshot:async()=>{
+        if(reason)return {kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce:NONCE,
+          unavailable_phase:'runtime',unavailable_reason:reason};
+        if(mode==='rejected')throw new Error('TOKEN=synthetic-rejected /private/path');
+        return new Promise<never>(()=>{});
+      }};
+      if(producer==='credential_monitor')f.env.CREDENTIAL_MONITOR_EVIDENCE=observer;
+      else f.env.PICKER_DIAGNOSTIC_EVIDENCE[producer]=observer;
+      const first=await f.sample();assert.equal(first.status,200);assert.equal((await first.json()).available,false);
+      assert.equal(reason,mode==='timeout'?'snapshot_route_timeout':'snapshot_route_rejected');
+      const next=await (await f.sample()).json();assert.equal(next.unavailable_reason,reason);assert.ok(!JSON.stringify(next).includes('TOKEN='));
+    }
+  });
+  test('first fault dry run observer errors retain primary response with bounded stage reasons',async t=>{
+    for(const mode of ['begin','sync_finish','async_finish','timeout']){
+      const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+      const f=await fixture(directory,{timeoutMs:2000,writer:semanticWriter});t.after(()=>f.observer.close());f.model.unhealthy=false;
+      let reason:string|undefined,finishes=0;
+      f.env.CREDENTIAL_MONITOR_EVIDENCE={begin:()=>{if(mode==='begin')throw new Error('TOKEN=synthetic-begin');return 1;},
+        finish:()=>{finishes++;if(mode==='sync_finish')throw new Error('TOKEN=synthetic-finish');
+          return mode==='timeout'?new Promise<never>(()=>{}):Promise.reject(new Error('TOKEN=synthetic-finish'));},
+        invalidate:(value:string)=>{reason??=value;},snapshot:async()=>({})};
+      const response=await f.post();assert.equal(response.status,200);assert.ok(['codex','claude'].includes((await response.json()).engine));
+      assert.equal(reason,mode==='begin'?'dry_run_begin_failed':mode==='timeout'?'dry_run_finish_timeout':'dry_run_finish_failed');
+      assert.equal(finishes,mode==='begin'?0:1);
+    }
+  });
+
   test('unavailable reason: first runtime fault is closed, sticky and never changes healthy shape',async t=>{
     for(const producer of ['credential_monitor','picker_excluded']){
       const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
@@ -577,7 +638,7 @@ async function defineTests() {
       assert.equal(primary.status,503,'optional authority never changes missing-policy behavior');
       const after=await (await fetch(base+'/api/model-picker/diagnostic-evidence?producer=picker_quota_stale&nonce='+NONCE,{headers})).json() as any;
       assert.equal(after.available,false,'uncertain pre-decision invocation cannot become healthy zero');
-      assert.equal(after.unavailable_phase,'runtime');assert.equal(after.unavailable_reason,'invalidated');
+      assert.equal(after.unavailable_phase,'runtime');assert.equal(after.unavailable_reason,'picker_snapshot_data_unavailable');
       await stop(child);
     }
   });
