@@ -311,7 +311,7 @@ try:
     with opener.open(request, timeout=1.5) as response:
         if response.status != 200: raise ValueError()
         if not any(x.strip() == 'no-store' for x in response.headers.get('Cache-Control', '').lower().split(',')): raise ValueError()
-    raw = response.read(131073)
+        raw = response.read(131073)
     if len(raw) > 131072: raise ValueError()
     json.loads(raw, object_pairs_hook=unique)
     sys.stdout.buffer.write(raw)
