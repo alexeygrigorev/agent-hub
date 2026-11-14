@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import copy
+import http.client
 import importlib.util
 import io
 import json
@@ -145,6 +146,29 @@ class AdapterTests(unittest.TestCase):
         observed = m.picker_control_observation(wire(), entry(), observed_at_ms=NOW)
         with self.assertRaises(m.EvidenceUnavailable):
             m.witness('picker_control', entry(), now_ms=NOW, remote_value=observed)
+
+    def test_fetch_reads_real_http_response_before_context_closes(self):
+        body = json.dumps(wire()).encode()
+        class SocketBytes:
+            def makefile(self, mode):
+                return io.BytesIO(b'HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: '
+                                  + str(len(body)).encode() + b'\r\n\r\n' + body)
+        response = http.client.HTTPResponse(SocketBytes())
+        response.begin()
+        class Opener:
+            def open(self, request, timeout): return response
+        class Input:
+            buffer = io.BytesIO(json.dumps({'url': 'https://hub.example/api/picker-alerts/counters',
+                                           'token': 'synthetic-not-real'}).encode())
+        class Output:
+            buffer = io.BytesIO()
+        import urllib.request
+        with patch.object(sys, 'stdin', Input()), patch.object(sys, 'stdout', Output()), \
+                patch.object(urllib.request, 'build_opener', return_value=Opener()):
+            exec(compile(m.PICKER_FETCH, '<real HTTPResponse bounded fetch>', 'exec'), {})
+        self.assertEqual(Output.buffer.getvalue(), body)
+        self.assertTrue(response.closed)
+        self.assertEqual(response.read(131073), b'')
 
     def test_actual_aggregate_branch_preserves_other_six_and_generation(self):
         entries = {}
