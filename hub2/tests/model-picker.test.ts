@@ -880,3 +880,74 @@ test('quota classification: degraded pool remains degraded after normal reserve 
  assert.equal(result.diagnostics.pool_degraded,true);assert.equal(result.route.model,'sonnet');
  assert.deepEqual(result.decisions.picker_excluded,['observation']);
 });
+
+
+function firstFaultPair(env:any, fail?:'begin'|'sync_finish'|'async_finish') {
+ const records=Object.fromEntries(['picker_excluded','picker_quota_stale'].map(role=>[role,{reasons:[] as unknown[],finished:0}]));
+ env.PICKER_DIAGNOSTIC_EVIDENCE=Object.fromEntries(Object.entries(records).map(([role,row])=>[role,{
+  begin(){if(fail==='begin')throw new Error('TOKEN=synthetic-begin');return 1;},
+  finish(){row.finished++;if(fail==='sync_finish')throw new Error('TOKEN=synthetic-finish');
+   return fail==='async_finish'?Promise.reject(new Error('TOKEN=synthetic-finish')):Promise.resolve();},
+  invalidate(reason:unknown){row.reasons.push(reason);},snapshot:async()=>({})
+ }]));
+ return records;
+}
+function firstFaultControl(env:any, replacement:(path:string)=>Response|undefined) {
+ const previous=env.CONTROL;
+ env.CONTROL={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(url:string,init?:any)=>
+  replacement(new URL(url).pathname)??previous.get(id).fetch(url,init)})};
+}
+
+test('first fault picker snapshot and pool failures retain original business error and safe stage',async()=>{
+ const cases=[
+  ['snapshot','picker_snapshot_failed'],['data','picker_snapshot_data_unavailable'],
+  ['snapshot_host','picker_snapshot_no_host'],['policy','picker_snapshot_policy_unavailable'],
+  ['pool_host','picker_pool_no_host'],['pool_policy','picker_pool_policy_unavailable']
+ ] as const;
+ for(const [kind,expected] of cases){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+  const injected=new Error('TOKEN=synthetic provider path /private/not-for-wire');
+  if(kind==='snapshot')env.CONTROL={idFromName:(x:string)=>x,get:()=>({fetch:async()=>{throw injected;}})};
+  if(kind==='data')firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({}, {status:503}):undefined);
+  if(kind==='policy')firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({version:1,candidates:[]}):undefined);
+  if(kind==='snapshot_host'){
+   firstFaultControl(env,path=>path==='/api/directory'?Response.json({items:[],next:null}):undefined);
+   env.ACCOUNTS={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({hosts:[]})})};
+  }
+  if(kind==='pool_host')env.MACHINES={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:false,engines:[]})})};
+  if(kind==='pool_policy'){
+   firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({version:1,candidates:[candidates[0]]}):undefined);
+   env.ACCOUNTS={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({hosts:['h1'],quota:{remaining:0,captured_at:Date.now(),valid_until:Date.now()+900000}})})};
+  }
+  await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>0),error=>kind==='snapshot'?error===injected:true);
+  for(const row of Object.values(records)){assert.deepEqual(row.reasons,[expected]);assert.equal(row.finished,0);}
+  assert.ok(!JSON.stringify(records).includes('TOKEN='));
+ }
+});
+test('first fault picker begin and sync or async finish errors never change successful choice',async()=>{
+ for(const fail of ['begin','sync_finish','async_finish'] as const){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env,fail);
+  const result=await pickModelRouteDetailed(env,{interactive:true},()=>0);
+  assert.equal(result.route.engine,'codex');
+  await new Promise<void>(done=>setImmediate(done));
+  for(const row of Object.values(records))assert.deepEqual(row.reasons,[fail==='begin'?'picker_begin_failed':'picker_finish_failed']);
+ }
+});
+test('first fault completed decisions stay settled when weighted choice itself throws',async()=>{
+ const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+ const original=new Error('TOKEN=synthetic-choice');
+ await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>{throw original;}),error=>error===original);
+ for(const row of Object.values(records)){assert.equal(row.finished,1);assert.deepEqual(row.reasons,[]);}
+});
+
+test('first fault unknown public code or throwing code getter keeps stage fallback and original error',async()=>{
+ const {HttpError}=await import('../src/http.ts');
+ for(const throwingGetter of [false,true]){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+  const original=new HttpError('TOKEN=synthetic-unknown-code',503,'/private/provider/detail');
+  if(throwingGetter)Object.defineProperty(original,'code',{get(){throw new Error('private getter failure');}});
+  env.CONTROL={idFromName:(id:string)=>id,get:()=>({fetch:async()=>{throw original;}})};
+  await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>0),error=>error===original);
+  for(const row of Object.values(records))assert.deepEqual(row.reasons,['picker_snapshot_failed']);
+ }
+});

@@ -226,7 +226,12 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
 }
 
 const FAILURE_REASONS = new Set(['invalidated', 'persist_failed', 'capacity_or_counter_limit',
-  'finish_identity_invalid', 'snapshot_source_verification_failed', 'snapshot_store_verification_failed', 'closed']);
+  'finish_identity_invalid', 'snapshot_source_verification_failed', 'snapshot_store_verification_failed', 'closed',
+  'picker_snapshot_failed', 'picker_pool_failed', 'picker_decision_incomplete',
+  'picker_snapshot_no_host', 'picker_pool_no_host', 'picker_snapshot_data_unavailable',
+  'picker_snapshot_policy_unavailable', 'picker_pool_policy_unavailable',
+  'picker_begin_failed', 'picker_finish_failed', 'snapshot_route_timeout', 'snapshot_route_rejected',
+  'dry_run_begin_failed', 'dry_run_finish_timeout', 'dry_run_finish_failed']);
 
 /** One live Node incarnation. No clean sample is possible after any observer error. */
 export class AlertEvidence implements CredentialMonitorEvidence {
