@@ -110,9 +110,11 @@ const router = {
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
-      if (/^\/api\/picker-alerts\/(?:counters|offers|[1-9][0-9]*\/(?:ack|nack))$/.test(path)) {
+      if (/^\/api\/picker-alerts\/(?:counters|offers|draw-diagnostics|[1-9][0-9]*\/(?:ack|nack))$/.test(path)) {
         if(!admin(actor))return error('forbidden',403);
-        return control.fetch(await forwardRequest(request, CONTROL + path, actor));
+        if(path==='/api/picker-alerts/draw-diagnostics'&&actor.kind!=='operator')return error('forbidden',403);
+        const query=path==='/api/picker-alerts/draw-diagnostics'?new URL(request.url).search:'';
+        return control.fetch(await forwardRequest(request, CONTROL + path + query, actor));
       }
       if (path === '/api/model-picker/credential-monitor-evidence') {
         if (!admin(actor)) return error('forbidden', 403);
