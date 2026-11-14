@@ -151,3 +151,172 @@ def positive_only_context(role, *, socket_path, parent_id=None, deadline=None, e
     _CLAIMED_SOURCE_CONTEXTS.add(context)  # Burn before use; failed delivery never replays it.
     return Child({'HUB_ALERT_BROKER_SOCKET':socket_path,'HUB_ALERT_INVOCATION_ID':context,
         'HUB_ALERT_ROLE':role},deadline=deadline)
+
+
+class SourceSessionError(Exception):
+    """Only fixed protocol reasons may cross the local source-session pipe."""
+
+
+def source_nonblocking(fd):
+    import stat
+    mode = os.fstat(fd).st_mode
+    if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+        raise SourceSessionError('transport_unavailable')
+    if stat.S_ISSOCK(mode):
+        # Packet os.read can silently discard an oversized packet suffix.
+        # Only byte streams preserve the complete NDJSON/total-byte budget.
+        duplicate = os.dup(fd)
+        try:
+            endpoint = socket.socket(fileno=duplicate)
+        except BaseException:
+            os.close(duplicate)
+            raise
+        try:
+            if endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+                raise SourceSessionError('transport_unavailable')
+        finally:
+            endpoint.close()
+    original = os.get_blocking(fd)
+    os.set_blocking(fd, False)
+    return original
+
+
+def source_options(argv):
+    allowed = {'--socket', '--role', '--parent-source-claim', '--lifetime-seconds'}
+    if not argv or argv[0] != 'source-session' or len(argv) % 2 != 1:
+        raise SourceSessionError('invalid_arguments')
+    options = {}
+    for index in range(1, len(argv), 2):
+        key, value = argv[index:index + 2]
+        if key not in allowed or key in options:
+            raise SourceSessionError('invalid_arguments')
+        options[key] = value
+    role, path = options.get('--role'), options.get('--socket', '')
+    parent = options.get('--parent-source-claim')
+    lifetime = options.get('--lifetime-seconds', '900')
+    if (role not in ('backup_pull', 'backup_notifier') or not path.startswith('/')
+            or '\0' in path or '..' in path.split('/') or len(os.fsencode(path)) > 107
+            or not re.fullmatch('[1-9][0-9]{0,2}', lifetime) or int(lifetime) > 900
+            or parent is not None and (role != 'backup_notifier' or not ram.identity(parent))):
+        raise SourceSessionError('invalid_arguments')
+    if any(key in os.environ for key in _CONTEXT_KEYS):
+        raise SourceSessionError('inherited_context')
+    return path, role, parent, int(lifetime)
+
+
+def source_write(fd, value, deadline):
+    """One bounded local reply, never a business action or broker retry."""
+    raw = encode(value, 511) + b'\n'
+    end = min(deadline, time.monotonic() + BUDGET)
+    while raw:
+        if not select.select([], [fd], [], left(end))[1]:
+            raise SourceSessionError('output_unavailable')
+        try:
+            count = os.write(fd, raw)
+        except BlockingIOError:
+            continue
+        if count <= 0:
+            raise SourceSessionError('output_unavailable')
+        raw = raw[count:]
+        left(end)
+
+
+def source_event(raw, child, count):
+    try:
+        value = decode(raw, 1024)
+        require(type(value) is dict and 'phase' in value and set(value) <= {
+            'phase', 'decision', 'condition', 'flags', 'recipient_class'})
+        frame = dict(v=1, invocation_id=child.identity, parent_id=child.parent_id,
+            role=child.role, phase=value['phase'], seq=child.seq,
+            decision=value.get('decision'), condition=value.get('condition'),
+            flags=value.get('flags', {}), recipient_class=value.get('recipient_class', 'none'),
+            observer_ok=not child.dirty)
+        checked(frame)
+        require((count == 0 and frame['phase'] == 'begin')
+            or (count > 0 and frame['phase'] != 'begin'))
+        return {key: frame[key] for key in ('phase', 'decision', 'condition', 'flags', 'recipient_class')}
+    except Exception:
+        raise SourceSessionError('invalid_event') from None
+
+
+def run_source_session(argv, input_fd=0, output_fd=1):
+    """One stable-PID backup source CLAIM; never admitted or complete authority.
+
+    EOF does not synthesize a terminal. A valid terminal ends this helper;
+    callers must match each typed sequence ACK and never replay business.
+    """
+    child, original = None, {}
+    deadline = time.monotonic() + BUDGET
+    try:
+        path, role, parent, lifetime = source_options(argv)
+        deadline = time.monotonic() + lifetime
+        for fd in (output_fd, input_fd):
+            if fd not in original:
+                original[fd] = source_nonblocking(fd)
+        child = Client(path, uuid.uuid4().hex, parent, role, deadline=deadline)
+        source_write(output_fd, {'kind': 'hub_alert_source_session_v1',
+            'state': 'ready_unqualified', 'role': role, 'admitted': False,
+            'source_claim_id': child.identity, 'parent_source_claim': parent}, deadline)
+        buffer, total, count = b'', 0, 0
+        while count < 8:
+            while b'\n' not in buffer:
+                if len(buffer) > 1024:
+                    raise SourceSessionError('input_limit')
+                if not select.select([input_fd], [], [], left(deadline))[0]:
+                    raise SourceSessionError('deadline')
+                try:
+                    chunk = os.read(input_fd, 1025)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise SourceSessionError('eof')
+                total += len(chunk)
+                if total > 4096:
+                    raise SourceSessionError('input_limit')
+                buffer += chunk
+            raw, buffer = buffer.split(b'\n', 1)
+            event = source_event(raw, child, count)
+            if event['phase'] == 'terminal' and buffer.strip():
+                raise SourceSessionError('invalid_event')
+            sequence = child.seq
+            broker_ok = child.emit(**event)
+            count += 1
+            source_write(output_fd, {'kind': 'hub_alert_source_session_ack_v1',
+                'seq': sequence, 'local_ok': True, 'broker_ok': broker_ok,
+                'observer_ok': not child.dirty, 'admitted': False}, deadline)
+            if event['phase'] == 'terminal':
+                return 0
+        raise SourceSessionError('event_limit')
+    except BaseException as error:
+        if child is not None:
+            child.dirty = True
+        if not isinstance(error, Exception):
+            raise
+        reason = str(error) if isinstance(error, SourceSessionError) else 'transport_unavailable'
+        try:
+            if output_fd not in original:
+                original[output_fd] = source_nonblocking(output_fd)
+            source_write(output_fd, {'kind': 'source_session_error_v1', 'reason': reason,
+                'admitted': False}, deadline)
+        except Exception:
+            pass  # Closed/stalled output is loss, never an ACK or retry.
+        return 2
+    finally:
+        for fd, blocking in original.items():
+            try:
+                os.set_blocking(fd, blocking)
+            except OSError:
+                pass
+
+
+def source_session_main(argv=None):
+    import sys
+    try:
+        return run_source_session(sys.argv[1:] if argv is None else argv)
+    except BaseException:
+        # Control interruption ends the observer process; no raw traceback/data.
+        return 130
+
+
+if __name__ == '__main__':
+    raise SystemExit(source_session_main())
