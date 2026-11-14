@@ -61,6 +61,10 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     expected_files = {'hub.pyz', 'hub.pyz.sha256', 'manifest.json', 'host-install.sh',
                       'hub2-self-update.py', 'hub2-enroll.py', 'websockets-16.0-py3-none-any.whl',
                       wheel, *CLI_INSTALLERS, *UNITS}
+    # Retained pre-client releases remain valid rollback targets under their
+    # original CI-pinned manifest. New builds always emit the standalone client.
+    if 'hub_alert_client.py' in records:
+        expected_files.add('hub_alert_client.py')
     if records.keys() != expected_files or {path.name for path in directory.iterdir()} != expected_files | {'host-release.json'}:
         raise ValueError('release directory has missing or unexpected files')
     for name, record in records.items():
@@ -102,6 +106,7 @@ def export_source(repo, revision, target):
     archive = run(['git', '-C', str(repo), 'archive', sha, '--', 'hub2/host', 'host/agent_hub_host',
                    'config/model-routing.json', 'scripts/build-hub-cli.py',
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
+                   'scripts/hub_alert_client.py',
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
                    'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'uv.lock',
                    *(f'public/cli/{name}' for name in CLI_INSTALLERS)])
@@ -161,6 +166,7 @@ def build(repo, revision, output):
             shutil.copyfile(source / 'public/cli' / installer, artifacts / installer)
         shutil.copyfile(source / 'scripts/hub2-self-update.py', artifacts / 'hub2-self-update.py')
         shutil.copyfile(source / 'scripts/hub2-enroll.py', artifacts / 'hub2-enroll.py')
+        shutil.copyfile(source / 'scripts/hub_alert_client.py', artifacts / 'hub_alert_client.py')
         shutil.copyfile(source / 'deploy/host-install.sh', artifacts / 'host-install.sh')
         for unit in UNITS:
             shutil.copyfile(source / 'deploy' / unit, artifacts / unit)

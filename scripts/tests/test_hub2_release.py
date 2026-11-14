@@ -1429,7 +1429,7 @@ def publication_bundle(directory, commit, label='fixture'):
     (directory / 'hub.pyz.sha256').write_text(f'{cli_digest}  hub.pyz\n')
     (directory / 'manifest.json').write_text(json.dumps(
         {'built_from_commit': commit, 'sha256': cli_digest, 'build_label': label}))
-    for name in ('websockets-16.0-py3-none-any.whl', 'host-install.sh', 'hub2-enroll.py',
+    for name in ('websockets-16.0-py3-none-any.whl', 'host-install.sh', 'hub2-enroll.py', 'hub_alert_client.py',
                  *builder.CLI_INSTALLERS, *builder.UNITS):
         (directory / name).write_text('artifact:' + name)
     (directory / 'hub2-self-update.py').write_text('raise RuntimeError("staged updater must never run")\n')
@@ -1442,6 +1442,114 @@ def publication_bundle(directory, commit, label='fixture'):
     raw = json.dumps(manifest, sort_keys=True).encode()
     (directory / 'host-release.json').write_bytes(raw)
     return directory, hashlib.sha256(raw).hexdigest()
+
+
+class AlertClientPackagingTests(unittest.TestCase):
+    def setUp(self):
+        scratch = REPO / '.local/tmp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=scratch, prefix='test-client-packaging-')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.client = (REPO / 'scripts/hub_alert_client.py').read_bytes()
+
+    def test_export_client_uses_committed_bytes_not_dirty_or_untracked_source(self):
+        repo = self.directory / 'repo'
+        repo.mkdir()
+        names = ['hub2/host/pyproject.toml', 'host/agent_hub_host/__init__.py',
+                 'config/model-routing.json', 'scripts/build-hub-cli.py',
+                 'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py',
+                 'scripts/hub2-enroll.py', 'scripts/hub_alert_client.py', 'deploy/host-install.sh', 'uv.lock',
+                 *(f'deploy/{name}' for name in builder.UNITS),
+                 *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]
+        for name in names:
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.client if name == 'scripts/hub_alert_client.py' else b'synthetic source\n')
+        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null', GIT_TERMINAL_PROMPT='0')
+        def git(*args):
+            return subprocess.run(['git', '-C', str(repo), *args], env=env, check=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10).stdout
+        git('init', '--initial-branch=main')
+        git('add', '--all')
+        git('-c', 'user.name=Synthetic release fixture', '-c', 'user.email=fixture@example.invalid',
+            'commit', '-m', 'Synthetic committed release source\n\nScope: in')
+        commit = git('rev-parse', 'HEAD').decode().strip()
+        (repo / 'scripts/hub_alert_client.py').write_bytes(b'raise RuntimeError("uncommitted client must not ship")\n')
+        (repo / 'scripts/hub_alert_client_private.py').write_bytes(b'untracked fixture data\n')
+        target = self.directory / 'export'
+        target.mkdir()
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(builder.export_source(repo, commit, target), commit)
+        self.assertEqual((target / 'scripts/hub_alert_client.py').read_bytes(), self.client)
+        self.assertFalse((target / 'scripts/hub_alert_client_private.py').exists())
+
+    def test_build_exports_standalone_client_with_exact_manifest_hash_and_size(self):
+        repo = self.directory / 'build-repo'
+        repo.mkdir()
+        output = self.directory / 'built'
+        def export(_repo, _revision, target):
+            files = {
+                'hub2/host/agent_hub_host/__init__.py': b'',
+                'hub2/host/pyproject.toml': b'[project]\nname = "agent_hub_host_v2"\nversion = "2.0.0"\n',
+                'uv.lock': b'[[package]]\nname = "websockets"\nversion = "16.0"\nwheels = [{url = "https://fixture.invalid/websockets-16.0-py3-none-any.whl", hash = "sha256:' + b'a'*64 + b'"}]\n',
+                'scripts/hub_alert_client.py': self.client,
+            }
+            cli_source = """import hashlib,json,zipfile
+from pathlib import Path
+def git_sha(): raise AssertionError('builder must bind exported commit')
+def build(out, version):
+    with zipfile.ZipFile(out/'hub.pyz','w') as archive:
+        archive.writestr('agent_hub_host/_build_info.py','BUILD_COMMIT = "'+git_sha()+'"\\n')
+    digest=hashlib.sha256((out/'hub.pyz').read_bytes()).hexdigest()
+    (out/'manifest.json').write_text(json.dumps({'built_from_commit':git_sha(),'sha256':digest}))
+    (out/'hub.pyz.sha256').write_text(digest+'  hub.pyz\\n')
+"""
+            files['scripts/build-hub-cli.py'] = cli_source.encode()
+            for name in ['scripts/hub2-self-update.py', 'scripts/hub2-enroll.py', 'deploy/host-install.sh',
+                         *(f'deploy/{name}' for name in builder.UNITS),
+                         *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]:
+                files[name] = b'synthetic artifact, never executed\n'
+            for name, data in files.items():
+                path = target / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            return SHA
+        def build_command(args, **_kwargs):
+            self.assertEqual(args[:3], [sys.executable, '-m', 'pip'])
+            artifacts = Path(args[args.index('--wheel-dir')+1] if 'wheel' in args else args[args.index('--dest')+1])
+            if 'wheel' in args:
+                with zipfile.ZipFile(artifacts / HOST, 'w') as wheel:
+                    wheel.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {SHA!r}\nPROTOCOL_VERSION = 1\n')
+            else:
+                (artifacts / 'websockets-16.0-py3-none-any.whl').write_bytes(b'synthetic pinned transport fixture')
+            return b''
+        with patch.object(builder, 'export_source', side_effect=export), patch.object(builder, 'run', side_effect=build_command):
+            manifest = builder.build(repo, SHA, output)
+        self.assertEqual((output / 'hub_alert_client.py').read_bytes(), self.client)
+        self.assertEqual(manifest['artifacts']['hub_alert_client.py'],
+                         {'sha256': hashlib.sha256(self.client).hexdigest(), 'size': len(self.client)})
+        digest = hashlib.sha256((output / 'host-release.json').read_bytes()).hexdigest()
+        self.assertEqual(builder.verify_bundle(output, SHA, digest), manifest)
+
+    def test_missing_and_tampered_client_never_pass_verified_bundle(self):
+        bundle, digest = publication_bundle(self.directory / 'bundle', SHA)
+        self.assertIn('hub_alert_client.py', builder.verify_bundle(bundle, SHA, digest)['artifacts'])
+        client = bundle / 'hub_alert_client.py'
+        original = client.read_bytes()
+        client.write_bytes(b'X' * len(original))
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch: hub_alert_client.py'):
+            builder.verify_bundle(bundle, SHA, digest)
+        client.unlink()
+        with self.assertRaisesRegex(ValueError, 'missing or unexpected files'):
+            builder.verify_bundle(bundle, SHA, digest)
+        # Removing both record and file cannot retain the original CI pin.
+        manifest = json.loads((bundle / 'host-release.json').read_bytes())
+        del manifest['artifacts']['hub_alert_client.py']
+        (bundle / 'host-release.json').write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'differs from the CI bundle'):
+            builder.verify_bundle(bundle, SHA, digest)
 
 
 class PublicationTests(unittest.TestCase):
@@ -1477,6 +1585,28 @@ class PublicationTests(unittest.TestCase):
         bundle, digest = publication_bundle(self.directory / label, commit, label)
         self.publish('stage', commit, digest, bundle)
         return bundle, digest
+
+    def test_new_publisher_can_restore_real_legacy_bundle_without_standalone_client(self):
+        legacy, legacy_digest = publication_bundle(self.directory / 'legacy', OLD_SHA, 'legacy')
+        manifest = json.loads((legacy / 'host-release.json').read_bytes())
+        del manifest['artifacts']['hub_alert_client.py']
+        (legacy / 'hub_alert_client.py').unlink()
+        (legacy / 'host-release.json').write_text(json.dumps(manifest, sort_keys=True))
+        legacy_digest = hashlib.sha256((legacy / 'host-release.json').read_bytes()).hexdigest()
+        # Separately pinned old-layout bundle; never reuse a new CI digest.
+        builder.verify_bundle(legacy, OLD_SHA, legacy_digest)
+        self.publish('stage', OLD_SHA, legacy_digest, legacy)
+        old_receipt = self.directory / 'legacy-publication.json'
+        self.publish('activate', OLD_SHA, legacy_digest, receipt=old_receipt)
+        _, new_digest = self.stage(SHA, 'new-client')
+        self.publish('activate', SHA, new_digest)
+        self.assertEqual(json.loads(self.receipt.read_bytes())['previous_manifest_sha256'], legacy_digest)
+        self.publish('rollback')
+        self.assertEqual(os.readlink(self.current), f'releases/{OLD_SHA}')
+        retained = self.root / 'releases' / OLD_SHA
+        self.assertFalse((retained / 'hub_alert_client.py').exists())
+        self.assertEqual(builder.verify_bundle(retained, OLD_SHA, legacy_digest), manifest)
+        self.assertTrue((self.root / 'releases' / SHA / 'hub_alert_client.py').is_file())
 
     def test_stage_is_immutable_and_reuses_only_exact_bundle(self):
         bundle, digest = self.stage(SHA, 'original')

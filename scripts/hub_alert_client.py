@@ -1,5 +1,5 @@
 """Immutable stdlib API-v1 producer client; no dispatcher or broker imports."""
-import json,os,re,select,socket,struct,time
+import json,os,re,select,socket,struct,time,uuid
 class ram:
     ROLES={'canary':'start_canary','quota_publish':'quota_stale','quota_monitor':'quota_stale','backup_pull':'backup','backup_notifier':'backup'}
     DECISIONS={'observation':False,'alert':True,'alert_dedup':True,'recovery':True}
@@ -94,13 +94,17 @@ def exchange(path, request, *, deadline=None):
 class Client:
     """Existing API-v1 emit interface, now one bounded Unix exchange per frame."""
 
-    def __init__(self, path, invocation_id, parent_id, role):
+    def __init__(self, path, invocation_id, parent_id, role, *, deadline=None):
         self.path, self.identity, self.parent_id, self.role = (path, invocation_id, parent_id, role)
         self.seq, self.dirty = (0, False)
+        self.deadline = deadline
 
     def emit(self, phase, *, decision=None, condition=None, flags=None, recipient_class=None):
         try:
             end = time.monotonic() + BUDGET
+            if self.deadline is not None:
+                end = min(end, self.deadline)
+            left(end)
             frame = dict(v=1, invocation_id=self.identity, parent_id=self.parent_id, role=self.role, phase=phase, seq=self.seq, decision=decision, condition=condition, flags=flags or {}, recipient_class=recipient_class or ('dev' if decision in ('alert', 'alert_dedup', 'recovery') else 'none'), observer_ok=not self.dirty)
             self.seq += 1
             checked(frame)
@@ -114,11 +118,36 @@ class Client:
             return False
 
 class Child(Client):
-    def __init__(self, env=None):
+    def __init__(self, env=None, *, deadline=None):
         env=os.environ if env is None else env
         self.active=bool(env.get('HUB_ALERT_BROKER_SOCKET'))
         super().__init__(env.get('HUB_ALERT_BROKER_SOCKET'),env.get('HUB_ALERT_INVOCATION_ID'),
-            env.get('HUB_ALERT_PARENT_ID') or None,env.get('HUB_ALERT_ROLE','canary'))
+            env.get('HUB_ALERT_PARENT_ID') or None,env.get('HUB_ALERT_ROLE','canary'),deadline=deadline)
     def emit(self, phase, **kwargs):
         if not self.active:return False
         return super().emit(phase,**kwargs)
+
+
+_CLAIMED_SOURCE_CONTEXTS = set()
+_CONTEXT_KEYS = ('HUB_ALERT_INVOCATION_ID','HUB_ALERT_PARENT_ID','HUB_ALERT_ROLE',
+    'HUB_ALERT_EVENT_FD','HUB_ALERT_ACK_FD','HUB_ALERT_BROKER_SOCKET',
+    'HUB_ALERT_CONTROLLER_DIR','HUB_ALERT_LEDGER_DIR')
+
+
+def positive_only_context(role, *, socket_path, parent_id=None, deadline=None, env=None):
+    """One top-level quota SOURCE CLAIM, never an admitted invocation.
+
+    No environment mutation, inherited context adoption, child spawn or retry.
+    Backup/canary owner integration is deliberately outside this first splice.
+    """
+    env = os.environ if env is None else env
+    require(type(role) is str and role in ('quota_publish','quota_monitor') and parent_id is None)
+    require(type(socket_path) is str and socket_path.startswith('/') and '\0' not in socket_path
+        and len(os.fsencode(socket_path)) <= 107 and '..' not in socket_path.split('/'))
+    require(not any(key in env for key in _CONTEXT_KEYS))
+    context = uuid.uuid4().hex
+    require(ram.identity(context) and context not in _CLAIMED_SOURCE_CONTEXTS
+        and len(_CLAIMED_SOURCE_CONTEXTS) < 128)
+    _CLAIMED_SOURCE_CONTEXTS.add(context)  # Burn before use; failed delivery never replays it.
+    return Child({'HUB_ALERT_BROKER_SOCKET':socket_path,'HUB_ALERT_INVOCATION_ID':context,
+        'HUB_ALERT_ROLE':role},deadline=deadline)

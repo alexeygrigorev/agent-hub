@@ -5,6 +5,8 @@ No quota details or command stderr are emitted or included in alerts. Only a
 validated successful `hub quota publish` receipt advances publication times.
 """
 import argparse
+import hashlib
+import types
 import contextlib
 import fcntl
 import json
@@ -30,6 +32,80 @@ DEFAULT_STALE_SECONDS = 840  # 14m + independent 5m cadence + bounded sink < 20m
 
 class Failure(Exception):
     pass
+
+
+def alert_client(path, expected_sha):
+    """One immutable selected companion, read/hash once; no cwd/PATH import."""
+    if (not isinstance(path, Path) or not path.is_absolute() or '..' in path.parts
+            or type(expected_sha) is not str or not re.fullmatch('[0-9a-f]{64}', expected_sha)):
+        raise Failure('observer_unavailable')
+    directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    source = None
+    try:
+        for part in path.parts[1:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory); directory = nxt
+            info = os.fstat(directory)
+            if info.st_uid not in (0,os.getuid()) or info.st_mode & 0o002:
+                raise Failure('observer_unavailable')
+        source = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        before = os.fstat(source)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0,os.getuid())
+                or before.st_nlink != 1 or before.st_mode & 0o022 or not 0 < before.st_size <= 65536):
+            raise Failure('observer_unavailable')
+        data = os.read(source,65537)
+        stamp = lambda s:(s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+        if (len(data) != before.st_size or hashlib.sha256(data).hexdigest() != expected_sha
+                or stamp(os.fstat(source)) != stamp(before)
+                or stamp(os.stat(path.name,dir_fd=directory,follow_symlinks=False)) != stamp(before)):
+            raise Failure('observer_unavailable')
+    finally:
+        try:
+            if source is not None:
+                os.close(source)
+        finally:
+            os.close(directory)
+    module = types.ModuleType('selected_quota_alert_client')
+    exec(compile(data,'<verified-quota-alert-client>','exec'),module.__dict__)
+    return module
+
+
+class AlertObserver:
+    """Best-effort source claims; negative ACK never gates original work."""
+    def __init__(self, args, role):
+        self.child, self.dirty = None, False
+        try:
+            # Existing unit budgets, not a deadline extension or admission gate.
+            deadline = time.monotonic() + (45 if args.check else 135)
+            module = alert_client(args.alert_client, args.alert_client_sha256)
+            self.child = module.positive_only_context(role, socket_path=args.alert_broker_socket,
+                                                      deadline=deadline)
+        except Exception:
+            self.fail()
+
+    def fail(self):
+        self.dirty = True
+        if self.child is not None:
+            self.child.dirty = True
+
+    def emit(self, phase, **fields):
+        try:
+            if self.child is None:
+                self.fail(); return False
+            self.child.dirty |= self.dirty
+            if not self.child.emit(phase, **fields):
+                self.fail(); return False
+            return True
+        except BaseException as error:
+            self.fail()
+            if not isinstance(error, Exception):
+                raise
+            return False
+
+
+def observe(observer, decision, condition, recipient='none'):
+    if observer is not None:
+        observer.emit('decision',decision=decision,condition=condition,recipient_class=recipient)
 
 
 def unique_object(pairs):
@@ -179,12 +255,14 @@ def receipt(raw):
     return published
 
 
-def publish(args):
+def publish(args, observer=None):
     # The subprocess does not own the state lock: an independent monitor remains
     # runnable if the publisher is blocked, killed or otherwise stopped.
     started = now_ms()
     try:
-        result = subprocess.run([str(args.hub), 'quota', 'publish'], capture_output=True, text=True, timeout=args.publish_timeout)
+        # No observer channel/identity reaches the Hub/provider subprocess.
+        env = {k: v for k, v in os.environ.items() if not k.startswith('HUB_ALERT_')}
+        result = subprocess.run([str(args.hub), 'quota', 'publish'], capture_output=True, text=True, timeout=args.publish_timeout, env=env)
     except subprocess.TimeoutExpired:
         raise Failure('cli_timeout') from None
     except UnicodeError:
@@ -199,12 +277,16 @@ def publish(args):
         if current < started:
             raise Failure('clock_regressed')
         data = read_state(args.state, current)
+        observe(observer, 'observation', 'quota_publication')
         for account in published:
             # Use invocation time: a slow or overlapping publisher cannot make
             # old evidence appear newer than it was, nor overwrite a newer receipt.
             data['accounts'][account] = max(data['accounts'].get(account, 0), started)
-        data['alerted'] = [account for account in data['alerted']
-                           if account not in published or current - data['accounts'][account] > args.stale_seconds * 1000]
+        retained_alerted = [account for account in data['alerted']
+                            if account not in published or current - data['accounts'][account] > args.stale_seconds * 1000]
+        if set(data['alerted']).difference(retained_alerted):
+            observe(observer, 'recovery', 'quota_stale')
+        data['alerted'] = retained_alerted
         write_state(args.state, data)
     return {'status': 'published', 'accounts': sorted(published)}
 
@@ -221,7 +303,7 @@ def alert(args, accounts=(), message=None):
         return False
 
 
-def check(args):
+def check(args, observer=None):
     with locked(args.state):
         now = now_ms()
         try:
@@ -229,6 +311,10 @@ def check(args):
         except (Failure, OSError):
             data = empty_state()  # corrupt data proves no account fresh
         stale = {account for account in args.accounts if account not in data['accounts'] or now - data['accounts'][account] > args.stale_seconds * 1000}
+        # Count the actual logical condition BEFORE incident dedupe or SMTP.
+        decision = ('alert' if stale.difference(data['alerted']) else 'alert_dedup') if stale else ('recovery' if data['alerted'] else 'observation')
+        observe(observer, decision, 'quota_stale' if stale else 'quota_fresh',
+                'dev' if stale else 'none')
         # Recovery resets incident dedupe. Publication itself never marks an alert sent.
         data['alerted'] = sorted(set(data['alerted']).intersection(stale))
         unsent = stale.difference(data['alerted'])
@@ -402,7 +488,7 @@ def sample_health(args):
         reader.close()
 
 
-def check_health(args):
+def check_health(args, observer=None):
     try:
         started = now_ms()
         # Serialize sample + transition + sink so overlapping/older invocations
@@ -424,10 +510,15 @@ def check_health(args):
                 raise Failure('state_invalid')
             if started <= data['last_sample']:
                 raise Failure('clock_regressed')
+            prior_alerted = data['alerted']
             data['last_sample'] = started
             data['failures'] = 0 if sample['healthy'] else min(2, data['failures'] + 1)
             if sample['healthy']:
                 data['alerted'] = False
+            decision = ('recovery' if prior_alerted else 'observation') if sample['healthy'] else (
+                ('alert_dedup' if data['alerted'] else 'alert') if data['failures'] == 2 else 'observation')
+            observe(observer, decision, 'health_critical',
+                    'dev' if decision in ('alert', 'alert_dedup') else 'none')
             # Persist failure evidence before invoking the renderer. Sink failure
             # or process death leaves a retryable unsent incident.
             write_state(args.health_state, data)
@@ -440,6 +531,9 @@ def check_health(args):
             return {**sample, 'status': 'healthy' if sample['healthy'] else 'health_failed',
                     'failures': data['failures'], 'alert_sent': bool(unsent and delivered), 'sink_failed': not delivered}
     except (Failure, OSError):
+        if observer is not None:
+            observer.fail()
+        observe(observer, 'observation', 'error')
         # Unsafe/unavailable durable state cannot prove recovery or dedupe.
         return {'status': 'health_unknown', 'healthy': False, 'stage': 'state',
                 'reason': 'state_unavailable', 'alert_sent': False, 'sink_failed': False}
@@ -448,6 +542,9 @@ def check_health(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='independent staleness monitor; never invokes hub/quse')
+    parser.add_argument('--alert-client', type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--alert-client-sha256', default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--alert-broker-socket', default=None, help=argparse.SUPPRESS)
     parser.add_argument('--accounts', type=account_set, default=sorted(ACCOUNTS), help='expected account labels, comma separated (default all known labels)')
     parser.add_argument('--state', type=absolute_path, default=Path.home() / '.local/state/agent-hub-quota-publisher/state.json')
     parser.add_argument('--hub', type=absolute_path, default=Path.home() / '.local/bin/hub')
@@ -469,30 +566,41 @@ def main(argv=None):
         parser.error('health monitor requires alert timeout1..8 seconds to retain 45s service budget')
     if not 1 <= args.stale_seconds <= 900 or not 1 <= args.publish_timeout <= 120 or not 1 <= args.alert_timeout <= 30:
         parser.error('bounds: stale1..900, publish timeout1..120, alert timeout1..30 seconds')
-    health = check_health(args) if args.health_check else None
+    role = 'quota_monitor' if args.check else 'quota_publish'
+    observer = AlertObserver(args, role)
+    observer.emit('begin')
     try:
-        result = check(args) if args.check else publish(args)
-    except (Failure, OSError) as error:
-        # No raw CLI, provider, filesystem or credential errors reach logs/mail.
-        if args.check:
-            delivered = alert(args, args.accounts)
-            result = {'status': 'quota_stale', 'accounts': args.accounts, 'reason': 'state_unavailable',
-                      'alert_sent': delivered, 'sink_failed': not delivered}
-        else:
-            slug = str(error) if isinstance(error, Failure) else 'operation_failed'
-            result = {'status': 'publish_failed', 'reason': slug if slug in {
-                'clock_invalid', 'clock_regressed', 'state_invalid', 'state_directory_untrusted',
-                'state_lock_untrusted', 'result_invalid', 'cli_timeout', 'cli_unavailable', 'cli_failed'} else 'operation_failed'}
-    if health is not None:
-        result['health'] = health
-        if health['sink_failed']:
-            result['sink_failed'] = True
-    print(json.dumps(result, sort_keys=True))
-    if health is not None and (not health['healthy'] or health['sink_failed']):
-        return 3 if result.get('sink_failed') else 2
-    if result['status'] in ('fresh', 'published'):
-        return 0
-    return 3 if result.get('sink_failed') else 2 if result['status'] == 'quota_stale' else 1
+        health = check_health(args, observer) if args.health_check else None
+        try:
+            result = check(args, observer) if args.check else publish(args, observer)
+        except (Failure, OSError) as error:
+            # No raw CLI, provider, filesystem or credential errors reach logs/mail.
+            observer.fail()
+            if args.check:
+                observe(observer, 'alert', 'quota_stale', 'dev')
+                delivered = alert(args, args.accounts)
+                result = {'status': 'quota_stale', 'accounts': args.accounts, 'reason': 'state_unavailable',
+                          'alert_sent': delivered, 'sink_failed': not delivered}
+            else:
+                slug = str(error) if isinstance(error, Failure) else 'operation_failed'
+                result = {'status': 'publish_failed', 'reason': slug if slug in {
+                    'clock_invalid', 'clock_regressed', 'state_invalid', 'state_directory_untrusted',
+                    'state_lock_untrusted', 'result_invalid', 'cli_timeout', 'cli_unavailable', 'cli_failed'} else 'operation_failed'}
+        if health is not None:
+            result['health'] = health
+            if health['sink_failed']:
+                result['sink_failed'] = True
+        print(json.dumps(result, sort_keys=True))
+        if health is not None and (not health['healthy'] or health['sink_failed']):
+            return 3 if result.get('sink_failed') else 2
+        if result['status'] in ('fresh', 'published'):
+            return 0
+        return 3 if result.get('sink_failed') else 2 if result['status'] == 'quota_stale' else 1
+    except BaseException:
+        observer.fail()
+        raise
+    finally:
+        observer.emit('terminal')
 
 
 if __name__ == '__main__':
