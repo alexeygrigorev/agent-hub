@@ -1330,7 +1330,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET tag='wrong-tag'")
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
 
     def test_legacy_resolution_cas_preserves_native_binding_and_inflight_attempt(self):
