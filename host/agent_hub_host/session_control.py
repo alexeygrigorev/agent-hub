@@ -1311,7 +1311,11 @@ def _execute(args):
             payload['effort'] = args.effort
         if getattr(args, 'intake_worktree', None):
             if payload.get('cwd'):
-                raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')
+                mode = args.intake_worktree
+                raise ValueError(f'--intake-worktree {mode} cannot be combined with --cwd: '
+                                 + ('Hub plans the successor worktree itself' if mode == 'successor'
+                                    else 'a detached start never resumes or creates a worktree, so it has no cwd to name')
+                                 + '; drop --cwd (to continue a failed intake in its own retained worktree, omit --intake-worktree)')
             payload['intake_worktree'] = args.intake_worktree
         needs = getattr(args, 'needs', None)
         if needs:

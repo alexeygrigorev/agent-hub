@@ -814,7 +814,11 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'detached')
         args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
                           '--intake-worktree', 'successor', '--cwd', 'sub/dir', '--key', 'k-bad')
-        with self.assertRaisesRegex(ValueError, 'drop --cwd'):
+        with self.assertRaisesRegex(ValueError, 'successor cannot be combined with --cwd.*Hub plans'):
+            session_control.execute(args)
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
+                          '--intake-worktree', 'detached', '--cwd', 'sub/dir', '--key', 'k-bad2')
+        with self.assertRaisesRegex(ValueError, 'detached cannot be combined with --cwd.*never resumes'):
             session_control.execute(args)
 
     def test_commands_rendering_shows_waiting_in_inbox_and_reason(self):
