@@ -16,7 +16,7 @@ const candidates=[
   {id:'terra-route',engine:'codex',model:'gpt-6.1-terra',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
   {id:'luna-route',engine:'codex',model:'gpt-6.1-luna',effort:'max',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
 ];
-const AC=['Feature works for the requester','PR merged with green CI'];
+const AC=['Feature works for the requester','PR merged with green CI (t1a)'];
 
 function fixture(routes=candidates){
   const parent=resolve('.local/tmp');mkdirSync(parent,{recursive:true});

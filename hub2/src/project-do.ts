@@ -2141,9 +2141,13 @@ function criteriaError(value: unknown): Response | null {
     const item = value[index];
     if (typeof item !== 'string' || !item.trim()) return error('acceptance_criterion_empty', 400, `criterion ${index + 1} must be non-empty text`);
     if (item.length > ACCEPTANCE_CRITERION_MAX_CHARS) return error('acceptance_criterion_too_long', 400, `criterion ${index + 1} is ${item.length} characters; max ${ACCEPTANCE_CRITERION_MAX_CHARS} per criterion (16 KiB per request)`);
+    if (index > 0 && !T_ID_CITATION.test(item)) return error('acceptance_criterion_missing_t_id', 400, `criterion ${index + 1} (AC${index + 1}) cites no requester t-id (a token like t3416u); only AC1 is exempt: ${item.trim().slice(0, 160)}`);
   }
   return null;
 }
+
+/** A t-id citation is a token like t3416u: t + digits + optional letter, not embedded in a longer word. */
+const T_ID_CITATION = /(?<![A-Za-z0-9])t\d+[a-z]?(?![A-Za-z0-9])/i;
 
 /** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */
 function normalizeCriteria(body: Record<string, unknown>): void {
