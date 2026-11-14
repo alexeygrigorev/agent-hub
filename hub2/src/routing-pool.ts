@@ -3,7 +3,7 @@
 // otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
-import { isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
+import { explicitLunaIntent, isLunaModel, matchesModelIntent, isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
@@ -105,10 +105,12 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
   if (input.model && !allowsAstra(purpose) && policy.candidates.some(candidate =>
     (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
     throw new HttpError('astra_not_for_implementation', 400);
+  const lunaRequested = explicitLunaIntent(policy.candidates, input.model);
   const excluded=new Set(input.exclude_policy_ids||[]);
   const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
   const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !deep;
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && (!isLunaModel(candidate) || lunaRequested)
     && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
     // High effort is opt-in: an explicit --effort, the exact policy id or a deep tier.
     && (!isElevatedEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || deep)
@@ -120,7 +122,7 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
     && isModelPolicyCandidateAllowed(candidate)
     && (input.managed_credential_label===undefined||candidate.account_id==='claude')
     && (!input.engine || input.engine === candidate.engine)
-    && (!input.model || input.model === candidate.model || input.model === candidate.id)
+    && (!input.model || matchesModelIntent(candidate, input.model))
     && (!input.effort || input.effort === candidate.effort));
   if (!candidates.length) throw new HttpError('model_policy_unavailable', 503);
 
