@@ -279,17 +279,17 @@ test('quota freshness expires at the earlier provider validity or thirty-minute 
 const healthy={codex:true,claude:true,'shared-go':true,'zai-central':true,gemini:true};
 const left={codex:95,claude:87,'shared-go':40,'zai-central':73,gemini:90};
 
-test('pool spreads across engines, keeps astra/unadvertised engines out and caps luna',async()=>{
+test('pool spreads across engines and keeps automatic Luna/Astra/unadvertised engines out',async()=>{
  const env=poolEnv(healthy,left);
  const seen=new Map<string,number>();
  for(let i=0;i<200;i++){
   const route=await pickModelRoute(env,{interactive:false},()=>(i+0.5)/200);
   seen.set(route.policy_id,(seen.get(route.policy_id)||0)+1);
  }
- assert.ok(seen.size>=5,[...seen.keys()].join());
+ assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse'].sort(),'all four surviving default routes stay usable');
  assert.ok(!seen.has('codex-astra-medium'));
  assert.ok(!seen.has('gemini-argon-medium'),'engine no host advertises is not picked');
- assert.ok((seen.get('codex-luna-max')||0)<=(seen.get('codex-sol-medium')||0)*1.2+1,'luna never dominates');
+ assert.ok(!seen.has('codex-luna-max'),'Luna must never be an automatic default');
 });
 
 test('expired credentials are excluded from every pick',async()=>{
@@ -778,7 +778,7 @@ test('Codex reserve leaves other providers on advisory 5% and unknown semantics,
  assert.ok(exhaustedOthers.options.length>0);
 });
 
-test('Codex reserve keeps weights, multiplicity and Luna clipping for the survivors',()=>{
+test('Codex reserve keeps weights and multiplicity while Luna stays explicit-only',()=>{
  const snap=reserveSnapshot({codex:6,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60});
  const result=buildRoutingPool(snap,{interactive:false});
  assert.ok(Math.abs(result.diagnostics.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
@@ -786,9 +786,9 @@ test('Codex reserve keeps weights, multiplicity and Luna clipping for the surviv
  assert.ok(!result.diagnostics.pool.some(row=>row.policy_id==='codex-sol-medium'||row.policy_id==='codex-luna-max'));
  assert.equal(result.diagnostics.share_floor?.applied,true);
  const withLuna=buildRoutingPool(reserveSnapshot({codex:90,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60}),{interactive:false});
- const luna=withLuna.diagnostics.pool.find(row=>row.policy_id==='codex-luna-max')!;
- const others=withLuna.diagnostics.pool.filter(row=>row!==luna);
- assert.ok(luna.share<=others.reduce((sum,row)=>sum+row.share,0)/others.length+1e-12);
+ assert.ok(!withLuna.diagnostics.pool.some(row=>row.policy_id==='codex-luna-max'));
+ const explicitLuna=buildRoutingPool(reserveSnapshot({codex:90,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60}),{interactive:false,model:'codex-luna-max'});
+ assert.deepEqual(explicitLuna.options.map(row=>row.value.policy_id),['codex-luna-max']);
 });
 
 test('Codex reserve: seeded draws never select an excluded Codex candidate, including through the actual picker',async()=>{
@@ -992,4 +992,82 @@ test('high effort never joins ordinary picks or plain --model opus, and stays op
  assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model:'gpt-6-astra'}),/astra_not_for_implementation/);
  for(const model of ['gpt-6.1-sol','gemini-4-argon-medium'])
   assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model}),(e:any)=>e.code==='model_policy_unavailable');
+});
+
+// Explicit model intent, not placement/purpose/effort hints, authorizes Luna.
+test('Luna never joins model-less pools across purposes tiers engines and effort hints',()=>{
+ const policy=[...reservePolicy,{id:'claude-opus-high',engine:'claude',model:'opus',effort:'high',account_id:'claude',weight:1,capabilities:[],enabled:true}];
+ for(const purpose of [undefined,'implement','fix','review','think'] as any[])
+  for(const tier of [undefined,'quick','daily','deep'])for(const effort of [undefined,'medium','max'])
+   for(const engine of [undefined,'codex'])for(const interactive of [false,true]){
+    const snapshot=reserveSnapshot({codex:90,'codex-orin':90,claude:90,'shared-go':90,'zai-central':90,gemini:90},policy);
+    const input={interactive,purpose,tier,effort,engine};
+    try{
+     const result=buildRoutingPool(snapshot,input as any);
+     assert.ok(result.options.every(row=>!/luna/i.test(row.value.model+' '+row.value.policy_id)),JSON.stringify(input));
+     assert.ok(result.diagnostics.pool.every(row=>!/luna/i.test(row.model+' '+row.policy_id)),JSON.stringify(input));
+    }catch(error){assert.equal((error as any).code,'model_policy_unavailable',JSON.stringify(input));}
+   }
+});
+test('explicit Luna canonical alias and exact policy remain usable without a new reason gate',async()=>{
+ for(const model of ['gpt-6-luna','luna','codex-luna-max']){
+  const snapshot=reserveSnapshot({codex:90,'codex-orin':90,claude:90,'shared-go':90,'zai-central':90});
+  for(const purpose of ['implement','fix','review','think'] as Array<'implement'|'fix'|'review'|'think'>){
+   const result=buildRoutingPool(snapshot,{interactive:false,model,purpose});
+   assert.deepEqual(result.options.map(row=>row.value.policy_id),['codex-luna-max']);
+   assert.equal(result.options[0].value.model,'gpt-6-luna');assert.equal(result.options[0].value.effort,'max');
+  }
+ }
+ const opaque=reservePolicy.map(row=>row.id==='codex-luna-max'?{...row,id:'work-route-17'}:row);
+ assert.deepEqual(buildRoutingPool(reserveSnapshot({codex:90},opaque),{interactive:false,model:'work-route-17'}).options.map(row=>row.value.policy_id),['work-route-17']);
+ const {env}=envFor({codex:90},true);
+ const route=await pickModelRoute(env,{interactive:false,model:'luna'},()=>0);
+ assert.equal(route.model,'gpt-6-luna');assert.equal(route.override_reason,'explicit_route');
+});
+test('explicit Luna still refuses disabled quota-stale unknown reserve and disconnected hosts',()=>{
+ for(const model of ['gpt-6-luna','luna','codex-luna-max']){
+  for(const left of [0,6,15,null])assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:left as any}),{interactive:false,model}),
+   (error:any)=>error.code==='model_policy_unavailable');
+  const stale=reserveSnapshot({codex:90});stale.accounts.get('codex')!.quota!.valid_until=stale.observed_at;
+  assert.throws(()=>buildRoutingPool(stale,{interactive:false,model}),(error:any)=>error.code==='model_policy_unavailable');
+  const disabled=reserveSnapshot({codex:90},reservePolicy.map(row=>({...row,enabled:row.id!=='codex-luna-max'})));
+  assert.throws(()=>buildRoutingPool(disabled,{interactive:false,model}),(error:any)=>error.code==='model_policy_unavailable');
+  const host=reserveSnapshot({codex:90});host.machines.get('h1')!.connected=false;
+  assert.throws(()=>buildRoutingPool(host,{interactive:false,model}),(error:any)=>error.code==='no_connected_host');
+ }
+});
+test('non-Luna and Fable model aliases never authorize a hidden Luna policy',()=>{
+ const luna=reservePolicy.find(row=>row.id==='codex-luna-max')!;
+ const catalog=JSON.parse(readFileSync(new URL('../../config/model-routing.json',import.meta.url),'utf8'));
+ const names=new Set<string>(['fable','claude-fable-5-2',...catalog.models.filter((row:any)=>!/luna/i.test(row.id+' '+row.model)).flatMap((row:any)=>[row.id,row.model])]);
+ for(const model of names){
+  const policy=[{...luna,id:model}];
+  assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:90},policy),{interactive:false,model,purpose:'think'}),
+   (error:any)=>error.code==='model_policy_unavailable',model);
+ }
+ const collision=[{...luna,id:'gpt-6.1-sol'},...reservePolicy.filter(row=>row.id==='codex-sol-medium')];
+ const result=buildRoutingPool(reserveSnapshot({codex:90},collision),{interactive:false,model:'gpt-6.1-sol'});
+ assert.deepEqual(result.options.map(row=>row.value.policy_id),['codex-sol-medium']);
+});
+test('explicit Luna selector collisions never authorize an unrelated model or default fallback',()=>{
+ const luna=reservePolicy.find(row=>row.id==='codex-luna-max')!;
+ const nonLuna={...reservePolicy.find(row=>row.id==='codex-sol-medium')!,id:'luna'};
+ for(const model of ['luna','gpt-6-luna']){
+  const colliding={...nonLuna,id:model};
+  assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:90},[luna,colliding]),{interactive:false,model}),
+   (error:any)=>error.code==='model_policy_unavailable');
+ }
+ const only=reserveSnapshot({codex:90},[luna]);
+ assert.throws(()=>buildRoutingPool(only,{interactive:false}),(error:any)=>error.code==='model_policy_unavailable');
+ assert.throws(()=>buildRoutingPool(only,{interactive:false,engine:'codex',effort:'max',tier:'deep'}),
+  (error:any)=>error.code==='model_policy_unavailable');
+});
+
+test('valid non-Luna models retain custom Luna-text policy IDs for default and explicit picks',()=>{
+ const policy=[{...reservePolicy.find(row=>row.id==='codex-sol-medium')!,id:'luna-compat'}];
+ for(const model of [undefined,'gpt-6.1-sol','luna-compat']){
+  const result=buildRoutingPool(reserveSnapshot({codex:90},policy),{interactive:false,model});
+  assert.deepEqual(result.options.map(row=>row.value.model),['gpt-6.1-sol']);
+  assert.deepEqual(result.options.map(row=>row.value.policy_id),['luna-compat']);
+ }
 });

@@ -43,20 +43,20 @@ test('skewed headroom keeps Go above three percent in the real simulation and dr
  const f=skewedFixture();let index=0;
  const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);
  assert.deepEqual(result.share_floor,{minimum_share:.03,applied:true,reason:null});
- assert.equal(result.pool.length,6);assert.equal(result.pool_degraded,false);
+ assert.equal(result.pool.length,5);assert.equal(result.pool_degraded,false);
  assert.ok(result.pool.every(row=>row.share>.03));
  assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  const go=result.pool.find(row=>row.policy_id==='go-muse')!;
- assert.ok(Math.abs(go.share-(.03+.82*7/352.45))<1e-12);
- assert.deepEqual({...result.counts},{'codex-luna-max':160,'codex-sol-medium':161,'claude-sonnet-medium':206,
-  'go-muse':47,'claude-opus-medium':207,'antigravity-hydrogen-medium':219});
+ assert.ok(Math.abs(go.share-(.03+.85*7/296.45))<1e-12);
+ // Five automatic routes: headroom296.45, residual1-5*.03=.85; Luna is explicit-only.
+ assert.deepEqual({...result.counts},{'codex-sol-medium':191,'claude-sonnet-medium':247,
+  'go-muse':51,'claude-opus-medium':247,'antigravity-hydrogen-medium':264});
  // The actual start draw uses the same transformed weights, not just diagnostics.
- const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.55);
+ const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>.46);
  assert.equal(start.route.policy_id,'go-muse');
  assert.deepEqual(start.diagnostics.pool,result.pool);
- const luna=result.pool.find(row=>row.policy_id==='codex-luna-max')!;
- const others=result.pool.filter(row=>row!==luna);
- assert.ok(luna.share<=others.reduce((sum,row)=>sum+row.share,0)/others.length);
+ assert.ok(!result.pool.some(row=>row.policy_id==='codex-luna-max'));
+ assert.equal(result.counts['codex-luna-max'],undefined);
 });
 
 test('exploration retains the five-percent eligibility boundary and cannot restore a depleted route',async()=>{
@@ -74,7 +74,7 @@ test('exploration retains the five-percent eligibility boundary and cannot resto
 test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
  const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
  const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.82*50/395.45))<1e-12);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.85*50/339.45))<1e-12);
  assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
  f.accountRows.get('shared-go').fresh=true;
  const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
@@ -93,12 +93,15 @@ test('exploration preserves stale-neutral headroom, quota influence and underlyi
  assert.ok(Math.abs(medium.pool.find(row=>row.policy_id==='antigravity-argon-medium')!.share-(.03+.91*81.45/477.45))<1e-12);
 });
 
-test('Luna mean clipping and candidate shares survive skew and additional hosts',async()=>{
+test('automatic non-Luna weights and candidate shares survive skew and additional hosts',async()=>{
  const f=skewedFixture();
  for(const [id,row] of f.accountRows)row.quota.remaining=id==='codex'?100:5;
  const original=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- const luna=original.pool.find(row=>row.policy_id==='codex-luna-max')!;
- assert.ok(Math.abs(luna.share-1/6)<1e-12,'clipped Luna equals the other five candidates mean');
+ assert.equal(original.pool.length,5);
+ assert.ok(!original.pool.some(row=>row.policy_id==='codex-luna-max'));
+ // Sol100 and four5-point accounts: total120, unchanged exploration residual.85.
+ for(const row of original.pool)assert.ok(Math.abs(row.share-(.03+.85*(row.policy_id==='codex-sol-medium'?100:5)/120))<1e-12);
+ assert.ok(Math.abs(original.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  f.machines.set('h2',{machine_id:'h2',connected:true,engines:['codex'],capabilities:[flags()[0]]});
  const expanded=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
  assert.deepEqual(expanded.pool,original.pool);
@@ -126,9 +129,10 @@ test('1000 simulated draws use one passive observation set and the committed ord
  assert.ok(!result.pool.some(row=>row.policy_id==='antigravity-argon-medium'));
  assert.ok(result.pool.some(row=>row.policy_id==='antigravity-hydrogen-medium')&&!result.pool.some(row=>/flash/.test(row.model)));
  assert.ok(result.pool.every(row=>row.share>.03&&!/astra|fable/i.test(row.model)));
- const luna=result.pool.find(row=>/luna/.test(row.model))!;
- const others=result.pool.filter(row=>row!==luna);
- assert.ok(luna.share<=others.reduce((n,row)=>n+row.share,0)/others.length+1e-12);
+ assert.equal(result.pool.length,5);
+ assert.ok(!result.pool.some(row=>/luna/i.test(row.model)));
+ assert.equal(result.counts['codex-luna-max'],undefined);
+ assert.ok(result.pool.every(row=>Math.abs(row.share-.2)<1e-12));
  for(const kind of ['accounts','machines']){
   const rows=f.calls.filter(call=>call.kind===kind);
   assert.equal(rows.length,kind==='accounts'?4:1);
@@ -191,8 +195,18 @@ test('unhealthy observations retained by soft fallback are advisories, never cla
  assert.equal(diagnostics.advisories.filter(row=>row.reason==='capability_not_advertised').length,diagnostics.pool.length);
  assert.ok(diagnostics.advisories.every(row=>['credential_missing','capability_not_advertised'].includes(row.reason)));
  const only=f.state.policies.filter((row:any)=>row.id==='codex-luna-max');f.state.policies=only;
- const degraded=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.equal(degraded.pool_degraded,true);assert.equal(degraded.counts['codex-luna-max'],1,'degradation does not refuse a start');
+ // Soft credential fallback cannot restore a hard-excluded automatic Luna.
+ await assert.rejects(simulateModelRoutes(f.env,{interactive:false},1,()=>0),
+  (error:any)=>error.code==='model_policy_unavailable'&&error.status===503);
+ // Explicit canonical/policy intent still uses the same quota/host safety checks.
+ for(const model of ['gpt-6-luna','codex-luna-max']){
+  const explicit=await simulateModelRoutes(f.env,{interactive:false,model},1,()=>0);
+  assert.equal(explicit.pool_degraded,true);assert.equal(explicit.counts['codex-luna-max'],1);
+ }
+ f.accountRows.get('codex').quota.remaining=15;
+ for(const model of ['gpt-6-luna','codex-luna-max'])await assert.rejects(
+  simulateModelRoutes(f.env,{interactive:false,model},1,()=>0),
+  (error:any)=>error.code==='model_policy_unavailable'&&error.status===503);
 });
 
 test('legacy monitor retains all-bad credential diagnostics while passive simulation distinguishes advisories',async()=>{

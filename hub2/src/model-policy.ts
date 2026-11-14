@@ -82,6 +82,53 @@ export function isExplicitOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'mo
   return /astra/i.test(`${candidate.id} ${candidate.model}`);
 }
 
+/** Luna needs explicit model/policy intent, never a machine/effort/tier hint. */
+export function isLunaModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
+  return /luna/i.test(candidate.model);
+}
+
+/** Catalog's canonical Luna alias; other model selectors retain exact matching. */
+export function matchesModelIntent(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>, model: string): boolean {
+  if (model === 'luna' || model === 'gpt-6-luna') return candidate.model === 'gpt-6-luna';
+  return model === candidate.id || model === candidate.model;
+}
+
+// Closed projection of the existing model-routing catalog's NON-Luna names.
+// The adjacent test checks the catalog projection; no runtime file/config read.
+const NON_LUNA_MODEL_NAMES = new Set([
+  "antigravity-carbon-medium","antigravity-hydrogen-medium","argon","argon-gemini",
+  "astra","beam-free","claude-fable-5-2","deepseek-flash",
+  "deepseek-v4-pro","fable","gemini-4-argon-contributor","gemini-4-argon-medium",
+  "gemini-4-carbon-medium","gemini-4-hydrogen-medium","glm-5-2","glm-5-3",
+  "glm-5-3-flash","glm-5.3-flash","glm-flash","glm-flash-zcodex",
+  "gpt-6-astra","gpt-6.1-sol","grok","grok-4-7",
+  "grok-4.6","hy3","hy4-preview","kimi-k2-7-code",
+  "kimi-k3","longcat-2-0","mimo-v2-5","mimo-v2-5-pro",
+  "mimo-v2-6-flash","mimo-v2-6-pro","minimax-m3","minimax-m3-1-flash",
+  "muse","muse-spark-1-2-contributor","opencode-go/beam-free","opencode-go/deepseek-v4-pro",
+  "opencode-go/deepseek-v4.1-flash","opencode-go/gemini-4-argon-contributor","opencode-go/glm-5.2","opencode-go/glm-5.3",
+  "opencode-go/glm-5.3-flash","opencode-go/grok-4.7","opencode-go/hy3","opencode-go/hy4-preview",
+  "opencode-go/kimi-k2.7-code","opencode-go/kimi-k3","opencode-go/longcat-2.0","opencode-go/mimo-v2.5",
+  "opencode-go/mimo-v2.5-pro","opencode-go/mimo-v2.6-flash","opencode-go/mimo-v2.6-pro","opencode-go/minimax-m3",
+  "opencode-go/minimax-m3.1-flash","opencode-go/muse-spark-1.2-contributor","opencode-go/muse-spark-1.3-contributor","opencode-go/qwen3.7-plus",
+  "opencode-go/qwen3.8-flash","opencode-go/qwen3.8-max","opencode-go/step-5-preview","qwen3-7-plus",
+  "qwen3-8-flash","qwen3-8-max","sol","sonnet",
+  "step-5-preview",
+]);
+
+/** Resolve the complete selector before authorizing any Luna candidate.
+ * A policy-id/model collision with another model cannot silently become Luna.
+ * Non-Luna model aliases (including Fable) never convey Luna intent, even if
+ * a policy gives a Luna route that ambiguous alias as its id.
+ */
+export function explicitLunaIntent(candidates: readonly ModelPolicyRoute[], model: string | undefined): boolean {
+  if (!model) return false;
+  const hint = model.toLowerCase();
+  if (NON_LUNA_MODEL_NAMES.has(hint)) return false;
+  const matches = candidates.filter(candidate => candidate.id === model || matchesModelIntent(candidate, model));
+  return matches.length > 0 && matches.every(candidate => /luna/i.test(candidate.model));
+}
+
 /** Deep-work models that a deep/complex tier hint biases toward. */
 export function isDeepWorkModel(candidate: Pick<ModelPolicyRoute, 'engine' | 'model'>): boolean {
   return (candidate.engine.toLowerCase() === 'claude' && candidate.model.toLowerCase() === 'opus')
