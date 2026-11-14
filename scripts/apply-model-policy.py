@@ -76,7 +76,7 @@ def candidates(value, empty=False):
         if (type(weight) not in (int,float) or not math.isfinite(weight) or not 0 < weight <= 1000000
             or type(row.get('enabled')) is not bool or not isinstance(caps,list) or len(caps)>32
             or any(not isinstance(cap,str) or not cap.strip() or len(cap.encode())>80 for cap in caps)
-            or 'effort' in row and row['effort'] not in ('low','medium','max') or row['id'] in ids): raise Problem('invalid_candidates')
+            or 'effort' in row and row['effort'] not in ('low','medium','high','max') or row['id'] in ids): raise Problem('invalid_candidates')
         ids.add(row['id']); item = dict(row); item['capabilities'] = sorted(set(caps)); item['weight'] = int(weight) if weight == int(weight) else weight
         result.append(item)
     return result
