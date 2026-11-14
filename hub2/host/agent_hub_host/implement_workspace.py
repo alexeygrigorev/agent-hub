@@ -31,7 +31,8 @@ _HUB_SESSION_LOCK_RE = re.compile(
 # (phase "owned"); earlier pre-creation records are rejected fail-closed.
 _RECORD_VERSION = 2
 _RECORD_PHASE = 'owned'
-_RECORD_SOURCES = frozenset({'prepare', 'legacy_worktree_bootstrap', 'operator_legacy_adoption'})
+_RECORD_SOURCES = frozenset({'prepare', 'legacy_worktree_bootstrap', 'operator_legacy_adoption',
+                             'legacy_pristine_adoption'})
 
 
 def _run_git(root, args, allowed=(0,)):
@@ -447,6 +448,23 @@ def _head_binds_ref(root, ref):
         return False
 
 
+def _tip_is_default_branch_ancestor(root, tip):
+    """True if the tip is already contained in the local origin default branch.
+
+    Offline by design: only remote-tracking refs already on disk are consulted.
+    A branch holding no commit beyond origin's default branch has no unique work
+    for a same-name ref to steal or lose.
+    """
+    for ref in ('refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'):
+        code, _ = _run_git(root, ('rev-parse', '--verify', '-q', ref + '^{commit}'), allowed=(0, 1))
+        if code != 0:
+            continue
+        code, _ = _run_git(root, ('merge-base', '--is-ancestor', tip, ref), allowed=(0, 1))
+        if code == 0:
+            return True
+    return False
+
+
 def _ensure_legacy_worktree_record(root, digest, identity, ref):
     """Make an existing record durable, or bootstrap one from a bound marker.
 
@@ -633,9 +651,17 @@ def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_d
             else:
                 # A retained branch must have a durable common-dir ownership
                 # record; branch name alone never proves ownership.
-                if record is None:
+                if record is None and _tip_is_default_branch_ancestor(root, tip):
+                    # Branches created before ownership records existed and whose
+                    # worktree was retired never got a bootstrap record. With no
+                    # commit beyond origin's default branch there is nothing to
+                    # protect, so the derived name (a hash of the Hub-supplied
+                    # identity) is enough to retry the same intake.
+                    _write_ownership_record(common, digest, identity, ref, 'legacy_pristine_adoption')
+                elif record is None:
                     raise ValueError(f'implement_worktree_ownership_unverified ref={ref}')
-                _make_record_durable(common, digest)
+                else:
+                    _make_record_durable(common, digest)
                 for entry in _worktree_entries(root):
                     if entry.get('branch') != ref:
                         continue

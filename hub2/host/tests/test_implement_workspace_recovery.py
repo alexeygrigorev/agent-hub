@@ -231,6 +231,26 @@ with _repository_lock(sys.argv[1]):
         fresh = module.prepare_workspace(self.repo, 'implement', 'fresh-after-kill', 'org/project')
         self.assertTrue(fresh.exists())
 
+    def test_retired_legacy_branch_at_default_ancestor_is_adopted_for_retry(self):
+        # Branch predates ownership records and its worktree was retired.
+        self.git(self.repo, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main')
+        self.git(self.repo, 'branch', self.branch, 'main')
+        tip = self.git(self.repo, 'rev-parse', 'main')
+        recovered = self.prepare()
+        self.assertEqual(recovered, self.target)
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+        self.assertEqual(self.git(recovered, 'symbolic-ref', 'HEAD'), self.ref)
+        record = json.loads(self.record_path().read_text())
+        self.assertEqual(record['source'], 'legacy_pristine_adoption')
+        self.assertEqual(self.prepare(), recovered)
+
+    def test_retired_legacy_branch_with_unique_commit_still_unverified(self):
+        self.git(self.repo, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main')
+        self.foreign_same_name_ref()
+        with self.assertRaisesRegex(ValueError, 'ownership_unverified'):
+            self.prepare()
+        self.assertFalse(self.record_path().exists())
+
     def test_foreign_same_name_branch_without_record_fails_ownership_unverified(self):
         (self.repo / 'foreign').write_text('foreign')
         self.git(self.repo, 'add', 'foreign')
