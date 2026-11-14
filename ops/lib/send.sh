@@ -31,8 +31,11 @@ fi
 sid=$(a list --json 2>/dev/null | python3 -c '
 import json,sys
 w,t=sys.argv[1:3]
+prefix=w.rstrip("/")+"/"
 for s in json.load(sys.stdin):
-    if s.get("workspace")==w and s.get("tag")==t and s.get("phase")=="running": print(s["id"]); break' "$RUNDIR/$SUB" "$TAG")
+    ws=s.get("workspace") or ""
+    if s.get("tag")==t and s.get("phase")=="running" and (ws==w or ws.startswith(prefix)):
+        print(s["id"]); break' "$RUNDIR/$SUB" "$TAG")
 if [ -z "$sid" ]; then echo "DELIVERY=not-delivered (no running $TAG session; watchdog will restart it, item stays in inbox)"; exit 2; fi
 if timeout 60 a send "$sid" "$msg" --enter >/dev/null 2>&1; then echo "DELIVERY=delivered to $TAG ($sid)"; exit 0
 else echo "DELIVERY=not-delivered (a send rc=$?; item stays in inbox, drained next loop)"; exit 2; fi

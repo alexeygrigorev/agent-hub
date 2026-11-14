@@ -234,26 +234,47 @@ assert_not_contains "$output" 'Hub quota unavailable'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
 [[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
-# A legacy Gemini quota route is never eligible for oncall, even when Hub
-# advertises it as fresh and configured.
+# When OpenCode Go is exhausted and Antigravity (Gemini pool) has fresh quota,
+# oncall recovers onto Antigravity with its pinned Hydrogen Medium model (never Claude).
 write_quota <<'JSON'
-{"pools":[{"provider":"gemini","state":"fresh","remaining_percent":44,"harness":["gemini"]}]}
+{"pools":[
+ {"provider":"claude","state":"fresh","remaining_percent":60,"harness":["claude","sonnet","opus","haiku"]},
+ {"provider":"go","state":"exhausted","remaining_percent":0,"harness":["opencode"]},
+ {"provider":"gemini","state":"fresh","remaining_percent":97,"harness":["antigravity"]}
+]}
 JSON
 write_live oncall 'You have hit your weekly limit - resets Nov 5'
-status=0
-output="$(run_ctl oncall check 2>&1)" || status=$?
-[[ "$status" -ne 0 ]]
-assert_not_contains "$output" 'Hub quota unavailable'
-assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
-[[ ! -e "$FAKE_START_ENGINE" ]]
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'provider usage limit screen'
+assert_contains "$output" 'engine preference unavailable; Hub quota selected antigravity'
+[[ "$(<"$FAKE_START_ENGINE")" == antigravity ]]
+[[ "$(<"$FAKE_START_MODEL")" == gemini-4-hydrogen-medium ]]
 
-# A legacy engine override cannot widen the oncall allowlist, even when it is
-# marked preselected. It normalizes to the pinned Muse route.
+# When oncall inbox is stale and OpenCode Go + Antigravity are exhausted,
+# recovery selects the next non-Claude/non-Astra engine with fresh quota (grok).
+write_quota <<'JSON'
+{"pools":[
+ {"provider":"go","state":"exhausted","remaining_percent":0,"harness":["opencode"]},
+ {"provider":"gemini","state":"exhausted","remaining_percent":0,"harness":["antigravity"]},
+ {"provider":"grok","state":"fresh","remaining_percent":40,"harness":["grok"]}
+]}
+JSON
+write_live oncall 'normal ready prompt'
+printf 'unprocessed alert\n' > "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+touch -d '25 minutes ago' "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'STALLED session=old-oncall: oncall inbox'
+[[ "$(<"$FAKE_START_ENGINE")" == grok ]]
+[[ -z "$(<"$FAKE_START_MODEL")" ]]
+rm -f "$HOME/tmp/agent-reports/oncall/inbox/old.md"
+
+# A disallowed engine override (such as claude or astra) cannot widen the oncall
+# allowlist, even when it is marked preselected. It normalizes to the primary route.
 write_default_quota
 write_dead oncall
-output="$(ENGINE=antigravity ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
+output="$(ENGINE=claude ENGINE_SELECTED=1 "$repo/ops/lib/session-ctl.sh" oncall start 2>&1)"
 assert_not_contains "$output" 'recovery held'
-assert_contains "$output" 'oncall route '\''antigravity'\'' is disallowed'
+assert_contains "$output" 'oncall route '\''claude'\'' is disallowed'
 [[ "$(<"$FAKE_START_ENGINE")" == opencode ]]
 [[ "$(<"$FAKE_START_MODEL")" == opencode-go/muse-spark-1.3-contributor ]]
 
@@ -376,5 +397,22 @@ output="$(run_ctl oncall check 2>&1)" || status=$?
 [[ "$status" -ne 0 ]]
 assert_contains "$output" 'no configured non-Claude engine has fresh Hub quota headroom'
 [[ ! -e "$FAKE_START_ENGINE" ]]
+
+# Both session-ctl and oncall-send recognize a running oncall-engineer session
+# whose workspace is a Hub nested worktree under ops/oncall.
+nested_ws="$HOME/git/agent-hub-wt-oncall-run/ops/oncall/.local/hub-worktrees/deadbeef"
+mkdir -p "$nested_ws"
+printf '[{"id":"nested-oncall","workspace":"%s","tag":"oncall-engineer","phase":"running","worker_alive":true}]\n' "$nested_ws" > "$FAKE_SESSIONS"
+printf 'normal ready prompt\n' > "$FAKE_SCREEN"
+rm -f "$FAKE_START_ENGINE" "$FAKE_START_MODEL"
+: > "$FAKE_SEND_LOG"
+output="$(run_ctl oncall check 2>&1)"
+assert_contains "$output" 'OK session=nested-oncall'
+[[ ! -e "$FAKE_START_ENGINE" ]]
+
+install -m755 "$repo/ops/lib/send.sh" "$bin/oncall-send"
+send_output="$("$bin/oncall-send" "nested worktree delivery probe" 2>&1)"
+assert_contains "$send_output" 'DELIVERY=delivered to oncall-engineer (nested-oncall)'
+assert_contains "$(<"$FAKE_SEND_LOG")" 'nested-oncall [INBOX '
 
 echo 'session-ctl targeted tests passed'

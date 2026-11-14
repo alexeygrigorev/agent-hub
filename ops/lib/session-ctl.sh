@@ -18,10 +18,11 @@ SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone 
 SKILLS_REMOTE="${SKILLS_REMOTE:-alexeygrigorev/bots-management}"
 SKILLS_DIR="${SKILLS_DIR:-$SKILLS_REPO/.agents/skills}"   # skills live under .agents/skills
 if [ "$ROLE" = oncall ]; then
-  # The persistent oncall coordinator stays on the explicitly named daily Muse model.
-  # Do not inherit the old shared Antigravity preference or the orchestrator fallback.
+  # The persistent oncall coordinator prefers the daily Muse model on OpenCode Go,
+  # and falls back to another configured non-Claude/non-Astra engine (e.g. Antigravity
+  # Hydrogen Medium) when OpenCode Go has no quota headroom.
   ENGINE="${ONCALL_ENGINE:-${ENGINE:-opencode}}"
-  FALLBACK_ENGINE="opencode"
+  FALLBACK_ENGINE="${ONCALL_FALLBACK_ENGINE:-antigravity}"
 else
   ENGINE="${ENGINE:-${ORCH_ENGINE:-antigravity}}"
   FALLBACK_ENGINE="${ORCH_FALLBACK_ENGINE:-antigravity}"  # second recovery path prefers Ag; selection excludes the failed route
@@ -113,8 +114,10 @@ matching_sessions() {
   t a list --json | python3 -c '
 import json,sys
 w,t,live=sys.argv[1:4]
+prefix=w.rstrip("/")+"/"
 for s in json.load(sys.stdin):
-    if s.get("workspace")==w and s.get("tag")==t:
+    ws=s.get("workspace") or ""
+    if (ws==w or ws.startswith(prefix)) and s.get("tag")==t:
         if live == "all" or (s.get("phase")=="running" and s.get("worker_alive") is True):
             print(s["id"])' "$RUNDIR/$SUB" "$TAG" "${1:-live}"
 }
@@ -207,11 +210,8 @@ if not isinstance(quota, dict) or "error" in quota or not isinstance(quota.get("
 
 # Hub currently labels the Google quota pool "gemini". That is quota metadata;
 # the only Google-family engine this watchdog selects is Antigravity.
-if role == "oncall":
-    allowed = {"opencode": "go"}
-else:
-    allowed = {"antigravity": "gemini", "grok": "grok",
-               "opencode": "go", "zcodex": "zai"}
+allowed = {"antigravity": "gemini", "grok": "grok",
+           "opencode": "go", "zcodex": "zai"}
 aliases = {"gemini": "antigravity"}
 def normalize_engine(value):
     value = value.strip().lower()
@@ -267,7 +267,7 @@ def has_headroom(engine, pool):
     return remaining > reserve
 
 order = []
-default_order = ("opencode",) if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
+default_order = ("opencode", "antigravity", "grok", "zcodex") if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
 for candidate in (preferred, fallback, *default_order):
     candidate = normalize_engine(candidate)
     if candidate in allowed and candidate not in order:
@@ -293,7 +293,7 @@ local_engine() {  # $1 preferred, $2 excluded route, $3 fallback preference, $4 
 import json, sys
 
 preferred, excluded, fallback, exact, role = sys.argv[1:6]
-allowed = {"opencode"} if role == "oncall" else {"antigravity", "grok", "opencode", "zcodex"}
+allowed = {"antigravity", "grok", "opencode", "zcodex"}
 aliases = {"gemini": "antigravity"}
 def normalize_engine(value):
     value = value.strip().lower()
@@ -324,7 +324,7 @@ if exact == "1":
     order = [preferred]
 else:
     order = []
-    default_order = ("opencode",) if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
+    default_order = ("opencode", "antigravity", "grok", "zcodex") if role == "oncall" else ("antigravity", "opencode", "grok", "zcodex")
     for candidate in (preferred, fallback, *default_order):
         candidate = normalize_engine(candidate)
         if candidate in allowed and candidate not in order:
@@ -347,14 +347,18 @@ sys.exit(1)
 
 enforce_oncall_route() {
   [ "$ROLE" = oncall ] || return 0
-  if [ "$ENGINE" != opencode ]; then
-    log "oncall route '$ENGINE' is disallowed; using OpenCode Muse Spark"
-    ENGINE=opencode
-    ENGINE_SELECTED=0
-  fi
-  # Recovery path 2 must stay on the same safe route; environment settings
-  # intended for orchestrator recovery cannot widen the oncall allowlist.
-  FALLBACK_ENGINE=opencode
+  case "$ENGINE" in
+    opencode|antigravity|grok|zcodex) ;;
+    *)
+      log "oncall route '$ENGINE' is disallowed; using OpenCode Muse Spark"
+      ENGINE=opencode
+      ENGINE_SELECTED=0
+      ;;
+  esac
+  case "$FALLBACK_ENGINE" in
+    opencode|antigravity|grok|zcodex) ;;
+    *) FALLBACK_ENGINE=antigravity ;;
+  esac
 }
 
 select_engine() {
@@ -420,9 +424,22 @@ start() {
   date +%s > "$STATE/last_start"
   model_args=()
   if [ "$ROLE" = oncall ]; then
-    [ "$ENGINE" = opencode ] || { log "refusing unsafe oncall engine $ENGINE"; return 1; }
-    model_args=(--model opencode-go/muse-spark-1.3-contributor)
-    log "oncall model pinned to opencode-go/muse-spark-1.3-contributor"
+    case "$ENGINE" in
+      opencode)
+        model_args=(--model opencode-go/muse-spark-1.3-contributor)
+        log "oncall model pinned to opencode-go/muse-spark-1.3-contributor"
+        ;;
+      antigravity)
+        model_args=(--model "${ONCALL_ANTIGRAVITY_MODEL:-gemini-4-hydrogen-medium}")
+        log "oncall model pinned to ${ONCALL_ANTIGRAVITY_MODEL:-gemini-4-hydrogen-medium}"
+        ;;
+      grok|zcodex)
+        log "oncall using engine $ENGINE default model"
+        ;;
+      *)
+        log "refusing unsafe oncall engine $ENGINE"; return 1
+        ;;
+    esac
   elif [ "$ENGINE" = antigravity ]; then
     # Preserve the orchestrator's explicit Flash default; never leak it into oncall.
     model_args=(--model "${ORCH_MODEL:-gemini-3.8-flash-high}")
