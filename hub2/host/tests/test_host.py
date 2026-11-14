@@ -1476,6 +1476,28 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[-1]["stage"], "host_launch")
         self.assertEqual(sent[-1]["detail"], "implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")
 
+    def test_validate_launch_unwraps_missing_implement_worktree_to_parent_checkout(self):
+        from agent_hub_host.implement_workspace import _identity_and_ref
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        _, digest, _ = _identity_and_ref("intake-1", "org/repo")
+        worktree = checkout / ".local" / "hub-worktrees" / digest
+        offer = self.offer(session_id="sess-unwrap", operation_id="op-unwrap:0")
+        offer["intake_id"] = "intake-1"
+        offer["project_id"] = "org/repo"
+        offer["launch"]["purpose"] = "implement"
+        offer["launch"]["workspace"] = str(worktree)
+        self.assertEqual(self.bridge.validate_launch(offer)["workspace"], str(checkout.resolve()))
+
+        offer["launch"]["purpose"] = "review"
+        with self.assertRaisesRegex(ValueError, "workspace_unavailable"):
+            self.bridge.validate_launch(offer)
+
+        offer["launch"]["purpose"] = "implement"
+        offer["launch"]["workspace"] = str(checkout / ".local" / "hub-worktrees" / ("0" * 64))
+        with self.assertRaisesRegex(ValueError, "workspace_unavailable"):
+            self.bridge.validate_launch(offer)
+
     def test_is_session_dead_checks_journal_and_api(self):
         with self.journal.db:
             self.journal.db.execute(

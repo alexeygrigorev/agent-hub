@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .client import ApiError, private_file, save_config
 from . import native_launch, launch_reaper, credential_delivery
-from .implement_workspace import prepare_workspace
+from .implement_workspace import prepare_workspace, _identity_and_ref
 from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
@@ -224,7 +224,19 @@ class Bridge:
         launch = offer.get("launch")
         if not isinstance(launch, dict):
             raise ValueError("launch_specification_required")
-        workspace = self.resolve_workspace(launch.get("workspace"))
+        try:
+            workspace = self.resolve_workspace(launch.get("workspace"))
+        except ValueError as exc:
+            if not str(exc).startswith("workspace_unavailable "):
+                raise
+            workspace = self._unwrap_missing_implement_worktree(
+                launch.get("workspace"),
+                launch.get("purpose"),
+                offer.get("intake_id"),
+                offer.get("project_id"),
+            )
+            if workspace is None:
+                raise
         engine = launch.get("engine")
         if engine not in self.engines:
             raise ValueError("engine_not_allowed")
@@ -261,6 +273,29 @@ class Bridge:
         return {"workspace": str(workspace), "engine": engine, "model": model,
                 "prompt": prompt, "interactive": bool(launch.get("interactive", False)), "timeout_seconds": timeout,
                 'with_goal':with_goal,'effort':effort,**managed}
+
+    def _unwrap_missing_implement_worktree(self, value, purpose, intake_id, project_id):
+        if (not isinstance(value, str)
+                or purpose not in {None, "implement", "fix"}
+                or not isinstance(intake_id, str)
+                or not isinstance(project_id, str)):
+            return None
+        candidate = Path(value)
+        if (not (candidate.is_absolute() or re.match(r"^[A-Za-z]:\\", value))
+                or len(candidate.parts) < 4
+                or candidate.parts[-3:-1] != (".local", "hub-worktrees")
+                or not re.fullmatch(r"[0-9a-f]{64}", candidate.name)):
+            return None
+        try:
+            _, expected_digest, _ = _identity_and_ref(intake_id, project_id)
+            parent = candidate.parents[2].resolve(strict=True)
+        except (OSError, ValueError):
+            return None
+        if (candidate.name == expected_digest
+                and parent.is_dir()
+                and any(parent.is_relative_to(root) for root in self.roots)):
+            return parent
+        return None
 
     def resolve_workspace(self, value):
         if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mergeWorkspaceBinding,boundWorkspace} from '../src/workspace-binding';
+import {mergeWorkspaceBinding,boundWorkspace,checkoutWorkspace} from '../src/workspace-binding';
 
 test('host can bind a label or absolute checkout to its intake worktree and keep continuation binding',()=>{
  for(const requested of ['agent-hub','/work/agent-hub','C:\\work\\agent-hub']){
@@ -22,4 +22,11 @@ test('a retained intake worktree created under another enrolled checkout stays a
  assert.equal(boundWorkspace({workspace:'/work/newsletter'},binding),resolved);
  for(const bad of ['/work/x/../y/.local/hub-worktrees/'+'9'.repeat(64),'/.local/hub-worktrees/'+'9'.repeat(64),'/work/x/.local/other/'+'9'.repeat(64),'/work/x/.local/hub-worktrees/'+'G'.repeat(64)])
   assert.throws(()=>mergeWorkspaceBinding('/work/newsletter',undefined,{...binding,resolved_workspace:bad}),/invalid_workspace_binding/);
+});
+
+test('checkoutWorkspace unwraps ephemeral intake worktrees to their parent checkout while keeping other bindings',()=>{
+ const digest='c'.repeat(64);
+ assert.equal(checkoutWorkspace({workspace:'repo-label'},{version:1,requested_workspace:'repo-label',resolved_workspace:'/work/repo/.local/hub-worktrees/'+digest}),'/work/repo');
+ assert.equal(checkoutWorkspace({workspace:'repo-label'},{version:1,requested_workspace:'repo-label',resolved_workspace:'C:\\work\\repo\\.local\\hub-worktrees\\'+digest}),'C:\\work\\repo');
+ assert.equal(checkoutWorkspace({workspace:'repo-label'},{version:1,requested_workspace:'repo-label',resolved_workspace:'/srv/accepted-worktree'}),'/srv/accepted-worktree');
 });

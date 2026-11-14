@@ -1251,3 +1251,24 @@ test('merge evidence for a PR of another repository never satisfies the gate',as
     assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('is not in org/completion')));
   }finally{f.close();}
 });
+
+test('continuations and verifiers unwrap cleaned-up intake worktrees to their parent checkout',async()=>{
+  const f=fixture();
+  try{
+    const digest='d'.repeat(64),checkout='/srv/work/cmp-banner',worktree=`${checkout}/.local/hub-worktrees/${digest}`;
+    const id=await createIntake(f,'unwrap-worktree',false);
+    await start(f,id,'first',{workspace:'cmp-banner'});
+    const first=await run(f,id);
+    assert((await f.call('/_internal/started','POST',{...first,workspace_binding:{version:1,requested_workspace:'cmp-banner',resolved_workspace:worktree}})).ok);
+    await finish(f,first,0);
+    await f.project.alarm();
+    const cont=activeSaga(f,id);
+    assert.equal(JSON.parse(cont.launch_spec_json).workspace,checkout);
+    const second=await run(f,id);
+    await claim(f,id,second.session_id);
+    await finish(f,second,0);
+    await f.project.alarm();
+    const verifier=activeSaga(f,id);
+    assert.equal(JSON.parse(verifier.launch_spec_json).workspace,checkout);
+  }finally{f.close();}
+});
