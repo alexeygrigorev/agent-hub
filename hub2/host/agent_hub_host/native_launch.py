@@ -354,6 +354,14 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
             raise ValueError('interactive_effort_unsupported')
         if 'run' not in result or '--auto' not in result:
             raise ValueError('interactive_adapter_shape_unverified')
+        # Mini is a terminal UI, not run's JSON event stream. Its native
+        # parser rejects --format; validate and remove only our inherited pair.
+        if result.count('--format') != 1:
+            raise ValueError('interactive_adapter_shape_unverified')
+        output = result.index('--format')
+        if output + 1 >= len(result) or result[output + 1] != 'json':
+            raise ValueError('interactive_adapter_shape_unverified')
+        del result[output:output + 2]
         result[result.index('run')] = 'mini'
         result.remove('--auto')
         result += ['--prompt', prompt]
