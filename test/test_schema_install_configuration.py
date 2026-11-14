@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ('hub2/node/alert-evidence.ts', 'hub2/node/main.ts', 'hub2/src/worker.ts')
+ALL_ARTIFACTS = ARTIFACTS + ('hub2/src/model-picker.ts', 'hub2/src/routing-pool.ts')
 
 
 class SchemaInstallConfigurationTests(unittest.TestCase):
@@ -31,7 +32,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
     def _create_synthetic_checkout(self, base: Path) -> tuple[Path, str]:
         repo = base / 'checkout'
         repo.mkdir(mode=0o700)
-        for rel in ARTIFACTS:
+        for rel in ALL_ARTIFACTS:
             target = repo / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(('synthetic authority ' + rel).encode('utf-8'))
@@ -58,10 +59,17 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
         ).strip()
         return repo, head
 
+    @staticmethod
+    def primary_config(original):
+        value=original.replace('HUB2_RELEASE_MODE=bootstrap','HUB2_RELEASE_MODE=active')
+        if 'HUB2_SCHEMA_MIGRATIONS=' not in original:
+            value='HUB2_SCHEMA_MIGRATIONS=apply\n'+value
+        return value
+
     def test_updates_modes_without_changing_secret_lines_or_permissions(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
             path = Path(temporary) / '.dev.vars'
-            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\nHUB2_SCHEMA_MIGRATIONS=defer\nHUB2_SCHEMA_MIGRATIONS=apply\n')
+            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=\nHUB2_SCHEMA_MIGRATIONS=defer\nHUB2_SCHEMA_MIGRATIONS=apply\n')
             path.chmod(0o640)
             previous = path.stat()
             def run(mode, schema):
@@ -83,52 +91,33 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertEqual((current.st_uid, current.st_gid), (previous.st_uid, previous.st_gid))
             self.assertEqual(list(path.parent.glob('.dev.vars.*')), [])
 
-    def test_active_mode_stages_fresh_credential_monitor_boundary_and_sets_dev_vars(self):
+    def test_active_mode_prepares_three_boundaries_and_reuses_same_release(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
-            base = Path(temporary)
-            base.chmod(0o700)
-            repo, head = self._create_synthetic_checkout(base)
-            # Notice evidence_root does not exist before first active run; Python block creates it O_NOFOLLOW 0700.
-            evidence_root = base / 'credential-monitor-evidence'
-            path = base / '.dev.vars'
-            path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n')
-            path.chmod(0o600)
-
-            res1 = subprocess.run(
-                [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(evidence_root)],
-                input=self.block, text=True, capture_output=True,
-            )
-            self.assertEqual(res1.returncode, 0, res1.stderr)
-            self.assertEqual(stat.S_IMODE(evidence_root.lstat().st_mode), 0o700)
-            boundaries1 = sorted(evidence_root.iterdir())
-            self.assertEqual(len(boundaries1), 1)
-            first_boundary = boundaries1[0]
-            self.assertTrue(first_boundary.name.startswith(head + '-'))
-            self.assertEqual(stat.S_IMODE(first_boundary.stat().st_mode), 0o700)
-            enrollment = json.loads((first_boundary / 'enrollment.json').read_text())
-            journal = json.loads((first_boundary / 'journal.json').read_text())
-            self.assertEqual(enrollment['release_sha'], head)
-            self.assertEqual(enrollment['producer'], 'credential_monitor')
-            self.assertEqual(enrollment['recipient'], 'dev@dtcdev.click')
-            self.assertEqual((journal['occurrence_count'], journal['started_total'], journal['finished_total']), (0, 0, 0))
-            contents1 = path.read_text()
-            self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={first_boundary}\n', contents1)
-            self.assertIn('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\n', contents1)
-
-            # A second active run stages a brand-new boundary and preserves the first untouched.
-            first_snapshot = {p.name: p.read_bytes() for p in first_boundary.iterdir()}
-            res2 = subprocess.run(
-                [sys.executable, '-', str(path), 'active', 'defer', str(repo), str(evidence_root)],
-                input=self.block, text=True, capture_output=True,
-            )
-            self.assertEqual(res2.returncode, 0, res2.stderr)
-            boundaries2 = sorted(evidence_root.iterdir())
-            self.assertEqual(len(boundaries2), 2)
-            second_boundary = [b for b in boundaries2 if b != first_boundary][0]
-            self.assertEqual(first_snapshot, {p.name: p.read_bytes() for p in first_boundary.iterdir()})
-            contents2 = path.read_text()
-            self.assertEqual(contents2.count('HUB2_ALERT_EVIDENCE_DIR='), 1)
-            self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={second_boundary}\n', contents2)
+            base=Path(temporary);base.chmod(0o700)
+            repo,head=self._create_synthetic_checkout(base)
+            evidence_root=base/'credential-monitor-evidence'
+            path=base/'.dev.vars';path.write_text('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n');path.chmod(0o600)
+            def run():
+                return subprocess.run([sys.executable,'-',str(path),'active','apply',str(repo),str(evidence_root)],
+                                      input=self.block,text=True,capture_output=True,timeout=15)
+            first=run();self.assertEqual(first.returncode,0,first.stderr);self.assertNotIn('unavailable',first.stderr)
+            boundaries=sorted(p for p in evidence_root.iterdir() if p.is_dir())
+            self.assertEqual(len(boundaries),3)
+            keys={'credential_monitor':'HUB2_ALERT_EVIDENCE_DIR','picker_excluded':'HUB2_PICKER_EXCLUDED_EVIDENCE_DIR',
+                  'picker_quota_stale':'HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR'}
+            for boundary in boundaries:
+                self.assertEqual(stat.S_IMODE(boundary.stat().st_mode),0o700)
+                entry=json.loads((boundary/'enrollment.json').read_text());journal=json.loads((boundary/'journal.json').read_text())
+                self.assertEqual(entry['release_sha'],head);self.assertEqual(entry['recipient'],'dev@dtcdev.click')
+                self.assertEqual(len(entry['artifacts']),3 if entry['producer']=='credential_monitor' else 5)
+                self.assertEqual((journal['occurrence_count'],journal['started_total'],journal['finished_total']),(0,0,0))
+                self.assertIn(keys[entry['producer']]+'='+str(boundary)+'\n',path.read_text())
+            before={str(p):p.read_bytes() for d in boundaries for p in d.iterdir()}
+            config=path.read_bytes();second=run();self.assertEqual(second.returncode,0,second.stderr)
+            self.assertEqual(config,path.read_bytes(),'same release retry must not rotate a healthy epoch to zero')
+            self.assertEqual(before,{str(p):p.read_bytes() for d in boundaries for p in d.iterdir()})
+            self.assertEqual(sorted(p for p in evidence_root.iterdir() if p.is_dir()),boundaries)
+            self.assertIn('# retained comment\nSYNTHETIC_SECRET=keep-private-fixture\n',path.read_text())
 
     def test_bootstrap_and_schema_only_modes_do_not_stage_or_mutate_alert_evidence_dir(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
@@ -155,7 +144,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                 self.assertEqual(list(evidence_root.iterdir()), [prior_dir])
                 self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={prior_dir}\n', path.read_text())
 
-    def test_staging_failure_fails_closed_before_modifying_dev_vars(self):
+    def test_staging_failure_keeps_evidence_unknown_without_primary_refusal(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
             base = Path(temporary)
             base.chmod(0o700)
@@ -163,7 +152,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             evidence_root = base / 'credential-monitor-evidence'
             evidence_root.mkdir(mode=0o750)  # non-private parent must be refused without repairing mode
             path = base / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -171,10 +160,10 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                 [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(evidence_root)],
                 input=self.block, text=True, capture_output=True,
             )
-            self.assertNotEqual(res.returncode, 0)
-            self.assertIn('credential_monitor_staging_failed', res.stderr)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn('no new coverage authorized', res.stderr)
             self.assertEqual(stat.S_IMODE(evidence_root.lstat().st_mode), 0o750)
-            self.assertEqual(path.read_text(), original)
+            self.assertEqual(path.read_text(), self.primary_config(original))
             self.assertEqual(list(evidence_root.iterdir()), [])
 
     def test_installer_shell_and_python_never_follow_symlink_or_mutate_existing_evidence_root_metadata(self):
@@ -192,7 +181,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             base.chmod(0o700)
             repo, head = self._create_synthetic_checkout(base)
             path = repo / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -249,8 +238,8 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             before_victim = victim_dir.lstat()
             before_link = evidence_root.lstat()
             res_sym = run_installer_section(evidence_root)
-            self.assertNotEqual(res_sym.returncode, 0)
-            self.assertIn('credential_monitor_staging_failed', res_sym.stderr)
+            self.assertEqual(res_sym.returncode, 0)
+            self.assertIn('no new coverage authorized', res_sym.stderr)
             after_victim = victim_dir.lstat()
             after_link = evidence_root.lstat()
             self.assertTrue(evidence_root.is_symlink())
@@ -258,47 +247,47 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertEqual((after_victim.st_uid, after_victim.st_gid), (before_victim.st_uid, before_victim.st_gid))
             self.assertEqual(after_link.st_ino, before_link.st_ino)
             self.assertEqual(list(victim_dir.iterdir()), [])
-            self.assertEqual(path.read_text(), original)
+            self.assertEqual(path.read_text(), self.primary_config(original))
             evidence_root.unlink()
 
             # 2. Existing non-private directory (0755): must fail closed and preserve 0755 without repair.
             evidence_root.mkdir(mode=0o755)
             evidence_root.chmod(0o755)
             res_nonpriv = run_installer_section(evidence_root)
-            self.assertNotEqual(res_nonpriv.returncode, 0)
-            self.assertIn('credential_monitor_staging_failed', res_nonpriv.stderr)
+            self.assertEqual(res_nonpriv.returncode, 0)
+            self.assertIn('no new coverage authorized', res_nonpriv.stderr)
             self.assertEqual(stat.S_IMODE(evidence_root.lstat().st_mode), 0o755)
             self.assertEqual(list(evidence_root.iterdir()), [])
-            self.assertEqual(path.read_text(), original)
+            self.assertEqual(path.read_text(), self.primary_config(original))
             evidence_root.rmdir()
 
             # 3. Existing regular file (0644): must fail closed and preserve 0644 + contents.
             evidence_root.write_text('keep-existing-file')
             evidence_root.chmod(0o644)
             res_file = run_installer_section(evidence_root)
-            self.assertNotEqual(res_file.returncode, 0)
+            self.assertEqual(res_file.returncode, 0)
             self.assertEqual(stat.S_IMODE(evidence_root.lstat().st_mode), 0o644)
             self.assertEqual(evidence_root.read_text(), 'keep-existing-file')
-            self.assertEqual(path.read_text(), original)
+            self.assertEqual(path.read_text(), self.primary_config(original))
             evidence_root.unlink()
 
             # 4. Symlinked ancestor directory: must fail closed and leave victim untouched.
             linked_state = base / 'linked-state'
             linked_state.symlink_to(state_dir, target_is_directory=True)
             res_anc = run_installer_section(linked_state / 'credential-monitor-evidence')
-            self.assertNotEqual(res_anc.returncode, 0)
+            self.assertEqual(res_anc.returncode, 0)
             self.assertFalse(evidence_root.exists())
-            self.assertEqual(path.read_text(), original)
+            self.assertEqual(path.read_text(), self.primary_config(original))
 
             # 5. Clean absent evidence_root: installer creates 0700 directory, stages boundary, updates .dev.vars.
             res_ok = run_installer_section(evidence_root)
             self.assertEqual(res_ok.returncode, 0, res_ok.stderr)
             self.assertTrue(evidence_root.is_dir() and not evidence_root.is_symlink())
             self.assertEqual(stat.S_IMODE(evidence_root.lstat().st_mode), 0o700)
-            staged = list(evidence_root.iterdir())
-            self.assertEqual(len(staged), 1)
-            self.assertTrue(staged[0].name.startswith(head + '-'))
-            self.assertIn(f'HUB2_ALERT_EVIDENCE_DIR={staged[0]}\n', path.read_text())
+            staged = [p for p in evidence_root.iterdir() if p.is_dir()]
+            self.assertEqual(len(staged), 3)
+            self.assertTrue(all(head in p.name for p in staged))
+            self.assertTrue(any(f'HUB2_ALERT_EVIDENCE_DIR={p}\n' in path.read_text() for p in staged))
 
     def test_helper_refuses_owned_temp_replacement_between_mkdir_and_stat_or_open(self):
         # Ensure ensure_private_evidence_root never drops process capabilities, switches process euid/egid,
@@ -314,7 +303,7 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             base.chmod(0o700)
             repo, head = self._create_synthetic_checkout(base)
             path = base / '.dev.vars'
-            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n'
+            original = 'SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=\n'
             path.write_text(original)
             path.chmod(0o600)
 
@@ -400,9 +389,9 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(boxes[0].lstat().st_mode), 0o700)
             self.assertEqual(list(boxes[0].iterdir()), [])
             self.assertTrue(root_evidence.is_dir() and not root_evidence.is_symlink())
-            staged = list(root_evidence.iterdir())
-            self.assertEqual(len(staged), 1)
-            self.assertTrue(staged[0].name.startswith(head + '-'))
+            staged = [p for p in root_evidence.iterdir() if p.is_dir()]
+            self.assertEqual(len(staged), 3)
+            self.assertTrue(all(head in p.name for p in staged))
             path.write_text(original)
 
             # 2. Cleanup replacement race: replacing .stage-box-<uuid> after publish with an unrelated empty or
@@ -549,6 +538,10 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                         '        os.rmdir(os.path.join(state_dir, "credential-monitor-evidence"))\n'
                         '        os.rename(pre_existing, os.path.join(state_dir, "credential-monitor-evidence"))\n'
                         '    return _wrap(real_stat(path_arg, dir_fd=dir_fd, follow_symlinks=follow_symlinks))\n'
+                        'def fake_config_chown(p, uid, gid):\n'
+                        '    assert str(p).startswith(sys.argv[1] + ".dev.vars.") or str(p).startswith(sys.argv[1] + ".")\n'
+                        '    assert (uid, gid) == (SERVICE_UID, SERVICE_GID)\n'
+                        'os.chown = fake_config_chown\n'
                         'os.mkdir = hooked_mkdir\n'
                         'os.stat = hooked_stat\n'
                     ) + self.block
@@ -560,9 +553,9 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
                         capture_output=True,
                         timeout=15,
                     )
-                    self.assertNotEqual(res.returncode, 0, f'{scenario} should fail closed')
-                    self.assertIn('credential_monitor_staging_failed', res.stderr)
-                    self.assertEqual(path.read_text(), original)
+                    self.assertEqual(res.returncode, 0, f'{scenario} must not refuse primary service: {res.stderr}')
+                    self.assertIn('no new coverage authorized', res.stderr)
+                    self.assertEqual(path.read_text(), self.primary_config(original))
                     # Verify pre_existing directory was never deleted or mutated regardless of where it was moved.
                     matching_dirs = [
                         p for p in state_dir.rglob('*')
@@ -576,38 +569,30 @@ class SchemaInstallConfigurationTests(unittest.TestCase):
 
     def test_rollback_restores_previous_dev_vars_and_retains_all_historical_boundaries(self):
         with tempfile.TemporaryDirectory(dir=self.temporary_root) as temporary:
-            base = Path(temporary)
-            base.chmod(0o700)
-            repo, _head = self._create_synthetic_checkout(base)
-            evidence_root = base / 'credential-monitor-evidence'
-            evidence_root.mkdir(mode=0o700)
-            path = base / '.dev.vars'
-            backup = base / 'dev.vars.previous'
-            path.write_text('SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\nHUB2_ALERT_EVIDENCE_DIR=/synthetic-already-enabled\n')
-            path.chmod(0o600)
-
-            # Release 1 (active)
-            res1 = subprocess.run(
-                [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(evidence_root)],
-                input=self.block, text=True, capture_output=True,
-            )
-            self.assertEqual(res1.returncode, 0, res1.stderr)
-            shutil.copy2(path, backup)
-            previous_contents = backup.read_text()
-
-            # Release 2 (active) before rollback
-            res2 = subprocess.run(
-                [sys.executable, '-', str(path), 'active', 'apply', str(repo), str(evidence_root)],
-                input=self.block, text=True, capture_output=True,
-            )
-            self.assertEqual(res2.returncode, 0, res2.stderr)
-            self.assertNotEqual(path.read_text(), previous_contents)
-            self.assertEqual(len(list(evidence_root.iterdir())), 2)
-
-            # Rollback restores dev.vars.previous and leaves both boundary directories intact
-            shutil.copy2(backup, path)
-            self.assertEqual(path.read_text(), previous_contents)
-            self.assertEqual(len(list(evidence_root.iterdir())), 2)
+            base=Path(temporary);base.chmod(0o700);repo,_head=self._create_synthetic_checkout(base)
+            evidence_root=base/'credential-monitor-evidence';evidence_root.mkdir(mode=0o700)
+            path=base/'.dev.vars';backup=base/'dev.vars.previous'
+            path.write_text('SYNTHETIC_SECRET=keep-private-fixture\nHUB2_RELEASE_MODE=bootstrap\n');path.chmod(0o600)
+            def run():
+                return subprocess.run([sys.executable,'-',str(path),'active','apply',str(repo),str(evidence_root)],
+                                      input=self.block,text=True,capture_output=True,timeout=15)
+            first=run();self.assertEqual(first.returncode,0,first.stderr);self.assertNotIn('unavailable',first.stderr)
+            shutil.copy2(path,backup);previous=backup.read_bytes()
+            old_dirs=[p for p in evidence_root.iterdir() if p.is_dir()]
+            before={str(p):p.read_bytes() for d in old_dirs for p in d.iterdir()}
+            # A real changed source commit, not a reinstall, creates a new boundary.
+            (repo/'hub2/src/worker.ts').write_text('synthetic next reviewed worker')
+            subprocess.run(['/usr/bin/git','-C',str(repo),'add','.'],check=True)
+            subprocess.run(['/usr/bin/git','-C',str(repo),'-c','user.name=Offline Fixture','-c','user.email=fixture@example.invalid',
+                            '-c','commit.gpgsign=false','-c','core.hooksPath=/dev/null','commit','-qm','new synthetic release'],check=True)
+            second=run();self.assertEqual(second.returncode,0,second.stderr);self.assertNotIn('unavailable',second.stderr)
+            self.assertNotEqual(path.read_bytes(),previous)
+            self.assertEqual(len([p for p in evidence_root.iterdir() if p.is_dir()]),6)
+            self.assertTrue(all(Path(p).read_bytes()==data for p,data in before.items()))
+            shutil.copy2(backup,path)
+            self.assertEqual(path.read_bytes(),previous)
+            self.assertEqual(len([p for p in evidence_root.iterdir() if p.is_dir()]),6)
+            self.assertTrue(all(Path(p).read_bytes()==data for p,data in before.items()))
 
 
 if __name__ == '__main__':

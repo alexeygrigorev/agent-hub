@@ -271,17 +271,18 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
 
 # Match Node parseDevVars: outer JS trim, paired quotes, last assignment wins.
 OBSERVER_KEY = "HUB2_ALERT_EVIDENCE_DIR"
+OBSERVER_KEYS = (OBSERVER_KEY, "HUB2_PICKER_EXCLUDED_EVIDENCE_DIR", "HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR")
 JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
 
-def file_observer_value(text):
+def file_observer_value(text, target=OBSERVER_KEY):
     selected = ""
     for raw in text.split("\n"):
         line = raw.strip(JS_SPACE)
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.strip(JS_SPACE) != OBSERVER_KEY:
+        if key.strip(JS_SPACE) != target:
             continue
         value = value.strip(JS_SPACE)
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -318,7 +319,7 @@ def service_environment():
     if set(props) != set(names) - {"EnvironmentFiles"} or props["NeedDaemonReload"] != "no":
         raise ValueError("observer_service_environment_unverified")
     for name in ("PassEnvironment", "UnsetEnvironment"):
-        if any(word.split("=", 1)[0] == OBSERVER_KEY for word in shlex.split(props[name])):
+        if any(word.split("=", 1)[0] in OBSERVER_KEYS for word in shlex.split(props[name])):
             raise ValueError("observer_service_override_unsupported")
     entries = []
     for row in file_rows:
@@ -346,43 +347,28 @@ def service_environment():
         # Do not implement systemd's multiline value language. An assignment
         # affecting this target needs explicit owner resolution, not OFF.
         logical = content.decode("utf-8").replace("\\\n", "").replace("\\\r\n", "")
-        if re.search(r"(?m)^[ \t\r\v\f]*" + OBSERVER_KEY + r"[ \t\r\v\f]*=", logical):
+        if re.search(r"(?m)^[ \t\r\v\f]*(?:" + "|".join(OBSERVER_KEYS) + r")[ \t\r\v\f]*=", logical):
             raise ValueError("observer_service_override_unsupported")
     assignments = {}
     for word in shlex.split(props["Environment"]):
         key, separator, value = word.partition("=")
-        if separator and key == OBSERVER_KEY:
+        if separator and key in OBSERVER_KEYS:
             assignments[key] = value
-    if OBSERVER_KEY not in assignments:
+    if any(key not in assignments for key in OBSERVER_KEYS):
         manager = systemctl("show-environment")
-        if any(line.split("=", 1)[0] == OBSERVER_KEY for line in manager.splitlines()):
+        if any(line.split("=", 1)[0] in OBSERVER_KEYS for line in manager.splitlines()):
             raise ValueError("observer_service_override_unsupported")
     return assignments
 
 
-observer_selected = False
-if mode == "active" and (repo_arg or evidence_root_arg):
+# Observer preparation is optional to primary service availability. A refusal
+# never authorizes a zero, deletes prior evidence or fabricates activation.
+if mode == "active" and repo_arg and evidence_root_arg:
     try:
         overrides = service_environment()
-        if OBSERVER_KEY in overrides:
-            if overrides[OBSERVER_KEY]:
-                # A fixed process override would ignore the new file pointer.
-                raise ValueError("observer_service_override_unhonorable")
-        else:
-            observer_selected = bool(file_observer_value(original_text))
-    except Exception as exc:
-        reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
-            "observer_service_environment_unverified", "observer_service_override_unsupported",
-            "observer_service_override_unhonorable"} else "observer_service_environment_unverified"
-        raise SystemExit("observer_selection_failed: " + reason) from None
-
-
-if mode == "active" and observer_selected and (repo_arg or evidence_root_arg):
-    if not repo_arg or not evidence_root_arg:
-        raise SystemExit("credential_monitor_staging_failed")
-    try:
-        repo = Path(repo_arg)
-        evidence_root = Path(evidence_root_arg)
+        if any(key in overrides for key in OBSERVER_KEYS):
+            raise ValueError("observer_service_override_unhonorable")
+        repo, evidence_root = Path(repo_arg), Path(evidence_root_arg)
         owner_uid, owner_gid = original_stat.st_uid, original_stat.st_gid
         ensure_private_evidence_root(evidence_root, owner_uid, owner_gid)
         def _drop_privileges():
@@ -390,79 +376,41 @@ if mode == "active" and observer_selected and (repo_arg or evidence_root_arg):
                 os.setgroups([owner_gid])
                 os.setresgid(owner_gid, owner_gid, owner_gid)
                 os.setresuid(owner_uid, owner_uid, owner_uid)
+        child_options = {"preexec_fn": _drop_privileges} if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else {}
+        git_env = {"PATH": os.defpath, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+        selected = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-C", str(repo),
+                                   "rev-parse", "--verify", "HEAD"], env=git_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+        if selected.returncode or len(selected.stdout) > 64:
+            raise ValueError("observer_checkout_unverified")
+        commit = selected.stdout.decode("ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("observer_checkout_unverified")
+        command = [sys.executable, "-I", "-S", str(repo / "scripts/stage-credential-monitor.py"),
+                   "--checkout", str(repo), "--expected-commit", commit, "--prepare-active-root", str(evidence_root)]
+        for producer, key in zip(("credential-monitor", "picker-excluded", "picker-quota-stale"), OBSERVER_KEYS):
+            command += ["--current-" + producer, file_observer_value(original_text, key)]
+        staged = subprocess.run(command, env=git_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=15, check=False, **child_options)
+        if staged.returncode or len(staged.stdout) > 16384:
+            raise ValueError("node_observer_preparation_unavailable")
+        receipt = json.loads(staged.stdout)
+        if (not isinstance(receipt, dict) or receipt.get("kind") != "hub_node_observers_prepared_v1"
+                or receipt.get("release_sha") != commit or receipt.get("activated") is not False
+                or receipt.get("historical_coverage") is not False
+                or set(receipt.get("pointers", {})) != set(OBSERVER_KEYS)):
+            raise ValueError("node_observer_preparation_unavailable")
+        for key, value in receipt["pointers"].items():
+            if (not isinstance(value, str) or not value.startswith(str(evidence_root) + "/")
+                    or Path(value).parent != evidence_root or any(ord(c) < 33 or ord(c) == 127 for c in value)):
+                raise ValueError("node_observer_preparation_unavailable")
+        updates.update(receipt["pointers"])
+    except Exception:
+        # Do not print exceptions/config/paths. Existing pointers and histories
+        # remain; loaded/current/boot checks determine UNKNOWN independently.
+        print("node_observer_preparation_unavailable; no new coverage authorized", file=sys.stderr)
 
-        git_env = {
-            "PATH": os.defpath,
-            "HOME": "/nonexistent",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-        head_proc = subprocess.run(
-            ["/usr/bin/git", "--no-optional-locks", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
-            env=git_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
-        )
-        if head_proc.returncode != 0 or len(head_proc.stdout) > 64:
-            raise ValueError("unable to resolve checkout HEAD")
-        expected_commit = head_proc.stdout.decode("ascii").strip()
-        if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
-            raise ValueError("invalid checkout HEAD")
-        hashes = {}
-        for rel in ARTIFACTS:
-            artifact_path = repo / rel
-            st = os.lstat(artifact_path)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_mode & 0o022):
-                raise ValueError(f"untrusted authority artifact: {rel}")
-            hashes[rel] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-        destination = evidence_root / f"{expected_commit}-{uuid.uuid4().hex}"
-
-        stage_cmd = [
-            sys.executable,
-            "-I",
-            "-S",
-            str(repo / "scripts/stage-credential-monitor.py"),
-            "--checkout",
-            str(repo),
-            "--destination",
-            str(destination),
-            "--expected-commit",
-            expected_commit,
-            "--observer-sha256",
-            hashes["hub2/node/alert-evidence.ts"],
-            "--main-sha256",
-            hashes["hub2/node/main.ts"],
-            "--worker-sha256",
-            hashes["hub2/src/worker.ts"],
-        ]
-        stage_proc = subprocess.run(
-            stage_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
-            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
-        )
-        if stage_proc.returncode != 0:
-            raise ValueError("stage-credential-monitor refused")
-        receipt = json.loads(stage_proc.stdout.decode("utf-8"))
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("kind") != "credential_monitor_staged_boundary_v1"
-            or receipt.get("destination") != str(destination)
-            or receipt.get("release_sha") != expected_commit
-            or receipt.get("activated") is not False
-            or not (destination / "enrollment.json").is_file()
-            or not (destination / "journal.json").is_file()
-        ):
-            raise ValueError("invalid staged boundary receipt")
-        updates["HUB2_ALERT_EVIDENCE_DIR"] = str(destination)
-    except Exception as exc:
-        raise SystemExit(f"credential_monitor_staging_failed: {exc}") from None
 
 # Keep every unrelated byte, including CRLF and absent final newline.
 lines = re.findall(r"[^\n]*\n|[^\n]+$", original_text)
@@ -480,7 +428,7 @@ for line in lines:
     updated.append(line)
 for key, value in updates.items():
     if key not in inserted:
-        if key == OBSERVER_KEY:
+        if key in OBSERVER_KEYS:
             if updated and not updated[-1].endswith("\n"):
                 updated.append("\n")
             updated.append(f"{key}={value}\n")
@@ -496,7 +444,23 @@ try:
         os.fsync(temporary.fileno())
     os.chown(temporary_name, original_stat.st_uid, original_stat.st_gid)
     os.chmod(temporary_name, stat.S_IMODE(original_stat.st_mode))
+    # Publish only against the config image this installer actually read.
+    current = os.lstat(path)
+    if ((current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            != (original_stat.st_dev, original_stat.st_ino, original_stat.st_size, original_stat.st_mtime_ns, original_stat.st_ctime_ns)
+            or path.read_bytes().decode("utf-8") != original_text):
+        raise ValueError("release_configuration_changed")
+    sync_fd = os.open(temporary_name, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(sync_fd)
+    finally:
+        os.close(sync_fd)
     os.replace(temporary_name, path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 except BaseException:
     try:
         os.unlink(temporary_name)

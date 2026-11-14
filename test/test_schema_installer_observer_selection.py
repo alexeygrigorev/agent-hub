@@ -57,8 +57,8 @@ subprocess.run=_fake_run
         self.assertNotIn('SYNTHETIC_PRIVATE',done.stdout+done.stderr)
         return done
 
-    def assert_off(self, text, **kwargs):
-        # OFF must not even inspect these deliberately untrusted authority files.
+    def assert_unavailable_without_mutation(self, text, **kwargs):
+        # Deliberately unavailable evidence must never repair these untrusted files or refuse primary service.
         for rel in configuration_fixture.ARTIFACTS:(self.repo/rel).chmod(0o664)
         target=self.base/'untouched';target.mkdir(mode=0o755)
         self.evidence.symlink_to(target,target_is_directory=True)
@@ -74,39 +74,61 @@ subprocess.run=_fake_run
         self.assertEqual(stat.S_IMODE(self.vars.stat().st_mode),0o640)
         self.assertNotIn('zero',done.stdout.lower());self.assertNotIn('healthy',done.stdout.lower())
 
-    def test_off_variants_preserve_all_other_bytes_and_never_touch_untrusted_artifacts(self):
+    def test_unavailable_file_variants_preserve_all_other_bytes_and_untrusted_artifacts(self):
         core=b'# retained\r\nSYNTHETIC_PRIVATE=never-print\r\nHUB2_RELEASE_MODE=bootstrap\r\nHUB2_SCHEMA_MIGRATIONS=defer\r\n'
         for tail in [b'',b'HUB2_ALERT_EVIDENCE_DIR=',b'HUB2_ALERT_EVIDENCE_DIR=""',b"HUB2_ALERT_EVIDENCE_DIR='   '\nHUB2_ALERT_EVIDENCE_DIR=''",b'HUB2_ALERT_EVIDENCE_DIR=/old\n  HUB2_ALERT_EVIDENCE_DIR = ""']:
             with self.subTest(tail=tail):
-                self.assert_off(core+tail)
+                self.assert_unavailable_without_mutation(core+tail)
                 self.evidence.unlink()
                 (self.base/'untouched').rmdir()
 
     def test_service_empty_override_wins_file_on_and_caller_environment_is_ignored(self):
         text='HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\nHUB2_ALERT_EVIDENCE_DIR=/old\n'
-        self.assert_off(text,props={'Environment':'HUB2_ALERT_EVIDENCE_DIR='},ambient={KEY:'/caller-not-authority'})
+        self.assert_unavailable_without_mutation(text,props={'Environment':'HUB2_ALERT_EVIDENCE_DIR='},ambient={KEY:'/caller-not-authority'})
 
     def test_unset_file_ignores_nonempty_caller_environment(self):
-        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',ambient={KEY:'/caller-not-authority'})
+        self.assert_prepared(self.invoke('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',ambient={KEY:'/caller-not-authority'}))
 
-    def test_truthy_node_values_stage_fresh_generations(self):
+    def assert_prepared(self,done):
+        self.assertEqual(done.returncode,0,done.stderr);self.assertNotIn('unavailable',done.stderr)
+        keys={'HUB2_ALERT_EVIDENCE_DIR','HUB2_PICKER_EXCLUDED_EVIDENCE_DIR','HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR'}
+        selected=dict(line.split('=',1) for line in self.vars.read_text().splitlines() if '=' in line and line.split('=',1)[0] in keys)
+        self.assertEqual(set(selected),keys)
+        self.assertEqual(len([p for p in self.evidence.iterdir() if p.is_dir()]),3)
+        for key,value in selected.items():
+            directory=Path(value);self.assertEqual(directory.parent,self.evidence)
+            entry=json.loads((directory/'enrollment.json').read_text())
+            self.assertEqual(entry['release_sha'],self.head)
+            self.assertEqual(len(entry['artifacts']),3 if key==KEY else 5)
+            self.assertTrue((directory/'journal.json').is_file())
+
+    @staticmethod
+    def primary_config(text):
+        expected=text.replace('HUB2_RELEASE_MODE=bootstrap','HUB2_RELEASE_MODE=active').replace('HUB2_SCHEMA_MIGRATIONS=defer','HUB2_SCHEMA_MIGRATIONS=apply')
+        if not any(line.startswith('HUB2_SCHEMA_MIGRATIONS=') for line in text.splitlines()):
+            expected='HUB2_SCHEMA_MIGRATIONS=apply\n'+expected
+        return expected
+
+    def assert_unknown(self,done,text):
+        self.assertEqual(done.returncode,0,done.stderr)
+        self.assertIn('no new coverage authorized',done.stderr)
+        self.assertEqual(self.vars.read_text(),self.primary_config(text))
+        if self.evidence.is_dir():
+            self.assertEqual([p for p in self.evidence.iterdir() if p.is_dir()],[])
+
+    def test_invalid_configured_paths_never_heal_into_fresh_zero(self):
         for value in ['0',"'   '",'"   "','"a\u2028b"','/old\nHUB2_ALERT_EVIDENCE_DIR=" "']:
             with self.subTest(value=value):
-                done=self.invoke('SYNTHETIC_PRIVATE=never-print\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n'+KEY+'='+value+'\n')
-                self.assertEqual(done.returncode,0,done.stderr)
-                rows=list(self.evidence.iterdir());self.assertTrue(rows)
-                selected=[x for x in self.vars.read_text().splitlines() if x.startswith(KEY+'=')]
-                self.assertEqual(len(selected),1)
-                path=Path(selected[0].split('=',1)[1]);self.assertIn(path,rows)
-                self.assertTrue((path/'journal.json').is_file());self.assertTrue((path/'enrollment.json').is_file())
+                text='SYNTHETIC_PRIVATE=never-print\nHUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n'+KEY+'='+value+'\n'
+                done=self.invoke(text);self.assert_unknown(done,text)
 
     def test_enabled_0664_authority_is_still_refused_without_changing_configuration(self):
         (self.repo/configuration_fixture.ARTIFACTS[0]).chmod(0o664)
-        text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=0\n'
+        text='HUB2_RELEASE_MODE=bootstrap\n'
         done=self.invoke(text)
-        self.assertNotEqual(done.returncode,0)
-        self.assertIn('untrusted authority artifact',done.stderr)
-        self.assertEqual(self.vars.read_text(),text)
+        self.assertEqual(done.returncode,0)
+        self.assertIn('no new coverage authorized',done.stderr)
+        self.assertEqual(self.vars.read_text(),self.primary_config(text))
 
     def test_enabled_symlink_hardlink_and_hash_race_remain_refused(self):
         artifact=self.repo/configuration_fixture.ARTIFACTS[0]
@@ -117,11 +139,11 @@ subprocess.run=_fake_run
                 if fault=='symlink':
                     linked.write_bytes(original);artifact.unlink();artifact.symlink_to(linked)
                 elif fault=='hardlink':os.link(artifact,linked)
-                text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=0\n'
+                text='HUB2_RELEASE_MODE=bootstrap\n'
                 done=self.invoke(text,race=fault=='hash_race')
-                self.assertNotEqual(done.returncode,0)
-                self.assertIn('credential_monitor_staging_failed',done.stderr)
-                self.assertEqual(self.vars.read_text(),text)
+                self.assertEqual(done.returncode,0)
+                self.assertIn('no new coverage authorized',done.stderr)
+                self.assertEqual(self.vars.read_text(),self.primary_config(text))
                 if fault=='symlink':artifact.unlink();artifact.write_bytes(original)
                 elif fault=='hash_race':artifact.write_bytes(original)
                 linked.unlink(missing_ok=True);artifact.chmod(0o600)
@@ -135,39 +157,39 @@ subprocess.run=_fake_run
             with self.subTest(props=props):
                 text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=""\n'
                 done=self.invoke(text,props=props)
-                self.assertNotEqual(done.returncode,0)
-                self.assertIn('observer_selection_failed:',done.stderr)
-                self.assertEqual(self.vars.read_text(),text)
+                self.assertEqual(done.returncode,0)
+                self.assertIn('no new coverage authorized',done.stderr)
+                self.assertEqual(self.vars.read_text(),self.primary_config(text))
                 self.assertFalse(self.evidence.exists())
         done=self.invoke('HUB2_RELEASE_MODE=bootstrap\n',manager=KEY+'=/manager\n')
-        self.assertNotEqual(done.returncode,0);self.assertFalse(self.evidence.exists())
+        self.assertEqual(done.returncode,0);self.assertFalse(self.evidence.exists())
 
     def test_unrelated_service_environment_files_and_names_are_not_a_gate(self):
         file=self.base/'service.env';file.write_text('UNRELATED=one\nAUTH_FAKE=not-a-credential\n')
         props={'Environment':'UNRELATED=1','EnvironmentFiles':str(file)+' (ignore_errors=no)',
                'PassEnvironment':'UNRELATED','UnsetEnvironment':'UNRELATED=one'}
-        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',props=props,manager='UNRELATED=2\n')
+        self.assert_prepared(self.invoke('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',props=props,manager='UNRELATED=2\n'))
 
     def test_target_environment_file_is_explicitly_unsupported_not_silently_off(self):
         file=self.base/'service.env';file.write_text(KEY+'=""\n')
         text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
         done=self.invoke(text,props={'EnvironmentFiles':str(file)+' (ignore_errors=no)'})
-        self.assertNotEqual(done.returncode,0)
-        self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+        self.assertEqual(done.returncode,0)
+        self.assertEqual(self.vars.read_text(),self.primary_config(text));self.assertFalse(self.evidence.exists())
         file.write_text('HUB2_ALERT_' + chr(92) + '\nEVIDENCE_DIR=/hidden\n')
         done=self.invoke(text,props={'EnvironmentFiles':str(file)+' (ignore_errors=no)'})
-        self.assertNotEqual(done.returncode,0)
-        self.assertIn('observer_service_override_unsupported',done.stderr)
-        self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+        self.assertEqual(done.returncode,0)
+        self.assertIn('no new coverage authorized',done.stderr)
+        self.assertEqual(self.vars.read_text(),self.primary_config(text));self.assertFalse(self.evidence.exists())
 
-    def test_actual_systemd255_omitted_empty_array_preserves_off_without_staging(self):
+    def test_actual_systemd255_omitted_empty_array_allows_default_active_staging(self):
         # Observed formatter shape: rc0, four scalar lines, no EnvironmentFiles.
         show='Environment=NODE_ENV=production TMPDIR=/synthetic/tmp HOME=/synthetic/home\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n'
-        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show)
+        self.assert_prepared(self.invoke('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show))
 
-    def test_omitted_empty_array_still_stages_explicitly_selected_on(self):
+    def test_omitted_empty_array_stages_all_default_authorities(self):
         show='Environment=NODE_ENV=production\nPassEnvironment=\nUnsetEnvironment=\nNeedDaemonReload=no\n'
-        done=self.invoke('HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=0\n',show=show)
+        done=self.invoke('HUB2_RELEASE_MODE=bootstrap\n',show=show)
         self.assertEqual(done.returncode,0,done.stderr)
         selected=[line for line in self.vars.read_text().splitlines() if line.startswith(KEY+'=')]
         self.assertEqual(len(selected),1)
@@ -183,11 +205,11 @@ subprocess.run=_fake_run
         show=scalar+f'EnvironmentFiles={first} (ignore_errors=no)\nEnvironmentFiles={second} (ignore_errors=no)\n'
         text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
         done=self.invoke(text,show=show)
-        self.assertNotEqual(done.returncode,0)
-        self.assertIn('observer_service_override_unsupported',done.stderr)
-        self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+        self.assertEqual(done.returncode,0)
+        self.assertIn('no new coverage authorized',done.stderr)
+        self.assertEqual(self.vars.read_text(),self.primary_config(text));self.assertFalse(self.evidence.exists())
         first.write_text('UNRELATED=two\n')
-        self.assert_off('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show)
+        self.assert_prepared(self.invoke('HUB2_RELEASE_MODE=bootstrap\nHUB2_SCHEMA_MIGRATIONS=defer\n',show=show))
 
     def test_only_environment_files_may_be_absent_or_repeated(self):
         scalar={'Environment':'','PassEnvironment':'','UnsetEnvironment':'','NeedDaemonReload':'no'}
@@ -203,9 +225,9 @@ subprocess.run=_fake_run
         for show in cases:
             with self.subTest(shape=show):
                 done=self.invoke(text,show=show)
-                self.assertNotEqual(done.returncode,0)
-                self.assertIn('observer_service_environment_unverified',done.stderr)
-                self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+                self.assertEqual(done.returncode,0)
+                self.assertIn('no new coverage authorized',done.stderr)
+                self.assertEqual(self.vars.read_text(),self.primary_config(text));self.assertFalse(self.evidence.exists())
 
     def test_each_metadata_command_failure_and_timeout_is_still_unknown(self):
         text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
@@ -213,14 +235,14 @@ subprocess.run=_fake_run
             for option in ['fail_stage','timeout_stage']:
                 with self.subTest(stage=stage,kind=option):
                     done=self.invoke(text,**{option:stage})
-                    self.assertNotEqual(done.returncode,0)
-                    self.assertIn('observer_service_environment_unverified',done.stderr)
-                    self.assertEqual(self.vars.read_text(),text);self.assertFalse(self.evidence.exists())
+                    self.assertEqual(done.returncode,0)
+                    self.assertIn('no new coverage authorized',done.stderr)
+                    self.assertEqual(self.vars.read_text(),self.primary_config(text));self.assertFalse(self.evidence.exists())
 
     def test_metadata_failure_is_unknown_and_cannot_disable_selected_observer(self):
         text='HUB2_RELEASE_MODE=bootstrap\n'+KEY+'=/on\n'
         done=self.invoke(text,fail=True)
-        self.assertNotEqual(done.returncode,0);self.assertEqual(self.vars.read_text(),text)
+        self.assertEqual(done.returncode,0);self.assertEqual(self.vars.read_text(),self.primary_config(text))
         self.assertFalse(self.evidence.exists())
 
 
