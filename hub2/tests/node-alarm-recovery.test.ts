@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { registerTypeScriptResolveHook } from '../node/compat.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { Hub2Runtime } from '../node/runtime.ts';
+import { ServerSideSocket } from '../node/wire.ts';
 
 class Probe {
   static calls = 0;
@@ -262,5 +263,83 @@ test('real AccountDO encrypted credentials keep their historical AAD across rest
   assert.equal(instance.ctx.id,undefined);assert.deepEqual(await instance.unseal(stored.sealed,'codex',stored.generation),files);
   await runtime.fetch(new Request('https://test/_metrics'));
   assert.equal((runtime.containerOf('ACCOUNTS','provider/account-with-full-canonical-name') as any).instance,instance,'canonical fetch reuses the recovered account');
+ }finally{await runtime.dispose();rmSync(f.dataDir,{recursive:true});}
+});
+
+// Actual Node runtime/ServerSideSocket abstraction; no listening server/network.
+test('runtime accepted websocket is open only after registry and delivery hooks exist',async()=>{
+ let accepted!:ServerSideSocket,ctx:any,seenMessage:unknown,seenError:unknown,closes=0;
+ class InspectSocket extends ServerSideSocket {
+  override accept(){
+   assert.ok(ctx.getWebSockets('hub2:owned').includes(this));
+   assert.equal(typeof this.__deliver?.message,'function');
+   assert.equal(typeof this.__deliver?.closed,'function');
+   assert.equal(typeof this.__deliver?.error,'function');
+   super.accept();
+  }
+ }
+ class SocketProbe {
+  constructor(state:any){ctx=state;}
+  fetch(){accepted=new InspectSocket();ctx.acceptWebSocket(accepted,['hub2:owned']);return new Response('ok');}
+  webSocketMessage(socket:unknown,message:unknown){assert.equal(socket,accepted);seenMessage=message;}
+  webSocketError(socket:unknown,error:unknown){assert.equal(socket,accepted);seenError=error;}
+  webSocketClose(socket:unknown){assert.equal(socket,accepted);closes++;}
+ }
+ const f=fixture('TEST','socket-accepted-state',SocketProbe),runtime=new Hub2Runtime(f.options);
+ try{
+  await runtime.fetch(new Request('https://test/'));
+  assert.equal(accepted.readyState,1,'ctx acceptance opens before bindWire, not after101');
+  accepted.__deliver!.message('owned-message');assert.equal(seenMessage,'owned-message');
+  const error=new Error('synthetic');accepted.__deliver!.error(error);assert.equal(seenError,error);
+  accepted.wireClosed();assert.equal(accepted.readyState,3);
+  assert.deepEqual(ctx.getWebSockets('hub2:owned'),[]);assert.equal(closes,1);
+ }finally{await runtime.dispose();rmSync(f.dataDir,{recursive:true});}
+});
+
+test('runtime prewire pending replay queues on initial acceptance and reconnect',async()=>{
+ let accepted!:ServerSideSocket,ctx:any;const all:ServerSideSocket[]=[];
+ class ReplayProbe {
+  constructor(state:any){ctx=state;}
+  fetch(){
+   for(const old of ctx.getWebSockets('hub2:owned'))old.close(1000,'superseded');
+   accepted=new ServerSideSocket();accepted.serializeAttachment({authorized:true,owner:'owned'});
+   ctx.acceptWebSocket(accepted,['hub2:owned']);all.push(accepted);
+   accepted.send('resync');
+   // MachineDO's authorized current-socket selection also requires OPEN here,
+   // inside fetch BEFORE its101 response can cause server.ts bindWire.
+   const current=ctx.getWebSockets('hub2:owned').filter((s:ServerSideSocket)=>s.readyState===1);
+   if(current.length===1&&current[0]===accepted&&(accepted.deserializeAttachment() as {authorized:boolean}).authorized)
+    accepted.send('pending-owned-mail');
+   return new Response('upgrade-shaped fixture');
+  }
+ }
+ const f=fixture('TEST','socket-prewire-replay',ReplayProbe),runtime=new Hub2Runtime(f.options);
+ try{
+  for(let connection=0;connection<2;connection++){
+   await runtime.fetch(new Request('https://test/'));
+   const sent:string[]=[],closed:unknown[]=[];
+   assert.deepEqual(sent,[],'handler sends are queued before any wire exists');
+   accepted.bindWire({send:data=>sent.push(String(data)),close:(...args)=>closed.push(args)});
+   assert.deepEqual(sent,['resync','pending-owned-mail'],'initial pending frame queued before handler return');
+   assert.deepEqual(closed,[]);
+   accepted.send('live-owned-mail');assert.deepEqual(sent,['resync','pending-owned-mail','live-owned-mail']);
+   if(connection===1)assert.equal(all[0].readyState,2,'superseded connection stays excluded from OPEN selection');
+  }
+ }finally{await runtime.dispose();rmSync(f.dataDir,{recursive:true});}
+});
+
+test('runtime refused websocket never enters accepted registry or sends pending data',async()=>{
+ let candidate!:ServerSideSocket,ctx:any;
+ class RefusedProbe {
+  constructor(state:any){ctx=state;}
+  fetch(){candidate=new ServerSideSocket();return new Response('forbidden',{status:403});}
+ }
+ const f=fixture('TEST','socket-refused-upgrade',RefusedProbe),runtime=new Hub2Runtime(f.options);
+ try{
+  assert.equal((await runtime.fetch(new Request('https://test/'))).status,403);
+  assert.equal(candidate.readyState,0);assert.equal(candidate.__deliver,undefined);
+  assert.deepEqual(ctx.getWebSockets(),[]);
+  const sent:unknown[]=[];candidate.bindWire({send:value=>sent.push(value),close:()=>{}});
+  assert.deepEqual(sent,[],'no pending frame from an unaccepted handler path');
  }finally{await runtime.dispose();rmSync(f.dataDir,{recursive:true});}
 });
