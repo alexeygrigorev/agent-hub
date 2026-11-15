@@ -413,7 +413,9 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   private async bounded(work: Promise<void>, trace?:PersistTrace) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timerStart=trace?persistClock():undefined;
-    if(trace)trace.budgetStart=timerStart;
+    // A persist operation records its diagnostic origin before eager work.
+    // Keep this separate from timerStart: timer scheduling/lateness is unchanged.
+    if(trace&&trace.budgetStart===undefined)trace.budgetStart=timerStart;
     try { await Promise.race([work, new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         const error=new Error('observer_timeout');ownDeadlines.add(error);
@@ -437,6 +439,9 @@ export class AlertEvidence implements CredentialMonitorEvidence {
         while (this.nextSnapshot && !this.dirty) {
           const value = this.nextSnapshot;
           this.nextSnapshot = undefined;
+          // The async argument below starts before bounded() is entered.
+          // Refresh for EACH coalesced write, before its first stage is sampled.
+          trace.budgetStart=persistClock();
           await this.bounded((async () => {
             await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded, trace));
             await this.store.write(value, this.writer, trace);

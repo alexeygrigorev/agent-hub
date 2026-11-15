@@ -201,6 +201,57 @@ async function drainArtifactFake(h:any){
 
 async function defineTests() {
 
+  test('persist diagnostic origin precedes eager artifact read without moving timer',async t=>{
+    let clock=0;const options={clock:()=>clock++,delayed:true};
+    const h=artifactHarness(options);
+    t.mock.timers.enable({apis:['setTimeout']});
+    try{
+      h.observer.begin();await artifactMicrotasks();
+      assert.equal(h.waiting.length,2,'both first-batch reads are held in real persist');
+      clock=151;t.mock.timers.tick(149);await artifactMicrotasks();
+      assert.equal(h.observer.dirty,false,'existing 150ms timer has not fired early');
+      clock=170;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.queue;
+      options.delayed=false;await drainArtifactFake(h);
+      const first=await h.observer.snapshot(NONCE);
+      assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'artifacts');
+      assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'on_tick');
+      assert.equal(first.unavailable_persist_before_stage,'under_25');
+      assert.equal(first.unavailable_persist_stage_await,'150_or_more');
+      assert.equal(first.unavailable_artifact_completed,0);
+      assert.deepEqual(first.unavailable_artifact_slots,[{slot:0,operation:'read'},{slot:1,operation:'read'}]);
+      assert.equal(h.timeout,150);assert.equal(h.stats().active,0);
+      clock=900;h.observer.invalidate('snapshot_route_rejected');
+      assert.deepEqual(await h.observer.snapshot(NONCE),first,'late work cannot change first timing buckets');
+      assert.ok(!JSON.stringify(first).includes('/synthetic/'));
+    }finally{
+      options.delayed=false;
+      try{await drainArtifactFake(h);}finally{t.mock.timers.reset();}
+    }
+  });
+  test('persist diagnostic origin refreshes before each coalesced eager write',async t=>{
+    let clock=0,writes=0,releaseFirst=()=>{};const options={clock:()=>clock++,delayed:false};
+    const h=artifactHarness(options);
+    h.observer.store.write=async()=>{if(++writes===1)await new Promise<void>(yes=>releaseFirst=yes);};
+    t.mock.timers.enable({apis:['setTimeout']});
+    try{
+      const id=h.observer.begin();await artifactMicrotasks();assert.equal(writes,1);
+      const finished=h.observer.finish(id,'observation');
+      clock=300;options.delayed=true;releaseFirst();await artifactMicrotasks();
+      assert.equal(h.waiting.length,2,'next cumulative write is held at its first artifact batch');
+      clock=470;t.mock.timers.tick(150);await artifactMicrotasks();await finished;
+      options.delayed=false;await drainArtifactFake(h);
+      const first=await h.observer.snapshot(NONCE);
+      assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'artifacts');
+      assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'on_tick');
+      assert.equal(first.unavailable_persist_before_stage,'under_25','not the previous write origin');
+      assert.equal(first.unavailable_persist_stage_await,'150_or_more');
+      assert.equal(writes,2);assert.equal(h.stats().active,0);assert.equal(h.timeout,150);
+      clock=999;assert.deepEqual(await h.observer.snapshot(NONCE),first);
+    }finally{
+      options.delayed=false;releaseFirst();
+      try{await drainArtifactFake(h);}finally{t.mock.timers.reset();}
+    }
+  });
   test('persist budget distinguishes time spent before sync from pending sync without extending timeout',async t=>{
     for(const [entry,expected] of [[140,['75_to_149','under_25']],[10,['under_25','75_to_149']]] as const){
       let clock=0,release!:()=>void;const h=artifactHarness({clock:()=>clock});
