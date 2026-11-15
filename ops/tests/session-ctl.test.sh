@@ -415,4 +415,32 @@ send_output="$("$bin/oncall-send" "nested worktree delivery probe" 2>&1)"
 assert_contains "$send_output" 'DELIVERY=delivered to oncall-engineer (nested-oncall)'
 assert_contains "$(<"$FAKE_SEND_LOG")" 'nested-oncall [INBOX '
 
+# skills-sync (hourly-check step 0) moves a clean, already-existing run
+# checkout to origin/main, so instruction fixes reach a running oncall session
+# without a restart (intake fc36c32b).
+rundir="$HOME/git/agent-hub-wt-oncall-run"
+realgit_dir="$(dirname "$(type -aP git | grep -vxF "$bin/git" | head -1)")"
+git() { PATH="$realgit_dir:$PATH" command git "$@"; }
+rm -rf "$rundir" "$fake/origin.git" "$BASE_REPO"
+git init -q --bare -b main "$fake/origin.git"
+git clone -q "$fake/origin.git" "$BASE_REPO" 2>/dev/null
+git -C "$BASE_REPO" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m one
+git -C "$BASE_REPO" push -q origin HEAD:main
+git -C "$BASE_REPO" fetch -q origin
+git -C "$BASE_REPO" worktree add -q --detach "$rundir" origin/main
+old_head="$(git -C "$rundir" rev-parse HEAD)"
+git clone -q "$fake/origin.git" "$fake/pusher" 2>/dev/null
+git -C "$fake/pusher" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m two
+git -C "$fake/pusher" push -q origin HEAD:main
+new_head="$(git -C "$fake/pusher" rev-parse HEAD)"
+output="$(PATH="$realgit_dir:$PATH" run_ctl oncall skills-sync 2>&1)"
+[[ "$(git -C "$rundir" rev-parse HEAD)" == "$new_head" ]] || { echo "run checkout stayed at $old_head" >&2; echo "$output" >&2; exit 1; }
+assert_contains "$output" 'run checkout updated'
+assert_contains "$output" 'skills synced'
+unset -f git
+
+# The engine-neutral hourly check (read every tick by any engine) keeps DataOps
+# credential blockers out of NEEDS_ALEXEY.md (t3406u).
+assert_contains "$(<"$repo/ops/oncall/hourly-check.md")" 'Never put DataOps/dapier access in `NEEDS_ALEXEY.md`'
+
 echo 'session-ctl targeted tests passed'

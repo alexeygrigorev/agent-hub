@@ -171,6 +171,20 @@ skills_sync() {
   log "skills synced: $n linked from $SKILLS_DIR @ $(git -C "$SKILLS_REPO" rev-parse --short HEAD)"
 }
 
+# Every scheduled check runs skills-sync first (hourly-check.md step 0). Move an
+# existing clean run checkout to origin/main too, so instruction fixes (e.g. the
+# DataOps credential routing, intake fc36c32b) reach a session that is already
+# running instead of waiting for the next restart. A dirty checkout is kept.
+refresh_rundir() {
+  [ -e "$RUNDIR/.git" ] || return 0
+  T=120 t git -C "$BASE_REPO" fetch -q origin main || log "fetch failed (using local origin/main)"
+  local before after
+  before=$(git -C "$RUNDIR" rev-parse --short HEAD 2>/dev/null)
+  git -C "$RUNDIR" checkout -q --detach origin/main 2>/dev/null || { log "worktree not clean; keeping current checkout"; return 0; }
+  after=$(git -C "$RUNDIR" rev-parse --short HEAD 2>/dev/null)
+  [ "$before" = "$after" ] || log "run checkout updated $before -> $after"
+}
+
 prep_worktree() {
   T=120 t git -C "$BASE_REPO" fetch -q origin main || log "fetch failed (using local origin/main)"
   if [ ! -e "$RUNDIR/.git" ]; then
@@ -603,6 +617,6 @@ case "$CMD" in
   restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
     FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
-  skills-sync) skills_sync ;;
+  skills-sync) refresh_rundir; skills_sync ;;
   *) echo "unknown command $CMD" >&2; exit 64 ;;
 esac
