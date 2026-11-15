@@ -485,6 +485,7 @@ def add_commands(sub):
     update.add_argument('--priority', choices=['high', 'normal', 'low'], help='Queue priority (high is taken before normal before low)')
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
+    update.add_argument('--code-task', choices=['true', 'false'], help='Operator only: reclassify the intake as a code task (merge gate applies) or not')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
     update.add_argument('--note', help='Note recorded with this update (max 4000 characters); given alone it appends a plain note')
     close = commands.add_parser('close', help='CAS status done; refused while intake worktrees are present or unmerged unless --force --reason')
@@ -990,6 +991,8 @@ def execute(args):
             args.status = 'done'
         if getattr(args, 'note', None) is not None:
             payload['note'] = _note_text(args.note)
+        if getattr(args, 'code_task', None) is not None:
+            payload['code_task'] = args.code_task == 'true'
         for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
@@ -1003,7 +1006,7 @@ def execute(args):
     raise IntakeInputError('Unknown intake operation')
 
 
-UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by')
+UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by', 'code_task')
 
 
 def _usage_error(message):
