@@ -126,6 +126,7 @@ def check_service_ready(target):
     installed = read_release_receipt(target)
     if installed['host_version'] != target.name:
         raise ValueError('installed release receipt does not match release directory')
+    verify_alert_client(target, installed)
     config = Path.home() / '.config/agent-hub/v2.json'
     if not config.is_file():
         raise ValueError('missing enrollment config')
@@ -226,6 +227,35 @@ def matches_installed_artifact(path, record):
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise ValueError('refusing to replace an unmanaged path')
     return path.is_file() and path.stat().st_size == record['size'] and artifact_matches(path.read_bytes(), record)
+
+
+
+ALERT_CLIENT = 'hub_alert_client.py'
+
+
+def verify_alert_client(target, manifest):
+    record = manifest['artifacts'].get(ALERT_CLIENT)
+    if record is not None and not matches_installed_artifact(target / ALERT_CLIENT, record):
+        raise ValueError('installed release artifact mismatch: ' + ALERT_CLIENT)
+
+
+def retain_alert_client(target, manifest, data):
+    record = manifest['artifacts'][ALERT_CLIENT]
+    if not artifact_matches(data, record):
+        raise ValueError('artifact checksum mismatch: ' + ALERT_CLIENT)
+    # Never replace a foreign symlink or special file, including during repair.
+    matches_installed_artifact(target / ALERT_CLIENT, record)
+    durable_write(target / ALERT_CLIENT, data, 0o600)
+    verify_alert_client(target, manifest)
+
+
+def repair_alert_client(base, manifest, installed, target):
+    record = installed['artifacts'].get(ALERT_CLIENT)
+    if manifest['artifacts'].get(ALERT_CLIENT) != record:
+        raise ValueError('same-version companion artifact mismatch: ' + ALERT_CLIENT)
+    if record is not None and not matches_installed_artifact(target / ALERT_CLIENT, record):
+        retain_alert_client(target, installed, verified_artifact(base, ALERT_CLIENT, record))
+    verify_alert_client(target, installed)
 
 
 def install_operator_cli(target, manifest):
@@ -853,6 +883,8 @@ def prepare_environment(target, download, manifest, host_wheel):
     command([target / 'bin/hub2', '--help'])
     shutil.copyfile(download / 'hub.pyz', target / 'hub.pyz')
     shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
+    if ALERT_CLIENT in manifest['artifacts']:
+        retain_alert_client(target, manifest, (download / ALERT_CLIENT).read_bytes())
     (target / 'hub.pyz').chmod(0o755)
     command([python, target / 'hub.pyz', '--help'])
     install_operator_cli(target, manifest)
@@ -982,7 +1014,10 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
     scratch.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='download-', dir=scratch) as temporary:
         download = Path(temporary)
-        for name in (host_wheel, 'websockets-16.0-py3-none-any.whl', 'hub.pyz', 'hub2-enroll.py'):
+        names = [host_wheel, 'websockets-16.0-py3-none-any.whl', 'hub.pyz', 'hub2-enroll.py']
+        if ALERT_CLIENT in manifest['artifacts']:
+            names.append(ALERT_CLIENT)
+        for name in names:
             (download / name).write_bytes(verified_artifact(base, name, manifest['artifacts'][name]))
         journal = root / 'retained-switch.json'
         state = {'current': old.name, 'target': target.name,
@@ -1298,6 +1333,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             # Older updaters install the wheel's hub shim even for a release
             # containing this fix. Repair it on the next same-version check,
             # using the original receipt if a rebuild changed zipapp bytes.
+            repair_alert_client(base, manifest, installed, target)
             install_operator_cli(target, installed)
             if install_service:
                 repair_service_files(base, manifest, root, target)
