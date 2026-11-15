@@ -112,6 +112,35 @@ function persistAge(value:number|undefined):PersistAgeBucket{
   if(value===undefined||!Number.isFinite(value)||value<0)return 'unspecified';
   return value<25?'under_25':value<75?'25_to_74':value<150?'75_to_149':'150_or_more';
 }
+// Five completed pre-sync phases only; pending/failing work is never credited.
+// Buckets describe JS boundaries, not kernel IO or an exact timer allocation.
+const COMPLETED_PHASES = ['artifacts','store_identity','store_sentinel','snapshot_create','snapshot_write'] as const;
+type CompletedPhase = typeof COMPLETED_PHASES[number];
+type CompletedPhases = Partial<Record<CompletedPhase,PersistAgeBucket>>;
+type CompletedPhasesSnapshot = CompletedPhases|'unspecified';
+const COMPLETED_AGES = new Set(['under_25','25_to_74','75_to_149','150_or_more','unspecified']);
+function freezeCompletedPhases(value:unknown):CompletedPhasesSnapshot|undefined{
+  if(value===undefined)return undefined;
+  try{
+    if(value===null||typeof value!=='object'||utilTypes.isProxy(value)
+      ||Object.getPrototypeOf(value)!==Object.prototype)return 'unspecified';
+    const keys=Reflect.ownKeys(value);
+    if(keys.length>COMPLETED_PHASES.length)return 'unspecified';
+    const result:CompletedPhases={};
+    for(const key of keys){
+      if(typeof key!=='string'||!COMPLETED_PHASES.includes(key as CompletedPhase))return 'unspecified';
+      const descriptor=Object.getOwnPropertyDescriptor(value,key);
+      if(!descriptor||!('value' in descriptor)||typeof descriptor.value!=='string'
+        ||!COMPLETED_AGES.has(descriptor.value))return 'unspecified';
+      result[key as CompletedPhase]=descriptor.value as PersistAgeBucket;
+    }
+    return result;
+  }catch{return 'unspecified';}
+}
+function completedPhaseFields(value:unknown){
+  const frozen=freezeCompletedPhases(value);
+  return frozen===undefined?{}:{unavailable_persist_completed:frozen};
+}
 function persistBudget(trace:PersistTrace):PersistBudget{
   const now=persistClock(),start=trace.budgetStart,stage=trace.stageStart;
   // These are JS operation-boundary observations, never kernel IO latency.
@@ -125,14 +154,22 @@ function persistBudgetFields(budget:PersistBudget|undefined){
     unavailable_persist_stage_await:budget.stage_await}:{};
 }
 function firstPersistFailure(trace:PersistTrace|undefined,stage:EvidencePersistStage,error:unknown,timer?:PersistTimerLateness){
-  if(trace&&!trace.first)trace.first={stage,error,budget:persistBudget(trace),
+  if(trace&&!trace.first)trace.first={stage,error,budget:persistBudget(trace),completed:freezeCompletedPhases(trace.completed),
     ...(stage==='artifacts'?{artifacts:freezeArtifactProgress(trace.artifacts)}:{}),...(timer?{timer}:{})};
 }
 const ownDeadlines = new WeakSet<object>();
-type PersistTrace = { stage: EvidencePersistStage; budgetStart?:number;stageStart?:number;artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;budget?:PersistBudget;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
+type PersistTrace = { completed?:CompletedPhases; stage: EvidencePersistStage; budgetStart?:number;stageStart?:number;artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;budget?:PersistBudget;completed?:CompletedPhasesSnapshot;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
 async function persistStep<T>(trace:PersistTrace|undefined,stage:EvidencePersistStage,work:()=>Promise<T>):Promise<T>{
   if(trace){trace.stage=stage;trace.stageStart=persistClock();}
-  try{return await work();}
+  const started=trace?.stageStart;
+  try{
+    const result=await work();
+    if(trace&&COMPLETED_PHASES.includes(stage as CompletedPhase)){
+      const ended=persistClock();
+      (trace.completed??={})[stage as CompletedPhase]=persistAge(started===undefined||ended===undefined?undefined:ended-started);
+    }
+    return result;
+  }
   catch(error){firstPersistFailure(trace,stage,error);throw error;}
 }
 export function classifyPersistFailure(error:unknown):EvidencePersistError{
@@ -372,7 +409,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
   private firstFailure: string | undefined;
-  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError;budget?:PersistBudget;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} | undefined;
+  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError;budget?:PersistBudget;completed?:CompletedPhasesSnapshot;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} | undefined;
   private pending = 0;
   private active = new Set<number>();
   private requests = 0;
@@ -442,6 +479,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
           // The async argument below starts before bounded() is entered.
           // Refresh for EACH coalesced write, before its first stage is sampled.
           trace.budgetStart=persistClock();
+          trace.completed={};
           await this.bounded((async () => {
             await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded, trace));
             await this.store.write(value, this.writer, trace);
@@ -450,7 +488,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       } catch(error) {
         if(!this.dirty){
           const first=trace.first??{stage:trace.stage,error};
-          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('budget' in first?{budget:first.budget}:{}),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
+          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('budget' in first?{budget:first.budget}:{}),...('completed' in first?{completed:first.completed}:{}),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
         }
         this.invalidate('persist_failed');
       }
@@ -493,7 +531,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
       unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
         (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced'),
-      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...persistBudgetFields(this.firstPersist?.budget),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
+      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...persistBudgetFields(this.firstPersist?.budget),...completedPhaseFields(this.firstPersist?.completed),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
     if (this.dirty || this.pending || this.active.size) return unavailable();
     const version = canonical(this.journal);
     try {

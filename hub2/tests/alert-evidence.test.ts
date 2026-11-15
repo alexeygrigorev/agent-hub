@@ -201,6 +201,92 @@ async function drainArtifactFake(h:any){
 
 async function defineTests() {
 
+  test('completed persist phases distinguish pre-sync costs and freeze at the original deadline',async t=>{
+    for(const [artifactMs,sentinelMs,writeMs] of [[80,10,35],[10,80,35],[10,10,105]]){
+      let clock=0,release!:()=>void;const options={clock:()=>clock,delayed:true};
+      const h=artifactHarness(options),held=new Promise<void>(yes=>release=yes);
+      h.observer.store.write=async(_value:any,_writer:any,trace:any)=>{
+        await h.step(trace,'store_identity',async()=>{clock+=10;});
+        await h.step(trace,'store_sentinel',async()=>{clock+=sentinelMs;});
+        await h.step(trace,'snapshot_create',async()=>{clock+=5;});
+        await h.step(trace,'snapshot_write',async()=>{clock+=writeMs;});
+        await h.step(trace,'snapshot_sync',()=>held);
+        clock=999;await h.step(trace,'snapshot_close',async()=>{});
+      };
+      t.mock.timers.enable({apis:['setTimeout']});
+      try{
+        h.observer.begin();await artifactMicrotasks();assert.equal(h.waiting.length,2);
+        clock=artifactMs;options.delayed=false;await drainArtifactFake(h);await artifactMicrotasks();
+        assert.equal(clock,140);t.mock.timers.tick(149);await artifactMicrotasks();assert.equal(h.observer.dirty,false);
+        clock=150;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.queue;
+        const first=await h.observer.snapshot(NONCE);
+        assert.equal(first.unavailable_persist_stage,'snapshot_sync');assert.equal(first.unavailable_persist_error,'deadline');
+        assert.equal(first.unavailable_persist_before_stage,'75_to_149');assert.equal(first.unavailable_persist_stage_await,'under_25');
+        assert.deepEqual(first.unavailable_persist_completed,{artifacts:artifactMs===80?'75_to_149':'under_25',
+          store_identity:'under_25',store_sentinel:sentinelMs===80?'75_to_149':'under_25',snapshot_create:'under_25',
+          snapshot_write:writeMs===105?'75_to_149':'25_to_74'});
+        assert.equal(h.timeout,150);assert.equal(h.stats().active,0);
+        release();await artifactMicrotasks();h.observer.invalidate('snapshot_route_rejected');
+        assert.deepEqual(await h.observer.snapshot(NONCE),first,'late sync/close and later faults cannot rewrite completed phases');
+        assert.ok(!JSON.stringify(first).includes('/synthetic/'));assert.ok(!JSON.stringify(first).includes('999'));
+      }finally{release();options.delayed=false;await drainArtifactFake(h);t.mock.timers.reset();}
+    }
+  });
+  test('completed persist phases exclude failed work and preserve healthy seventeen fields',async()=>{
+    let clock=0;const h=artifactHarness({clock:()=>clock});
+    const healthy=await h.observer.snapshot(NONCE);
+    assert.equal(healthy.complete,true);assert.equal(Object.keys(healthy).length,17);
+    assert.ok(!Object.keys(healthy).some(key=>key.startsWith('unavailable_')));
+    h.observer.store.write=async(_value:any,_writer:any,trace:any)=>{
+      await h.step(trace,'store_identity',async()=>{clock=30;});
+      await h.step(trace,'store_sentinel',async()=>{clock=140;throw Object.assign(new Error('SECRET /private/path'),{code:'EIO'});});
+      assert.fail('no creation after failed sentinel');
+    };
+    h.observer.begin();await artifactMicrotasks();await h.observer.queue;
+    const proof=await h.observer.snapshot(NONCE);
+    assert.equal(proof.unavailable_persist_stage,'store_sentinel');assert.equal(proof.unavailable_persist_error,'io');
+    assert.deepEqual(proof.unavailable_persist_completed,{artifacts:'under_25',store_identity:'25_to_74'});
+    assert.ok(!JSON.stringify(proof).includes('SECRET'));assert.ok(!JSON.stringify(proof).includes('/private/'));
+  });
+  test('completed persist phases close malformed absent and backward-clock projections',async()=>{
+    const h=artifactHarness();h.observer.dirty=true;h.observer.firstFailure='persist_failed';
+    h.observer.firstPersist={stage:'snapshot_sync',error:'deadline'};
+    assert.ok(!('unavailable_persist_completed' in await h.observer.snapshot(NONCE)),'absence is never fabricated timing');
+    const getter={};Object.defineProperty(getter,'artifacts',{get(){throw new Error('must not execute');}});
+    const proxy=new Proxy({},{ownKeys(){throw new Error('must not execute');}});
+    for(const malformed of [null,[],{foreign_secret:'under_25'},{artifacts:15},{artifacts:'PRIVATE'},getter,proxy,{[Symbol('secret')]:'under_25'}]){
+      h.observer.firstPersist.completed=malformed;
+      const proof=await h.observer.snapshot(NONCE);
+      assert.equal(proof.unavailable_persist_completed,'unspecified');assert.ok(!JSON.stringify(proof).includes('secret'));
+    }
+    let clock=20;const bad=artifactHarness({clock:()=>clock}),trace:any={stage:'artifacts'};
+    await bad.step(trace,'store_identity',async()=>{clock=10;});
+    assert.deepEqual(trace.completed,{store_identity:'unspecified'});
+    clock=NaN;await bad.step(trace,'store_sentinel',async()=>{});
+    assert.deepEqual(trace.completed,{store_identity:'unspecified',store_sentinel:'unspecified'});
+  });
+  test('completed persist phases reset for each coalesced write',async t=>{
+    let clock=0,writes=0,releaseFirst!:()=>void,releaseSecond!:()=>void;
+    const one=new Promise<void>(yes=>releaseFirst=yes),two=new Promise<void>(yes=>releaseSecond=yes);
+    const h=artifactHarness({clock:()=>clock});
+    h.observer.store.write=async(_value:any,_writer:any,trace:any)=>{
+      writes++;
+      if(writes===1){await h.step(trace,'store_identity',async()=>{clock=80;});await h.step(trace,'snapshot_sync',()=>one);}
+      else{await h.step(trace,'store_sentinel',async()=>{clock=110;});await h.step(trace,'snapshot_sync',()=>two);}
+    };
+    t.mock.timers.enable({apis:['setTimeout']});
+    try{
+      const id=h.observer.begin();await artifactMicrotasks();assert.equal(writes,1);
+      const finishing=h.observer.finish(id,'observation');clock=100;releaseFirst();await artifactMicrotasks();assert.equal(writes,2);
+      clock=250;t.mock.timers.tick(150);await artifactMicrotasks();await finishing;
+      const first=await h.observer.snapshot(NONCE);
+      assert.deepEqual(first.unavailable_persist_completed,{artifacts:'under_25',store_sentinel:'under_25'},'previous identity phase must not bleed into next write');
+      assert.equal(first.unavailable_persist_stage,'snapshot_sync');assert.equal(h.timeout,150);
+      releaseSecond();await artifactMicrotasks();assert.deepEqual(await h.observer.snapshot(NONCE),first);
+    }finally{releaseFirst();releaseSecond();await artifactMicrotasks();t.mock.timers.reset();}
+  });
+
+
   test('persist diagnostic origin precedes eager artifact read without moving timer',async t=>{
     let clock=0;const options={clock:()=>clock++,delayed:true};
     const h=artifactHarness(options);
