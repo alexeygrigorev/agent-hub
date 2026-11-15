@@ -235,6 +235,18 @@ class CliTests(unittest.TestCase):
         refresh.assert_not_called()
         self.assertEqual(self.config.read_bytes(), saved_config)
 
+    def test_intake_update_parent(self):
+        code, _ = self.invoke("intake", "update", "0cfeba5e", "--project", "DataTalksClub/website", "--parent", "bf3a67fb", "--key", "p1")
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("PATCH", "/api/intakes/0cfeba5e"))
+        self.assertEqual(parse_qs(urlsplit(path).query)["project"], ["DataTalksClub/website"])
+        self.assertEqual(body, {"key": "p1", "parent_intake_id": "bf3a67fb"})
+
+        code, _ = self.invoke("intake", "update", "0cfeba5e", "--project", "DataTalksClub/website", "--parent", "none", "--key", "p2")
+        self.assertEqual(code, 0)
+        self.assertIsNone(Handler.calls[-1][2]["parent_intake_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

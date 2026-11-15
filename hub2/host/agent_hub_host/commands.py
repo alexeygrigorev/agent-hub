@@ -28,7 +28,7 @@ def add_commands(subparsers):
         parser.add_argument("identity", nargs="?")
         for flag in ("project", "status", "after", "cursor", "search", "title", "text", "text-file", "acceptance-criteria-file",
                      "intake-task-id", "machine", "machine-id", "key", "body-file", "prompt", "file", "to",
-                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at", "repo", "pr", "code-task", "note"):
+                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at", "repo", "pr", "code-task", "note", "parent"):
             parser.add_argument("--" + flag)
         parser.add_argument("--acceptance-criteria", action="append", default=[])
         parser.add_argument("--required-capability", action="append", default=[])
@@ -93,6 +93,8 @@ def execute(client, args, config):
             method = "PATCH"
             body.setdefault("key", key)
             body.update({k: v for k, v in {"status": args.status, "title": args.title, "text": text, "note": args.note}.items() if v is not None})
+            if args.parent is not None:
+                body["parent_intake_id"] = None if args.parent.lower() in {"", "none", "null"} else args.parent
             if args.code_task is not None:
                 body["code_task"] = parse_bool(args.code_task)
             elif args.non_code_task:
