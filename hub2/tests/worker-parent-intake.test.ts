@@ -84,3 +84,46 @@ test('child-intake worker session shows and appends to its parent intake by full
  const notes=JSON.stringify(history);
  assert.match(notes,/child progress via /);assert.match(notes,/child append via /);assert.match(notes,new RegExp('session:'+childSession));
 });
+
+test('operator can set parent_intake_id on an existing intake (short or full id) and its worker session gains parent read/append',async t=>{
+ const f=fixture();t.after(f.close);
+ const {default:worker}=await import('../src/worker');
+ const create=async(key:string)=>{const r=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key,title:'T '+key,text:'X',acceptance_criteria:['A']},admin);assert.equal(r.status,201,key);return(await data(r)).intake;};
+ const parent=await create('parent2'),standalone=await create('standalone');
+ assert.equal(standalone.parent_intake_id,null);
+ const adminToken='synthetic-admin-'+'a'.repeat(32),projectWriterToken='synthetic-writer-'+'w'.repeat(32);
+ const childSession='cccccccc-3333-4333-8333-333333333333',childToken='synthetic-standalone-worker-'+'e'.repeat(32);
+ f.tokens.set(adminToken,admin);
+ f.tokens.set(projectWriterToken,{id:'human:writer',kind:'operator',scopes:['intake:read','intake:write','project:'+PROJECT]});
+ f.tokens.set(childToken,workerActor(childSession,standalone.id));
+ const call=(path:string,token:string,method='GET',b?:unknown)=>worker.fetch(new Request('http://127.0.0.1'+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(b===undefined?{}:{body:JSON.stringify(b)})}),f.env);
+
+ // Non-operator (even project writer) and worker session cannot set parent_intake_id.
+ const deniedWriter=await f.direct(PROJECT,'/api/intakes/'+standalone.id,'PATCH',{key:'p-deny-w',parent_intake_id:parent.id},{id:'human:writer',kind:'operator',scopes:['intake:read','intake:write','project:'+PROJECT]});
+ assert.equal(deniedWriter.status,403);assert.equal((await data(deniedWriter)).missing_scope,'operator:admin');
+ const deniedWorker=await call('/api/intakes/'+standalone.id,childToken,'PATCH',{key:'p-deny-s',parent_intake_id:parent.id});
+ assert.equal(deniedWorker.status,403);
+
+ // Self, cycle, and missing parent checks.
+ assert.equal((await f.direct(PROJECT,'/api/intakes/'+standalone.id,'PATCH',{key:'p-self',parent_intake_id:standalone.id},admin)).status,409);
+ assert.equal((await f.direct(PROJECT,'/api/intakes/'+standalone.id,'PATCH',{key:'p-miss',parent_intake_id:'deadbeef'},admin)).status,404);
+
+ // Operator sets parent using short IDs for both child and parent.
+ const linked=await f.direct(PROJECT,'/api/intakes/'+standalone.id.slice(0,8)+'?project='+PROJECT,'PATCH',{key:'p-set',parent_intake_id:parent.id.slice(0,8)},admin);
+ assert.equal(linked.status,200);assert.equal((await data(linked)).intake.parent_intake_id,parent.id);
+
+ // Cycle check: parent cannot become a child of its own child.
+ assert.equal((await f.direct(PROJECT,'/api/intakes/'+parent.id,'PATCH',{key:'p-cycle',parent_intake_id:standalone.id},admin)).status,409);
+
+ // Worker session bound to the updated child now reads and appends to the parent by short and full id.
+ for(const ref of [parent.id,parent.id.slice(0,8)]){
+  const shown=await call('/api/intake/tasks/'+ref,childToken);
+  assert.equal(shown.status,200,'show '+ref);assert.equal((await data(shown)).intake.id,parent.id);
+  const appended=await call('/api/intake/tasks/'+ref+'/events',childToken,'POST',{key:'linked-note-'+ref,note:'linked child note '+ref});
+  assert.equal(appended.status,201,'append '+ref);
+ }
+
+ // Operator can clear parent_intake_id back to null.
+ const cleared=await f.direct(PROJECT,'/api/intakes/'+standalone.id,'PATCH',{key:'p-clear',parent_intake_id:null},admin);
+ assert.equal(cleared.status,200);assert.equal((await data(cleared)).intake.parent_intake_id,null);
+});

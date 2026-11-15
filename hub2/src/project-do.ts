@@ -177,7 +177,7 @@ export class ProjectDO {
       if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
       const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate))?$/);
       if (!match) return error('not_found', 404);
-      const intakeId = this.resolveWorkerParentRef(actorFrom(request), decodeURIComponent(match[1]));
+      const intakeId = this.resolveIntakeRef(actorFrom(request), decodeURIComponent(match[1]));
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
       if (match[2] === 'discard' && request.method === 'POST') return await this.discardUnused(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
@@ -537,9 +537,11 @@ export class ProjectDO {
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
+    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task','parent_intake_id',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
     if(!editable.some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
     if(body.code_task!==undefined&&typeof body.code_task!=='boolean')return error('invalid_code_task',400);
+    if(body.parent_intake_id!==undefined&&body.parent_intake_id!==null&&(typeof body.parent_intake_id!=='string'||!body.parent_intake_id.trim()))return error('invalid_parent_intake_id',400);
+    if(typeof body.parent_intake_id==='string'&&body.parent_intake_id.trim().length<6)return error('prefix_too_short',400,'parent_intake_id prefix must be at least 6 characters');
     if(body.project!==undefined&&(typeof body.project!=='string'||!/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(body.project)))return error('invalid_intake_project',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
     if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
@@ -553,6 +555,13 @@ export class ProjectDO {
       if(body.project!==undefined&&body.project!==row.project&&!this.canProject(actor,body.project as string,'intake:write'))return error('forbidden',403);
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
       if(body.code_task!==undefined&&!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can reclassify an intake');
+      if(body.parent_intake_id!==undefined&&!hasScope(actor,'operator:admin'))return forbiddenScope('operator:admin','only an operator can set parent_intake_id');
+      let nextParentId=row.parent_intake_id;
+      if(body.parent_intake_id!==undefined){
+        const resolved=this.resolveParentIntakeId(row.id,body.parent_intake_id as string|null);
+        if(resolved instanceof Response)return resolved;
+        nextParentId=resolved;
+      }
       if(body.status==='accepted'){
         const gate=this.intakeMergeGate(row);
         if(!gate.ok){
@@ -575,8 +584,8 @@ export class ProjectDO {
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
       if(body.status==='accepted'&&(!['completed-awaiting-review','accepted'].includes(row.status)||!hasScope(actor,'operator:admin')))return error('review_required',409);
       if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
-      const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
-      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
+      const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2,parent_intake_id:nextParentId};
+      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,parent_intake_id=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,next.parent_intake_id,at,row.id);
       if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
         const context={...this.intakeContext(row.id)};
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
@@ -2171,12 +2180,41 @@ export class ProjectDO {
     return !!own?.parent_intake_id && own.parent_intake_id === intake.id;
   }
 
-  /** A worker's short parent id resolves here: Control routes only cover the worker's own intake. */
-  private resolveWorkerParentRef(actor: ReturnType<typeof actorFrom>, ref: string): string {
-    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !actor.resource_id || ref.length < 6) return ref;
-    if (this.db.one('SELECT id FROM intakes WHERE id=?', ref)) return ref;
-    const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
-    return own?.parent_intake_id?.startsWith(ref) ? own.parent_intake_id : ref;
+  /** Resolve short intake refs: bound worker sessions only see their own parent; operators/project callers resolve any unique prefix in this project. */
+  private resolveIntakeRef(actor: ReturnType<typeof actorFrom>, ref: string): string {
+    if (ref.length < 6 || this.db.one('SELECT id FROM intakes WHERE id=?', ref)) return ref;
+    if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id) {
+      const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
+      return own?.parent_intake_id?.startsWith(ref) ? own.parent_intake_id : ref;
+    }
+    const rows = this.db.all<{ id: string }>('SELECT id FROM intakes WHERE id>=? AND id<? ORDER BY id LIMIT 2', ref, ref + '\uffff');
+    if (rows.length > 1) throw new HttpError('ambiguous_prefix', 409, `intake id prefix ${ref} matches several intakes; pass the full id`);
+    return rows.length === 1 ? rows[0].id : ref;
+  }
+
+  /** Resolve and validate parent_intake_id within this project, rejecting missing, ambiguous, self, or cyclic links. */
+  private resolveParentIntakeId(childId: string, raw: string | null): string | null | Response {
+    if (raw === null) return null;
+    const ref = raw.trim();
+    const exact = this.db.one<{ id: string }>('SELECT id FROM intakes WHERE id=?', ref);
+    let parentId: string;
+    if (exact) {
+      parentId = exact.id;
+    } else {
+      const rows = this.db.all<{ id: string }>('SELECT id FROM intakes WHERE id>=? AND id<? ORDER BY id LIMIT 2', ref, ref + '\uffff');
+      if (rows.length > 1) return error('ambiguous_prefix', 409, `parent_intake_id prefix ${ref} matches several intakes; pass the full id`);
+      if (!rows.length) return error('parent_intake_not_found', 404, `parent intake ${ref} was not found in this project`);
+      parentId = rows[0].id;
+    }
+    if (parentId === childId) return error('parent_intake_self', 409, 'an intake cannot be its own parent');
+    const seen = new Set<string>([childId]);
+    let cur: string | null = parentId;
+    for (let depth = 0; cur && depth < 64; depth++) {
+      if (seen.has(cur)) return error('parent_intake_cycle', 409, `${parentId} is already a descendant of ${childId}`);
+      seen.add(cur);
+      cur = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', cur)?.parent_intake_id ?? null;
+    }
+    return parentId;
   }
 
   private intakeReadDenied(intake: IntakeRow): Response {
