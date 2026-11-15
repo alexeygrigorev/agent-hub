@@ -394,6 +394,10 @@ export class ProjectDO {
         return forbiddenScope('intake:append',`append to intake ${intake.id} needs intake:append on that intake, its child-intake worker session, or operator:admin`);
       // A completion claim may come only from that session itself or an operator.
       const claimKind=(body.evidence as JsonRecord|undefined)?.kind;
+      // A child's session reports progress to its parent; it never writes records the parent's gates read.
+      if(!hasScope(actor,'operator:admin')&&actor.resource_id!==intake.id&&claimKind!==undefined
+        &&['merge_gate','task_complete','session_finished','task_blocked','acceptance_verification'].includes(String(claimKind)))
+        return forbiddenScope('operator:admin',`a child-intake worker session may append notes and evidence to parent ${intake.id}, not ${String(claimKind)} records`);
       const claimed=['task_complete','session_finished'].includes(String(claimKind))?(body.evidence as JsonRecord).session_id:undefined;
       if(claimed!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(claimed))return error('completion_claim_forbidden',403);
       if(claimed!==undefined&&intake.session_id!==claimed)return error('completion_claim_stale',409);
@@ -458,7 +462,7 @@ export class ProjectDO {
     const actor=actorFrom(request);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
     if(!intake)return error('intake_not_found',404);
-    if(!this.canReadIntake(actor,intake))return this.intakeReadDenied(intake);
+    if(!this.canReadIntake(actor,intake)&&!(this.isWorkerParent(actor,intake)&&hasScope(actor,'intake:read')))return this.intakeReadDenied(intake);
     const gate=this.intakeMergeGate(intake);
     const completion=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined;
     return json({intake_id:intake.id,project:intake.project,status:intake.status,code_task:gate.required,
