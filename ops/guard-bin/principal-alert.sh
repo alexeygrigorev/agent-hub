@@ -13,7 +13,8 @@ ts=$(date -u +%FT%TZ)
 printf '%s %s\n' "$ts" "$msg" >> "$log" 2>/dev/null || true
 if [ -n "${ALERT_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$ALERT_LOG"
-  exit 0
+  # Rendered to the deliberate test/drill sink, never delivered to SMTP.
+  exit 75
 fi
 if command -v msmtp >/dev/null 2>&1; then
   printf 'To: %s\nSubject: [principal-ping] %s\n\n%s\n\nhost: %s\ntime: %s\n' \
