@@ -159,7 +159,8 @@ class HostTests(unittest.TestCase):
         self.assertIn('credentials:local:interactive:claude:claude', flags)
         self.assertLessEqual(len(flags), 32)
         self.auth_observer.return_value *= 2
-        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(27))}}
+        # Leave one auth-observation slot after the complete engine-mode declaration.
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(26))}}
         self.bridge.heartbeat([], include_native_sessions=False)
         self.assertEqual(len(captured[-1][2]),32)
         self.assertEqual(sum(flag.startswith('auth:missing:') for flag in captured[-1][2]),1)

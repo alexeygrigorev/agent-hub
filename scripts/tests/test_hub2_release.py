@@ -1979,6 +1979,47 @@ class ManagedProfileRepinTests(unittest.TestCase):
                 'from agent_hub_host.provisioning import execute; execute()', 'shared-codex'])
             self.assertEqual(profiles['mine']['command'], ['x'])
 
+    def test_three_argument_execute_generator_keeps_conservative_generic_output(self):
+        target = Path('/synthetic/release')
+        managed = '/synthetic/managed'
+        for label in ('test-account', 'shared-codex'):
+            with self.subTest(label=label):
+                expected = [str(target / 'bin/python'), '-I', '-S',
+                            *self.stale(str(target / 'hub.pyz'), managed, label)[1:]]
+                self.assertEqual(updater.release_execute_command(target, label, managed), expected)
+                self.assertEqual(updater.release_execute_command(target, label, managed, engine=None), expected)
+        self.assertEqual(len(updater.release_execute_command(target, 'shared-codex', managed, engine='codex')), 4)
+
+    def test_archive_owned_non_codex_canonical_name_keeps_generic_isolated_output(self):
+        for engine in ('shell', 'zai', 'claude'):
+            with self.subTest(engine=engine), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                managed = str(root / 'managed')
+                stale = self.stale('/legacy/recovery/hub.pyz', managed, 'shared-codex')
+                config, target, _ = self.write(root, [('hub-shared-codex', engine, stale)],
+                                             outside='\n[profiles.operator]\ncommand = ["opaque"]\n')
+                before = config.read_bytes()
+                expected = [str(target / 'bin/python'), '-I', '-S',
+                            *self.stale(str(target / 'hub.pyz'), managed, 'shared-codex')[1:]]
+                with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
+                    self.assertEqual(updater.repin_managed_profiles(target), ['hub-shared-codex'])
+                    self.assertEqual(updater.repin_managed_profiles(target), [])
+                profile = updater.tomllib.loads(config.read_text())['profiles']['hub-shared-codex']
+                self.assertEqual(profile, {'engine': engine, 'command': expected})
+                self.assertEqual(expected[-2].count('sys.path.insert'), 1)
+                self.assertEqual(config.read_bytes(), before.replace(json.dumps(stale).encode(), json.dumps(expected).encode()))
+
+    def test_source_tree_repin_requires_canonical_codex_engine_and_preserves_operator_routes(self):
+        for engine, name in [('shell', 'hub-shared-codex'), ('zai', 'hub-shared-codex'), ('codex', 'hub-custom-codex')]:
+            with self.subTest(engine=engine, name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = self.stale('/operator/source', str(root / 'managed'), name[4:])
+                config, target, _ = self.write(root, [(name, engine, source)])
+                before = config.read_bytes()
+                with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
+                    self.assertEqual(updater.repin_managed_profiles(target), [])
+                self.assertEqual(config.read_bytes(), before)
+
     def test_label_mismatch_or_unmanaged_profile_is_left_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

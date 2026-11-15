@@ -865,7 +865,7 @@ class NativeLauncher:
         result = {"shell": {"headless"}}
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
-            supported = PROVIDER_CAPABILITIES.get(provider, set())
+            supported = set(PROVIDER_CAPABILITIES.get(provider, set()))
             available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
             if self.config.get('private_provider_homes') and provider == 'claude':
                 available = provider_home.claude_install_available()
@@ -873,18 +873,22 @@ class NativeLauncher:
                 # Advertise Codex only when the maintained quota wrapper (and,
                 # for a profile route, the maintained profile name) is usable.
                 available = self._codex_advertisable(route)
+                if not available and self._codex_withdrawn_reason == 'profile_release_mismatch':
+                    supported.discard('headless')
+                    available = bool(supported)
             if supported and available:
                 result[engine] = set(supported)
         return result
 
     def _codex_advertisable(self, route):
-        """Codex is advertised only when a launch would actually pass.
+        """Check shared wrapper and local headless profile readiness.
 
         launch() needs the wrapper and, for the local profile path, the
         release-pinned profile proof. Checking only the wrapper advertised codex
         on a host whose profile pointed at a stale release, so the picker kept
-        routing there and every launch was refused (intake f88ae417). A failure
-        withdraws codex and logs a loud ERROR once per change of reason."""
+        routing headless work there (intake f88ae417). Profile failure removes
+        only headless support; interactive work uses the direct wrapper path.
+        Report a fixed diagnostic once per change of reason."""
         reason = None
         try:
             wrapper = str(codex_launch_wrapper())
@@ -905,8 +909,8 @@ class NativeLauncher:
         if getattr(self, '_codex_withdrawn_reason', None) != reason:
             self._codex_withdrawn_reason = reason
             if reason:
-                print('ALERT hub2-host: codex_launch_wrapper_unavailable (%s): codex withdrawn from this host\'s '
-                      'advertised engines until fixed; picks must fall back to another engine' % reason,
+                affected = 'headless capability withdrawn; interactive remains available' if reason == 'profile_release_mismatch' else 'all codex capabilities withdrawn'
+                print('ALERT hub2-host: codex_launch_wrapper_unavailable (%s): %s' % (reason, affected),
                       file=sys.stderr, flush=True)
             else:
                 print('RECOVERED hub2-host: codex advertised again', file=sys.stderr, flush=True)
