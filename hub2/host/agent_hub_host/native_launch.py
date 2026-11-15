@@ -712,6 +712,11 @@ class NativeLauncher:
                              timeout=timeout, check=False, env=env, cwd=workspace)
         if result.returncode and not allow_failure:
             raise RuntimeError("native_command_failed")
+        # Headless Windows sessions can yield None instead of captured text.
+        if result.stdout is None:
+            result.stdout = ""
+        if result.stderr is None:
+            result.stderr = ""
         if len(result.stdout) > output_limit:
             raise RuntimeError("native_response_too_large")
         return result
