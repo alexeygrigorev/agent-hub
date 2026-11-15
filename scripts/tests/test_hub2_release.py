@@ -118,6 +118,169 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     def receipt(self):
         return json.loads((self.root / updater.ACTIVATION_RECEIPT).read_text())
 
+    def add_alert_client(self):
+        profiles = patch.dict(os.environ, {'APLEXER_CONFIG': str(Path(self.temporary.name) / 'absent-profiles')})
+        profiles.start()
+        self.addCleanup(profiles.stop)
+        data = b'# selected standalone client\n'
+        self.files['hub_alert_client.py'] = data
+        self.manifest['artifacts']['hub_alert_client.py'] = {
+            'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+        return data
+
+    def test_alert_client_retained_and_verified_before_receipt(self):
+        data = self.add_alert_client()
+        original = updater.write_json
+        seen = []
+        def write(path, value):
+            if path.name == 'release.json':
+                client = path.parent / 'hub_alert_client.py'
+                self.assertEqual(client.read_bytes(), data)
+                self.assertEqual(client.stat().st_mode & 0o777, 0o600)
+                seen.append(path)
+            return original(path, value)
+        with patch.object(updater, 'write_json', write):
+            self.install(restart=False)
+        self.assertEqual(len(seen), 1)
+        target = (self.root / 'current').resolve()
+        updater.verify_alert_client(target, self.manifest)
+        self.assertEqual(json.loads((target / 'release.json').read_text()), self.manifest)
+
+    def test_alert_client_bad_download_never_selects_candidate(self):
+        self.add_alert_client()
+        old = self.old_release()
+        self.files['hub_alert_client.py'] = b'wrong payload'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.install(restart=False)
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertFalse((self.root / 'releases' / SHA / 'release.json').exists())
+
+    def test_alert_client_prepare_rejects_missing_or_tampered_staging(self):
+        self.add_alert_client()
+        for data in (None, b'bad'):
+            with self.subTest(data=data):
+                target = Path(self.temporary.name) / ('candidate-' + str(data is None))
+                download = target / 'download'
+                download.mkdir(parents=True)
+                for name in ('hub.pyz', 'hub2-enroll.py'):
+                    (download / name).write_bytes(self.files[name])
+                if data is not None:
+                    (download / 'hub_alert_client.py').write_bytes(data)
+                with patch.object(updater, 'command', self.command), \
+                     self.assertRaises((FileNotFoundError, ValueError)):
+                    updater.prepare_environment(target, download, self.manifest, HOST)
+                self.assertFalse((target / 'release.json').exists())
+
+    def test_alert_client_same_version_repairs_exact_manifest_without_restart(self):
+        data = self.add_alert_client()
+        self.install(restart=False)
+        target = (self.root / 'current').resolve()
+        receipt = (target / 'release.json').read_bytes()
+        client = target / 'hub_alert_client.py'
+        for damage in ('missing', 'tampered'):
+            with self.subTest(damage=damage):
+                if damage == 'missing':
+                    client.unlink()
+                else:
+                    client.write_bytes(b'x' * len(data))
+                self.calls.clear(); self.downloads.clear()
+                self.install(restart=False)
+                self.assertEqual(client.read_bytes(), data)
+                self.assertEqual(self.downloads, ['host-release.json', 'hub_alert_client.py'])
+                self.assertEqual(self.calls, [])
+                self.assertEqual((target / 'release.json').read_bytes(), receipt)
+                self.assertEqual((self.root / 'current').resolve(), target)
+
+    def test_alert_client_same_version_rebuild_cannot_change_binding(self):
+        self.add_alert_client()
+        self.install(restart=False)
+        target = (self.root / 'current').resolve()
+        client = target / 'hub_alert_client.py'
+        original = client.read_bytes()
+        client.unlink()
+        self.files['hub_alert_client.py'] = b'changed same-version client'
+        self.manifest['artifacts']['hub_alert_client.py'] = {
+            'sha256': hashlib.sha256(self.files['hub_alert_client.py']).hexdigest(),
+            'size': len(self.files['hub_alert_client.py'])}
+        self.downloads.clear(); self.calls.clear()
+        with self.assertRaisesRegex(ValueError, 'same-version companion artifact mismatch'):
+            self.install(restart=False)
+        self.assertEqual(self.downloads, ['host-release.json'])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(client.exists())
+        self.assertEqual((self.root / 'current').resolve(), target)
+        self.assertNotEqual(original, self.files['hub_alert_client.py'])
+
+    def test_alert_client_bad_repair_preserves_current_and_receipt(self):
+        self.add_alert_client()
+        self.install(restart=False)
+        target = (self.root / 'current').resolve()
+        client = target / 'hub_alert_client.py'
+        receipt = (target / 'release.json').read_bytes()
+        client.unlink()
+        self.files['hub_alert_client.py'] = b'corrupt repair'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.install(restart=False)
+        self.assertFalse(client.exists())
+        self.assertEqual((target / 'release.json').read_bytes(), receipt)
+        self.assertEqual((self.root / 'current').resolve(), target)
+
+    def test_alert_client_readiness_rejects_missing_tampered_and_symlink(self):
+        data = self.add_alert_client()
+        self.install(restart=False)
+        target = (self.root / 'current').resolve()
+        client = target / 'hub_alert_client.py'
+        for damage in ('missing', 'tampered', 'symlink'):
+            with self.subTest(damage=damage):
+                client.unlink(missing_ok=True)
+                if damage == 'tampered':
+                    client.write_bytes(b'x' * len(data))
+                elif damage == 'symlink':
+                    foreign = Path(self.temporary.name) / 'foreign-client'
+                    foreign.write_bytes(data)
+                    client.symlink_to(foreign)
+                with self.assertRaisesRegex(ValueError, 'artifact mismatch|unmanaged path'):
+                    updater.check_service_ready(target)
+        self.downloads.clear()
+        with self.assertRaisesRegex(ValueError, 'unmanaged path'):
+            self.install(restart=False)
+        self.assertEqual(self.downloads, ['host-release.json'])
+        self.assertTrue(client.is_symlink())
+
+    def test_alert_client_retained_reactivation_rebuilds_companion(self):
+        data = self.add_alert_client()
+        current, retained, _ = self.prepare_retained_switch()
+        (retained / 'hub_alert_client.py').write_bytes(b'untrusted retained copy')
+        self.install()
+        self.assertEqual((self.root / 'current').resolve(), retained)
+        self.assertEqual((self.root / 'previous').resolve(), current)
+        self.assertEqual((retained / 'hub_alert_client.py').read_bytes(), data)
+        self.assertIn('hub_alert_client.py', self.downloads)
+
+    def test_alert_client_retained_bad_download_keeps_old_selection(self):
+        self.add_alert_client()
+        current, retained, _ = self.prepare_retained_switch()
+        original = (retained / 'hub_alert_client.py').read_bytes()
+        self.files['hub_alert_client.py'] = b'corrupt retained download'
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), current)
+        self.assertEqual((retained / 'hub_alert_client.py').read_bytes(), original)
+        self.assertFalse((self.root / 'retained-switch.json').exists())
+
+    def test_alert_client_legacy_manifest_keeps_original_compatibility(self):
+        self.add_alert_client()
+        self.files.pop('hub_alert_client.py')
+        self.manifest['artifacts'].pop('hub_alert_client.py')
+        self.install(restart=False)
+        target = (self.root / 'current').resolve()
+        self.assertFalse((target / 'hub_alert_client.py').exists())
+        updater.verify_alert_client(target, self.manifest)
+        self.calls.clear(); self.downloads.clear()
+        self.install(restart=False)
+        self.assertEqual(self.downloads, ['host-release.json'])
+        self.assertEqual(self.calls, [])
+
     def test_scheduled_batch_defers_without_downloading_or_restarting(self):
         old = self.old_release()
         self.policy(last=1000)
