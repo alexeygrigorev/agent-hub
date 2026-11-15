@@ -1917,5 +1917,77 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual([call[0] for call in policy.writes()], ['POST', 'PUT', 'POST'])
 
 
+class ManagedProfileRepinTests(unittest.TestCase):
+    """Intake fc36c32b: non-Claude managed profiles follow the installed release."""
+
+    def stale(self, archive, managed, label):
+        code = ('import sys; sys.path.insert(0, ' + repr(archive) + '); import os; '
+                'os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(managed) + '; '
+                'from agent_hub_host.provisioning import execute; execute()')
+        return ['/usr/bin/python3.12', '-c', code, label]
+
+    def write(self, root, block_profiles, outside=''):
+        managed = root / 'managed'
+        managed.mkdir()
+        (managed / 'reconcile.lock').write_text('')
+        target = root / 'releases' / SHA
+        (target / 'bin').mkdir(parents=True)
+        (target / 'bin/python').write_text('')
+        (target / 'hub.pyz').write_bytes(b'PK')
+        block = ''.join('\n[profiles.%s]\nengine = %s\ncommand = %s\n' % (name, json.dumps(engine), json.dumps(cmd))
+                        for name, engine, cmd in block_profiles)
+        config = root / 'aplexer' / 'config.toml'
+        config.parent.mkdir()
+        config.write_text('version = 1\n' + outside + '\n' + updater.MANAGED_BEGIN + block + updater.MANAGED_END)
+        return config, target, managed
+
+    def test_stale_recovery_archive_profile_is_repinned_to_the_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = str(root / 'managed')
+            stale = self.stale('/home/x/.local/lib/agent-hub-recovery-cli/' + OLD_SHA + '/hub.pyz', managed, 'hub-antigravity')
+            claude = ['/opt/r/' + OLD_SHA + '/bin/python', '-I', '-S', '-c', 'claude-pin', 'hub-claude']
+            go = ['/m/engine-launch/shared-go.sh', 'shared-go']
+            source = self.stale('/legacy/host', managed, 'shared-codex')
+            config, target, _ = self.write(root, [('hub-hub-antigravity', 'antigravity', stale),
+                                                  ('hub-hub-claude', 'claude', claude),
+                                                  ('hub-shared-go', 'opencode', go),
+                                                  ('hub-shared-codex', 'codex', source)],
+                                           outside='\n[profiles.mine]\ncommand = ["x"]\n')
+            with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
+                self.assertEqual(updater.repin_managed_profiles(target), ['hub-hub-antigravity'])
+                self.assertEqual(updater.repin_managed_profiles(target), [])
+            profiles = updater.tomllib.loads(config.read_text())['profiles']
+            command = profiles['hub-hub-antigravity']['command']
+            self.assertEqual(command[:4], [str(target / 'bin/python'), '-I', '-S', '-c'])
+            self.assertIn(repr(str(target / 'hub.pyz')), command[4])
+            self.assertIn(repr(managed), command[4])
+            self.assertNotIn('recovery-cli', command[4])
+            self.assertEqual(command[5], 'hub-antigravity')
+            self.assertEqual(profiles['hub-hub-antigravity']['engine'], 'antigravity')
+            # The fenced Claude pin, launcher scripts, source-tree pins and
+            # operator profiles stay byte-identical.
+            self.assertEqual(profiles['hub-hub-claude']['command'], claude)
+            self.assertEqual(profiles['hub-shared-go']['command'], go)
+            self.assertEqual(profiles['hub-shared-codex']['command'], source)
+            self.assertEqual(profiles['mine']['command'], ['x'])
+
+    def test_label_mismatch_or_unmanaged_profile_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = str(root / 'managed')
+            wrong = self.stale('/r/hub.pyz', managed, 'hub-claude')
+            config, target, _ = self.write(root, [('hub-hub-antigravity', 'antigravity', wrong)])
+            before = config.read_bytes()
+            with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
+                self.assertEqual(updater.repin_managed_profiles(target), [])
+            self.assertEqual(config.read_bytes(), before)
+
+    def test_missing_config_never_fails_the_update(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'APLEXER_CONFIG': str(Path(tmp) / 'absent.toml')}):
+            self.assertEqual(updater.repin_managed_profiles(Path(tmp) / 'releases' / SHA), [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -686,6 +686,109 @@ def repin_managed_claude(target, base, root, updater):
     return status['status']
 
 
+# Other managed engine profiles (hub-antigravity, ...) run the same
+# `provisioning.execute()` entry point but were never re-pinned: they kept the
+# archive of whichever CLI last ran a sync (a one-off recovery hub.pyz on
+# hetzner-aplexer), so session provisioning fixes such as the operator DataOps
+# login and dapier session link never reached them (intake fc36c32b).
+EXECUTE_CODE = re.compile(
+    r"import sys; (?:sys\.path\.insert\(0, '[^'\\]+'\); )+import os; "
+    r"os\.environ\[\"AGENT_HUB_MANAGED_DIR\"\] = '(?P<managed>[^'\\]+)'; "
+    r"from agent_hub_host\.provisioning import execute; execute\(\)\Z")
+
+
+def release_execute_command(target, label, managed_dir):
+    archive = target / 'hub.pyz'
+    code = ('import sys; sys.path.insert(0, ' + repr(str(archive)) + '); import os; '
+            'os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(str(managed_dir)) + '; '
+            'from agent_hub_host.provisioning import execute; execute()')
+    return [str(target / 'bin/python'), '-I', '-S', '-c', code, label]
+
+
+def repinnable_execute_profile(name, table):
+    """The managed dir of a generated archive-pinned execute() profile, or None."""
+    if (not name.startswith('hub-') or name == MANAGED_PROFILE or not isinstance(table, dict)
+            or set(table) != {'engine', 'command'} or not isinstance(table['command'], list)
+            or not all(isinstance(part, str) for part in table['command'])):
+        return None
+    command = table['command']
+    if len(command) < 4 or command[-1] != name[4:] or command[-3] != '-c':
+        return None
+    match = EXECUTE_CODE.fullmatch(command[-2])
+    # Only zipapp pins; a checkout/venv source tree is operator-maintained.
+    if not match or '.pyz' not in command[-2]:
+        return None
+    return match.group('managed')
+
+
+def repin_managed_profiles(target):
+    """Point every other generated managed execute() profile at this release.
+
+    Best effort and bounded to the marked block: a failure leaves the file as it
+    was and never fails the update (the Claude pin has its own fenced path).
+    Returns the re-pinned profile names.
+    """
+    path = managed_profile_path()
+    try:
+        archive = target / 'hub.pyz'
+        if not archive.is_file() or not (target / 'bin/python').is_file():
+            return []
+        with path.open('rb') as stream:
+            raw = stream.read(262145)
+        if len(raw) > 262144:
+            return []
+        text = raw.decode()
+        if text.count(MANAGED_BEGIN) != 1 or text.count(MANAGED_END) != 1:
+            return []
+        before, rest = text.split(MANAGED_BEGIN)
+        block, after = rest.split(MANAGED_END)
+        profiles = tomllib.loads(block).get('profiles', {})
+        changed = []
+        for name, table in profiles.items():
+            managed = repinnable_execute_profile(name, table)
+            if managed is None:
+                continue
+            command = release_execute_command(target, name[4:], managed)
+            if command == table['command']:
+                continue
+            old_line = 'command = ' + json.dumps(table['command']) + '\n'
+            heading = '[profiles.' + name + ']\n'
+            start = block.find(heading)
+            index = block.find(old_line, start)
+            if start < 0 or index < 0 or block.find('\n[', start + len(heading), index) >= 0:
+                continue
+            block = block[:index] + 'command = ' + json.dumps(command) + '\n' + block[index + len(old_line):]
+            changed.append(name)
+        if not changed:
+            return []
+        updated = before + MANAGED_BEGIN + block + MANAGED_END + after
+        parsed = tomllib.loads(updated).get('profiles', {})
+        if any(parsed.get(name, {}).get('command') != release_execute_command(
+                target, name[4:], repinnable_execute_profile(name, profiles[name])) for name in changed):
+            return []
+        managed_root = Path(repinnable_execute_profile(changed[0], profiles[changed[0]]))
+        lock = managed_lock(managed_root) if (managed_root / 'reconcile.lock').is_file() else contextlib.nullcontext()
+        with lock:
+            with path.open('rb') as stream:
+                if stream.read(262145) != raw:
+                    return []
+            temporary = path.with_name(path.name + '.hub2-repin')
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(fd, 'wb') as stream:
+                    stream.write(updated.encode())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            sync_directory(path.parent)
+        return changed
+    except (OSError, ValueError, TypeError, KeyError, UnicodeDecodeError, TimeoutError, tomllib.TOMLDecodeError) as exc:
+        print('managed profile re-pin skipped: ' + type(exc).__name__, file=sys.stderr)
+        return []
+
+
 def release_path(releases, name):
     if not isinstance(name, str) or not re.fullmatch(r'[0-9a-f]{40}', name):
         raise ValueError('invalid retained release identity')
@@ -920,6 +1023,7 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
         committed = root / 'retained-switch-committed.json'
         journal.rename(committed)
         commit_repin(root, releases)
+        repin_managed_profiles(target)
         commit_updater(root, releases)
         finish_retained_switch(root, releases, committed)
         return True
@@ -1194,6 +1298,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             repin_managed_claude(target, base_url.rstrip('/'), root,
                                  lambda: release_updater(base, manifest, root))
             commit_repin(root, releases)
+            repin_managed_profiles(target)
             commit_updater(root, releases)
             print('Hub2 release already current: ' + version)
             return
@@ -1291,6 +1396,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         # Release activation and updater publication are committed. If enabling
         # the timer fails, leave that working pair in place for same-version retry.
         commit_repin(root, releases)
+        repin_managed_profiles(target)
         commit_updater(root, releases)
         if install_service and restart:
             enable_service_timer()
