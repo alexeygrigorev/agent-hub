@@ -188,7 +188,7 @@ class Bridge:
         self.executable = shutil.which(executable) or str(Path(executable).resolve(strict=True))
 
     def native(self, *args, input=None, allow_failure=False, timeout=30):
-        result = self.runner([self.executable, *args], input=input, text=True,
+        result = self.runner([self.executable, *args], input=input, text=True, encoding='utf-8', errors='replace',
                              capture_output=True, timeout=timeout, check=False)
         if result.returncode and not allow_failure:
             raise RuntimeError("native_command_failed")
@@ -1375,6 +1375,8 @@ class Bridge:
                     continue
                 phase=str((status or {}).get('phase',(status or {}).get('state',
                     'launching' if row['state']=='launching' else 'missing')))
+                if phase == 'running' and (status or {}).get('worker_alive') is False:
+                    phase = 'missing'
             activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
             if type(activity) is not int:activity=None
             exit_code=native_returncode((status or {}).get('exit') or {}) if phase=='exited' else None

@@ -540,6 +540,16 @@ def validate_first_action(fa_path, start_json, min_mtime):
         return False
 
 
+def native_state_directory(state_dir=None):
+    """Use aplexer's platform default, preserving explicit operator overrides."""
+    configured = state_dir or os.environ.get('APLEXER_STATE_DIR')
+    if configured:
+        return Path(configured).resolve()
+    if sys.platform == 'win32':
+        return Path(os.environ['LOCALAPPDATA']).joinpath('aplexer', 'state').resolve()
+    return Path.home().joinpath('.local', 'state', 'aplexer').resolve()
+
+
 def read_tombstone(native_id, state_dir=None):
     """Bounded explicit read of retired-sessions/<native_id>/tombstone.json.
 
@@ -550,9 +560,7 @@ def read_tombstone(native_id, state_dir=None):
     if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id.strip()):
         return None
     canonical_id = native_id.strip().lower()
-    if state_dir is None:
-        state_dir = os.environ.get("APLEXER_STATE_DIR")
-    base = Path(state_dir).resolve() if state_dir else Path(os.path.expanduser("~/.local/state/aplexer")).resolve()
+    base = native_state_directory(state_dir)
     tombstone_file = base / "retired-sessions" / canonical_id / "tombstone.json"
     try:
         if tombstone_file.is_symlink() or not tombstone_file.is_file():
@@ -712,8 +720,13 @@ class NativeLauncher:
     def __init__(self, configuration, runner=subprocess.run, aplexer="a", journal=None):
         self.config = {**configuration}
         if not self.config.get("private_provider_homes", False):
-            self.config["routes"] = {**LOCAL_ROUTES, **{
-                engine: {**LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get("provider"), {})), **route}
+            defaults = {**LOCAL_ROUTES}
+            if sys.platform == 'win32':
+                # Local Windows enrollment means the user's native login. The
+                # legacy managed profile has a separate, potentially stale home.
+                defaults['codex'] = {'provider': 'codex', 'engine': 'codex'}
+            self.config["routes"] = {**defaults, **{
+                engine: {**defaults.get(engine, defaults.get(route.get("provider"), {})), **route}
                 for engine, route in configuration.get("routes", {}).items()
             }}
         else:
@@ -730,7 +743,7 @@ class NativeLauncher:
             env.pop(key, None)
         if env_overrides:
             env.update(env_overrides)
-        result = self.runner([self.native_binary, *args], input=input, text=True, capture_output=True,
+        result = self.runner([self.native_binary, *args], input=input, text=True, encoding='utf-8', errors='replace', capture_output=True,
                              timeout=timeout, check=False, env=env, cwd=workspace)
         if result.returncode and not allow_failure:
             raise RuntimeError("native_command_failed")
@@ -1191,7 +1204,7 @@ class NativeLauncher:
         if before_dispatch:
             before_dispatch()
         try:
-            result = self.runner(argv, text=True, capture_output=True,
+            result = self.runner(argv, text=True, encoding='utf-8', errors='replace', capture_output=True,
                                  timeout=35, check=False,
                                  env=env, cwd=specification["workspace"])
         except subprocess.TimeoutExpired:
@@ -1420,7 +1433,7 @@ class NativeLauncher:
                     or not re.fullmatch('[0-9a-f]{64}', expected.get('digest', ''))):
                 return None
             manifest = retirement_private_json(Path(workspace)/'.local'/('launch-hub2-'+session+'.json'), 65536)
-            base = Path(self.state_dir) if self.state_dir else Path(os.environ.get('APLEXER_STATE_DIR', str(Path.home()/'.local/state/aplexer')))
+            base = native_state_directory(self.state_dir)
             tombstone = retirement_private_json(base/'retired-sessions'/native_id.lower()/'tombstone.json', TOMBSTONE_ENVELOPE_BYTES)
             tombstone.pop('output', None)
             if len(json.dumps(tombstone, ensure_ascii=True).encode()) > TOMBSTONE_METADATA_BYTES:

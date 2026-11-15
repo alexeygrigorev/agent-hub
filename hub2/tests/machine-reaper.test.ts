@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { MachineDO } from '../src/machine-do.ts';
-import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, isLiveActiveSession } from '../src/session-liveness.ts';
+import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, CLAIMED_WITHOUT_NATIVE_GRACE_MS, isLiveActiveSession } from '../src/session-liveness.ts';
 
 const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','session:report']};
 const header={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(machineActor)};
@@ -1416,6 +1416,21 @@ test('missing native process with stop_unconfirmed becomes terminal failed with 
  assert.equal(reaped[0].body.stopped,false);
  assert.equal(reaped[0].body.unconfirmed,true);
  assert.equal(reaped[0].body.native_id,'native-absent');
+});
+
+test('missing native after startup grace fails with attention without waiting for a stop command',async()=>{
+ const f=fixture(),session='missing-after-start-grace';await startClaimed(f,session,'native-absent');
+ f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000,session);
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+  session_id:session,native_id:'native-absent',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+ }]})).status,200);
+ const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(reap.reaped,1);assert.equal(reap.stop_requested,0);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any).reason,'native_process_absent');
+ assert.equal(f.events.at(-1)?.body.stopped,false);assert.equal(f.events.at(-1)?.body.unconfirmed,true);
+ const again=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(again.reaped,0);
 });
 
 test('reap immediately fails a dead native session that already has a failed stop_unconfirmed command',async()=>{
