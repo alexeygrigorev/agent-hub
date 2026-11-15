@@ -1465,7 +1465,10 @@ test('recurring heartbeats cannot postpone the pending reaper alarm or hide an a
   assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
   assert.equal(f.alarm,due,'a heartbeat must not push the scheduled reaper into the future');
  }
- now=Number(due)+1;await f.machine.alarm();
+ now=Number(due)+1;
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+ assert.equal(f.alarm,due,'an overdue alarm also survives a heartbeat racing the poller');
+ await f.machine.alarm();
  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
  assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any).reason,'native_process_absent');
  assert.equal(f.events.at(-1)?.body.stopped,false);

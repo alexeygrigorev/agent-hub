@@ -76,6 +76,37 @@ function dueAt(dataDir:string):number|null {
  return readSql(dataDir,'SELECT due FROM hub2_alarm WHERE singleton=1')?.due??null;
 }
 
+for(const pending of ['disconnected','outbox'])test(`real Machine alarm rearms ${pending} work beyond the runtime retry lease`,async(t)=>{
+ registerTypeScriptResolveHook();
+ const {MachineDO}=await import('../src/machine-do.ts');
+ let now=Date.now();t.mock.method(Date,'now',()=>now);
+ const name='machine-reaper-rearm-'+pending,f=fixture('MACHINES',name,MachineDO);
+ f.options.env={CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true,revoked:true})})},
+  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({error:'synthetic_retry'},{status:503})})}};
+ const runtime=new Hub2Runtime(f.options);
+ try{
+  const actor={id:'machine:'+name,kind:'machine',resource_id:name,generation:'1',scopes:['machine:heartbeat','session:report']};
+  const beat=await runtime.fetch(new Request('https://test/api/heartbeat',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},
+   body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})}));
+  assert.equal(beat.status,200,await beat.clone().text());
+  const container=runtime.containerOf('MACHINES',name)!,machine=(container as any).instance,storage=machine.ctx.storage;
+  if(pending==='outbox')machine.db.run(`INSERT INTO machine_outbox(id,kind,operation_id,project_id,payload_json,state,attempt,next_action_at,created_at,updated_at)
+   VALUES('retry-fixture','started','op-fixture','project-fixture','{}','pending',0,?,?,?)`,now-1,now,now);
+  await storage.setAlarm(now-1);
+  await container.pollAlarm(now);
+  const next=dueAt(f.dataDir);
+  assert.equal(typeof next,'number','successful handler must retain its own next alarm');
+  assert(Number(next)>now);
+  if(pending==='outbox'){
+   const row=machine.db.one("SELECT attempt,next_action_at FROM machine_outbox WHERE id='retry-fixture'");
+   assert.equal(row.attempt,1);assert.equal(next,row.next_action_at,'outbox retry owns its wake even at the runtime retry timestamp');
+  }else assert(Number(next)>now+1000,'disconnected-host deadline replaces the short runtime lease');
+  await runtime.dispose();
+  const restarted=new Hub2Runtime(f.options);
+  try{assert.equal(dueAt(f.dataDir),next,'rearmed Machine wake survives restart');}finally{await restarted.dispose();}
+ }finally{await runtime.dispose();rmSync(f.dataDir,{recursive:true});}
+});
+
 test('a concurrent rearm while the retry write resolves survives successful delivery',async()=>{
  let storage:any,deliveries=0;
  class Concurrent {

@@ -379,9 +379,9 @@ export class MachineDO {
       JSON.stringify({stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
     await this.reapInactive(false);
     await this.checkHostPresence(now);
-    await this.scheduleNext();
+    await this.scheduleNext(true);
     await this.flushOutbox(now);
-    await this.scheduleNext();
+    await this.scheduleNext(true);
   }
 
   private async heartbeat(request: Request): Promise<Response> {
@@ -1356,7 +1356,7 @@ export class MachineDO {
       VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)`, id, kind, operationId, projectId, JSON.stringify(payload), now+30_000, now, now);
   }
 
-  private async scheduleNext(): Promise<void> {
+  private async scheduleNext(fromAlarm=false): Promise<void> {
     const pending=this.alarmQueue.catch(()=>{}).then(async()=>{
     this.db.alarmOperation();
     const current = await this.ctx.storage.getAlarm();
@@ -1374,9 +1374,10 @@ export class MachineDO {
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
     )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,presenceDue,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
-      // Heartbeats recompute the periodic reaper deadline. Preserve an earlier
-      // pending wake; otherwise a connected host can postpone reaping forever.
-      if (current !== next.due && (current === null || current <= Date.now() || next.due < current)) {
+      // Ordinary requests preserve pending wakes, even overdue ones. Only the
+      // handler may replace the runtime's retry lease and own the next wake.
+      // Rearm even an identical timestamp so the runtime retains our revision.
+      if (fromAlarm || (current !== next.due && (current === null || next.due < current))) {
         this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due);
       }
     } else if (current !== null) {
