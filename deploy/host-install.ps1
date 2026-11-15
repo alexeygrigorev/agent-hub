@@ -20,7 +20,7 @@
 # It only ever stops processes whose command line is this Hub2 venv's `serve`,
 # the legacy session-host supervisor/controller loop, or aplexer *shell*
 # sessions tagged hub-controller-*. Codex/Claude/other worker processes and
-# their aplexer sessions are never touched. Nothing is deleted.
+# their aplexer sessions are never touched. Only the throwaway preflight venv is deleted.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -129,6 +129,15 @@ function Resolve-Aplexer {
   throw 'aplexer not found; set HUB2_APLEXER to the native aplexer binary'
 }
 
+function Get-RunningSessions {
+  # `a list --json --running` is a flat array of session records.
+  $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $listing = & $script:Aplexer list --json --running 2>$null } finally { $ErrorActionPreference = $previous }
+  $text = ($listing | Out-String).Trim()
+  if (-not $text) { return @() }
+  return @($text | ConvertFrom-Json)
+}
+
 function Retire-LegacyHost {
   if ($env:HUB2_RETIRE_LEGACY -eq '0') { Write-Step 'legacy retirement skipped (HUB2_RETIRE_LEGACY=0)'; return }
   # Cooperative stop first: the legacy runner/supervisor exit 76 on this marker.
@@ -155,18 +164,29 @@ function Retire-LegacyHost {
   }
   # The supervisor's controller runs as an aplexer shell session tagged
   # hub-controller-*. Stop only those; never codex/claude/other sessions.
-  try {
-    $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $listing = & $script:Aplexer list --json --running 2>$null } finally { $ErrorActionPreference = $previous }
-    foreach ($session in @($listing | ConvertFrom-Json)) {
+  $sessions = @()
+  try { $sessions = @(Get-RunningSessions) } catch { Write-Step "legacy controller session scan failed: $($_.Exception.Message)" }
+  # A controller that cannot be stopped still holds host.lock: that failure is fatal.
+  foreach ($session in $sessions) {
+    if ($true) {
       $tag = if ($session.PSObject.Properties['tag']) { [string]$session.tag } else { '' }
       $engine = if ($session.PSObject.Properties['engine']) { [string]$session.engine } else { '' }
       if ($tag -like 'hub-controller-*' -and $engine -eq 'shell') {
         Write-Step "stopping legacy controller session $($session.id) tag=$tag"
-        Invoke-Native $script:Aplexer @('kill', [string]$session.id) $InstallLog | Out-Null
+        Invoke-Native $script:Aplexer @('kill', [string]$session.id, '--grace-ms', '5000') $InstallLog | Out-Null
+        # The session must really be gone: it holds journal\host.lock. Escalate to
+        # its process tree, and fail the install rather than report success.
+        $alive = @(Get-RunningSessions | Where-Object { $_.id -eq $session.id })
+        if ($alive.Count -gt 0 -and $session.PSObject.Properties['workload_pid'] -and $session.workload_pid) {
+          Write-Step "controller session $($session.id) survived kill; terminating process tree $($session.workload_pid)"
+          Invoke-Native 'taskkill.exe' @('/PID', [string]$session.workload_pid, '/T', '/F') $InstallLog | Out-Null
+          Start-Sleep -Seconds 2
+          $alive = @(Get-RunningSessions | Where-Object { $_.id -eq $session.id })
+        }
+        if ($alive.Count -gt 0) { throw "legacy controller session $($session.id) is still running and holds journal\host.lock" }
       }
     }
-  } catch { Write-Step "legacy controller session scan failed: $($_.Exception.Message)" }
+  }
 }
 
 Write-Step "Hub2 host install from $Base (mode=$(if ($env:HUB2_INSTALL_MODE) { $env:HUB2_INSTALL_MODE } else { 'install' }))"
@@ -186,17 +206,67 @@ Write-Step "verified release $version"
 
 $script:Aplexer = Resolve-Aplexer
 Write-Step "aplexer: $script:Aplexer"
-Stop-Hub2Host
-if (-not (Test-Path -LiteralPath $VenvPython)) {
+function New-Venv([string]$Path, [switch]$Clear) {
   $python = Find-BasePython
-  Write-Step "creating venv with $($python -join ' ')"
+  Write-Step "creating venv $Path with $($python -join ' ')"
   $pythonExe = $python[0]; $pythonArgs = @($python | Select-Object -Skip 1)
-  if ((Invoke-Native $pythonExe (@($pythonArgs) + @('-m', 'venv', $Venv)) $InstallLog) -ne 0) { throw 'venv creation failed' }
+  $venvArgs = @('-m', 'venv') + $(if ($Clear) { @('--clear') } else { @() }) + @($Path)
+  if ((Invoke-Native $pythonExe (@($pythonArgs) + $venvArgs) $InstallLog) -ne 0) { throw 'venv creation failed' }
 }
-$code = Invoke-Native $VenvPython @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--find-links', $download, '--force-reinstall', $wheel) $InstallLog
-if ($code -ne 0) { throw "pip install failed; see $InstallLog" }
-$installed = (& $Hub2 version | ConvertFrom-Json)
-if ($installed.host_version -ne $version) { throw "installed host_version $($installed.host_version) != $version" }
+
+function Test-VenvPip([string]$PythonExe) {
+  # A uv-created venv has no pip; `python -m pip` then exits non-zero.
+  if (-not (Test-Path -LiteralPath $PythonExe)) { return $false }
+  return (Invoke-Native $PythonExe @('-m', 'pip', '--version') $InstallLog) -eq 0
+}
+
+function Initialize-VenvPip([string]$Path) {
+  # ensurepip first; a venv whose interpreter cannot bootstrap pip is recreated.
+  $py = Join-Path $Path 'Scripts\python.exe'
+  if (Test-VenvPip $py) { return }
+  Write-Step "venv $Path has no pip; running ensurepip"
+  if ((Invoke-Native $py @('-m', 'ensurepip', '--upgrade', '--default-pip') $InstallLog) -eq 0 -and (Test-VenvPip $py)) { return }
+  Write-Step "ensurepip failed; recreating venv $Path"
+  New-Venv $Path -Clear
+  if (-not (Test-VenvPip $py)) { throw "venv $Path has no usable pip after recreation; see $InstallLog" }
+}
+
+function Install-Wheel([string]$Path) {
+  Initialize-VenvPip $Path
+  $py = Join-Path $Path 'Scripts\python.exe'
+  $code = Invoke-Native $py @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--find-links', $download, '--force-reinstall', $wheel) $InstallLog
+  if ($code -ne 0) { throw "pip install failed; see $InstallLog" }
+}
+
+# Rehearse the whole install in a throwaway venv BEFORE touching the running
+# daemon: a broken Python/pip/wheel must never leave the desktop disconnected.
+$Preflight = Join-Path $Root ('tmp\preflight-' + $version)
+if (Test-Path -LiteralPath $Preflight) { Remove-Item -LiteralPath $Preflight -Recurse -Force -ErrorAction SilentlyContinue }
+try {
+  New-Venv $Preflight
+  Install-Wheel $Preflight
+  $probe = (& (Join-Path $Preflight 'Scripts\hub2.exe') version | ConvertFrom-Json)
+  if ($probe.host_version -ne $version) { throw "preflight host_version $($probe.host_version) != $version" }
+  Write-Step 'preflight install succeeded'
+} finally {
+  Remove-Item -LiteralPath $Preflight -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$serveWasRunning = @(Get-ServeProcesses).Count -gt 0
+Stop-Hub2Host
+try {
+  if (-not (Test-Path -LiteralPath $VenvPython)) { New-Venv $Venv }
+  Install-Wheel $Venv
+  $installed = (& $Hub2 version | ConvertFrom-Json)
+  if ($installed.host_version -ne $version) { throw "installed host_version $($installed.host_version) != $version" }
+} catch {
+  Write-Step "install failed after serve was stopped: $($_.Exception.Message)"
+  if ($serveWasRunning -and (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+    Write-Step "restarting $TaskName"
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  }
+  throw
+}
 Copy-Item -LiteralPath $installer -Destination $SavedInstaller -Force
 Write-Step "installed host_version=$version"
 
