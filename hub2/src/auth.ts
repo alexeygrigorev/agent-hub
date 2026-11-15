@@ -246,13 +246,17 @@ export function verifyKnownCredential(row: any, env: AuthEnv): Actor | undefined
     const allowed = [
       'intake:read',
       'intake:append',
+      'intake:create',
+      'session:start',
+      'routing:read',
       'claim:read',
       'claim:write',
       'message:read',
       'message:send',
       'mailbox:' + row.actor_id,
     ];
-    if (scopes.some((scope) => !allowed.includes(scope))) return;
+    if (scopes.some((scope) => !allowed.includes(scope)
+      && !(scope.startsWith('worker_project:') && scope.length > 15 && scope.length <= 195))) return;
   } else if (
     typeof row.principal_email !== 'string' ||
     !allowlisted(env, row.principal_email) ||

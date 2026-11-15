@@ -11,7 +11,7 @@ import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { credentialKey, openCredential, sealCredential } from './credential-crypto';
-import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
+import { actorFrom, bodyObject, boundedString, boundedText, error, forbiddenScope, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
 import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from './claude-oauth';
@@ -1168,8 +1168,11 @@ export class ControlDO {
 
   private showRepo(request: Request, name: string): Response {
     const actor = actorFrom(request);
-    if (!hasScope(actor, 'repos:read') && !hasScope(actor, 'operator:admin')) return error('forbidden', 403);
     const canonical = this.resolveRepoName(name);
+    const hasWorkerProject = !!canonical && hasScope(actor, 'worker_project:' + canonical);
+    if (!hasScope(actor, 'repos:read') && !hasScope(actor, 'operator:admin') && !hasWorkerProject) {
+      return forbiddenScope('repos:read', 'grant repos:read or operator:admin to read repository metadata');
+    }
     if (!canonical) return error('repo_not_found', 404);
     const row = this.db.one<Record<string, unknown>>(
       'SELECT canonical_name, canonical_url, purpose, status, duplicate_of, domains_json, metadata_json, updated_at FROM repos WHERE canonical_name = ?', canonical,
@@ -1372,7 +1375,7 @@ export class ControlDO {
     const match=new URL(request.url).pathname.match(/^\/api\/routes\/(intake|session|message|schedule)\/([^/]+)$/);if(!match)return error('not_found',404);
     const kind=match[1],value=decodeURIComponent(match[2]);if(!boundedString(value,180))return error('invalid_route_id',400);
     type Route={id:string;owner:string;resource_id:string;bound_intake_id:string|null};
-    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||hasScope(actor,'routing:read');
+    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||(actor.kind!=='agent'&&hasScope(actor,'routing:read'));
     const bound=(r:Route)=>kind!=='message'&&hasScope(actor,'intake:read')&&((kind==='intake'&&actor.resource_id===r.id)||(kind==='session'&&!!r.bound_intake_id&&actor.resource_id===r.bound_intake_id)||hasScope(actor,'project:'+r.resource_id));
     const exact=this.db.one<Route>('SELECT '+columns+' FROM object_routes WHERE kind=? AND id=?',kind,value);
     if(exact){if(!admin&&!bound(exact)&&!this.db.one('SELECT id FROM route_acl WHERE actor_id=? AND kind=? AND id=?',actor.id,kind,exact.id))return error('route_not_found',404);return json({route:{kind,...exact}});}
@@ -1392,7 +1395,7 @@ export class ControlDO {
   }
 
   private directory(request:Request):Response{
-    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'routing:read')&&!hasScope(actor,'directory:read'))return error('forbidden',403);
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'routing:read')&&!hasScope(actor,'directory:read'))return forbiddenScope('routing:read','grant routing:read, directory:read, or operator:admin');
     const q=new URL(request.url).searchParams,kind=q.get('kind')||'agents',after=q.get('after')||'',limit=Number(q.get('limit')||25);
     if(!['agents','machines'].includes(kind)||!Number.isInteger(limit)||limit<1||limit>50||after.length>180)return error('invalid_directory_query',400);
     const rows=kind==='agents'?this.db.all<{id:string}>('SELECT id,display_name FROM named_agents WHERE enabled=1 AND id>? ORDER BY id LIMIT ?',after,limit+1)

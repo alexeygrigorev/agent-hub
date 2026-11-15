@@ -15,6 +15,11 @@ export function error(code: string, status: number, detail?: string): Response {
   return json(detail ? { error: code, detail } : { error: code }, status);
 }
 
+export function forbiddenScope(scope: string, hint?: string): Response {
+  const detail = hint ? `missing scope ${scope}; ${hint}` : `missing scope ${scope}`;
+  return json({ error: 'forbidden', missing_scope: scope, detail }, 403);
+}
+
 export async function bodyObject(request: Request, limit = 16_384): Promise<JsonRecord> {
   const raw = await boundedText(request, limit);
   let parsed: unknown;

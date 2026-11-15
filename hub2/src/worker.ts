@@ -1,7 +1,7 @@
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
-import { bodyObject, boundedText, error, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
+import { bodyObject, boundedText, error, forbiddenScope, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './model-picker';
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
@@ -255,7 +255,8 @@ const router = {
           const response = await control.fetch(await forwardRequest(new Request(request.url, {headers:request.headers}), CONTROL+'/api/routes/intake/'+encodeURIComponent(actor.resource_id), actor));
           if (!response.ok) return response;
           const {route} = await response.json() as {route:{owner:string}};
-          if (requested && requested !== route.owner) return error('project_forbidden',403);
+          if (requested && requested !== route.owner)
+            return json({ error: 'project_forbidden', missing_scope: `project:${requested}`, detail: `session is scoped to project ${route.owner}; missing scope project:${requested} or operator:admin` }, 403);
           url.searchParams.set('project',route.owner);
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
           const relation = await relationForward(request, env, control, actor, internalPath);
@@ -692,7 +693,8 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
  * Every refusal names a reason; nothing here waits on a machine.
  */
 async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor) && !actor.scopes.includes('session:start')) return error('forbidden', 403);
+  if (!admin(actor) && !hasScope(actor, 'session:start'))
+    return forbiddenScope('session:start', 'grant session:start or operator:admin to start sessions');
   let body: JsonRecord;
   try {
     const parsed = JSON.parse(await boundedText(request, 32_768));
@@ -749,6 +751,10 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     const items = list.ok ? ((await list.json()) as { items?: { canonical_name: string }[] }).items ?? [] : [];
     if (items.length !== 1) return error('project_required', 400, 'pass --repo owner/name (no unique default project)');
     project = items[0].canonical_name;
+  }
+  if (actor.kind === 'agent' && actor.id.startsWith('session:') && !admin(actor)
+    && !hasScope(actor, `project:${project}`) && !hasScope(actor, `worker_project:${project}`)) {
+    return forbiddenScope(`project:${project}`, `session is scoped to its own project; grant project:${project} or operator:admin`);
   }
   const repoResponse = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
   let repoBody = repoResponse;
@@ -949,7 +955,8 @@ async function ownMachineConnection(env: Hub2Env, actor: Actor): Promise<Respons
 
 /** `hub routing-machines`: registered host routing information. */
 async function routingMachines(env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor)) return error('forbidden', 403);
+  if (!admin(actor) && !hasScope(actor, 'routing:read'))
+    return forbiddenScope('routing:read', 'grant routing:read or operator:admin to read fleet routing machines');
   const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
   const ids:string[]=[];let after='';
   do{
