@@ -575,7 +575,7 @@ def materialize(root, account, provider, generation, files, model, timeout_secon
                     'model': model, 'source': source, 'credential_hash': digest,
                     'files': {name: fingerprint(value) for name, value in content.items()}, **bounds}
         fd = os.open(staging / 'manifest.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf8') as stream:
             json.dump(metadata, stream)
             stream.flush()
             os.fsync(stream.fileno())

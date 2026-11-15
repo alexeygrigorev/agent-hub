@@ -1392,3 +1392,50 @@ test('finishWithoutDispatch surfaces attention and events on sessions show and e
  const eventsBody=(await eventsRes.json() as any);
  assert.ok(eventsBody.events.some((e:any)=>e.kind==='attention'&&e.reason==='native_launch_route_missing'));
 });
+
+test('missing native process with stop_unconfirmed becomes terminal failed with attention and reaped event',async()=>{
+ const f=fixture(),session='missing-stop-unconfirmed',epoch=await startClaimed(f,session,'native-absent');
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+  session_id:session,native_id:'native-absent',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+ }]})).status,200);
+ const dry=await f.call('/_internal/reap','POST',{dry_run:true});
+ assert((await dry.json() as any).candidates.some((c:any)=>c.session_id===session&&c.reason==='dead'));
+ const reap1=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(reap1.stop_requested,1);assert.equal(reap1.reaped,0);
+ const cmd=f.database.prepare("SELECT id FROM session_commands WHERE session_id=? AND kind='stop' AND state='pending'").get(session) as any;
+ assert(cmd);
+ const ack=await f.call(`/api/sessions/${session}/commands/${cmd.id}/ack`,'POST',{
+  epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'},
+ });
+ assert.equal(ack.status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any)?.reason,'native_process_absent');
+ const reaped=f.events.filter(e=>e.path==='/_internal/reaped');
+ assert.equal(reaped.length,1);
+ assert.equal(reaped[0].body.reason,'native_process_absent');
+ assert.equal(reaped[0].body.stopped,false);
+ assert.equal(reaped[0].body.unconfirmed,true);
+ assert.equal(reaped[0].body.native_id,'native-absent');
+});
+
+test('reap immediately fails a dead native session that already has a failed stop_unconfirmed command',async()=>{
+ const f=fixture(),session='already-unconfirmed-stop',epoch=await startClaimed(f,session,'native-gone');
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const queued=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'prior-stop',kind:'stop'},actor);
+ assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
+ assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+  epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'},
+ })).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+  session_id:session,native_id:'native-gone',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+ }]})).status,200);
+ const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(reap.reaped,1);assert.equal(reap.stop_requested,0);
+ assert.equal(reap.actions[0].action,'marked_failed');assert.equal(reap.actions[0].reason,'native_process_absent');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any)?.reason,'native_process_absent');
+ assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
+ assert.equal(f.events.at(-1)?.body.reason,'native_process_absent');
+});
