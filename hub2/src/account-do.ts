@@ -178,7 +178,9 @@ export class AccountDO {
  }
  private canReadQuota(a:Actor|undefined):boolean{return hasScope(a,'quota:read')||hasScope(a,'operator:admin')||!!(a?.kind==='machine'&&a.resource_id&&this.db.one('SELECT id FROM approved_hosts WHERE id=?',a.resource_id));}
  private view(a:Actor|undefined):Response{
-  if(!this.canReadQuota(a))return error('forbidden',403);
+  // A host enrolled for central provider homes but missing from this account's
+  // approved_hosts gets a typed refusal (intake 41ef7048), not a bare forbidden.
+  if(!this.canReadQuota(a))return a?.kind==='machine'?error('host_not_approved',403):error('forbidden',403);
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
   return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
  }

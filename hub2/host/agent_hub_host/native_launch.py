@@ -7,6 +7,7 @@ external Agent Quota Launcher remains untouched for its other consumers.
 import hashlib
 import json
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -147,6 +148,20 @@ def _valid_codex_wrapper_body(text):
     if not exec_match or '..' in Path(exec_match.group(1)).parts:
         return False
     return True
+
+
+def resolve_windows_program(program, environ=None):
+    """Absolute path of a bare engine name on Windows (PATH x PATHEXT).
+
+    Windows npm installs expose only claude/claude.cmd shims; an engine spawned
+    by bare name from a process that resolves .exe alone dies "program not
+    found" (exit 127). Anything that is not a bare name, or is not found, is
+    returned unchanged. Other platforms never rewrite."""
+    if os.name != 'nt' or not isinstance(program, str) or not program or any(c in program for c in '/\\:'):
+        return program
+    environ = os.environ if environ is None else environ
+    found = shutil.which(program, path=environ.get('PATH'))
+    return found if found and ntpath.isabs(found) else program
 
 
 def codex_launch_wrapper(environ=None, home=None):
@@ -870,21 +885,60 @@ class NativeLauncher:
         result = {"shell": {"headless"}}
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
-            supported = PROVIDER_CAPABILITIES.get(provider, set())
+            supported = set(PROVIDER_CAPABILITIES.get(provider, set()))
             available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
             if self.config.get('private_provider_homes') and provider == 'claude':
                 available = provider_home.claude_install_available()
             if provider == 'codex':
                 # Advertise Codex only when the maintained quota wrapper (and,
                 # for a profile route, the maintained profile name) is usable.
-                try:
-                    codex_launch_wrapper()
-                    available = route.get('profile') in (None, CODEX_WRAPPER_PROFILE)
-                except ValueError:
-                    available = False
+                available = self._codex_advertisable(route)
+                if not available and self._codex_withdrawn_reason == 'profile_release_mismatch':
+                    supported.discard('headless')
+                    available = bool(supported)
             if supported and available:
                 result[engine] = set(supported)
         return result
+
+    def _codex_advertisable(self, route):
+        """Check shared wrapper and local headless profile readiness.
+
+        launch() needs the wrapper and, for the local profile path, the
+        release-pinned profile proof. Checking only the wrapper advertised codex
+        on a host whose profile pointed at a stale release, so the picker kept
+        routing headless work there (intake f88ae417). Profile failure removes
+        only headless support; interactive work uses the direct wrapper path.
+        Report a fixed diagnostic once per change of reason."""
+        reason = None
+        if os.name == 'nt':
+            # Windows hosts have no maintained quota wrapper or release-pinned
+            # profile: the installed Codex CLI with its own login is the route.
+            return bool(shutil.which(PROVIDER_BINARIES['codex']))
+        try:
+            wrapper = str(codex_launch_wrapper())
+        except ValueError:
+            reason = 'wrapper'
+        else:
+            if route.get('profile') not in (None, CODEX_WRAPPER_PROFILE):
+                reason = 'profile_name'
+            elif (not self.config.get('private_provider_homes', False)
+                  and route.get('profile') == CODEX_WRAPPER_PROFILE):
+                now = time.monotonic()
+                cached = getattr(self, '_codex_ready_cache', None)
+                if cached is None or now - cached[0] > 30 or cached[1] != wrapper:
+                    cached = (now, wrapper, bool(self.codex_exec_readiness(route, wrapper)))
+                    self._codex_ready_cache = cached
+                if not cached[2]:
+                    reason = 'profile_release_mismatch'
+        if getattr(self, '_codex_withdrawn_reason', None) != reason:
+            self._codex_withdrawn_reason = reason
+            if reason:
+                affected = 'headless capability withdrawn; interactive remains available' if reason == 'profile_release_mismatch' else 'all codex capabilities withdrawn'
+                print('ALERT hub2-host: codex_launch_wrapper_unavailable (%s): %s' % (reason, affected),
+                      file=sys.stderr, flush=True)
+            else:
+                print('RECOVERED hub2-host: codex advertised again', file=sys.stderr, flush=True)
+        return reason is None
 
     def _verified_release(self, release=None):
         """The exact installed release archive; no profile, credential or network probe.
@@ -999,7 +1053,7 @@ class NativeLauncher:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
         codex_wrapper = None
-        if provider == 'codex':
+        if provider == 'codex' and os.name != 'nt':
             # Resolve and verify before anything is written or spawned. The
             # operator-owned path is the only source; no raw SDK fallback.
             try:
@@ -1099,6 +1153,8 @@ class NativeLauncher:
             claude_goal.approve_external_includes(child_env.get('CLAUDE_CONFIG_DIR'), Path(specification['workspace']).resolve())
         tmpdir = Path(child_env["TMPDIR"])
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if child:
+            child = [resolve_windows_program(child[0]), *child[1:]]
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],

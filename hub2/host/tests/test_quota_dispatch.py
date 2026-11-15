@@ -1,0 +1,534 @@
+"""Pure owner-state controls. Fake manager handles are NOT runtime admission."""
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from agent_hub_host import alert_authority as ram, alert_broker as wire
+from agent_hub_host.quota_dispatch import QuotaDispatch
+from agent_hub_host.quota_dispatch_manager import V4QuotaManager
+
+PIN=ram.SourcePin(1,2,'a'*64)
+KEY=ram.ProcessKey(321,55,'11111111-2222-4333-8444-555555555555')
+class FakeManager:
+    def __init__(self):
+        self.source=SimpleNamespace(pin=PIN);self.channel=object();self.alive=True
+        self.lease=SimpleNamespace(process=KEY,channel=self.channel)
+        self.releases=[];self.bad_open=False;self.lost=False
+    def source_current(self,s):
+        if s is not self.source or self.lost:raise ram.Unknown('source_lost')
+    def bind_held(self,s,c,end):
+        if c is not self.channel:raise ram.Unknown('helper_pid_or_channel')
+        return self.lease
+    def lease_current(self,l):
+        if not self.alive or l is not self.lease:raise ram.Unknown('process_lost')
+    def drain_before_open(self,*a):
+        if self.lost:raise ram.Unknown('collector_lost')
+    def exact_open(self,*a):
+        if self.bad_open:raise ram.Unknown('unmatched_open')
+    def release_once(self,*a):self.releases.append(a)
+    def channel_current(self,l,c):
+        if c is not l.channel:raise ram.Unknown('channel_mismatch')
+    def retired(self,l):
+        if self.alive:raise ram.Unknown('not_retired')
+        return 0
+    def barrier(self,*a):
+        if self.lost:raise ram.Unknown('collector_lost')
+    def step(self,*a):pass
+    def close(self):pass
+
+class DispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.clock=0.;self.manager=FakeManager()
+        self.broker=SimpleNamespace(ram=ram.LiveRAM({role:PIN for role in ram.ROLES},wire.checked,now=lambda:100))
+        self.broker.ram.poison(ram.PRODUCERS,'dispatch_unqualified')
+        self.owner=QuotaDispatch(self.broker,self.manager,now=lambda:self.clock)
+        for target in ['socket.socket','subprocess.Popen','subprocess.run','os.pidfd_open','ctypes.CDLL']:
+            p=patch(target,side_effect=AssertionError('runtime forbidden'));p.start();self.addCleanup(p.stop)
+    def start(self):
+        t=self.owner.reserve(self.manager.source)
+        self.assertTrue(self.owner.bind_started(t,self.manager.channel))
+        self.assertTrue(self.owner.source_open(t,object()));self.assertTrue(self.owner.release(t));return t
+    def frame(self,t,seq):
+        return dict(v=1,invocation_id=t.context,parent_id=None,role='quota_monitor',phase=['begin','decision','terminal'][seq],seq=seq,decision='observation' if seq==1 else None,condition='quota_fresh' if seq==1 else None,flags={},recipient_class='none',observer_ok=True)
+    def test_core_math_success_never_clears_constructor_poison_or_grants_coverage(self):
+        t=self.start()
+        for n in range(3):self.assertTrue(self.owner.hook(t,self.manager.channel,self.frame(t,n))['ok'])
+        self.manager.alive=False;self.owner.retire(t)
+        self.assertEqual(self.broker.ram.counts['quota_stale'],{'started':1,'finished':1,'occurrences':0})
+        proof=self.broker.ram.barrier('b'*32,self.owner.barrier)
+        self.assertFalse(proof['complete']);self.assertFalse(proof['ram_consistent'])
+        self.assertEqual(proof['faults']['quota_stale'],'dispatch_unqualified')
+    def test_post_has_no_admission_and_expired_offer_cannot_resurrect(self):
+        offer=self.owner.post(self.manager.source)
+        self.assertFalse(self.broker.ram.active);self.clock=1;self.owner.step()
+        self.assertIsNone(offer.await_owner(now=lambda:self.clock));self.assertFalse(self.broker.ram.active)
+    def test_queued_reservation_uses_original_deadline_not_renewal(self):
+        offer=self.owner.post(self.manager.source);self.clock=.1;self.owner.step()
+        self.assertIs(offer.await_owner(now=lambda:self.clock),offer.ticket)
+        self.assertEqual(offer.ticket.deadline,.15)
+        self.clock=.16;self.assertFalse(self.owner.bind_started(offer.ticket,self.manager.channel))
+    def test_pre_hook_exit_and_later_good_math_do_not_heal(self):
+        t=self.owner.reserve(self.manager.source);self.owner.bind_started(t,self.manager.channel)
+        self.manager.alive=False;self.owner.retire(t)
+        self.assertEqual(self.broker.ram.counts['quota_stale']['finished'],0)
+        self.assertEqual(t.fault,'missing_terminal')
+        self.manager.alive=True;u=self.start()
+        self.assertIsNotNone(self.broker.ram.faults['quota_stale']);self.assertFalse(self.broker.ram.barrier('c'*32,lambda:True)['complete'])
+    def test_open_before_binding_wrong_open_and_read_without_reservation_refuse(self):
+        t=self.owner.reserve(self.manager.source);self.assertFalse(self.owner.source_open(t,object()))
+        self.assertFalse(self.owner.release(t));self.assertEqual(len(self.manager.releases),1)
+        self.owner.unmatched_open();self.assertFalse(self.broker.ram.active)
+    def test_helper_or_other_channel_never_substitutes_business_peer(self):
+        t=self.owner.reserve(self.manager.source);self.assertFalse(self.owner.bind_started(t,object()))
+        self.assertFalse(self.broker.ram.active)
+        u=self.start();self.assertFalse(self.owner.hook(u,object(),self.frame(u,0))['ok'])
+        self.assertFalse(self.owner.hook(u,self.manager.channel,self.frame(u,0))['ok'])
+    def test_replay_and_observer_false_are_sticky(self):
+        t=self.start();frame=self.frame(t,0)
+        self.assertTrue(self.owner.hook(t,self.manager.channel,frame)['ok'])
+        self.assertFalse(self.owner.hook(t,self.manager.channel,frame)['ok'])
+        self.assertFalse(self.owner.hook(t,self.manager.channel,self.frame(t,1))['ok'])
+        self.assertEqual(self.broker.ram.counts['quota_stale']['occurrences'],0)
+    def test_terminal_is_not_retirement_and_loss_never_finishes(self):
+        t=self.start()
+        for n in range(3):self.owner.hook(t,self.manager.channel,self.frame(t,n))
+        self.owner.retire(t);self.assertEqual(self.broker.ram.counts['quota_stale']['finished'],0)
+        self.assertEqual(t.fault,'missing_terminal')
+    def test_public_bound_context_is_refused_without_calling_hook(self):
+        t=self.start();reply=self.owner.public_hook(t.context)
+        self.assertIs(reply['ok'],False);self.assertFalse(self.owner.hook(t,self.manager.channel,self.frame(t,0))['ok'])
+    def test_owner_thread_and_capacity_loss_cannot_be_reset(self):
+        with patch('agent_hub_host.quota_dispatch.threading.get_ident',return_value=-1):
+            with self.assertRaises(ram.Unknown):self.owner.reserve(self.manager.source)
+        self.assertEqual(self.broker.ram.faults['quota_stale'],'dispatch_unqualified')
+    def test_real_manager_rejects_serialized_proof_without_os_calls(self):
+        with self.assertRaises(ram.Unknown):V4QuotaManager({'proof':True},None,[])
+    def test_bootstrap_business_once_and_exact_error_identity(self):
+        root=Path(__file__).resolve().parents[3]
+        spec=importlib.util.spec_from_file_location('quota_bootstrap',root/'scripts/qualified-quota-bootstrap.py')
+        m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        calls=[];original=KeyboardInterrupt()
+        def business(*a,**k):calls.append(1);raise original
+        with self.assertRaises(KeyboardInterrupt) as caught:m.run_once(SimpleNamespace(main=business),[],None)
+        self.assertIs(caught.exception,original);self.assertEqual(calls,[1])
+        self.assertEqual(m.FALLBACK_QUOTA,(root/'scripts/hub-quota-publish.py').read_bytes())
+
+    def test_observer_false_and_late_health_cannot_heal_session(self):
+        t=self.start();frame=self.frame(t,0);frame['observer_ok']=False
+        self.assertFalse(self.owner.hook(t,self.manager.channel,frame)['ok'])
+        frame['observer_ok']=True
+        self.assertFalse(self.owner.hook(t,self.manager.channel,frame)['ok'])
+    def test_queue_capacity_refuses_evidence_not_original_business(self):
+        for _ in range(ram.MAX_ACTIVE): self.owner.post(self.manager.source)
+        extra=self.owner.post(self.manager.source)
+        self.assertIsNone(extra.await_owner(now=lambda:self.clock))
+        self.assertTrue(self.owner.pending_loss.is_set());self.assertFalse(self.broker.ram.active)
+    def test_close_latches_interrupt_but_still_closes_manager_once(self):
+        t=self.owner.reserve(self.manager.source);original=KeyboardInterrupt();closed=[]
+        def release(*a):raise original
+        self.manager.release_once=release;self.manager.close=lambda:closed.append(1)
+        with self.assertRaises(KeyboardInterrupt) as caught:self.owner.close()
+        self.assertIs(caught.exception,original);self.assertEqual(closed,[1])
+
+
+class IncrementalManagerTests(unittest.TestCase):
+    """Pure owner-loop scheduler/transport controls; NO thread or IO created."""
+    def setUp(self):
+        from agent_hub_host import quota_dispatch_manager as mod
+        self.mod=mod;self.clock=0.;self.failures=[];self.releases=[];self.sent=[]
+        self.channel=SimpleNamespace(setblocking=lambda flag:None,send=lambda raw:self.sent.append(raw) or len(raw),close=lambda:None)
+        self.probe=SimpleNamespace(poll=lambda:None,submit=lambda *a:None,close=lambda:None)
+        self.collector=SimpleNamespace(epoch='epoch',fault=None)
+        self.ticket=SimpleNamespace(deadline=.15,released=True,context='a'*32,lease=SimpleNamespace(pidfd=4),terminal=False)
+        self.owner=SimpleNamespace(active={'ticket':self.ticket},fail=lambda t:self.failures.append(t),release=lambda t:self.releases.append(t) or True,
+            hook=lambda t,c,f:{'ok':True,'seq':f['seq']},retire=lambda t:None)
+        m=object.__new__(mod.V4QuotaManager);self.m=m
+        m.now=lambda:self.clock;m.p=SimpleNamespace(service_deadline=10.,poll_held=lambda:None)
+        m.phase='exit_poll';m.closed=False;m.handled=False;m.collector=self.collector;m.ticket=self.ticket
+        m.lease=self.ticket.lease;m.pending_channel=self.channel;m.probe=self.probe;m.probe_token=None
+        m.barriers=SimpleNamespace(close=lambda:None);m.frame_deadline=.15;m.frame_seq=0;m.outbound=None
+        m.channel_eof=False;m.last_hook_ok=False
+        def pending(*a):raise BlockingIOError()
+        self.channel.recvmsg=pending
+        def hook(ticket,channel,frame):
+            if frame.get('phase')=='terminal':ticket.terminal=True
+            return {'ok':True,'seq':frame['seq']}
+        self.owner.hook=hook
+        m.stable=SimpleNamespace(alive=lambda fd:True);m.observation=SimpleNamespace(records=[{}],unknown=False)
+        m.fan=SimpleNamespace(drain=lambda *a:None);m.group=3
+        for target in ['socket.socket','subprocess.Popen','subprocess.run','os.pidfd_open','ctypes.CDLL','threading.Thread.start']:
+            q=patch(target,side_effect=AssertionError('runtime forbidden'));q.start();self.addCleanup(q.stop)
+    def test_waiting_exit_yields_every_turn_without_sleep_or_clock_advance(self):
+        served=[]
+        with patch('time.sleep',side_effect=AssertionError('owner sleep')):
+            for _ in range(100):self.m.step(self.owner);served.append('observer-client')
+        self.assertEqual(len(served),100);self.assertEqual(self.clock,0.)
+        self.assertEqual(self.m.phase,'exit_poll');self.assertEqual(self.failures,[])
+    def test_hook_arrival_after_slow_business_uses_service_lifetime_not_old_ack_deadline(self):
+        self.clock=2.;self.m.phase='hook_receive';seen=[]
+        self.m.packet=lambda deadline:seen.append(deadline)
+        for _ in range(20):self.m.step(self.owner)
+        self.assertEqual(seen,[10.]*20);self.assertEqual(self.m.phase,'hook_receive')
+        self.assertEqual(self.m.frame_deadline,.15);self.assertEqual(self.failures,[])
+    def test_received_frame_starts_one_ack_budget_and_next_turn_sends(self):
+        import json
+        self.clock=2.;self.m.phase='hook_receive'
+        self.m.packet=lambda deadline:json.dumps({'v':1,'op':'hook','frame':{'seq':0}}).encode()
+        self.m.step(self.owner)
+        self.assertEqual(self.m.phase,'hook_send');self.assertEqual(self.sent,[]);self.assertEqual(self.m.frame_deadline,2.15)
+        self.m.step(self.owner)
+        self.assertEqual(len(self.sent),1);self.assertEqual(self.m.phase,'hook_receive');self.assertEqual(self.clock,2.)
+    def test_three_frames_require_six_distinct_turns_with_clients_between(self):
+        import json
+        self.m.phase='hook_receive';served=[]
+        self.m.packet=lambda deadline:json.dumps({'v':1,'op':'hook','frame':{'seq':self.m.frame_seq,'phase':['begin','decision','terminal'][self.m.frame_seq]}}).encode()
+        for n in range(6):
+            before=len(self.sent);self.m.step(self.owner);served.append(n)
+            self.assertLessEqual(len(self.sent)-before,1)
+        self.assertEqual(served,list(range(6)));self.assertEqual(self.m.phase,'exit_poll');self.assertEqual(len(self.sent),3)
+    def test_accepted_channel_owned_before_any_banner_or_binding_failure(self):
+        calls=[]
+        def bad(flag):raise ValueError('no raw message serialized')
+        self.channel.setblocking=bad;self.m.phase='accept';self.m.pending_channel=None
+        self.m.p.poll_held=lambda:self.channel;self.probe.close=lambda:calls.append('cleanup_requested')
+        self.m.step(self.owner)
+        self.assertIs(self.m.pending_channel,self.channel);self.assertEqual(self.m.phase,'failed')
+        self.assertEqual(calls,['cleanup_requested']);self.assertEqual(len(self.failures),1)
+    def test_pending_probe_yields_and_expiry_discards_late_token_without_healing(self):
+        self.m.phase='bind_poll';self.m.step(self.owner)
+        self.assertEqual(self.m.phase,'bind_poll');self.assertEqual(self.clock,0.)
+        self.clock=.16;self.probe.poll=lambda:self.mod.ProbeResult('bind',value=object())
+        self.m.step(self.owner);self.assertEqual(self.m.phase,'failed')
+        self.m.step(self.owner);self.assertEqual(len(self.failures),1)
+    def test_service_deadline_expires_without_owner_loop_wait(self):
+        self.clock=10.;self.m.step(self.owner)
+        self.assertEqual(self.m.phase,'failed');self.assertEqual(self.clock,10.);self.assertEqual(len(self.failures),1)
+    def test_control_identity_propagates_after_sticky_fault_and_cleanup_request(self):
+        error=KeyboardInterrupt();calls=[]
+        self.m.phase='accept';self.probe.close=lambda:calls.append('closed')
+        def interrupt():raise error
+        self.m.p.poll_held=interrupt
+        with self.assertRaises(KeyboardInterrupt) as caught:self.m.step(self.owner)
+        self.assertIs(caught.exception,error);self.assertEqual(calls,['closed']);self.assertEqual(self.m.phase,'failed')
+    def test_ordered_barrier_sends_once_polls_same_pending_without_waits(self):
+        calls=[]
+        c=SimpleNamespace(pending=None,started=True,fault=None,manager=':1.2',jobs={},
+            wire=SimpleNamespace(send=lambda *a:calls.append(a) or 7),receipt=lambda index:{'stream_index':index})
+        b=self.mod.OrderedBarrier(c,lambda:self.clock);b.begin(.15)
+        for _ in range(20):self.assertIsNone(b.poll())
+        self.assertEqual(len(calls),1);self.assertEqual(self.clock,0.)
+        c.pending['reply']=([],9);self.assertEqual(b.poll(),{'stream_index':9});self.assertIsNone(c.pending)
+    def test_wrong_probe_operation_cannot_be_used_as_binding_fact(self):
+        self.probe.poll=lambda:self.mod.ProbeResult('retire',value=object());self.m.phase='bind_poll'
+        self.m.step(self.owner);self.assertEqual(self.m.phase,'failed');self.assertEqual(len(self.failures),1)
+
+
+class AdapterBoundaryTests(unittest.TestCase):
+    """Actual manager methods with fake stat/socket data, never real FD/IO."""
+    def setUp(self):
+        import hashlib,stat
+        from agent_hub_host import quota_dispatch_manager as mod
+        self.mod=mod;self.clock=0.;self.calls=[]
+        self.info=SimpleNamespace(st_dev=11,st_ino=22,st_mode=stat.S_IFREG|0o400)
+        self.pin=ram.SourcePin(11,22,hashlib.sha256(b'quota').hexdigest())
+        self.held=mod.HeldSourceFD(3,4,'quota.py',b'quota',('stamp',),self.pin)
+        m=object.__new__(mod.V4QuotaManager);self.m=m;m.now=lambda:self.clock
+        m.source=self.held;m.closed=False;m.epoch='epoch';m.collector=SimpleNamespace(epoch='epoch',fault=None)
+        m.p=SimpleNamespace(companions=(self.held,self.held))
+        m.stable=SimpleNamespace(source_stamp=lambda info:('stamp',),checked_source=lambda *a:self.calls.append(a))
+        for target in ['socket.socket','subprocess.Popen','subprocess.run','os.pidfd_open','ctypes.CDLL','threading.Thread.start']:
+            q=patch(target,side_effect=AssertionError('runtime forbidden'));q.start();self.addCleanup(q.stop)
+        for target in ('os.fstat','os.stat'):
+            q=patch(target,return_value=self.info);q.start();self.addCleanup(q.stop)
+    def select(self,pin=None,raw=b'quota'):
+        self.held=self.mod.HeldSourceFD(3,4,'quota.py',raw,('stamp',),pin or self.pin)
+        self.m.source=self.held;self.m.p.companions=(self.held,self.held)
+    def test_live_fd_raw_pin_positive_in_owner_and_worker(self):
+        self.m.source_current(self.held);self.m.full_sources()
+        self.assertEqual(len(self.calls),3)
+    def test_pin_with_wrong_live_fd_device_or_inode_refused_in_owner_and_worker(self):
+        for pin in (ram.SourcePin(99,22,self.pin.sha256),ram.SourcePin(11,99,self.pin.sha256)):
+            self.select(pin)
+            for call in (lambda:self.m.source_current(self.held),self.m.full_sources):
+                with self.assertRaises(ram.Unknown):call()
+    def test_selected_pin_wrong_raw_digest_and_raw_replacement_refused(self):
+        for pin,raw in ((ram.SourcePin(11,22,'f'*64),b'quota'),(self.pin,b'other-source')):
+            self.select(pin,raw)
+            for call in (lambda:self.m.source_current(self.held),self.m.full_sources):
+                with self.assertRaises(ram.Unknown):call()
+    def test_companion_pin_relation_not_exempted(self):
+        bad=self.mod.HeldSourceFD(5,4,'client.py',b'quota',('stamp',),ram.SourcePin(11,99,self.pin.sha256))
+        self.m.p.companions=(self.held,bad)
+        with self.assertRaises(ram.Unknown):self.m.source_current(self.held)
+        with self.assertRaises(ram.Unknown):self.m.full_sources()
+    def test_recvmsg_explicit_zero_ancillary_capacity_and_nonblocking_flag(self):
+        import socket
+        calls=[]
+        self.m.pending_channel=SimpleNamespace(recvmsg=lambda *a:calls.append(a) or (b'packet',[],0,None))
+        self.assertEqual(self.m.packet(.15),b'packet')
+        self.assertEqual(calls,[(2049,0,socket.MSG_DONTWAIT)])
+    def test_control_or_packet_truncation_and_any_ancillary_refused(self):
+        import socket
+        for anc,flags in (([],socket.MSG_CTRUNC),([],socket.MSG_TRUNC),([('synthetic-control',)],0)):
+            self.m.pending_channel=SimpleNamespace(recvmsg=lambda *a:(b'packet',anc,flags,None))
+            with self.assertRaises(ram.Unknown):self.m.packet(.15)
+    def test_nonblocking_empty_and_expired_packet_never_wait_or_read_late(self):
+        calls=[]
+        def pending(*args):calls.append(args);raise BlockingIOError()
+        self.m.pending_channel=SimpleNamespace(recvmsg=pending)
+        self.assertIsNone(self.m.packet(.15));self.clock=.16
+        with self.assertRaises(ram.Unknown):self.m.packet(.15)
+        self.assertEqual(len(calls),1)
+    def test_source_session_constructor_uses_cached_epoch_without_collector_access(self):
+        class Manager:
+            epoch='cached-original-epoch'
+            @property
+            def collector(self):raise AssertionError('worker Collector access')
+        lease=self.mod.SourceSession(Manager(),object(),3,object(),'invocation','cgroup',{})
+        self.assertEqual(lease.epoch,'cached-original-epoch')
+    def test_bootstrap_receiver_has_same_explicit_no_ancillary_contract(self):
+        import socket
+        root=Path(__file__).resolve().parents[3]
+        spec=importlib.util.spec_from_file_location('quota_bootstrap_boundary',root/'scripts/qualified-quota-bootstrap.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        calls=[]
+        with patch.object(module.time,'monotonic',return_value=0),patch.object(module.select,'select',return_value=([object()],[],[])):
+            channel=SimpleNamespace(recvmsg=lambda *a:calls.append(a) or (b'packet',[],0,None))
+            self.assertEqual(module.recv(channel,.15),b'packet');self.assertEqual(calls,[(2049,0,socket.MSG_DONTWAIT)])
+            for anc,flags in (([],socket.MSG_CTRUNC),([],socket.MSG_TRUNC),([('synthetic-control',)],0)):
+                channel.recvmsg=lambda *a:(b'packet',anc,flags,None)
+                with self.assertRaises(RuntimeError):module.recv(channel,.15)
+
+
+class PartialSelectionTests(unittest.TestCase):
+    """Actual constructors/core paths, fake live-FD metadata; no runtime IO."""
+    def setUp(self):
+        import stat,hashlib
+        from agent_hub_host.quota_dispatch_manager import HeldSourceFD
+        self.pin=ram.SourcePin(11,22,hashlib.sha256(b'quota').hexdigest())
+        self.held=HeldSourceFD(3,4,'quota.py',b'quota',('stamp',),self.pin)
+        self.metadata=SimpleNamespace(st_dev=11,st_ino=22,st_mode=stat.S_IFREG|0o400)
+        self.factory=lambda callback:None;self.dispatch=lambda broker:None
+        for target in ['socket.socket','subprocess.Popen','subprocess.run','os.pidfd_open','ctypes.CDLL','threading.Thread.start']:
+            q=patch(target,side_effect=AssertionError('runtime forbidden'));q.start();self.addCleanup(q.stop)
+        q=patch('os.fstat',return_value=self.metadata);q.start();self.addCleanup(q.stop)
+        q=patch('os.getuid',return_value=1000);q.start();self.addCleanup(q.stop)
+    def broker(self):
+        return wire.Broker._selected_quota_attempt('/owned',self.held,collector_factory=self.factory,
+            dispatch_factory=self.dispatch,identity=lambda pid:KEY)
+    def frame(self,role,seq=0):
+        return dict(v=1,invocation_id='a'*32,parent_id=None,role=role,phase='begin' if seq==0 else 'decision' if seq==1 else 'terminal',
+            seq=seq,decision='observation' if seq==1 else None,condition='metadata_only' if seq==1 else None,
+            flags={},recipient_class='none',observer_ok=True)
+    def test_actual_broker_internal_constructor_has_only_real_selected_pin(self):
+        b=self.broker()
+        self.assertEqual(b.ram.pins,{'quota_monitor':self.pin})
+        self.assertEqual(b.ram.unselected,frozenset(ram.ROLES)-{'quota_monitor'})
+        self.assertIs(b.factory,self.factory);self.assertIs(b.dispatch_factory,self.dispatch)
+        self.assertIsNone(b.thread);self.assertIsNone(b.listener);self.assertIsNone(b.collector)
+        self.assertEqual(b.ram.faults,{p:'dispatch_unqualified' for p in ram.PRODUCERS})
+    def test_partial_snapshot_is_explicit_unselected_unknown_never_zero_aggregate(self):
+        b=self.broker();answer=b.request({'v':1,'op':'snapshot','nonce':'b'*32},(321,1000,1000))
+        self.assertFalse(answer['complete']);self.assertFalse(answer['ram_consistent'])
+        self.assertEqual(answer['counts'],{p:None for p in ram.PRODUCERS})
+        self.assertEqual(answer['source_selection'],{r:'SELECTED' if r=='quota_monitor' else 'UNSELECTED' for r in ram.ROLES})
+        self.assertNotIn(None,b.ram.pins.values())
+        for p in ('start_canary','backup'):self.assertIsNone(b.ram.counts[p])
+    def test_all_unselected_roles_reject_admit_open_hook_exit_without_null_matching(self):
+        for role in set(ram.ROLES)-{'quota_monitor'}:
+            b=self.broker()
+            for pin in (None,self.pin):
+                with self.assertRaises(ram.Unknown):b.ram.admit('a'*32,role,None,KEY,pin)
+                self.assertIsNone(b.ram.source_open(role,pin,KEY.pid,KEY))
+            answer=b.request({'v':1,'op':'hook','frame':self.frame(role)},(321,1000,1000))
+            self.assertIs(answer['ok'],False);self.assertEqual(b.ram.active,{})
+            b.ram.process_exit('a'*32,KEY,0)
+            self.assertEqual(b.ram.counts['quota_stale']['started'],0)
+            self.assertEqual(b.ram.faults,{p:'dispatch_unqualified' for p in ram.PRODUCERS})
+    def test_selected_role_math_uses_actual_same_core_and_cannot_heal_unknown(self):
+        b=self.broker();state=b.ram
+        state.admit('a'*32,'quota_monitor',None,KEY,self.pin)
+        state.source_open('quota_monitor',self.pin,KEY.pid,KEY)
+        for seq in range(3):self.assertIs(state.hook(self.frame('quota_monitor',seq),'a'*32,KEY)['ok'],True)
+        state.process_exit('a'*32,KEY,0)
+        self.assertEqual(state.counts['quota_stale'],{'started':1,'finished':1,'occurrences':0})
+        answer=state.barrier('c'*32,lambda:True)
+        self.assertFalse(answer['complete']);self.assertFalse(answer['ram_consistent'])
+        self.assertEqual(answer['counts'],{p:None for p in ram.PRODUCERS})
+        self.assertEqual(state.faults,{p:'dispatch_unqualified' for p in ram.PRODUCERS})
+    def test_missing_null_or_forged_partial_selection_rejected_before_initialization(self):
+        for selected in (None,self.pin,{'source_pin':self.pin}):
+            with self.assertRaises((wire.Refused,ram.Unknown)):
+                wire.Broker._selected_quota_attempt('/owned',selected,collector_factory=self.factory,dispatch_factory=self.dispatch)
+        for pin in (None,{'dev':11,'ino':22,'sha256':self.pin.sha256}):
+            with self.assertRaises(ram.Unknown):ram.LiveRAM._selected_quota_attempt(pin,wire.checked)
+        self.metadata.st_ino=99
+        with self.assertRaises(ram.Unknown):self.broker()
+    def test_default_full_constructor_and_parser_still_reject_partial_input(self):
+        partial={'quota_monitor':self.pin}
+        with self.assertRaises(ram.Unknown):ram.LiveRAM(partial,wire.checked)
+        with self.assertRaises(ram.Unknown):wire.Broker('/owned',partial)
+        fields={'dev':11,'ino':22,'sha256':self.pin.sha256}
+        cfg={'v':1,'enabled':True,'directory':'/owned','source_pins':{'quota_monitor':fields}}
+        self.assertIsNone(wire.configured(cfg));self.assertIsNone(wire.start_optional({'directory':'/owned','source_pins':cfg['source_pins']}))
+    def test_default_full_snapshot_shape_counters_and_firstfault_unchanged(self):
+        full={r:ram.SourcePin(n,n+1,format(n,'064x')) for n,r in enumerate(ram.ROLES,1)}
+        b=wire.Broker('/owned',full,identity=lambda pid:KEY)
+        self.assertEqual(b.ram.unselected,frozenset());self.assertEqual(b.ram.pins,full)
+        answer=b.ram.barrier('d'*32,lambda:True)
+        self.assertNotIn('source_selection',answer)
+        self.assertEqual(answer['counts'],{p:{'started':0,'finished':0,'occurrences':0} for p in ram.PRODUCERS})
+        b.ram.poison(ram.PRODUCERS,'source_replaced')
+        self.assertEqual(b.ram.faults,{p:'dispatch_unqualified' for p in ram.PRODUCERS})
+    def test_partial_invalid_source_and_null_process_do_not_return_attribute_errors(self):
+        state=self.broker().ram
+        for process,pin in ((None,self.pin),(KEY,None)):
+            with self.assertRaises(ram.Unknown):state.admit('a'*32,'quota_monitor',None,process,pin)
+        self.assertIs(state.hook(self.frame('quota_monitor'),'a'*32,None)['ok'],False)
+
+
+class ProducerTerminalProtocolTests(unittest.TestCase):
+    """Actual quota main/check_health/check + real Client, fake effects only."""
+    def setUp(self):
+        import contextlib,copy,io,json
+        from agent_hub_host import quota_dispatch_manager as mod
+        self.mod=mod;self.json=json;self.clock=0.;self.sent=[];self.failures=[];self.probe_closes=[]
+        self.frames=[];self.source_calls=0;self.alerts=0;self.writes=[]
+        self.effects={'health':0,'quota':0};self.store={}
+        root=Path(__file__).resolve().parents[3]
+        def load(name,path):
+            spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+        self.source=load('actual_selected_quota',root/'scripts/hub-quota-publish.py')
+        self.client=load('actual_selected_client',root/'scripts/hub_alert_client.py')
+        for target in ['socket.socket','subprocess.Popen','subprocess.run','os.pidfd_open','ctypes.CDLL','threading.Thread.start','os.open','urllib.request.urlopen']:
+            q=patch(target,side_effect=AssertionError('runtime forbidden'));q.start();self.addCleanup(q.stop)
+        q=patch.object(self.client.time,'monotonic',return_value=0.);q.start();self.addCleanup(q.stop)
+        self.channel=SimpleNamespace(send=lambda raw:self.sent.append(raw) or len(raw),close=lambda:None)
+        def pending(*a):raise BlockingIOError()
+        self.channel.recvmsg=pending
+        fm=FakeManager();fm.channel=self.channel;fm.lease.channel=self.channel;fm.lease.pidfd=4
+        self.fm=fm;self.owner=QuotaDispatch(SimpleNamespace(ram=ram.LiveRAM._selected_quota_attempt(PIN,wire.checked,now=lambda:100)),fm,now=lambda:self.clock)
+        self.ticket=self.owner.reserve(fm.source);self.owner.bind_started(self.ticket,self.channel);self.owner.source_open(self.ticket,object());self.owner.release(self.ticket)
+        m=object.__new__(mod.V4QuotaManager);self.manager=m
+        m.now=lambda:self.clock;m.p=SimpleNamespace(service_deadline=10.);m.phase='hook_receive';m.closed=False;m.ticket=self.ticket
+        m.pending_channel=self.channel;m.frame_seq=0;m.frame_deadline=None;m.outbound=None;m.last_hook_ok=False;m.channel_eof=False
+        m.collector=SimpleNamespace(fault=None);m.barriers=SimpleNamespace(close=lambda:None)
+        m.probe=SimpleNamespace(close=lambda:self.probe_closes.append(1))
+        m.fan=SimpleNamespace(drain=lambda *a:None);m.observation=SimpleNamespace(records=[{}],unknown=False);m.group=3
+        m.lease=fm.lease;m.stable=SimpleNamespace(alive=lambda fd:True)
+    def produce(self,*,health=False,critical=False,health_error=False,health_write_error=False,quota_write_error=False):
+        import contextlib,copy,io
+        source=self.source
+        self.store={'health':{'version':1,'last_sample':0,'failures':1 if critical else 0,'alerted':False},
+            'quota':{'version':1,'accounts':{name:100000 for name in source.ACCOUNTS},'alerted':[]}}
+        @contextlib.contextmanager
+        def locked(path):
+            key='health' if str(path).endswith('health') else 'quota';self.effects[key]+=1;yield None
+        def read_state(path,now):return copy.deepcopy(self.store['quota'])
+        def private_json(path):return copy.deepcopy(self.store['health'])
+        def write_state(path,value):
+            key='health' if str(path).endswith('health') else 'quota';self.writes.append(key)
+            if key=='health' and health_write_error:raise OSError('fixed fake state failure')
+            if key=='quota' and quota_write_error:raise OSError('fixed fake state failure')
+            self.store[key]=copy.deepcopy(value)
+        def sample(args):
+            if health_error:raise source.Failure('fixed_fake_health_error')
+            return {'healthy':not critical,'stage':'ready','reason':'fixed'}
+        def alert(*a,**k):self.alerts+=1;return True
+        def exchange(path,request,*,deadline):
+            self.assertEqual(set(request),{'v','op','frame'});self.assertEqual(request['op'],'hook')
+            frame=wire.checked(request['frame']);self.frames.append(copy.deepcopy(frame))
+            return {'seq':frame['seq'],'ok':True} # Fake ACK only, not admission.
+        self.client.exchange=exchange
+        observer=source.AlertObserver.__new__(source.AlertObserver)
+        observer.child=self.client.Client(None,self.ticket.context,None,'quota_monitor');observer.dirty=False
+        source.locked=locked;source.read_state=read_state;source.private_json=private_json
+        source.write_state=write_state;source.sample_health=sample;source.alert=alert;source.now_ms=lambda:100000
+        args=['--check','--state','/owned/quota','--health-state','/owned/health','--alert-command','/owned/sink','--alert-timeout','8']
+        if health:args+=['--health-check','--health-config','/owned/config','--health-timeout','8']
+        self.source_calls+=1
+        with contextlib.redirect_stdout(io.StringIO()):result=source.main(args,_managed_observer=observer)
+        return result
+    def packet(self,frame):
+        self.manager.packet=lambda deadline:self.json.dumps({'v':1,'op':'hook','frame':frame}).encode()
+        self.manager.step(self.owner);self.assertEqual(self.manager.phase,'hook_send')
+        self.manager.step(self.owner)
+    def normal_source(self,health,expected):
+        self.assertEqual(self.produce(health=health),0)
+        self.assertEqual([f['phase'] for f in self.frames],['begin']+['decision']*(expected-2)+['terminal'])
+        for frame in self.frames:self.packet(frame)
+        self.assertEqual(self.manager.phase,'exit_poll');self.assertTrue(self.ticket.terminal)
+        self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+        self.assertEqual(self.source_calls,1);self.assertEqual(self.effects['quota'],1)
+    def test_real_nohealth_three_frames_reach_terminal_not_retirement(self):self.normal_source(False,3)
+    def test_real_health_four_frames_reach_terminal_not_retirement(self):self.normal_source(True,4)
+    def test_real_health_critical_then_quota_healthy_never_clears_first_occurrence_or_health_state(self):
+        self.assertEqual(self.produce(health=True,critical=True),2)
+        self.assertEqual([(f['decision'],f['condition']) for f in self.frames if f['phase']=='decision'],
+            [('alert','health_critical'),('observation','quota_fresh')])
+        for frame in self.frames:
+            self.packet(frame)
+            if frame['seq'] in (1,2):self.assertEqual(self.owner.ram.counts['quota_stale']['occurrences'],1)
+        self.assertTrue(self.store['health']['alerted']);self.assertEqual(self.store['quota']['alerted'],[])
+        self.assertEqual(self.alerts,1);self.assertEqual(self.manager.phase,'exit_poll')
+        self.assertEqual(self.owner.ram.faults['quota_stale'],'dispatch_unqualified')
+    def test_real_health_error_four_frames_remain_unknown_without_business_retry(self):
+        self.assertEqual(self.produce(health=True,health_error=True),2);self.assertEqual(len(self.frames),4)
+        self.assertEqual(self.frames[1]['condition'],'error');self.assertFalse(self.frames[1]['observer_ok'])
+        self.packet(self.frames[0]);self.packet(self.frames[1])
+        self.assertEqual(self.manager.phase,'failed');self.assertIsNotNone(self.ticket.fault)
+        self.assertEqual(self.source_calls,1);self.assertEqual(self.effects,{'health':1,'quota':1})
+    def test_actual_late_error_branches_prove_six_frame_upper_bound_not_magic_four(self):
+        self.assertEqual(self.produce(health=True,health_write_error=True,quota_write_error=True),2)
+        self.assertEqual(len(self.frames),6);self.assertEqual(self.mod.MAX_QUOTA_MONITOR_FRAMES,6)
+        self.assertEqual([f['phase'] for f in self.frames],['begin','decision','decision','decision','decision','terminal'])
+        self.assertEqual([f['seq'] for f in self.frames],list(range(6)));self.assertEqual(self.source_calls,1)
+        self.assertFalse(self.frames[2]['observer_ok']);self.assertEqual(self.effects,{'health':1,'quota':1})
+        self.assertEqual(self.alerts,1)
+    def test_replay_and_early_terminal_get_negative_ack_and_sticky_failure(self):
+        self.produce(health=True);self.packet(self.frames[0]);self.packet(self.frames[0])
+        self.assertEqual(self.manager.phase,'failed');self.assertFalse(self.json.loads(self.sent[-1])['ok'])
+        self.assertFalse(self.ticket.terminal);self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+    def test_early_terminal_without_decision_is_not_a_terminal_proof(self):
+        self.produce();self.packet(self.frames[0]);early=dict(self.frames[-1],seq=1);self.packet(early)
+        self.assertEqual(self.manager.phase,'failed');self.assertFalse(self.ticket.terminal)
+    def test_wait_between_decisions_is_business_lifetime_but_ack_still_one150ms_budget(self):
+        self.produce(health=True);self.packet(self.frames[0]);self.packet(self.frames[1]);self.clock=1.
+        self.manager.packet=lambda deadline:None;self.manager.step(self.owner);self.assertEqual(self.manager.phase,'hook_receive')
+        self.packet(self.frames[2]);self.assertEqual(self.manager.frame_deadline,1.15)
+        self.manager.packet=lambda deadline:self.json.dumps({'v':1,'op':'hook','frame':self.frames[3]}).encode()
+        self.manager.step(self.owner);self.clock=1.16;self.manager.step(self.owner)
+        self.assertEqual(self.manager.phase,'failed');self.assertEqual(self.source_calls,1)
+    def test_postterminal_packet_is_refused_while_pidfd_alive_and_eof_is_not_retirement(self):
+        self.produce();
+        for frame in self.frames:self.packet(frame)
+        self.channel.recvmsg=lambda *args:(b'replay',[],0,None)
+        self.manager.step(self.owner);self.assertEqual(self.manager.phase,'failed')
+        self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+    def test_terminal_eof_yields_until_pidfd_exit_without_finished_credit(self):
+        self.produce();
+        for frame in self.frames:self.packet(frame)
+        calls=[];self.channel.recvmsg=lambda *args:calls.append(args) or (b'',[],0,None)
+        self.manager.step(self.owner);self.manager.step(self.owner)
+        self.assertEqual(self.manager.phase,'exit_poll')
+        self.assertEqual(len(calls),2);self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+    def test_absent_terminal_is_bounded_by_service_lifetime_not_an_unbounded_protocol(self):
+        self.produce(health=True)
+        for frame in self.frames[:-1]:self.packet(frame)
+        self.clock=10.;self.manager.step(self.owner)
+        self.assertEqual(self.manager.phase,'failed');self.assertFalse(self.ticket.terminal)
+        self.assertEqual(self.source_calls,1)
+    def test_source_derived_six_frame_cap_refuses_nonterminal_corruption_without_replay(self):
+        self.produce();self.packet(self.frames[0])
+        for seq in range(1,6):self.packet(dict(self.frames[1],seq=seq))
+        self.assertEqual(self.manager.frame_seq,6);self.assertEqual(self.manager.phase,'failed')
+        self.assertFalse(self.ticket.terminal);self.assertEqual(self.source_calls,1)
+        self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+    def test_postterminal_control_truncation_is_unknown_not_closure(self):
+        import socket
+        self.produce()
+        for frame in self.frames:self.packet(frame)
+        self.channel.recvmsg=lambda *args:(b'',[],socket.MSG_CTRUNC,None)
+        self.manager.step(self.owner);self.assertEqual(self.manager.phase,'failed')
+        self.assertEqual(self.source_calls,1);self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)

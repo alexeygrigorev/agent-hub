@@ -13,7 +13,8 @@
 // are observed; cumulative safe-integer counts do not reset. First256 immutable
 // snapshots are retained, then two atomic cumulative checkpoint slots roll
 // forward under this birth only. No old-birth record is overwritten or deleted.
-// Capacity/error remains sticky UNKNOWN and all primary responses continue.
+// Actual loss/error remains sticky UNKNOWN; an owned wait expiry alone does not
+// abandon physical IO or stop accounting. All primary responses continue.
 // journal.json remains the immutable initialized sentinel.
 // Source owners must manage retention only outside an accepted interval.
 // Diagnostic producers are separate opt-ins; the default credential_monitor
@@ -100,8 +101,31 @@ type PersistTimerLateness = 'on_tick'|'delayed'|'unspecified';
 function persistClock():number|undefined{
   try{const value=performance.now();return Number.isFinite(value)&&value>=0?value:undefined;}catch{return undefined;}
 }
-function persistTimerLateness(start:number|undefined,budget:number):PersistTimerLateness{
-  const end=persistClock();
+type WaitBudget = {start:number;last:number;deadline:number;invalid:boolean};
+function waitBudget(start:number|undefined,limit:number):WaitBudget {
+  if(start===undefined||!Number.isFinite(start)||start<0||!Number.isFinite(limit)||limit<=0)
+    throw new Error('observer_clock_unavailable');
+  return {start,last:start,deadline:start+limit,invalid:false};
+}
+function budgetRead(budget:WaitBudget):number {
+  const now=persistClock();
+  if(budget.invalid||now===undefined||now<budget.start||now<budget.last){
+    budget.invalid=true;throw new Error('observer_clock_invalid');
+  }
+  budget.last=now;return now;
+}
+// Diagnostic stage reads also cannot conceal a chronology reversal. They still
+// freeze the original error; the owner refuses authority on an invalid budget.
+function traceClock(trace:PersistTrace|undefined):number|undefined {
+  const now=persistClock(),budget=trace?.waitBudget;
+  if(budget){
+    if(now===undefined||now<budget.start||now<budget.last)budget.invalid=true;
+    else budget.last=now;
+  }
+  return now;
+}
+function persistTimerLateness(start:number|undefined,budget:number,chronology?:WaitBudget):PersistTimerLateness{
+  const end=chronology?budgetRead(chronology):persistClock();
   if(start===undefined||end===undefined||end-start<budget)return 'unspecified';
   // Diagnostic tolerance only, NEVER a timeout extension or cause attribution.
   return end-start<=budget+50?'on_tick':'delayed';
@@ -142,7 +166,7 @@ function completedPhaseFields(value:unknown){
   return frozen===undefined?{}:{unavailable_persist_completed:frozen};
 }
 function persistBudget(trace:PersistTrace):PersistBudget{
-  const now=persistClock(),start=trace.budgetStart,stage=trace.stageStart;
+  const now=traceClock(trace),start=trace.budgetStart,stage=trace.stageStart;
   // These are JS operation-boundary observations, never kernel IO latency.
   // Invalid ordering cannot be projected as a short or successful operation.
   if(start===undefined||stage===undefined||now===undefined||stage<start||now<stage)
@@ -156,16 +180,17 @@ function persistBudgetFields(budget:PersistBudget|undefined){
 function firstPersistFailure(trace:PersistTrace|undefined,stage:EvidencePersistStage,error:unknown,timer?:PersistTimerLateness){
   if(trace&&!trace.first)trace.first={stage,error,budget:persistBudget(trace),completed:freezeCompletedPhases(trace.completed),
     ...(stage==='artifacts'?{artifacts:freezeArtifactProgress(trace.artifacts)}:{}),...(timer?{timer}:{})};
+  trace?.failed?.(error);
 }
 const ownDeadlines = new WeakSet<object>();
-type PersistTrace = { completed?:CompletedPhases; stage: EvidencePersistStage; budgetStart?:number;stageStart?:number;artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;budget?:PersistBudget;completed?:CompletedPhasesSnapshot;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
+type PersistTrace = { waitBudget?:WaitBudget; failed?:(error:unknown)=>void; completed?:CompletedPhases; stage: EvidencePersistStage; budgetStart?:number;stageStart?:number;artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;budget?:PersistBudget;completed?:CompletedPhasesSnapshot;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
 async function persistStep<T>(trace:PersistTrace|undefined,stage:EvidencePersistStage,work:()=>Promise<T>):Promise<T>{
-  if(trace){trace.stage=stage;trace.stageStart=persistClock();}
+  if(trace){trace.stage=stage;trace.stageStart=traceClock(trace);}
   const started=trace?.stageStart;
   try{
     const result=await work();
     if(trace&&COMPLETED_PHASES.includes(stage as CompletedPhase)){
-      const ended=persistClock();
+      const ended=traceClock(trace);
       (trace.completed??={})[stage as CompletedPhase]=persistAge(started===undefined||ended===undefined?undefined:ended-started);
     }
     return result;
@@ -223,8 +248,14 @@ class PrivateStore {
   }
   get directory() { return this.handles[this.handles.length - 1]; }
   name(name: string) { return `/proc/self/fd/${this.directory.fd}/${name}`; }
-  async identity() {
-    const [actual, pinned] = await Promise.all([lstat(this.path), this.directory.stat()]);
+  async identity(trace?:PersistTrace) {
+    const failure=(error:unknown):never=>{
+      firstPersistFailure(trace,trace?.stage??'store_identity',error);throw error;
+    };
+    const rows=await Promise.allSettled([lstat(this.path).catch(failure),this.directory.stat().catch(failure)]);
+    if(rows[0].status==='rejected')throw rows[0].reason;
+    if(rows[1].status==='rejected')throw rows[1].reason;
+    const actual=rows[0].value,pinned=rows[1].value;
     check(actual.isDirectory() && actual.ino === pinned.ino && actual.dev === pinned.dev
       && actual.uid === process.geteuid!() && !(actual.mode & 0o077));
   }
@@ -248,7 +279,7 @@ class PrivateStore {
     this.journalBaseline = canonical(value);
   }
   async write(value: Journal, writer?: SnapshotWriter, trace?: PersistTrace) {
-    await persistStep(trace,'store_identity',()=>this.identity());
+    await persistStep(trace,'store_identity',()=>this.identity(trace));
     await persistStep(trace,'store_sentinel',async()=>check(this.journalBaseline !== undefined
       && canonical(await this.read('journal.json')) === this.journalBaseline));
     if (this.commits.length === PREFIX_SNAPSHOTS) {
@@ -304,7 +335,7 @@ class PrivateStore {
         await persistStep(trace,'checkpoint_sync',()=>handle.sync()); }
     } finally { await persistStep(trace,'checkpoint_close',()=>handle.close()); }
     await persistStep(trace,'checkpoint_publish',async()=>{
-    await this.identity();
+    await this.identity(trace);
     if (previous) {
       check(canonical(await this.read(name)) === previous.bytes);
       await rename(this.name(temporary), this.name(name));
@@ -321,8 +352,8 @@ class PrivateStore {
     this.checkpoints = this.checkpoints.filter(item => item.name !== name);
     this.checkpoints.push({name, bytes, digest: hash(bytes), journal: canonical(value), sequence});
   }
-  async verify(): Promise<string> {
-    await this.identity();
+  async verify(trace?:PersistTrace): Promise<string> {
+    await this.identity(trace);
     check(this.journalBaseline !== undefined
       && canonical(await this.read('journal.json')) === this.journalBaseline);
     for (const record of this.commits)
@@ -338,7 +369,11 @@ class PrivateStore {
         && JSON.parse(this.checkpoints[1].bytes).previous_sha256 === this.checkpoints[0].digest);
     return this.checkpoints.at(-1)?.journal ?? this.commits.at(-1)?.journal ?? this.journalBaseline;
   }
-  async close() { await Promise.all(this.handles.splice(0).map(handle => handle.close())); }
+  async close() {
+    const rows=await Promise.allSettled(this.handles.splice(0).map(handle=>handle.close()));
+    const failed=rows.find((row):row is PromiseRejectedResult=>row.status==='rejected');
+    if(failed)throw failed.reason;
+  }
 }
 
 async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>, trace?:PersistTrace) {
@@ -360,7 +395,7 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
   // rejection; an OUTER timeout still does not cancel underlying IO, as before.
   progress.phase='files';
   for (let index = 0; index < entry.artifacts.length; index += 2) {
-    await Promise.all(entry.artifacts.slice(index, index + 2).map(async (artifact,offset) => {
+    const batch = await Promise.allSettled(entry.artifacts.slice(index, index + 2).map(async (artifact,offset) => {
     const slot=index+offset;
     let handle:FileHandle|undefined;
     progress.slots.set(slot,'open');
@@ -387,6 +422,10 @@ async function verifyArtifacts(entry: Enrollment, loaded: Record<string, string>
     }
     progress.completed++;
     }));
+    // Rejection is latched inside each task immediately. Retain ownership until
+    // EVERY started sibling/finally has settled; never start a later batch.
+    const failed = batch.find((value):value is PromiseRejectedResult=>value.status==='rejected');
+    if(failed)throw failed.reason;
   }
   progress.phase='proof';
   const required = entry.producer === 'credential_monitor' ? requiredArtifacts : diagnosticArtifacts;
@@ -404,7 +443,7 @@ const FAILURE_REASONS = new Set(['invalidated', 'persist_failed', 'capacity_or_c
   'picker_begin_failed', 'picker_finish_failed', 'snapshot_route_timeout', 'snapshot_route_rejected',
   'dry_run_begin_failed', 'dry_run_finish_timeout', 'dry_run_finish_failed']);
 
-/** One live Node incarnation. No clean sample is possible after any observer error. */
+/** One live birth: delayed SUCCESS can catch up; actual coverage loss cannot heal. */
 export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
@@ -414,7 +453,12 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   private active = new Set<number>();
   private requests = 0;
   private queue: Promise<void> = Promise.resolve();
-  private nextSnapshot: Journal | undefined;
+  private nextSnapshot: {journal:Journal;revision:number} | undefined;
+  private revision = 0;
+  private durableRevision = 0;
+  private physical: symbol | undefined;
+  private responseWait: Promise<void> | undefined;
+  private closing: Promise<void> | undefined;
   private constructor(private store: PrivateStore, readonly enrollment: Enrollment, private journal: Journal,
     private writer: SnapshotWriter | undefined, private readonly timeoutMs: number,
     private readonly loaded: Record<string, string>) { this.boot = store.boot; }
@@ -444,109 +488,168 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   }
   invalidate(reason: unknown = 'invalidated') {
     // Keep only a closed first-fault enum; caller errors/paths never become wire data.
-    if (!this.dirty) this.firstFailure = typeof reason === 'string' && FAILURE_REASONS.has(reason) ? reason : 'invalidated';
+    if (this.firstFailure === undefined) this.firstFailure = typeof reason === 'string' && FAILURE_REASONS.has(reason) ? reason : 'invalidated';
     this.dirty = true;
   }
-  private async bounded(work: Promise<void>, trace?:PersistTrace) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timerStart=trace?persistClock():undefined;
-    // A persist operation records its diagnostic origin before eager work.
-    // Keep this separate from timerStart: timer scheduling/lateness is unchanged.
-    if(trace&&trace.budgetStart===undefined)trace.budgetStart=timerStart;
-    try { await Promise.race([work, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        const error=new Error('observer_timeout');ownDeadlines.add(error);
-        if(trace)firstPersistFailure(trace,trace.stage,error,persistTimerLateness(timerStart,this.timeoutMs));
-        reject(error);
-      }, this.timeoutMs);
-    })]); }
-    finally { clearTimeout(timer); }
+  private rememberPersist(trace:PersistTrace,error:unknown) {
+    if(this.firstFailure!==undefined&&this.firstFailure!=='persist_failed'){
+      if(!this.ownDeadline(error))this.invalidate('persist_failed');
+      return;
+    }
+    if(!this.firstPersist){
+      const first=trace.first??{stage:trace.stage,error};
+      this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('budget' in first?{budget:first.budget}:{}),...('completed' in first?{completed:first.completed}:{}),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
+    }
+    this.firstFailure??='persist_failed';
+    if(!this.ownDeadline(error))this.invalidate('persist_failed');
+  }
+  private ownDeadline(error:unknown) {
+    return error!==null&&typeof error==='object'&&ownDeadlines.has(error);
+  }
+  private async bounded<T>(work:Promise<T>,trace?:PersistTrace,start=persistClock(),provided?:WaitBudget):Promise<T> {
+    // Own BOTH outcomes before any clock/deadline branch. Early refusal must
+    // not abandon an already-started cleanup or its original tracked rejection.
+    const observed=work.then(value=>({ok:true as const,value}),error=>({ok:false as const,error}));
+    const budget=provided??waitBudget(start,this.timeoutMs);
+    if(trace){trace.waitBudget=budget;if(trace.budgetStart===undefined)trace.budgetStart=start;}
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    const expired=()=>{
+      budgetRead(budget); // Invalid chronology is NOT an observed own deadline.
+      const error=new Error('observer_timeout');ownDeadlines.add(error);
+      if(trace)firstPersistFailure(trace,trace.stage,error,persistTimerLateness(start,this.timeoutMs,budget));
+      if(budget.invalid)throw new Error('observer_clock_invalid');
+      return error;
+    };
+    try {
+      const remaining=Math.min(this.timeoutMs,budget.deadline-budgetRead(budget));
+      if(remaining<=0)throw expired();
+      const result=await Promise.race([observed,new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>{try{reject(expired());}catch(error){reject(error);}},remaining);
+      })]);
+      if(!result.ok)throw result.error;
+      if(budgetRead(budget)>=budget.deadline)throw expired();
+      return result.value;
+    } finally {if(timer!==undefined)clearTimeout(timer);}
   }
   private persist() {
-    if (this.dirty) return;
-    // This is a cumulative journal, not an event queue. Coalesce only pending
-    // snapshots; every counter/active request remains represented in the latest
-    // state. At most one physical write plus one latest snapshot is retained.
-    this.nextSnapshot = structuredClone(this.journal);
-    if (this.pending) return;
-    this.pending = 1;
-    this.queue = (async () => {
-      const trace:PersistTrace={stage:'artifacts'};
+    if(this.dirty)return;
+    this.nextSnapshot={journal:structuredClone(this.journal),revision:this.revision};
+    this.pump();
+  }
+  private pump() {
+    if(this.dirty||this.physical||!this.nextSnapshot)return;
+    const token=Symbol('publication');this.physical=token;this.pending=1;
+    const start=persistClock();
+    const trace:PersistTrace={stage:'artifacts',budgetStart:start,...(start===undefined?{}:{waitBudget:waitBudget(start,this.timeoutMs)})};
+    trace.failed=error=>this.rememberPersist(trace,error);
+    // queue is the ACTUAL physical lifetime. responseWait is a separate shared
+    // bounded waiter; no per-callback queue or renewed coalesced-write budget.
+    this.queue=(async()=>{
       try {
-        while (this.nextSnapshot && !this.dirty) {
-          const value = this.nextSnapshot;
-          this.nextSnapshot = undefined;
-          // The async argument below starts before bounded() is entered.
-          // Refresh for EACH coalesced write, before its first stage is sampled.
-          trace.budgetStart=persistClock();
-          trace.completed={};
-          await this.bounded((async () => {
-            await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment, this.loaded, trace));
-            await this.store.write(value, this.writer, trace);
-          })(),trace);
+        while(this.nextSnapshot&&!this.dirty){
+          const captured=this.nextSnapshot;this.nextSnapshot=undefined;
+          trace.budgetStart=traceClock(trace);trace.completed={};
+          await persistStep(trace,'artifacts',()=>verifyArtifacts(this.enrollment,this.loaded,trace));
+          if(trace.waitBudget?.invalid)throw new Error('observer_clock_invalid');
+          if(this.dirty)break;
+          await this.store.write(captured.journal,this.writer,trace);
+          check(this.physical===token);
+          if(trace.waitBudget?.invalid)throw new Error('observer_clock_invalid');
+          if(!this.dirty)this.durableRevision=captured.revision;
         }
-      } catch(error) {
-        if(!this.dirty){
-          const first=trace.first??{stage:trace.stage,error};
-          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('budget' in first?{budget:first.budget}:{}),...('completed' in first?{completed:first.completed}:{}),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
-        }
-        this.invalidate('persist_failed');
-      }
+      }catch(error){firstPersistFailure(trace,trace.stage,error);}
       finally {
-        // Clear the busy flag before this async body resolves. A separate
-        // promise.finally would leave a microtask window that could drop a new
-        // cumulative snapshot enqueued after the loop's last condition check.
-        this.pending = 0;
-        this.nextSnapshot = undefined;
+        // This finally is reached only after ALL physical tasks/finalizers.
+        if(this.physical!==token)this.invalidate('persist_failed');
+        else {this.physical=undefined;this.pending=0;}
       }
     })();
+    this.responseWait=this.bounded(this.queue,trace,start,trace.waitBudget).catch(error=>{
+      if(!trace.first)firstPersistFailure(trace,trace.stage,error);
+      else this.rememberPersist(trace,error);
+    });
   }
   begin(): unknown {
-    if (this.dirty || this.active.size >= MAX_ACTIVE || this.journal.started_total >= Number.MAX_SAFE_INTEGER) {
-      this.invalidate('capacity_or_counter_limit'); return null;
+    if(this.dirty||this.active.size>=MAX_ACTIVE||this.journal.started_total>=Number.MAX_SAFE_INTEGER
+      ||this.requests>=Number.MAX_SAFE_INTEGER||this.revision>=Number.MAX_SAFE_INTEGER){
+      this.invalidate('capacity_or_counter_limit');return null;
     }
-    const identity = ++this.requests;
-    this.journal.started_total++;
-    this.active.add(identity);
-    this.persist();
-    return identity;
+    const identity=++this.requests;this.journal.started_total++;this.revision++;
+    this.active.add(identity);this.persist();return identity;
   }
-  async finish(identity: unknown, decision: 'alert' | 'observation' | null) {
-    if (this.dirty) return;
-    if (typeof identity !== 'number' || !this.active.delete(identity)) { this.invalidate('finish_identity_invalid'); return; }
-    this.journal.finished_total++;
-    if (decision === 'alert') this.journal.occurrence_count++;
-    this.persist();
-    await this.queue; // bounded observer work, never business authorization
+  finish(identity:unknown,decision:'alert'|'observation'|null):Promise<void> {
+    if(this.dirty)return Promise.resolve();
+    if(typeof identity!=='number'||!Number.isSafeInteger(identity)||!this.active.has(identity)
+      ||(decision!=='alert'&&decision!=='observation')){
+      this.invalidate('finish_identity_invalid');return Promise.resolve();
+    }
+    if(this.revision>=Number.MAX_SAFE_INTEGER||this.journal.finished_total>=Number.MAX_SAFE_INTEGER
+      ||decision==='alert'&&this.journal.occurrence_count>=Number.MAX_SAFE_INTEGER){
+      this.invalidate('capacity_or_counter_limit');return Promise.resolve();
+    }
+    this.active.delete(identity);this.journal.finished_total++;this.revision++;
+    if(decision==='alert')this.journal.occurrence_count++;
+    this.persist();return this.responseWait??Promise.resolve();
   }
-  async snapshot(nonce: string): Promise<JsonRecord> {
-    try {
-      await this.bounded((async () => {
-        await this.store.identity();
-        const current = await this.store.read('enrollment.json');
-        check(canonical(current) === canonical(this.enrollment));
-        await verifyArtifacts(this.enrollment, this.loaded);
-      })());
-    } catch { this.invalidate('snapshot_source_verification_failed'); }
-    const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
-      unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
-        (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced'),
-      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...persistBudgetFields(this.firstPersist?.budget),...completedPhaseFields(this.firstPersist?.completed),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
-    if (this.dirty || this.pending || this.active.size) return unavailable();
-    const version = canonical(this.journal);
-    try {
-      let stored: unknown;
-      await this.bounded(this.store.verify().then(value => { stored = value; }));
-      if (this.pending || this.active.size || canonical(this.journal) !== version) return unavailable();
-      check(stored === version);
-    } catch { this.invalidate('snapshot_store_verification_failed'); }
-    if (this.dirty) return unavailable();
-    return { kind: 'hub_controller_coverage_v1', producer: this.enrollment.producer, recipient: RECIPIENT,
-      source_id: this.enrollment.source_id, release_sha: this.enrollment.release_sha, artifact_proof: 'loaded_and_current_v1',
-      epoch: hash(this.enrollment.enrollment_id + ':' + this.boot), controller_id: this.boot,
-      limitations: [], complete: true, started_total: this.journal.started_total,
-      finished_total: this.journal.finished_total, baseline_count: 0, baseline_invocations: 0,
-      occurrence_count: this.journal.occurrence_count, observed_at_ms: Date.now(), nonce };
+  private unavailable(nonce:string):JsonRecord {
+    return {kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce,
+      unavailable_phase:'runtime',unavailable_reason:this.firstFailure??
+        (this.pending?'pending_write':this.active.size?'active_invocation':'snapshot_raced'),
+      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...persistBudgetFields(this.firstPersist?.budget),...completedPhaseFields(this.firstPersist?.completed),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})};
   }
-  async close() { this.invalidate('closed'); await this.queue; await this.store.close(); }
+  async snapshot(nonce:string):Promise<JsonRecord> {
+    if(this.dirty||this.physical||this.active.size||this.nextSnapshot||this.revision!==this.durableRevision)
+      return this.unavailable(nonce);
+    const start=persistClock();
+    if(start===undefined){this.invalidate('snapshot_source_verification_failed');return this.unavailable(nonce);}
+    const budget=waitBudget(start,this.timeoutMs);
+    const token=Symbol('proof'),revision=this.revision,version=canonical(this.journal);
+    const captured=structuredClone(this.journal),binding=canonical(this.enrollment);
+    this.physical=token;this.pending=1;
+    let storePhase=false;
+    const trace:PersistTrace={stage:'artifacts',budgetStart:start,waitBudget:budget};
+    trace.failed=error=>{
+      if(this.ownDeadline(error))this.rememberPersist(trace,error);
+      else this.invalidate(storePhase?'snapshot_store_verification_failed':'snapshot_source_verification_failed');
+    };
+    const job=(async()=>{
+      try {
+        await this.store.identity(trace);budgetRead(budget);
+        check(canonical(await this.store.read('enrollment.json'))===binding);budgetRead(budget);
+        await verifyArtifacts(this.enrollment,this.loaded,trace);budgetRead(budget);
+        if(this.dirty)return this.unavailable(nonce);
+        storePhase=true;
+        const stored=await this.store.verify(trace);budgetRead(budget);
+        if(this.revision!==revision||this.active.size||this.nextSnapshot)return this.unavailable(nonce);
+        check(stored===version);
+        const now=budgetRead(budget);
+        if(this.dirty||this.physical!==token||this.revision!==revision||this.durableRevision!==revision
+          ||this.active.size||this.nextSnapshot||canonical(this.enrollment)!==binding
+          ||now===undefined||now>=start+this.timeoutMs)return this.unavailable(nonce);
+        // Linearization point: construct all fields from the same captured
+        // revision with no await until construction is complete.
+        return {kind:'hub_controller_coverage_v1',producer:this.enrollment.producer,recipient:RECIPIENT,
+          source_id:this.enrollment.source_id,release_sha:this.enrollment.release_sha,artifact_proof:'loaded_and_current_v1',
+          epoch:hash(this.enrollment.enrollment_id+':'+this.boot),controller_id:this.boot,
+          limitations:[],complete:true,started_total:captured.started_total,finished_total:captured.finished_total,
+          baseline_count:0,baseline_invocations:0,occurrence_count:captured.occurrence_count,observed_at_ms:Date.now(),nonce};
+      }catch(error){firstPersistFailure(trace,trace.stage,error);return this.unavailable(nonce);}
+      finally {
+        if(this.physical!==token)this.invalidate('snapshot_store_verification_failed');
+        else {this.physical=undefined;this.pending=0;}
+        this.pump();
+      }
+    })();
+    this.queue=job.then(()=>{},()=>{this.invalidate('snapshot_store_verification_failed');}); // Catch finalizer failures too.
+    try{return await this.bounded(job,trace,start,budget);}
+    catch(error){if(!this.ownDeadline(error))this.invalidate('snapshot_source_verification_failed');return this.unavailable(nonce);}
+  }
+  async close() {
+    this.invalidate('closed');
+    // Never close directory FDs while a borrowed operation/finalizer owns them.
+    this.closing??=this.queue.then(()=>this.store.close()).catch(error=>{this.invalidate('closed');throw error;});
+    try{await this.bounded(this.closing);}
+    catch{throw new Error('observer_cleanup_pending');}
+  }
+
 }

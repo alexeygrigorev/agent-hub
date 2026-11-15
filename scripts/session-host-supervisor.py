@@ -190,7 +190,10 @@ def main():
         # never on a non-zero action exit, so one supervisor exception left
         # the host dead until next logon (intake 88ff6766). Retry in-process.
         from agent_hub_host.bootstrap_control import replace_pending
-        supervise_windows(attempt, stop, replacing=lambda: replace_pending(args.control_dir))
+        # The Hub2 Windows installer retires this legacy host (intake 41ef7048):
+        # end the controller.ps1 loop instead of cycling on the dead Hub path.
+        supervise_windows(attempt, stop, replacing=lambda: retired_by_hub2(args.control_dir)
+                          or replace_pending(args.control_dir))
     else:
         attempt()
 
@@ -200,6 +203,13 @@ def main():
 # replace the accepted handover's task.
 RELEASE_RESTART_EXIT = 75
 HANDOVER_EXIT = 76
+# Written by the Hub2 host installer (deploy/host-install.ps1) when it replaces
+# this legacy supervisor; unlike replace-pending it never expires.
+RETIRED_BY_HUB2 = 'retired-by-hub2'
+
+
+def retired_by_hub2(control_dir):
+    return bool(control_dir) and (pathlib.Path(control_dir) / RETIRED_BY_HUB2).is_file()
 RETRY_DELAYS_S = (5, 15, 30, 60)
 HEALTHY_RUN_S = 300
 

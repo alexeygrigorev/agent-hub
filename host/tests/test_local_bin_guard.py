@@ -115,6 +115,15 @@ class WatchdogWiringTest(unittest.TestCase):
             file.write_text(ADAPTER)
             file.chmod(0o755)
         self.alert_log = self.home / "alert-log"
+        # Success means a synthetic delivered acknowledgement, not ALERT_LOG's
+        # render-only branch. This alerter has no SMTP or external command.
+        self.delivered = self.home / 'guard-bin' / 'synthetic-delivered'
+        self.delivered.parent.mkdir()
+        self.delivered.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DELIVERY_LOG"\nexit 0\n')
+        self.delivered.chmod(0o700)
+        self.copied_alerter = self.home / 'guard-bin' / 'copied-principal-alert.sh'
+        self.copied_alerter.write_bytes(ALERTER_SCRIPT.read_bytes())
+        self.copied_alerter.chmod(0o700)
         # Audit the SAME $HOME/.local/bin so a vanished ~/.local/bin also removes
         # any alerter inside ~/.local/bin — proving delivery from guard-bin outside it.
         self.audit_bin = self.home / ".local" / "bin"
@@ -131,11 +140,13 @@ class WatchdogWiringTest(unittest.TestCase):
         self.ticks.parent.mkdir(parents=True)
         self.ticks.write_text("{}\n")  # fresh: both sessions are progressing
         self.state_dir = self.home / "watch-state"
-        self.env = {**os.environ, "HOME": str(self.home),
-                    "PATH": str(self.bin) + ":" + os.environ["PATH"],
+        self.env = {"HOME": str(self.home), "LANG": "C.UTF-8",
+                    "PATH": str(self.bin) + ":/usr/local/bin:/usr/bin:/bin",
                     "LOOP_INTERVAL": "off", "MIN_RESTART_GAP": "0",
                     "OPS_LOCK_DIR": str(self.home),
-                    "ALERT_LOG": str(self.alert_log),
+                    "FAKE_DELIVERY_LOG": str(self.alert_log),
+                    "BIN_WATCH_ALERTER": str(self.delivered),
+                    "PRINCIPAL_ALERT_TO": "nobody@invalid.test",
                     "PRINCIPAL_ALERT_LOG": str(self.home / "principal-alerts.log"),
                     "BIN_WATCH_STATE": str(self.state_dir),
                     "BIN_WATCH_HOME": str(self.home)}
@@ -209,6 +220,23 @@ class WatchdogWiringTest(unittest.TestCase):
         self.assertNotEqual(second.returncode, 0)
         self.assertEqual(len(self.alerts()), 1)
         self.assertTrue(self.state_dir.joinpath("bin-watch.state").read_text().startswith("fail "))
+
+    def test_render_only75_is_unalerted_and_retried_until_actual_fake_success(self):
+        self.set_live_sessions()
+        shutil.rmtree(self.audit_bin)
+        rendered = self.home / 'rendered-alerts'
+        render_env = {'BIN_WATCH_ALERTER': str(self.copied_alerter), 'ALERT_LOG': str(rendered)}
+        for count in (1, 2):
+            result = self.run_watchdog(render_env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.alerts(), [], 'render-only is not a delivery acknowledgement')
+            self.assertEqual(len(rendered.read_text().splitlines()), count)
+            self.assertTrue(self.state_dir.joinpath('bin-watch.state').read_text().startswith('fail-unalerted '))
+        self.run_watchdog()  # The explicit synthetic delivered alerter returns0.
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertTrue(self.state_dir.joinpath('bin-watch.state').read_text().startswith('fail '))
+        self.run_watchdog()
+        self.assertEqual(len(self.alerts()), 1, 'real watchdog dedup remains once per successful episode')
 
     def test_session_checks_run_before_bin_watch_and_alerter_timeout_is_bounded(self):
         self.set_live_sessions()

@@ -14,7 +14,8 @@ class SharedDataopsCredentialTests(unittest.TestCase):
         if create:
             shared.mkdir(parents=True)
             (shared / 'credentials.json').write_text('{}', encoding='utf-8')
-        with mock.patch.object(p.config, 'get_config_path', return_value=Path(root) / 'agent-hub' / 'host.json'):
+        with mock.patch.object(p.config, 'get_config_path', return_value=Path(root) / 'agent-hub' / 'host.json'), \
+                mock.patch.object(p, 'operator_config_dir', lambda name: Path(root) / 'operator' / name):
             return p.engine_environment({'provider': 'codex'}, Path(root) / 'home', Path(root)), shared
 
     def test_points_sessions_at_the_shared_directory_when_provisioned(self):
@@ -28,6 +29,26 @@ class SharedDataopsCredentialTests(unittest.TestCase):
             os.environ.pop('DATAOPS_CONFIG_DIR', None)
             env, _ = self.env(root, False)
             self.assertNotIn('DATAOPS_CONFIG_DIR', env)
+
+    def test_operator_login_wins_over_the_private_copy(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DATAOPS_CONFIG_DIR', None)
+            operator = Path(root) / 'operator' / 'dataops'
+            operator.mkdir(parents=True)
+            (operator / 'credentials.json').write_text('{}', encoding='utf-8')
+            env, _ = self.env(root, True)
+            self.assertEqual(env['DATAOPS_CONFIG_DIR'], str(operator))
+
+    def test_dapier_session_is_linked_into_the_private_home(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DATAOPS_CONFIG_DIR', None)
+            dapier = Path(root) / 'operator' / 'dapier'
+            dapier.mkdir(parents=True)
+            (dapier / 'session.json').write_text('{}', encoding='utf-8')
+            self.env(root, False)
+            link = Path(root) / 'home' / '.config' / 'dapier'
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), dapier.resolve())
 
 
 if __name__ == '__main__':

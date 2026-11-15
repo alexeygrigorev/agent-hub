@@ -132,9 +132,10 @@ function artifactHarness(options:any={}) {
     .replace('export function classifyPersistFailure(','function classifyPersistFailure(');
   const projections=source.slice(source.indexOf('const PERSIST_STAGES'),source.indexOf('// Closed per-slot progress'))
     .replace('export function persistDiagnosticFields(','function persistDiagnosticFields(');
-  const failures=source.slice(source.indexOf('const FAILURE_REASONS'),source.indexOf('/** One live Node incarnation.'));
-  const methods=source.slice(source.indexOf('  invalidate(reason:'),source.indexOf('  async close() { this.invalidate'))
+  const failures=source.slice(source.indexOf('const FAILURE_REASONS'),source.indexOf('/** One live'));
+  const methods=source.slice(source.indexOf('  invalidate(reason:'),source.lastIndexOf('\n}'))
     .replaceAll('private async ','async ').replaceAll('private persist(','persist(');
+  const identityMethod=source.slice(source.indexOf('  async identity('),source.indexOf('  async read('));
   const names=Array.from({length:options.artifactCount??5},(_,i)=>'/synthetic/artifact-'+i);
   const bytes=new Map(names.map((name,i)=>[name,Buffer.from('immutable source '+i)]));
   const artifacts=names.map(path=>({path,sha256:sha(bytes.get(path)!)}));
@@ -175,17 +176,17 @@ function artifactHarness(options:any={}) {
     }};
   };
   const body=stripTypeScriptTypes(source.slice(source.indexOf('const LIMIT ='),source.indexOf('type Producer ='))+helpers+projections+progress+persistence+source.slice(start,end)+failures+
-    '\nclass Methods{'+methods+'};')+'\nreturn {verifyArtifacts,methods:Methods.prototype,freezeArtifactProgress,artifactDiagnosticFields,classifyPersistFailure,persistTimerLateness,persistStep,persistAge:typeof persistAge==="function"?persistAge:undefined,persistBudget:typeof persistBudget==="function"?persistBudget:undefined};';
-  const actual=new Function('open','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash','utilTypes','performance',body)
-    (open,artifactConstants,artifactIsAbsolute,names.slice(0,3),names,injectedHash,utilTypes,
+    '\nclass IdentityMethods{'+identityMethod+'};\nclass Methods{'+methods+'};')+'\nreturn {verifyArtifacts,identity:IdentityMethods.prototype.identity,methods:Methods.prototype,freezeArtifactProgress,artifactDiagnosticFields,classifyPersistFailure,persistTimerLateness,persistStep,persistAge:typeof persistAge==="function"?persistAge:undefined,persistBudget:typeof persistBudget==="function"?persistBudget:undefined};';
+  const actual=new Function('open','lstat','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash','utilTypes','performance',body)
+    (open,options.lstat??(async()=>{throw new Error('unexpected fake lstat');}),artifactConstants,artifactIsAbsolute,names.slice(0,3),names,injectedHash,utilTypes,
       {now:()=>options.clock?options.clock():0});
   const timeout=Number(source.match(/const TIMEOUT_MS = (\d+);/)![1]);
   const journal={kind:'hub_picker_diagnostic_journal_v1',producer:'picker_excluded',source_id:entry.source_id,
     enrollment_id:'2'.repeat(32),occurrence_count:0,started_total:0,finished_total:0};
-  const store={identity:async()=>{},read:async()=>entry,write:async()=>{},verify:async()=>canonical(journal)};
+  const store={identity:async()=>{},read:async()=>entry,write:async()=>{},verify:async()=>canonical(journal),close:async()=>{}};
   const observer=Object.assign(Object.create(actual.methods),{store,enrollment:entry,journal,writer:undefined,timeoutMs:timeout,
-    loaded,boot:'synthetic',dirty:false,pending:0,active:new Set(),requests:0,queue:Promise.resolve()});
-  return {verify:(trace?:any)=>actual.verifyArtifacts(entry,loaded,trace),entry,loaded,names,bytes,opened,closed,waiting,observer,
+    loaded,boot:'synthetic',dirty:false,pending:0,active:new Set(),requests:0,revision:0,durableRevision:0,queue:Promise.resolve()});
+  return {identity:actual.identity,verify:(trace?:any)=>actual.verifyArtifacts(entry,loaded,trace),entry,loaded,names,bytes,opened,closed,waiting,observer,
     project:actual.artifactDiagnosticFields,freeze:actual.freezeArtifactProgress,lateness:actual.persistTimerLateness,step:actual.persistStep,age:actual.persistAge,budget:actual.persistBudget,
     stats:()=>({active,maximum}),bounded:(work:Promise<void>,trace:any)=>actual.methods.bounded.call({timeoutMs:timeout},work,trace),timeout};
 }
@@ -200,6 +201,139 @@ async function drainArtifactFake(h:any){
 }
 
 async function defineTests() {
+
+  test('publication recovery V2: backward or unavailable clocks refuse snapshot without extending a budget',async()=>{
+    for(const invalid of [0,NaN,Infinity,-1]){
+      let reads=0;const h=artifactHarness({clock:()=>reads++===0?100:invalid});
+      const proof=await h.observer.snapshot(NONCE);
+      await h.observer.queue;
+      assert.equal(proof.available,false);assert.notEqual(proof.complete,true);
+      assert.equal(h.observer.dirty,true,'invalid chronology is fatal, not a recoverable own deadline');
+    }
+    const readings=[100,110,120,130,125];let index=0;
+    const h=artifactHarness({clock:()=>readings[Math.min(index++,readings.length-1)]});
+    assert.equal((await h.observer.snapshot(NONCE)).available,false,'phase-progress reversal cannot be hidden by a later valid origin');
+    assert.equal(h.observer.dirty,true);
+  });
+  test('publication recovery V2: early cleanup refusal observes late EIO without losing the original failure',async t=>{
+    const unhandled:unknown[]=[];const listener=(error:unknown)=>unhandled.push(error);
+    process.on('unhandledRejection',listener);t.after(()=>process.removeListener('unhandledRejection',listener));
+    for(const invalidStart of [false,true]){
+      let reads=0,calls=0,reject!:(error:unknown)=>void;
+      const h=artifactHarness({clock:()=>invalidStart?NaN:reads++===0?0:151}),o=h.observer;
+      const error=Object.assign(new Error('owned-close-fault'),{code:'EIO'});
+      o.store.close=()=>{calls++;return new Promise<void>((_,no)=>reject=no);};
+      await assert.rejects(o.close(),/observer_cleanup_pending/);
+      assert.equal(calls,1);assert.equal(o.dirty,true);
+      reject(error);await new Promise<void>(yes=>setImmediate(yes));
+      assert.deepEqual(unhandled,[],'every started cleanup has an immediate rejection consumer');
+      await assert.rejects(o.closing,(actual:unknown)=>actual===error,'the original tracked failure is not swallowed');
+      await assert.rejects(o.close(),/observer_cleanup_pending/);assert.equal(calls,1,'failed close is not replayed');
+    }
+  });
+  test('publication recovery: store identity rejection is immediate but joins the already started sibling stat',async()=>{
+    const error=Object.assign(new Error('private identity failure'),{code:'EIO'});
+    const h=artifactHarness({lstat:async()=>{throw error;}});let release!:(v:any)=>void,settled=false,failed=false;
+    const trace:any={stage:'store_identity',failed:()=>{failed=true;}};
+    const pending=h.identity.call({path:'/owned/fake',directory:{stat:()=>new Promise(yes=>release=yes)}},trace).finally(()=>{settled=true;});
+    const rejected=assert.rejects(pending,value=>value===error);
+    await artifactMicrotasks();assert.equal(failed,true);assert.equal(settled,false);
+    release({isDirectory:()=>true,ino:1,dev:1,uid:1000,mode:0o40700});await rejected;assert.equal(settled,true);
+  });
+  test('publication recovery: immediate sibling rejection retains the owner through held close and never heals',async()=>{
+    const error=Object.assign(new Error('private-source-error'),{code:'EIO'});
+    const h=artifactHarness({statError:error,closeError:Object.assign(new Error('private-close-error'),{code:'EACCES'}),pause:{operation:'close',slot:1}}),o=h.observer;
+    const id=o.begin();await artifactMicrotasks();
+    assert.equal(o.dirty,true);assert.equal(o.pending,1);assert.ok(o.physical);
+    const opened=h.opened.length;
+    for(let i=0;i<8;i++)assert.equal((await o.snapshot(NONCE)).available,false);
+    assert.equal(h.opened.length,opened,'no new reader while failed sibling still owns FD');
+    await o.finish(id,'alert');assert.equal(o.journal.finished_total,0,'fatal cannot infer a finish');
+    for(const resolve of h.waiting.splice(0))resolve();await o.queue;
+    assert.equal(o.pending,0);assert.equal(o.dirty,true);assert.equal(o.firstPersist.error,'io','late finally failure cannot rewrite the first fault');assert.equal((await o.snapshot(NONCE)).available,false);
+    assert.equal(h.opened.length,2,'no later artifact batch after rejection');
+  });
+  test('publication recovery: late actual IO error overrides lag without replacing the first diagnostic',async()=>{
+    const h=artifactHarness(),o=h.observer;let reject!: (error:any)=>void;
+    o.store.write=()=>new Promise<void>((_,no)=>reject=no);
+    const id=o.begin();await artifactMicrotasks();
+    const waiter=o.finish(id,'alert');await waiter;
+    assert.equal(o.dirty,false);assert.equal(o.firstPersist.error,'deadline');
+    const first=JSON.stringify(o.firstPersist);
+    reject(Object.assign(new Error('SECRET=must-not-be-projected'),{code:'EIO'}));await o.queue;
+    assert.equal(o.dirty,true);assert.equal(JSON.stringify(o.firstPersist),first);
+    const proof=await o.snapshot(NONCE);assert.equal(proof.available,false);assert.ok(!JSON.stringify(proof).includes('SECRET'));
+  });
+  test('publication recovery: proof reader owns IO through timeout and accounts intervening finished invocations',async()=>{
+    const h=artifactHarness(),o=h.observer;let release!:()=>void;let writes=0,reads=0;
+    o.store.identity=()=>{reads++;return new Promise<void>(yes=>release=yes);};
+    const timed=await o.snapshot(NONCE);assert.equal(timed.available,false);assert.equal(o.pending,1);
+    o.store.write=async()=>{writes++;};
+    for(let i=0;i<5;i++)assert.equal((await o.snapshot(NONCE)).available,false);
+    const id=o.begin();await o.finish(id,'observation');assert.equal(writes,0);assert.equal(reads,1);
+    o.store.identity=async()=>{};release();await artifactMicrotasks();await o.queue;
+    assert.equal(writes,1);assert.equal(o.revision,2);assert.equal(o.durableRevision,2);
+    assert.equal((await o.snapshot('4'.repeat(32))).complete,true);
+  });
+  test('publication recovery: revision changes during fresh proof reject even a fully finished intervening call',async()=>{
+    const h=artifactHarness(),o=h.observer;let release!:()=>void;
+    o.store.verify=()=>new Promise<string>(yes=>release=()=>yes(canonical(o.journal)));
+    const proof=o.snapshot(NONCE);await artifactMicrotasks();
+    const id=o.begin();await o.finish(id,'alert');
+    release();assert.equal((await proof).available,false);await artifactMicrotasks();await o.queue;
+    o.store.verify=async()=>canonical(o.journal);
+    assert.equal((await o.snapshot('5'.repeat(32))).complete,true);
+  });
+  test('publication recovery: final monotonic deadline defeats success before delayed timer and budgets do not renew',async()=>{
+    let now=0;const h=artifactHarness({clock:()=>now}),o=h.observer;
+    o.store.identity=async()=>{now=100;};
+    o.store.verify=async()=>{now=151;return canonical(o.journal);};
+    assert.equal((await o.snapshot(NONCE)).available,false);assert.equal(o.dirty,false);
+    assert.equal(o.firstPersist.error,'deadline');
+    assert.equal(o.firstPersist.timer,'on_tick');
+  });
+  test('publication recovery: close retains borrowed handles and reports pending rather than cleaning storage',async()=>{
+    const h=artifactHarness(),o=h.observer;let release!:()=>void,closed=0;
+    o.store.write=()=>new Promise<void>(yes=>release=yes);o.store.close=async()=>{closed++;};
+    o.begin();await artifactMicrotasks();
+    await assert.rejects(o.close(),/observer_cleanup_pending/);
+    assert.equal(closed,0);assert.equal(o.pending,1);assert.equal(o.dirty,true);
+    release();await o.queue;await o.closing;assert.equal(closed,1);
+    assert.equal((await o.snapshot(NONCE)).available,false);
+  });
+  test('publication recovery: invalid decisions identities overflow and explicit loss cannot be repaired',async()=>{
+    for(const mode of ['decision','double','foreign','overflow','revision','request','invalidated']){
+      const h=artifactHarness(),o=h.observer;
+      const id=o.begin();await o.queue;
+      if(mode==='decision')await o.finish(id,null);
+      if(mode==='double'){await o.finish(id,'observation');await o.finish(id,'observation');}
+      if(mode==='foreign')await o.finish(999,'alert');
+      if(mode==='overflow'){o.active=new Set(Array.from({length:128},(_,i)=>i));o.begin();}
+      if(mode==='revision'){o.revision=Number.MAX_SAFE_INTEGER;o.begin();}
+      if(mode==='request'){o.requests=Number.MAX_SAFE_INTEGER;o.begin();}
+      if(mode==='invalidated')o.invalidate('picker_decision_incomplete');
+      assert.equal(o.dirty,true,mode);assert.equal((await o.snapshot(NONCE)).available,false,mode);
+    }
+  });
+  test('publication recovery: one delayed checkpoint preserves all cumulative counts and both prefix-linked slots',async t=>{
+    const directory=temp();
+    let release!:()=>void,held=false,active=0,maximum=0;
+    const wait=new Promise<void>(yes=>release=yes);
+    const f=await fixture(directory,{timeoutMs:2000,writer:async(value:any,handle:any)=>{
+      active++;maximum=Math.max(maximum,active);
+      try{if(value.kind.endsWith('checkpoint_v1')&&!held){held=true;await wait;}await semanticWriter(value,handle);}finally{active--;}
+    }});t.after(async()=>{release();await (f.observer as any).queue;await f.observer.close();rmSync(directory,{recursive:true,force:true});});
+    for(let i=0;i<128;i++){const id=f.observer.begin();await f.observer.finish(id,'observation');}
+    const id=f.observer.begin();await f.observer.finish(id,'alert');assert.equal(held,true);
+    const next=f.observer.begin();await f.observer.finish(next,'observation');
+    assert.equal((await f.observer.snapshot(NONCE)).available,false);
+    assert.equal(snapshotFiles(f.state).length,256);
+    release();await (f.observer as any).queue;
+    const proof=await f.observer.snapshot('6'.repeat(32));assert.equal(proof.complete,true);
+    assert.equal(proof.started_total,130);assert.equal(proof.finished_total,130);assert.equal(proof.occurrence_count,1);
+    assert.equal(maximum,1);assert.equal(readdirSync(f.state).filter(name=>name.startsWith('checkpoint-')).length,2);
+    assert.equal(snapshotFiles(f.state).length,256);
+  });
 
   test('completed persist phases distinguish pre-sync costs and freeze at the original deadline',async t=>{
     for(const [artifactMs,sentinelMs,writeMs] of [[80,10,35],[10,80,35],[10,10,105]]){
@@ -218,7 +352,7 @@ async function defineTests() {
         h.observer.begin();await artifactMicrotasks();assert.equal(h.waiting.length,2);
         clock=artifactMs;options.delayed=false;await drainArtifactFake(h);await artifactMicrotasks();
         assert.equal(clock,140);t.mock.timers.tick(149);await artifactMicrotasks();assert.equal(h.observer.dirty,false);
-        clock=150;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.queue;
+        clock=150;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.responseWait;
         const first=await h.observer.snapshot(NONCE);
         assert.equal(first.unavailable_persist_stage,'snapshot_sync');assert.equal(first.unavailable_persist_error,'deadline');
         assert.equal(first.unavailable_persist_before_stage,'75_to_149');assert.equal(first.unavailable_persist_stage_await,'under_25');
@@ -242,7 +376,7 @@ async function defineTests() {
       await h.step(trace,'store_sentinel',async()=>{clock=140;throw Object.assign(new Error('SECRET /private/path'),{code:'EIO'});});
       assert.fail('no creation after failed sentinel');
     };
-    h.observer.begin();await artifactMicrotasks();await h.observer.queue;
+    h.observer.begin();await artifactMicrotasks();await h.observer.responseWait;
     const proof=await h.observer.snapshot(NONCE);
     assert.equal(proof.unavailable_persist_stage,'store_sentinel');assert.equal(proof.unavailable_persist_error,'io');
     assert.deepEqual(proof.unavailable_persist_completed,{artifacts:'under_25',store_identity:'25_to_74'});
@@ -282,7 +416,7 @@ async function defineTests() {
       const first=await h.observer.snapshot(NONCE);
       assert.deepEqual(first.unavailable_persist_completed,{artifacts:'under_25',store_sentinel:'under_25'},'previous identity phase must not bleed into next write');
       assert.equal(first.unavailable_persist_stage,'snapshot_sync');assert.equal(h.timeout,150);
-      releaseSecond();await artifactMicrotasks();assert.deepEqual(await h.observer.snapshot(NONCE),first);
+      releaseSecond();await artifactMicrotasks();await h.observer.queue;assert.equal((await h.observer.snapshot(NONCE)).complete,true);assert.deepEqual(h.observer.firstPersist.completed,first.unavailable_persist_completed,'catch-up cannot rewrite the historical first trace');
     }finally{releaseFirst();releaseSecond();await artifactMicrotasks();t.mock.timers.reset();}
   });
 
@@ -296,7 +430,7 @@ async function defineTests() {
       assert.equal(h.waiting.length,2,'both first-batch reads are held in real persist');
       clock=151;t.mock.timers.tick(149);await artifactMicrotasks();
       assert.equal(h.observer.dirty,false,'existing 150ms timer has not fired early');
-      clock=170;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.queue;
+      clock=170;t.mock.timers.tick(1);await artifactMicrotasks();await h.observer.responseWait;
       options.delayed=false;await drainArtifactFake(h);
       const first=await h.observer.snapshot(NONCE);
       assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'artifacts');
@@ -325,14 +459,14 @@ async function defineTests() {
       clock=300;options.delayed=true;releaseFirst();await artifactMicrotasks();
       assert.equal(h.waiting.length,2,'next cumulative write is held at its first artifact batch');
       clock=470;t.mock.timers.tick(150);await artifactMicrotasks();await finished;
-      options.delayed=false;await drainArtifactFake(h);
       const first=await h.observer.snapshot(NONCE);
+      options.delayed=false;await drainArtifactFake(h);
       assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'artifacts');
-      assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'on_tick');
+      assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'delayed');
       assert.equal(first.unavailable_persist_before_stage,'under_25','not the previous write origin');
       assert.equal(first.unavailable_persist_stage_await,'150_or_more');
       assert.equal(writes,2);assert.equal(h.stats().active,0);assert.equal(h.timeout,150);
-      clock=999;assert.deepEqual(await h.observer.snapshot(NONCE),first);
+      clock=999;await h.observer.queue;assert.equal((await h.observer.snapshot(NONCE)).complete,true);assert.equal(h.observer.firstPersist.error,'deadline','later eligible proof does not erase the historical timeout');
     }finally{
       options.delayed=false;releaseFirst();
       try{await drainArtifactFake(h);}finally{t.mock.timers.reset();}
@@ -349,7 +483,7 @@ async function defineTests() {
       t.mock.timers.enable({apis:['setTimeout']});
       try{
         h.observer.begin();await artifactMicrotasks();clock=150;t.mock.timers.tick(150);
-        await artifactMicrotasks();await h.observer.queue;
+        await artifactMicrotasks();await h.observer.responseWait;
         const first=await h.observer.snapshot(NONCE);
         assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'snapshot_sync');
         assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'on_tick');
@@ -381,7 +515,7 @@ async function defineTests() {
     t.mock.timers.enable({apis:['setTimeout']});
     try{
       h.observer.begin();await artifactMicrotasks();h.observer.invalidate('picker_pool_failed');clock=150;t.mock.timers.tick(150);
-      await artifactMicrotasks();await h.observer.queue;
+      await artifactMicrotasks();await h.observer.responseWait;
       const proof=await h.observer.snapshot(NONCE);assert.equal(proof.unavailable_reason,'picker_pool_failed');
       assert.ok(!Object.keys(proof).some(key=>key.startsWith('unavailable_persist')));
     }finally{release();await artifactMicrotasks();t.mock.timers.reset();}
@@ -460,7 +594,7 @@ async function defineTests() {
     t.mock.timers.enable({apis:['setTimeout']});const h=artifactHarness({pause:{slot:0,operation:'open'},clock:()=>150});
     try{
       h.observer.begin();await artifactMicrotasks();h.observer.invalidate('picker_pool_failed');
-      t.mock.timers.tick(150);await artifactMicrotasks();await h.observer.queue;
+      t.mock.timers.tick(150);await artifactMicrotasks();await h.observer.responseWait;
       await drainArtifactFake(h);const proof=await h.observer.snapshot(NONCE);
       assert.equal(proof.unavailable_reason,'picker_pool_failed');assert.equal(h.observer.firstPersist,undefined);
       assert.ok(!Object.keys(proof).some(key=>key.startsWith('unavailable_artifact')||key.startsWith('unavailable_persist')));
@@ -521,12 +655,19 @@ async function defineTests() {
     const late=Object.assign(new Error('synthetic late close'),{code:'EIO'});
     const h=artifactHarness({statError:original,delayed:true,delayOnlySecond:true,closeError:late});
     let rejected:any;
-    const work=h.verify().catch((error:unknown)=>{rejected=error;});
+    const failures:unknown[]=[];
+    const trace:any={stage:'artifacts',failed:(error:unknown)=>failures.push(error)};
+    const work=h.verify(trace).catch((error:unknown)=>{rejected=error;});
     try{
-      await artifactMicrotasks();assert.equal(rejected,original);
+      await artifactMicrotasks();assert.equal(trace.first.error,original);
+      assert.deepEqual(failures,[original],'failure notification is immediate');
+      assert.equal(rejected,undefined,'physical completion must join the held sibling');
       assert.equal(h.opened.length,2);assert.equal(h.stats().active,1);
     }finally{await drainArtifactFake(h);await work;}
-    assert.equal(rejected,original);assert.equal(h.closed.length,2);assert.equal(h.stats().active,0);
+    assert.equal(rejected,original);assert.equal(trace.first.error,original);
+    assert.deepEqual(failures,[original,late],'late close remains observed without replacing the primary error');
+    assert.equal(h.opened.length,2,'no next batch after the failure');
+    assert.equal(h.closed.length,2);assert.equal(h.stats().active,0);
   });
   test('artifact parallel verifier retains all descriptor hash membership and source identity refusals',async()=>{
     for(const metadata of [{mode:0o100666},{nlink:2},{uid:987654},{isFile:()=>false},{size:16*1024*1024+1}]){
@@ -968,13 +1109,26 @@ async function defineTests() {
     assert.equal(JSON.parse(readFileSync(journal,'utf8')).source_id,'f'.repeat(64));
     assert.equal((await f.observer.snapshot(NONCE)).available,false);
   });
-  test('pending writer timeout is bounded and stays unknown after late completion',async t=>{
-    const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
+  test('publication recovery: expired writer waits stay unknown but later durable catch-up can qualify',async t=>{
+    const directory=temp();
     let release!:()=>void;
-    const held=new Promise<void>(r=>release=r);
-    const f=await fixture(directory,{writer:()=>held,timeoutMs:25});t.after(()=>f.observer.close());
-    const before=Date.now();assert.equal((await f.post()).status,200);assert.ok(Date.now()-before<1500);
-    release();await Promise.resolve();assert.equal((await (await f.sample()).json() as any).available,false);
+    const held=new Promise<void>(r=>release=r);let writes=0,maximum=0,active=0;
+    const f=await fixture(directory,{timeoutMs:25,writer:async(value:any,handle:any)=>{
+      writes++;active++;maximum=Math.max(maximum,active);
+      try{if(writes===1)await held;await semanticWriter(value,handle);}finally{active--;}
+    }});t.after(async()=>{release();await (f.observer as any).queue;await f.observer.close();rmSync(directory,{recursive:true,force:true});});
+    const first=f.observer.begin();await f.observer.finish(first,'observation');
+    const expired=await f.observer.snapshot(NONCE);assert.equal(expired.available,false);
+    const second=f.observer.begin();await f.observer.finish(second,'alert');
+    assert.equal((f.observer as any).journal.started_total,2);
+    assert.equal((f.observer as any).journal.finished_total,2);
+    assert.equal((f.observer as any).journal.occurrence_count,1);
+    assert.equal(writes,1,'timeout does not release physical ownership');
+    release();await (f.observer as any).queue;
+    assert.equal(maximum,1);assert.equal(expired.available,false,'old receipt cannot change');
+    const fresh=await f.observer.snapshot('3'.repeat(32));
+    assert.equal(fresh.complete,true);assert.equal(fresh.started_total,2);assert.equal(fresh.finished_total,2);assert.equal(fresh.occurrence_count,1);
+    assert.equal(Object.keys(fresh).length,17);
   });
   test('inflight and concurrent requests cannot yield a complete nonce barrier',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));

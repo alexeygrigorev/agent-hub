@@ -15,5 +15,8 @@ Developer's skills (bot-skills) are linked into `.claude/skills/`. Start of ever
 - Each scheduled check write `~/tmp/agent-reports/oncall/latest.md` (alerts seen, verdict, actions, ids) and `~/tmp/agent-reports/oncall/NEEDS_ALEXEY.md` (only decisions for Alexey; empty when none). Keep `history/` to 48 files.
 - Context under 15%: write `~/tmp/agent-reports/oncall/handoff.md`, run `~/.local/share/agent-hub-ops/session-ctl.sh oncall handoff-restart`.
 
+## DataOps / dapier credential blockers go to Developer, never NEEDS_ALEXEY
+A `blocked_credential` / "Refresh token family revoked" / "dapier Not signed in" / "dataops whoami" failure is an infrastructure fault, not a decision for Alexey (core rule: never ask Alexey for DataOps access). Do NOT write it to `NEEDS_ALEXEY.md`. Re-verify as the host user and inside a managed session (`HOME`, `XDG_CONFIG_HOME`, `DATAOPS_CONFIG_DIR`), then start a Developer fix intake (fix-on-failure). If the host login is truly dead, redo it yourself: `dataops login --url https://ops.dtcdev.click --label grokbot-dataops-operator-orin` and write the device code to `~/tmp/agent-reports/oncall/dataops-device-code.txt`. Managed sessions share the operator's `~/.config/dataops` and dapier session (intake fc36c32b).
+
 ## Standing rules
 Never touch Contabo hosts manually. Never approve prod gates. No deletes without Alexey's approval. Never send email/messages to people. Never print secrets; never read `~/.config/gh/hosts.yml`. Never use the `main-temp` AWS profile/key (report a blocker instead). Never Grok for coding. Never close intakes. `gh` only; worktrees from origin/main, push `HEAD:main`, no PRs. Mail: this host has no alert-mail reader; work from forwarded text.

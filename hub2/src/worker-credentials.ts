@@ -42,8 +42,11 @@ export class WorkerCredentials {
       generation: this.generation(row), expires_at: row.deadline,
       revoked_at: row.revoked_at, family_id: 'worker:' + row.session_id + ':' + row.epoch,
       client_id: 'native-worker', scopes_json: JSON.stringify([
-        'intake:read', 'intake:append', 'claim:read', 'claim:write',
+        'intake:read', 'intake:append', 'intake:create',
+        'session:start', 'routing:read',
+        'claim:read', 'claim:write',
         'message:read', 'message:send', 'mailbox:' + actor,
+        'worker_project:' + row.project_id,
       ]),
     }, this.env);
   }

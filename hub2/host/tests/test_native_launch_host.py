@@ -17,6 +17,28 @@ from agent_hub_host import native_launch as nl
 from agent_hub_host import provider_home as ph
 
 
+class WindowsEngineTest(unittest.TestCase):
+    def test_bare_engine_resolves_to_the_cmd_shim_on_windows_only(self):
+        with mock.patch.object(nl.os, 'name', 'nt'), \
+                mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\claude.cmd') as which:
+            self.assertEqual(nl.resolve_windows_program('claude', {'PATH': 'C:\\npm'}), 'C:\\npm\\claude.cmd')
+            which.assert_called_once_with('claude', path='C:\\npm')
+            self.assertEqual(nl.resolve_windows_program('C:\\x\\claude.exe'), 'C:\\x\\claude.exe')
+        with mock.patch.object(nl.os, 'name', 'nt'), mock.patch.object(nl.shutil, 'which', return_value=None):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+        with mock.patch.object(nl.os, 'name', 'posix'), mock.patch.object(nl.shutil, 'which', return_value='/bin/claude'):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+
+    def test_codex_is_advertised_on_windows_when_installed(self):
+        launcher = nl.NativeLauncher({})
+        route = {'provider': 'codex'}
+        with mock.patch.object(nl.os, 'name', 'nt'):
+            with mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\codex.cmd'):
+                self.assertTrue(launcher._codex_advertisable(route))
+            with mock.patch.object(nl.shutil, 'which', return_value=None):
+                self.assertFalse(launcher._codex_advertisable(route))
+
+
 class AdapterArgvTest(unittest.TestCase):
     def test_zai_route_pins_harness_flags_and_model(self):
         argv = nl.adapter_argv('zai', 'goal-text', 'glm-5.3-flash')
@@ -1556,8 +1578,10 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
                     calls, error = self.launch(interactive=interactive)
                     self.assertEqual(error, 'codex_launch_wrapper_unavailable')
                     self.assertEqual(calls, [])
+        # The maintained wrapper itself is never available off Linux.
         with mock.patch.object(nl.sys, 'platform', 'win32'):
-            self.assertEqual(self.launch(interactive=True)[1], 'codex_launch_wrapper_unavailable')
+            with self.assertRaises(ValueError):
+                nl.codex_launch_wrapper()
 
     def test_profile_not_proven_wrapper_aware_refuses_before_spawn(self):
         calls, error = self.launch(interactive=False, readiness=False)
@@ -1583,7 +1607,8 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
 
     def test_capabilities_do_not_advertise_unusable_codex(self):
         config = {'routes': {'codex': {'provider': 'codex'}, 'opencode': {'provider': 'go'}}}
-        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b):
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value={'ok': 1}):
             self.assertIn('codex', nl.NativeLauncher(config).capabilities())
             with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
                 caps = nl.NativeLauncher(config).capabilities()
@@ -1591,6 +1616,77 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             self.assertIn('opencode', caps)
             custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
             self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
+
+    def test_codex_headless_withdrawn_loudly_when_release_profile_proof_fails(self):
+        """A stale headless profile cannot withdraw the separate interactive path."""
+        config = {'routes': {'codex': {'provider': 'codex'}}}
+        launcher = nl.NativeLauncher(config)
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch('sys.stderr') as err:
+            self.assertEqual(launcher.capabilities()['codex'], {'interactive', 'goal', 'effort'})
+            self.assertEqual(launcher.capabilities()['codex'], {'interactive', 'goal', 'effort'})
+            shown = ''.join(call.args[0] for call in err.write.call_args_list)
+        self.assertEqual(shown.count('ALERT hub2-host: codex_launch_wrapper_unavailable'), 1)
+        self.assertIn('profile_release_mismatch', shown)
+        self.assertIn('headless capability withdrawn; interactive remains available', shown)
+        self.assertEqual(proof.call_count, 1, 'proof is cached between heartbeats')
+
+    def test_stale_headless_profile_preserves_real_interactive_validation_and_launch(self):
+        from agent_hub_host.agent import Bridge
+        calls = []
+        def runner(argv, **options):
+            calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace),
+                'command': argv[argv.index('--') + 1:]}), '')
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}}}, runner=runner)
+        bridge = Bridge.__new__(Bridge)
+        bridge.launcher, bridge.engines = adapter, ['codex']
+        bridge.resolve_workspace = lambda value: self.workspace
+        offer = {'session_id': 'interactive-owned', 'operation_id': 'op-interactive', 'epoch': 1,
+                 'expires_at': time.time()*1000+60000, 'launch': {
+                     'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol',
+                     'prompt': 'synthetic source review', 'interactive': True, 'effort': 'medium'}}
+        original = set(nl.PROVIDER_CAPABILITIES['codex'])
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch.object(adapter, 'record_evidence'), mock.patch('sys.stderr'):
+            spec = bridge.validate_launch(offer)
+            self.assertEqual(adapter.launch('t1', spec)['mode'], 'interactive')
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(self.child(calls)[0], str(self.wrapper.resolve()))
+            self.assertNotIn('task', self.child(calls))
+            self.assertEqual(proof.call_count, 1, 'interactive launch uses no additional headless proof')
+            offer['launch']['interactive'] = False
+            with self.assertRaisesRegex(ValueError, 'launcher_capability_unavailable'):
+                bridge.validate_launch(offer)
+            with self.assertRaisesRegex(RuntimeError, 'codex_launch_wrapper_unavailable'):
+                adapter.launch('t1', dict(spec, interactive=False))
+            self.assertEqual(len(calls), 1, 'refused headless work must not spawn')
+        self.assertEqual(nl.PROVIDER_CAPABILITIES['codex'], original)
+
+    def test_codex_partial_withdrawal_recovers_after_cache_expiry_without_mutating_other_routes(self):
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}, 'zai': {'provider': 'zai'}}})
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(nl.time, 'monotonic', return_value=1) as clock, \
+                mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch('sys.stderr') as err:
+            first = adapter.capabilities()
+            self.assertNotIn('headless', first['codex'])
+            self.assertEqual(first['zai'], nl.PROVIDER_CAPABILITIES['zai'])
+            proof.return_value = {'ok': 1}
+            clock.return_value = 32
+            self.assertEqual(adapter.capabilities()['codex'], nl.PROVIDER_CAPABILITIES['codex'])
+            self.assertEqual(adapter.capabilities()['codex'], nl.PROVIDER_CAPABILITIES['codex'])
+            shown = ''.join(call.args[0] for call in err.write.call_args_list)
+            self.assertEqual(shown.count('ALERT hub2-host:'), 1)
+            self.assertEqual(shown.count('RECOVERED hub2-host:'), 1)
+            self.assertEqual(proof.call_count, 2)
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}), mock.patch('sys.stderr'):
+            self.assertNotIn('codex', adapter.capabilities())
+            self.assertEqual(adapter.capabilities()['zai'], nl.PROVIDER_CAPABILITIES['zai'])
 
     def test_packaged_archive_readiness_requires_wrapper_aware_pin_and_maintained_profile(self):
         if sys.platform != 'linux':

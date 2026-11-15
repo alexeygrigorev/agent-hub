@@ -2664,19 +2664,57 @@ def managed_subscriptions():
     return subs
 
 
+def operator_config_dir(name):
+    """The host operator's own ~/.config/<name> (real HOME, not a session HOME)."""
+    root = os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')
+    return Path(root) / name
+
+
 def shared_dataops_dir():
-    """Hub-owned DataOps credential directory shared by every managed session.
+    """DataOps credential directory every managed session reads.
 
     Managed engines run with a private HOME, so the operator's own
-    ~/.config/dataops is invisible to them (intake 3bae55cf). An operator
-    provisions this directory once per host with
-    `DATAOPS_CONFIG_DIR=<dir> dataops login --label "<agent>@<host>"`; it lives
-    outside every repository and its contents are never printed.
+    ~/.config/dataops is invisible to them (intake 3bae55cf). DataOps refresh
+    tokens are single-use and rotate inside one family; a second, Hub-private
+    login (the old `shared/dataops` copy) is revoked whenever the operator
+    re-logs in and cannot be repaired by the operator (intake fc36c32b: sessions
+    failed with "Refresh token family revoked"). So when the operator login
+    exists, sessions use that very directory: one family, rotated under the CLI's
+    credentials lock, always as fresh as the host login. The Hub-owned
+    `shared/dataops` directory remains only as the fallback for hosts with no
+    operator login. Contents are never printed.
     """
+    operator = operator_config_dir('dataops')
+    if (operator / 'credentials.json').is_file():
+        return operator
     try:
         return Path(config.get_config_path()).parent / 'shared' / 'dataops'
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def link_operator_dapier_session(home):
+    """Expose the operator's dapier session (XDG_CONFIG_HOME/dapier) in a session HOME.
+
+    dapier reads $XDG_CONFIG_HOME/dapier/session.json and managed sessions get a
+    private XDG_CONFIG_HOME, so they reported "Not signed in" while the host
+    user was signed in (intake fc36c32b). A symlink keeps a single session file.
+    """
+    source = operator_config_dir('dapier')
+    if not (source / 'session.json').is_file():
+        return
+    target = Path(home) / '.config' / 'dapier'
+    try:
+        if target.is_symlink():
+            if Path(os.readlink(target)) == source:
+                return
+            target.unlink()
+        elif target.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+    except OSError:
+        pass
 
 
 def engine_environment(bundle, home, dest=None):
@@ -2720,6 +2758,7 @@ def engine_environment(bundle, home, dest=None):
     shared = shared_dataops_dir()
     if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
         env['DATAOPS_CONFIG_DIR'] = str(shared)
+    link_operator_dapier_session(home)
     if bundle.get('provider') == 'go':
         from .fleet import load_settings
         from .opencode_auth import environment, prepare

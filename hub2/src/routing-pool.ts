@@ -55,6 +55,17 @@ function requiredCapabilitiesFor(input: PickInput): string[] {
   ])];
 }
 
+// Additive closed capability string: never reinterpret old interactive:<engine>
+// as absence of headless. Multiple complete declarations intersect conservatively.
+function declaredEngineModes(machine: MachineView | undefined, engine: string): string[] | null {
+  if (!/^[A-Za-z0-9_.-]{1,48}$/.test(engine)) return null;
+  const prefix = `modes:v1:${engine}:`;
+  const declarations = (machine?.capabilities || []).filter(value => value.startsWith(prefix))
+    .map(value => value.slice(prefix.length)).filter(bits => ['h', 'i', 'hi'].includes(bits));
+  if (!declarations.length) return null;
+  return ['headless', 'interactive'].filter((mode, index) => declarations.every(bits => bits.includes(index === 0 ? 'h' : 'i')));
+}
+
 export type RoutingPolicy = {version: unknown; candidates: Candidate[]};
 export type RoutingSnapshot = {policy: RoutingPolicy; accounts: Map<string, AccountView>; machines: Map<string, MachineView>; observed_at: number};
 
@@ -218,7 +229,18 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     });
     return kept.length ? kept : rows;
   };
-  let pool = scored;
+  // A complete engine declaration is actual mode support, not an advisory
+  // credential/health observation. A known denial cannot be restored by narrow().
+  const mode = input.interactive ? 'interactive' : 'headless';
+  let pool = scored.map(row => ({...row, hosts:row.hosts.filter(id => {
+    const modes = declaredEngineModes(machines.get(id), row.candidate.engine);
+    return modes === null || modes.includes(mode);
+  })})).filter((row, index) => {
+    const denied = scored[index].hosts.length > 0 && row.hosts.length === 0;
+    if (denied) dropped.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'capability_not_advertised'});
+    return !denied;
+  });
+  if (!pool.length) throw new HttpError('model_policy_unavailable', 503);
   // --with-goal is a launch requirement, not a preference (intake baab076a): a picked
   // engine must run where the host advertises goal:<engine>, or the host refuses it with
   // launcher_capability_unavailable. Filter before the advisory narrows so quota/credential
@@ -251,9 +273,13 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const compatibleHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
     const machine = machines.get(id), engine = row.candidate.engine;
     const needed = [...required, ...(row.candidate.effort ? ['effort'] : [])];
+    const capabilities = machine?.capabilities || [];
+    const modes = declaredEngineModes(machine, engine);
     return machine?.engines?.includes(engine) && needed.every(capability =>
       capability.startsWith('os:') ? machine.os?.toLowerCase() === capability.slice(3).toLowerCase()
-        : machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
+        : modes !== null && (capability === 'headless' || capability === 'interactive')
+          ? modes.includes(capability)
+          : capabilities.includes(capability) || capabilities.includes(`${capability}:${engine}`));
   });
   const compatible = new Map(pool.map(row => [row.candidate.id, compatibleHosts(row)]));
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');

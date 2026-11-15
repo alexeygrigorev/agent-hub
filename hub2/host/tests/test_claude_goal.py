@@ -209,7 +209,8 @@ class ClaudeGoalLaunchTest(unittest.TestCase):
 
     def test_available_claude_advertises_goal_without_losing_codex_or_zai(self):
         adapter = nl.NativeLauncher({})
-        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'):
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value={'ok': 1}):
             capabilities = adapter.capabilities()
         for provider in ['claude', 'codex', 'zai']:
             self.assertEqual(capabilities[provider], {'headless', 'interactive', 'goal', 'effort'})

@@ -141,6 +141,18 @@ type SessionRow = {
 // The server speaks version 1 of the host WebSocket protocol.
 const HOST_PROTOCOL_VERSION = 1;
 const MANAGED_CLAUDE_CAPABILITY = 'managed:hub-claude:opus:medium:v1';
+// AC2 of intake 41ef7048 (t1801u, systems fail loudly): a host that is running
+// (still sending HTTP heartbeats, or holding live sessions) but has had no
+// socket for more than 15 minutes raises a developer alert. The episode lives in
+// Durable Object KV storage so no schema migration or rollback fence is needed.
+export const HOST_DISCONNECT_ALERT_MS = 15 * 60_000;
+const HOST_DISCONNECT_RECHECK_MS = 5 * 60_000;
+const HOST_RUNNING_EVIDENCE_MS = 10 * 60_000;
+const HOST_DISCONNECT_WATCH_MS = 7 * 24 * 3_600_000;
+const HOST_PRESENCE_KEY = 'host_presence';
+export const HOST_ALERT_RECIPIENT = 'dev@dtcdev.click';
+type HostPresence = { machine_id: string; disconnected_since: number; running_seen_at?: number; checked_at?: number; alerted_at?: number; evidence?: string };
+type PresenceStore = { get(key: string): Promise<unknown>; put(key: string, value: unknown): Promise<void>; delete(key: string): Promise<unknown> };
 
 type HostRelease = { host_version: string; protocol_version: number };
 type SocketAttachment = { machine_id: string; actor_id: string; generation: string } & Partial<HostRelease>;
@@ -362,6 +374,7 @@ export class MachineDO {
     this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE kind='stop' AND state='pending' AND created_at<=?",
       JSON.stringify({stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
     await this.reapInactive(false);
+    await this.checkHostPresence(now);
     await this.scheduleNext();
     await this.flushOutbox(now);
     await this.scheduleNext();
@@ -411,6 +424,9 @@ export class MachineDO {
       }
       this.db.run('INSERT INTO machine_liveness(singleton,observed_at) VALUES(1,?) ON CONFLICT(singleton) DO UPDATE SET observed_at=excluded.observed_at',now);
     });
+    // A heartbeat with no socket (daemon cannot connect, or the DO restarted)
+    // starts a disconnect episode; the next socket ends it.
+    if(!this.hostSocketOpen(machineId))await this.hostDisconnected(machineId,now,'heartbeat_without_socket');
     await this.scheduleNext();
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
@@ -436,9 +452,13 @@ export class MachineDO {
     const visibleCapabilities=(capabilities?JSON.parse(capabilities.capabilities_json):[]) as string[];
     const currentCapabilities=visibleCapabilities.filter(cap=>cap!==MANAGED_CLAUDE_CAPABILITY
       ||connected&&this.managedClaudeAvailable(machine.machine_id));
+    const presence=connected?undefined:await this.hostPresence();
+    const hostAlert=presence?.alerted_at?{kind:'host_disconnected',recipient:HOST_ALERT_RECIPIENT,
+      disconnected_since:presence.disconnected_since,alerted_at:presence.alerted_at,evidence:presence.evidence??null}:undefined;
     return json({machine_id:machine.machine_id,connected,...release,version_mismatch:versionMismatch,
       last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
-      engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:currentCapabilities});
+      engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:currentCapabilities,
+      ...(presence?{disconnected_since:presence.disconnected_since}:{}),...(hostAlert?{host_alert:hostAlert}:{})});
   }
 
   private managedClaudeSocket(socket:WebSocket):boolean {
@@ -639,6 +659,7 @@ export class MachineDO {
     });
     this.connectQueue=accepted.then(()=>{},()=>{});
     if(!await accepted)return error('credential_revoked',401);
+    if(!stopOnly)await this.hostConnected(machineId);
     try { server.send(JSON.stringify({ type: 'resync', reason: 'connected' })); } catch {}
     await this.sendOffers(server, machineId);
     await this.sendPendingCommands(server, machineId);
@@ -699,6 +720,73 @@ export class MachineDO {
   async webSocketClose(socket:WebSocket,code:number,reason:string,_wasClean:boolean):Promise<void>{
     await this.ready;
     try{socket.close(code===1005||code===1006?1000:code,reason);}catch{}
+    let machineId:unknown;
+    try{const attachment=socket.deserializeAttachment();machineId=attachment?.stop_only===true?undefined:attachment?.machine_id;}catch{}
+    if(typeof machineId==='string'&&!this.hostSocketOpen(machineId,socket)){
+      await this.hostDisconnected(machineId,Date.now(),'socket_closed');
+      await this.scheduleNext();
+    }
+  }
+
+  private presenceStore():PresenceStore|undefined{
+    const storage=this.ctx.storage as unknown as Partial<PresenceStore>;
+    return typeof storage.get==='function'&&typeof storage.put==='function'&&typeof storage.delete==='function'
+      ?storage as PresenceStore:undefined;
+  }
+
+  private async hostPresence():Promise<HostPresence|undefined>{
+    const value=await this.presenceStore()?.get(HOST_PRESENCE_KEY) as HostPresence|undefined;
+    return value&&typeof value==='object'&&typeof value.machine_id==='string'&&Number.isSafeInteger(value.disconnected_since)?value:undefined;
+  }
+
+  /** True when an ordinary (not stop-only) host socket other than `except` is open. */
+  private hostSocketOpen(machineId:string,except?:WebSocket):boolean{
+    return this.ctx.getWebSockets('hub2:'+machineId).some(socket=>socket!==except&&socket.readyState===1&&!this.stopOnly(socket));
+  }
+
+  private async hostDisconnected(machineId:string,now:number,cause:'socket_closed'|'heartbeat_without_socket'):Promise<void>{
+    const store=this.presenceStore(),presence=await this.hostPresence();
+    if(!store)return;
+    // A heartbeat without a socket proves the daemon runs: only then arm the
+    // 15 minute alarm. A powered-off host leaves no pending alarm.
+    if(presence){
+      if(cause==='heartbeat_without_socket'&&!presence.running_seen_at)await store.put(HOST_PRESENCE_KEY,{...presence,running_seen_at:now} satisfies HostPresence);
+      return;
+    }
+    await store.put(HOST_PRESENCE_KEY,{machine_id:machineId,disconnected_since:now,
+      ...(cause==='heartbeat_without_socket'?{running_seen_at:now}:{})} satisfies HostPresence);
+    console.error('[hub2] HOST_DISCONNECT_WATCH',JSON.stringify({machine_id:machineId,cause,disconnected_since:now,alert_after_ms:HOST_DISCONNECT_ALERT_MS}));
+  }
+
+  private async hostConnected(machineId:string):Promise<void>{
+    const store=this.presenceStore(),presence=await this.hostPresence();
+    if(!store||!presence)return;
+    await store.delete(HOST_PRESENCE_KEY);
+    if(presence.alerted_at)console.error('[hub2] HOST_RECONNECTED alert='+HOST_ALERT_RECIPIENT,JSON.stringify({machine_id:machineId,
+      disconnected_since:presence.disconnected_since,alerted_at:presence.alerted_at,reconnected_at:Date.now()}));
+  }
+
+  /** Next alarm needed by the disconnect watch, or null when nothing is pending. */
+  private presenceDue(presence:HostPresence|undefined,now:number):number|null{
+    // Live sessions already keep the reaper alarm (which runs this check) armed.
+    if(!presence||!presence.running_seen_at||presence.alerted_at||now-presence.disconnected_since>HOST_DISCONNECT_WATCH_MS)return null;
+    const first=presence.disconnected_since+HOST_DISCONNECT_ALERT_MS;
+    return Math.max(first,(presence.checked_at??0)+HOST_DISCONNECT_RECHECK_MS);
+  }
+
+  private async checkHostPresence(now:number):Promise<void>{
+    const store=this.presenceStore(),presence=await this.hostPresence();
+    if(!store||!presence||presence.alerted_at||now<presence.disconnected_since+HOST_DISCONNECT_ALERT_MS)return;
+    if(this.hostSocketOpen(presence.machine_id)){await store.delete(HOST_PRESENCE_KEY);return;}
+    const machine=this.db.one<MachineRow>('SELECT * FROM machines WHERE machine_id=?',presence.machine_id);
+    const stranded=this.db.one<{total:number}>("SELECT COUNT(*) AS total FROM sessions WHERE machine_id=? AND state IN ('offered','claimed','running')",presence.machine_id)?.total??0;
+    const heartbeat=!!machine&&machine.last_seen>=presence.disconnected_since&&now-machine.last_seen<=HOST_RUNNING_EVIDENCE_MS;
+    const evidence=heartbeat?'http_heartbeat_without_socket':stranded>0?'sessions_without_socket':undefined;
+    if(!evidence){await store.put(HOST_PRESENCE_KEY,{...presence,checked_at:now} satisfies HostPresence);return;}
+    await store.put(HOST_PRESENCE_KEY,{...presence,checked_at:now,alerted_at:now,evidence} satisfies HostPresence);
+    console.error('[hub2] HOST_DISCONNECTED alert='+HOST_ALERT_RECIPIENT,JSON.stringify({machine_id:presence.machine_id,
+      disconnected_since:presence.disconnected_since,disconnected_ms:now-presence.disconnected_since,evidence,
+      last_seen:machine?.last_seen??null,live_sessions:stranded}));
   }
 
   async webSocketError(_socket: WebSocket, _error: unknown): Promise<void> { await this.ready; }
@@ -1257,6 +1345,7 @@ export class MachineDO {
     this.db.alarmOperation();
     const current = await this.ctx.storage.getAlarm();
     const nativeDue=this.db.schemaVersion>=9?this.db.one<{due:number|null}>("SELECT MIN(deadline_ms) AS due FROM native_commands WHERE state='pending'")?.due:null;
+    const presenceDue=this.presenceDue(await this.hostPresence(),Date.now());
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
       UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
@@ -1264,9 +1353,10 @@ export class MachineDO {
         FROM sessions WHERE state='running' AND native_id IS NOT NULL
       UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
       UNION ALL SELECT ? AS due
+      UNION ALL SELECT ? AS due
       UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
-    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,Date.now()+SESSION_REAP_INTERVAL_MS);
+    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,presenceDue,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
       if (current !== next.due) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due); }
     } else if (current !== null) {
@@ -1425,12 +1515,14 @@ export class MachineDO {
     }
     if (session) {
       const priorResult=this.parse(row.result_json) as JsonRecord|null;
+      const failedPrelaunch=row.state==='pending'&&session.state==='failed'&&session.native_id===null;
       const legacyBoundStop = session.state!=='lost' && result.stopped === true && result.evidence === undefined && !!session.native_id
         && (row.state === 'pending' && priorResult?.dispatch_native_id === session.native_id
           || row.state === 'acked' && priorResult?.evidence === 'legacy_bound_exit' && priorResult?.native_id === session.native_id);
       if (legacyBoundStop) {
         result = {...result,evidence:'legacy_bound_exit',native_id:session.native_id};
-      } else if (result.evidence === 'legacy_bound_exit' || !this.qualifiedStopResult(session,result)) {
+      } else if (result.evidence === 'legacy_bound_exit' || !this.qualifiedStopResult(session,result)
+        ||failedPrelaunch&&result.evidence!=='dispatch_fenced') {
         result = {stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'};
       }
     }
@@ -1472,6 +1564,7 @@ export class MachineDO {
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.operation_id') END=s.operation_id
         ) OR (c.kind='stop' AND (
           (s.state='lost' AND s.native_id IS NOT NULL) OR
+          (s.state='failed' AND s.native_id IS NULL) OR
           (s.state='expired' AND EXISTS(SELECT 1 FROM launch_admissions a
             WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
         ))
@@ -1489,7 +1582,7 @@ export class MachineDO {
       const view=this.commandView(command);
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
       if(command.kind==='capture'&&session&&session.state!=='running'&&session.state!=='claimed'&&!this.retainedCaptureReady(session))return;
-      if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired')) {
+      if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired' || session.state === 'failed')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
         view.pre_native=true;view.workspace=boundWorkspace(launch);view.tag=`task-hub2-${session.id}`;
       }
@@ -1823,7 +1916,8 @@ export class MachineDO {
 
   private canDispatchStop(session: SessionRow): boolean {
     return ['claimed', 'running'].includes(session.state) || (session.state === 'expired' && this.hasLaunchAdmission(session))
-      || (session.state==='lost' && !!session.native_id);
+      || (session.state==='lost' && !!session.native_id)
+      || (session.state==='failed' && session.native_id===null);
   }
 
   private async recordStopped(session:SessionRow,reason:string,observedAt:number,
@@ -1837,6 +1931,9 @@ export class MachineDO {
       const unclaimed=current&&this.unclaimedWithoutNative(current);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
         ||(!this.canDispatchStop(current)&&!unclaimed))return false;
+      const failedPrelaunch=current.state==='failed'&&current.native_id===null;
+      if(failedPrelaunch&&(!stopCommand||!('result_json' in stopCommand)
+        ||(this.parse(stopCommand.result_json) as JsonRecord|null)?.evidence!=='dispatch_fenced'))return false;
       const lost=current.state==='lost';
       if (lost && (!stopCommand || !('result_json' in stopCommand) || stopCommand.native_id!==current.native_id)) return false;
       if (stopCommand && 'result_json' in stopCommand) {

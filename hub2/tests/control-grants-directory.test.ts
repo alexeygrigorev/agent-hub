@@ -13,6 +13,8 @@ function fixture(options:{beforeAccount?:()=>Promise<void>;schemaMode?:string}={
  control=new ControlDO(state,env);
  const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots,env,restart:()=>{control=new ControlDO(state,env);}};}
 const data=async(r:Response)=>await r.json() as any;
+/** Fail loudly (bca192ab): an existing but invisible route is a named 403, never a bare 404 route_not_found. */
+const routeDenied=async(r:Promise<Response>,scope:string)=>{const x=await r;assert.equal(x.status,403);const b=await data(x);assert.equal(b.missing_scope,scope);assert.notEqual(b.error,'route_not_found');};
 
 function addMachine(database:DatabaseSync,id:string){
  database.prepare('INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
@@ -62,13 +64,13 @@ test('directory owner immutable, ACL readdress replaces readers, scoped workers 
  assert.equal((await call('/_routes/register','POST',route)).status,200);
  assert.equal((await call('/_routes/register','POST',{...route,owner:'agent:hijack'})).status,409);
  const old={id:'agent:old',kind:'agent',scopes:[]};assert.equal((await call('/api/routes/message/message-000001','GET',undefined,old)).status,200);
- await call('/_routes/register','POST',{...route,epoch:2,participants:['agent:sender','agent:new']});assert.equal((await call('/api/routes/message/message-000001','GET',undefined,old)).status,404);
+ await call('/_routes/register','POST',{...route,epoch:2,participants:['agent:sender','agent:new']});await routeDenied(call('/api/routes/message/message-000001','GET',undefined,old),'message:read');
  assert.equal((await call('/_routes/register','POST',route)).status,409);
  assert.equal((await call('/api/routes/message/message-000001','GET',undefined,{id:'agent:new',kind:'agent',scopes:[]})).status,200);
  await call('/_routes/register','POST',{kind:'intake',id:'intake-000001',owner:'project1',resource_id:'intake-000001',participants:[]});
  await call('/_routes/register','POST',{kind:'intake',id:'intake-000002',owner:'project1',resource_id:'intake-000002',participants:[]});
  const worker={id:'agent:worker',kind:'agent',scopes:['intake:read'],resource_id:'intake-000001'};
- assert.equal((await call('/api/routes/intake/intake-000002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/intake/intake-000002','GET',undefined,worker),'intake:read');
  assert.equal((await call('/api/routes/intake/intake-000001','GET',undefined,worker)).status,200);
  assert.equal((await call('/api/routes/intake/intake-','GET',undefined,admin)).status,409);
  const unique=await data(await call('/api/routes/intake/intake-','GET',undefined,worker));assert.equal(unique.route.id,'intake-000001');
@@ -125,15 +127,15 @@ test('canonical project route resource keeps bound intake and related session au
  for(const [id,intake] of [['session-shared-001','intake-shared-001'],['session-shared-002','intake-shared-002']])await call('/_routes/register','POST',{kind:'session',id,owner:'machine1',resource_id:'org/a',bound_intake_id:intake,participants:[]});
  const worker={id:'agent:bound',kind:'agent',resource_id:'intake-shared-001',scopes:['intake:read']};
  assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,worker)).status,200);
- assert.equal((await call('/api/routes/intake/intake-shared-002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/intake/intake-shared-002','GET',undefined,worker),'intake:read');
  assert.equal((await data(await call('/api/routes/intake/intake-shared-','GET',undefined,worker))).route.id,'intake-shared-001');
  assert.equal((await data(await call('/api/routes/session/session-shared-','GET',undefined,worker))).route.id,'session-shared-001');
- assert.equal((await call('/api/routes/session/session-shared-002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/session/session-shared-002','GET',undefined,worker),'intake:read');
  const reader={id:'agent:reader',kind:'agent',scopes:['project:org/a','intake:read']};
  assert.equal((await call('/api/routes/intake/intake-shared-','GET',undefined,reader)).status,409);
- assert.equal((await call('/api/routes/intake/intake-other-003','GET',undefined,reader)).status,404);
- assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['intake:read']})).status,404);
- assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['project:org/a']})).status,404);
+ await routeDenied(call('/api/routes/intake/intake-other-003','GET',undefined,reader),'intake:read');
+ await routeDenied(call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['intake:read']}),'intake:read');
+ await routeDenied(call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['project:org/a']}),'intake:read');
  assert.equal((await call('/_routes/register','POST',{kind:'session',id:'session-shared-001',owner:'machine1',resource_id:'org/a',bound_intake_id:'intake-shared-002',participants:[],epoch:2})).status,409);
 });
 
@@ -363,4 +365,29 @@ test('draw diagnostics real Worker forwards bounded query and rejects forged una
  assert.equal((await call('/api/picker-alerts/draw-diagnostics/private')).status,404);
  assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
  assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
+});
+
+test('routing-machines allows routing:read and fails loudly with missing_scope when absent',async t=>{
+ const f=fixture();t.after(()=>f.database.close());
+ const {default:worker}=await import('../src/worker');
+ const token='synthetic-routing-operator-'+'x'.repeat(32);
+ const workerToken='synthetic-routing-worker-'+'y'.repeat(32);
+ const deniedToken='synthetic-routing-denied-'+'z'.repeat(32);
+ const env={...f.env,HUB2_DEV_OPERATOR_TOKEN:token};
+ const origAuth=(f.control as any).fetch.bind(f.control);
+ const customEnv={...env,CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{
+  if(new URL(r.url).pathname==='/_verify'){
+   const body=await r.clone().json() as {token?:string};
+   if(body.token===workerToken)return Response.json({actor:{id:'session:11111111-1111-4111-8111-111111111111',kind:'agent',resource_id:'intake-1',scopes:['intake:read','routing:read','worker_project:org/a']}});
+   if(body.token===deniedToken)return Response.json({actor:{id:'human:limited',kind:'operator',scopes:['intake:read']}});
+  }
+  return origAuth(r);
+ }})}};
+ const allowed=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+workerToken}}),customEnv);
+ assert.equal(allowed.status,200);
+ const denied=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+deniedToken}}),customEnv);
+ assert.equal(denied.status,403);
+ const deniedBody=await data(denied);
+ assert.equal(deniedBody.missing_scope,'routing:read');
+ assert.match(String(deniedBody.detail),/routing:read/);
 });

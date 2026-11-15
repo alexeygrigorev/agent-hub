@@ -136,3 +136,24 @@ class OrphanControllerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RetiredByHub2Tests(unittest.TestCase):
+    """The Hub2 installer retires this supervisor; it must stop cycling, not retry."""
+
+    def test_retired_marker_ends_the_windows_loop_with_handover_exit(self):
+        import tempfile
+        import threading
+        supervisor = load_supervisor()
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertFalse(supervisor.retired_by_hub2(directory))
+            self.assertFalse(supervisor.retired_by_hub2(None))
+            (Path(directory) / supervisor.RETIRED_BY_HUB2).write_text('retired')
+            self.assertTrue(supervisor.retired_by_hub2(directory))
+            attempt = Mock(side_effect=AssertionError('a retired host must not start a controller'))
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as stopped:
+                supervisor.supervise_windows(attempt, threading.Event(),
+                                             replacing=lambda: supervisor.retired_by_hub2(directory))
+            self.assertEqual(stopped.exception.code, supervisor.HANDOVER_EXIT)
+            attempt.assert_not_called()
+

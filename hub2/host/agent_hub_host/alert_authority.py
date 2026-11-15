@@ -64,12 +64,36 @@ class LiveRAM:
     def __init__(self,source_pins,checked_frame,*,now=time.monotonic_ns):
         require(set(source_pins)==set(ROLES) and callable(checked_frame))
         self.pins={role:pin.checked() for role,pin in source_pins.items()}
+        self._state(checked_frame,now)
+
+    @classmethod
+    def _selected_quota_attempt(cls,source_pin,checked_frame,*,now=time.monotonic_ns):
+        """Trusted internal construction ONLY; no absent pin is substituted.
+
+        Caller independently holds the real selected quota source. No config,
+        wire request or producer operation reaches this entry. All unselected
+        sources/aggregate coverage remain explicitly UNKNOWN.
+        """
+        require(type(source_pin) is SourcePin and callable(checked_frame))
+        instance=cls.__new__(cls)
+        instance.pins={'quota_monitor':source_pin.checked()}
+        instance._state(checked_frame,now,unselected=frozenset(ROLES)-{'quota_monitor'})
+        instance.poison(PRODUCERS,'dispatch_unqualified')
+        return instance
+
+    def _state(self,checked_frame,now,*,unselected=frozenset()):
         self.checked_frame=checked_frame;self.now=now
         self.epoch=uuid.uuid4().hex;self.last_clock=None
         self.active={};self.seen=set();self.nonces=set()
         self.faults={producer:None for producer in PRODUCERS}
         self.counts={p:{'started':0,'finished':0,'occurrences':0} for p in PRODUCERS}
         self.tick()
+        self.unselected=unselected
+        if unselected:
+            # Internal partial counts may describe selected attempts only.
+            # Never initialize counters for wholly unselected producers.
+            self.counts={p:(v if any(ROLES[r]==p for r in self.pins) else None)
+                         for p,v in self.counts.items()}
 
     def tick(self):
         value=self.now()
@@ -103,6 +127,7 @@ class LiveRAM:
         scope=PRODUCERS
         try:
             require(type(role) is str and role in ROLES);p=ROLES[role];scope={p}
+            require(role in self.pins and type(process) is ProcessKey and type(source_pin) is SourcePin)
             self.tick();process.checked();source_pin.checked()
             require(source_pin==self.pins[role] and identity(invocation_id))
             if invocation_id in self.seen or len(self.seen)>=MAX_LIFETIME or len(self.active)>=MAX_ACTIVE:
@@ -132,7 +157,7 @@ class LiveRAM:
             attempt=self.active.get(channel_id)
             producers={ROLES[attempt.role]} if attempt else PRODUCERS
             frame=self.checked_frame(frame)
-            require(attempt is not None and channel_process.checked()==attempt.process
+            require(attempt is not None and attempt.role in self.pins and type(channel_process) is ProcessKey and channel_process.checked()==attempt.process
                     and frame['invocation_id']==channel_id and frame['role']==attempt.role
                     and frame['parent_id']==attempt.parent_id and frame['seq']==attempt.next_seq
                     and not attempt.terminal and frame['observer_ok'] is True)
@@ -158,7 +183,7 @@ class LiveRAM:
             require(identity(invocation_id))
             attempt=self.active.get(invocation_id)
             require(attempt is not None);p=ROLES[attempt.role];scope={p}
-            self.tick();require(process.checked()==attempt.process and type(exit_status) is int
+            self.tick();require(attempt.role in self.pins and type(process) is ProcessKey and process.checked()==attempt.process and type(exit_status) is int
                                 and attempt.began and attempt.terminal and attempt.decisions>0)
             self.counts[p]['finished']+=1
         except Exception:self.poison(scope,'missing_terminal')
@@ -176,8 +201,8 @@ class LiveRAM:
         try:
             require(type(role) is str and role in ROLES);scope={ROLES[role]}
             self.tick()
-            require(pin.checked()==self.pins[role] and type(kernel_pid) is int
-                    and verified_process is not None and verified_process.checked().pid==kernel_pid
+            require(role in self.pins and type(pin) is SourcePin and pin.checked()==self.pins[role] and type(kernel_pid) is int
+                    and type(verified_process) is ProcessKey and verified_process.checked().pid==kernel_pid
                     and any(a.role==role and a.process==verified_process for a in self.active.values()))
         except Exception:self.poison(scope,'unmatched_source_open')
 
@@ -200,7 +225,12 @@ class LiveRAM:
             require(callable(drain_current_sources) and drain_current_sources() is True)
             require(self.tick()-start<=ACK_NS)
         except Exception:self.poison(PRODUCERS,'barrier_unqualified')
-        return {'kind':'local_alert_ram_refusal_seam_v1','epoch':self.epoch,'nonce':nonce if identity(nonce) else None,
+        answer={'kind':'local_alert_ram_refusal_seam_v1','epoch':self.epoch,'nonce':nonce if identity(nonce) else None,
                 'complete':False,'authority':'UNQUALIFIED_DISPATCH_ADAPTERS',
                 'ram_consistent':not self.active and not any(self.faults.values()),
-                'counts':{p:dict(v) for p,v in self.counts.items()},'faults':dict(self.faults)}
+                'counts':{p:dict(v) for p,v in self.counts.items()} if not self.unselected else {
+                    p:None if any(r in self.unselected and ROLES[r]==p for r in ROLES) else dict(v)
+                    for p,v in self.counts.items()},'faults':dict(self.faults)}
+        if self.unselected:
+            answer['source_selection']={r:'UNSELECTED' if r in self.unselected else 'SELECTED' for r in ROLES}
+        return answer

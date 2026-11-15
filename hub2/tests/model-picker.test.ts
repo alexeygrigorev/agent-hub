@@ -1071,3 +1071,83 @@ test('valid non-Luna models retain custom Luna-text policy IDs for default and e
   assert.deepEqual(result.options.map(row=>row.value.policy_id),['luna-compat']);
  }
 });
+
+
+test('actual mixed Python heartbeat preserves interactive Codex and excludes its unready headless mode',async()=>{
+ const {spawnSync}=await import('node:child_process'),{fileURLToPath}=await import('node:url');
+ const {mkdtempSync,mkdirSync,rmSync}=await import('node:fs'),{join}=await import('node:path');
+ const temp=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(temp,{recursive:true});
+ const home=mkdtempSync(join(temp,'codex-mode-heartbeat-'));
+ try{
+  const script=`import sys,os,json,types
+os.environ.clear();os.environ.update(HOME=sys.argv[2],PATH='/usr/bin:/bin')
+sys.path.insert(0,sys.argv[1])
+from unittest.mock import patch
+from agent_hub_host.agent import Bridge
+from agent_hub_host.native_launch import NativeLauncher
+from agent_hub_host.advertisement import Advertisement
+bridge=Bridge.__new__(Bridge);bridge.roots=[];bridge.engines={'codex','zai'}
+bridge.launcher=NativeLauncher({'private_provider_homes':False})
+bridge.publish_managed_readiness=lambda:None
+published=[]
+bridge.client=types.SimpleNamespace(heartbeat=lambda labels,engines,capabilities:published.append({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities}))
+with patch('agent_hub_host.native_launch.shutil.which',return_value='/synthetic/installed'),patch('agent_hub_host.native_launch.codex_launch_wrapper',return_value='/synthetic/verified-wrapper'),patch.object(bridge.launcher,'codex_exec_readiness',return_value=None):
+ bridge.heartbeat([],include_native_sessions=False)
+ for count in (29,30,31):
+  tags=['tool:accepted-'+str(i) for i in range(count)]
+  bridge.advertisement=Advertisement([],tags)
+  bridge.heartbeat([],include_native_sessions=False)
+print(json.dumps(published))
+`;
+  const child=spawnSync('python3',['-I','-S','-B','-c',script,fileURLToPath(new URL('../host',import.meta.url)),home],{
+   encoding:'utf8',timeout:10000,maxBuffer:65536,env:{HOME:home,TMPDIR:home,PATH:process.env.PATH || '/usr/bin:/bin'}});
+  assert.equal(child.status,0,child.stderr);
+  const [machine,fullDeclarations,partialDeclarations,resourceOnly]=JSON.parse(child.stdout);
+  for(const [observed,count] of [[fullDeclarations,29],[partialDeclarations,30],[resourceOnly,31]] as const){
+   assert.equal(observed.capabilities.length,32);
+   assert.deepEqual(observed.capabilities.slice(0,count),Array.from({length:count},(_,i)=>'tool:accepted-'+i).sort());
+   for(const marker of observed.capabilities.filter((v:string)=>v.startsWith('modes:')))
+    assert.match(marker,/^modes:v1:(codex|zai):(i|hi)$/,'declarations are indivisible, never truncated pairs');
+  }
+  assert(fullDeclarations.capabilities.includes('modes:v1:codex:i'));
+  assert(fullDeclarations.capabilities.includes('modes:v1:zai:hi'));
+  assert(partialDeclarations.capabilities.includes('modes:v1:codex:i'));
+  assert(!partialDeclarations.capabilities.includes('modes:v1:zai:hi'));
+  assert(!resourceOnly.capabilities.some((v:string)=>v.startsWith('modes:')),'full accepted tag budget leaves mode authority unknown');
+  assert(machine.capabilities.includes('headless'),'existing global hint remains unchanged');
+  assert(machine.capabilities.includes('interactive:codex'));
+  assert(machine.capabilities.includes('modes:v1:codex:i'));
+  assert(machine.capabilities.includes('modes:v1:zai:hi'));
+  assert(!machine.capabilities.includes('headless:codex'));
+  assert(!machine.capabilities.includes('headless:zai'),'compact declaration avoids redundant legacy hints');
+  // Flash is intentionally outside ordinary implement defaults; review is its supported source-audit purpose.
+  const now=Date.now(),policy={version:1,candidates:hydrogenPolicy.candidates.filter((row:any)=>['codex-sol-medium','zai-glm-5-3-flash'].includes(row.id))};
+  const snapshot:RoutingSnapshot={policy,observed_at:now,machines:new Map([['h1',machine]]),accounts:new Map(
+   ['codex','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['h1'],...observed(80,now)}]))};
+  const headless=buildRoutingPool(snapshot,{interactive:false,purpose:'review'});
+  assert.deepEqual(headless.options.map(row=>row.value.engine),['zai'],JSON.stringify({machine,diagnostics:headless.diagnostics}));
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,with_goal:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
+  const onlyCodex={...snapshot,policy:{...policy,candidates:policy.candidates.filter((row:any)=>row.engine==='codex')}};
+  assert.throws(()=>buildRoutingPool(onlyCodex,{interactive:false,purpose:'review'}),(error:any)=>error.code==='model_policy_unavailable');
+  snapshot.machines.set('h1',{...machine,capabilities:['headless','interactive','effort']});
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
+test('engine mode declarations do not override unrelated global capabilities or legacy fallback',()=>{
+ const snapshot=capabilitySnapshot(['headless','interactive:codex','headless:claude','effort','custom-global','modes:v1:codex:i','modes:v1:claude:h']);
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,required_capabilities:['custom-global']}).options.map(row=>row.value.engine),['codex']);
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude']);
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort']});
+ assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2);
+ assert.equal(buildRoutingPool(snapshot,{interactive:true}).options.length,2);
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive:codex','interactive:claude','effort:codex','effort:claude']});
+ assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2,'old mixed-marker heartbeat has no authoritative declaration');
+ for(const unknown of ['modes:v2:codex:i','modes:v1:codex:','modes:v1:codex:ih','modes:v1:other:i']){
+  snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort',unknown]});
+  assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2,'unrecognized declarations do not redefine legacy hints');
+ }
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort','modes:v1:codex:i','modes:v1:codex:hi']});
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude'],'another positive declaration cannot heal a complete negative');
+});

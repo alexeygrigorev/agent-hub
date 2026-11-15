@@ -50,6 +50,16 @@ export function codeTask(source: unknown): boolean {
   return (source as Record<string, unknown>).code_task !== false;
 }
 
+/** True when the brief says the work is report-only: no code, no PR. Used only
+ * when the requester did not state code_task; an explicit value always wins.
+ * Any sign of code delivery (PR, merge, deploy, implement, fix) keeps the gate. */
+export function readOnlyBrief(title: string, text: string, criteria: string[]): boolean {
+  const all = [title, text, ...criteria].join('\n').toLowerCase();
+  const delivery = all.replace(/\b(?:no|without) (?:any )?(?:code|prs?|pull requests?|merges?|deploy(?:ments?)?)\b(?: changes?)?/g, ' ');
+  if (/\b(pull requests?|prs?|merge[ds]?|deploy(?:ed|ment)?|implement|refactor|bug ?fix|commits?)\b/.test(delivery)) return false;
+  return /\b(read[- ]only|report[- ]only|draft[- ]only|status report|no code|without (?:changing|touching) (?:any )?code|no pr)\b/.test(all);
+}
+
 export function mergeEvidenceError(value: unknown): string | undefined {
   const shape = mergeEvidenceShapeError(value);
   if (shape) return shape;

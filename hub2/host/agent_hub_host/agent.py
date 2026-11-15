@@ -1055,11 +1055,20 @@ class Bridge:
             self.begin_command(identity, digest)
         if kind == "stop":
             try:
+                # The native may already be gone (it exited on its own, so the
+                # registry holds only its aplexer tombstone and `kill` refuses):
+                # a failed kill is then reconciled from that tombstone below,
+                # never reported as an unconfirmed stop or a command failure.
+                try:
+                    if bounded_stop:
+                        self.native("kill", native_id, timeout=remaining_stop())
+                    else:
+                        self.native("kill", native_id)
+                except RuntimeError as exc:
+                    if str(exc) != 'native_command_failed':
+                        raise
                 if bounded_stop:
-                    self.native("kill", native_id, timeout=remaining_stop())
                     remaining_stop()
-                else:
-                    self.native("kill", native_id)
                 birth = (_status or {}).get('created_at_ms')
                 while True:
                     status = (self.lookup(native_id, row, timeout=remaining_stop())
@@ -1253,6 +1262,12 @@ class Bridge:
                     frame['native_id'] = launches[0]['native_id']
             if stage == 'host_launch' and target.get("epoch") is not None:
                 frame["epoch"] = target.get("epoch")
+            # Systems fail loudly (t1801u, intake 41ef7048): every refusal names
+            # its session, stage and typed reason in serve.log, not only on the wire.
+            logging.getLogger(__name__).error(
+                '%s session=%s operation=%s stage=%s reason=%s detail=%s',
+                'LAUNCH REFUSED' if frame['stage'] == 'host_launch' else 'HOST EVENT FAILED',
+                target.get('session_id'), target.get('operation_id'), frame['stage'], reason, detail)
             socket.send(canonical(frame))
 
     def run_engine_update(self, job):
@@ -1377,7 +1392,13 @@ class Bridge:
     def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
-        capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        # One complete mode declaration per engine; old generic/scoped hints keep
+        # their meaning for consumers and hosts that do not know this declaration.
+        modes = ['modes:v1:'+engine+':'+''.join(short for mode,short in
+                 (('headless','h'),('interactive','i')) if mode in available[engine])
+                 for engine in engines if re.fullmatch(r'[A-Za-z0-9_.-]{1,48}',engine)
+                 and available[engine].intersection({'headless','interactive'})]
+        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
         workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]

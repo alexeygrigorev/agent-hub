@@ -1025,3 +1025,32 @@ test('same-intake history honors limit with exclusive after cursor and traverses
  assert.equal((await f.call(path+'?limit=5','GET',undefined,{id:'human:nobody',kind:'operator',scopes:[]})).status,403);
  f.sql.close();f.collectorSql.close();
 });
+
+test('scoped worker session creates child intakes and starts child sessions while failing loudly on missing scopes',async()=>{
+ const candidate={id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate]}),parent=await intake(f,'orch-parent'),unrelated=await intake(f,'unrelated-task');
+ const worker={id:'session:11111111-1111-4111-8111-111111111111',kind:'agent' as const,resource_id:parent.id,
+  scopes:['intake:read','intake:append','intake:create','session:start','routing:read','worker_project:org/a']};
+ const created=await f.call('/api/intakes?project=org/a','POST',{key:'worker-child-1',title:'Child task',text:'Do child work',acceptance_criteria:['Child done']},worker);
+ assert.equal(created.status,201);
+ const child=(await body(created)).intake;
+ assert.equal(child.parent_intake_id,parent.id);
+ assert.equal((await f.call('/api/intakes/'+child.id,'GET',undefined,worker)).status,200);
+ assert.equal((await f.call('/api/intakes/'+unrelated.id,'GET',undefined,worker)).status,403);
+ const started=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'start-child-1',workspace:'/tmp/child'},worker);
+ assert.equal(started.status,201);
+ const selfStart=await f.call('/api/intakes/'+parent.id+'/start','POST',{key:'start-self',workspace:'/tmp/self'},worker);
+ assert.equal(selfStart.status,403);
+ assert.equal((await body(selfStart)).missing_scope,'operator:admin');
+ const unrelatedStart=await f.call('/api/intakes/'+unrelated.id+'/start','POST',{key:'start-unrelated',workspace:'/tmp/u'},worker);
+ assert.equal(unrelatedStart.status,403);
+ assert.equal((await body(unrelatedStart)).missing_scope,'session:start');
+ const foreignCreate=await f.call('/api/intakes?project=org/b','POST',{key:'foreign-c',title:'X',text:'Y',acceptance_criteria:['Z']},worker);
+ assert.equal(foreignCreate.status,403);
+ assert.equal((await body(foreignCreate)).missing_scope,'intake:write');
+ const noStart={id:'human:limited',kind:'operator' as const,scopes:['intake:read']};
+ const deniedStart=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'no-scope-start',workspace:'/tmp/n'},noStart);
+ assert.equal(deniedStart.status,403);
+ assert.equal((await body(deniedStart)).missing_scope,'session:start');
+ f.sql.close();f.collectorSql.close();
+});
