@@ -2,7 +2,9 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('intake_recovery_alerts', REPO / 'scripts/hub-intake-recovery-alerts.py')
@@ -44,6 +46,25 @@ class RecoveryAlertTest(unittest.TestCase):
         self.helper = root / 'helper.sh'
         self.helper.write_text('#!/bin/sh\nprintf "%s|%s\\n" "$PRINCIPAL_ALERT_TO" "$PING_ALERT_MESSAGE" >> ' + str(self.log) + '\n')
         self.helper.chmod(0o700)
+        self.helper_returncode = 0
+        self.helper_calls = []
+        # No test can execute a mail helper/MTA. Use a wholly controlled child
+        # environment rather than removing an inherited sink before real mail.
+        env_patch = patch.object(poller.os, 'environ', {})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        helper_patch = patch.object(poller.subprocess, 'run', side_effect=self.run_helper)
+        helper_patch.start()
+        self.addCleanup(helper_patch.stop)
+
+    def run_helper(self, argv, *, env, **kwargs):
+        self.assertEqual(argv[0], str(self.helper), 'only the synthetic helper is permitted')
+        self.helper_calls.append((argv, dict(env)))
+        if self.helper_returncode == 0:
+            target = Path(env['ALERT_LOG']) if env.get('ALERT_LOG') else self.log
+            with target.open('a') as stream:
+                stream.write(env['PRINCIPAL_ALERT_TO'] + '|' + env['PING_ALERT_MESSAGE'] + '\n')
+        return types.SimpleNamespace(returncode=self.helper_returncode)
 
     def tearDown(self):
         self.dir.cleanup()
@@ -76,8 +97,44 @@ class RecoveryAlertTest(unittest.TestCase):
 
     def test_failed_helper_is_retried_next_run(self):
         self.helper.write_text('#!/bin/sh\nexit 3\n')
+        self.helper_returncode = 3
         self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 0, 'errors': 1})
         self.assertFalse(self.state.exists())
+        self.helper_returncode = 0
+        self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 1, 'errors': 0})
+
+    def test_render_only_sink_does_not_journal_or_suppress_future_mail(self):
+        sink = Path(self.dir.name) / 'render-only.log'
+        poller.os.environ['ALERT_LOG'] = str(sink)
+        self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 0, 'errors': 1})
+        self.assertTrue(sink.exists())
+        self.assertFalse(self.log.exists(), 'sink routing must never fall through to mail')
+        self.assertFalse(self.state.exists(), 'render-only exit0 is not a sent receipt')
+        self.assertEqual(self.helper_calls[0][1]['ALERT_LOG'], str(sink))
+        poller.os.environ.pop('ALERT_LOG')  # Only this test's fake environment/helper.
+        self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 1, 'errors': 0})
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:9'])
+        self.assertEqual(len(self.helper_calls), 2)
+
+    def test_host_disconnect_sink_keeps_existing_receipts_unchanged(self):
+        sink = Path(self.dir.name) / 'host-render-only.log'
+        poller.os.environ['ALERT_LOG'] = str(sink)
+        poller.save_state(self.state, {'version': 1, 'sent': ['previous-real-receipt']})
+        previous = self.state.read_bytes()
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=[HOST]), self.state, self.helper),
+                         {'sent': 0, 'errors': 1})
+        self.assertEqual(self.state.read_bytes(), previous)
+        self.assertTrue(sink.exists())
+        self.assertFalse(self.log.exists())
+
+    def test_empty_sink_preserves_normal_delivery_and_nonzero_sink_is_not_sent(self):
+        poller.os.environ['ALERT_LOG'] = ''
+        self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 1, 'errors': 0})
+        poller.os.environ['ALERT_LOG'] = str(Path(self.dir.name) / 'never-delivered.log')
+        self.helper_returncode = 1
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=[HOST]), self.state, self.helper),
+                         {'sent': 0, 'errors': 1})
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:9'])
 
 
 HOST = {'machine_id': 'DESKTOP-FP4OP26', 'connected': False, 'last_seen': 1_800_000_900_000,
