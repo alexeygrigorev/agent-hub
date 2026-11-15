@@ -1434,12 +1434,14 @@ test('missing native after startup grace fails with attention without waiting fo
 });
 
 test('a complete census fails an omitted native after grace but incomplete or stale census cannot',async()=>{
- for(const mode of ['complete','incomplete','stale','present']){
+ for(const mode of ['complete','incomplete','stale','present','new-start','predates-start']){
   const f=fixture(),session='census-omitted-'+mode,native='11111111-2222-4333-8444-555555555555';
   await startClaimed(f,session,native);
-  f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000,session);
+  const old=Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
+  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,mode==='new-start'?Date.now():old,session);
   const observed=mode==='stale'?Date.now()-100_000:Date.now();
-  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',observed_at_ms:observed}));
+  const started=mode==='predates-start'?old-1:observed-1;
+  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',started_at_ms:started,observed_at_ms:observed}));
   if(mode==='present')f.database.prepare('INSERT INTO native_inventory_rows VALUES(?,?)').run(native,'{}');
   const result=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
   assert.equal(result.reaped,mode==='complete'?1:0);

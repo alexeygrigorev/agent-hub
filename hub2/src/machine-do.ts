@@ -1878,9 +1878,10 @@ export class MachineDO {
         // A bounded heartbeat omission proves nothing. A fresh complete census
         // can prove absence, including after a rejected finish was dead-lettered.
         // This authorizes failure only, never a successful stop or native exit.
-        const census=this.nativeInventory.status(now),observed=Number(census.observed_at_ms);
+        const census=this.nativeInventory.status(now),observed=Number(census.observed_at_ms),started=Number(census.started_at_ms);
         if(census.complete!==true||census.fresh!==true||!Number.isSafeInteger(observed)
-          ||observed>now+5000||observed-session.created_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS
+          ||!Number.isSafeInteger(started)||started<session.updated_at
+          ||observed>now+5000||observed-session.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS
           ||this.db.one('SELECT native_id FROM native_inventory_rows WHERE native_id=?',session.native_id))continue;
         live={session_id:session.id,native_id:session.native_id,phase:'missing',last_activity_at:null,observed_at:observed};
       }
