@@ -702,8 +702,8 @@ class NativeLauncher:
                 for engine, route in configuration.get("routes", {}).items()
             }}
         else:
-            self.config["routes"] = {**{engine: dict(route) for engine, route in CENTRAL_ROUTES.items()},
-                                     **configuration.get("routes", {})}
+            self.config["routes"] = ({**configuration["routes"]} if "routes" in configuration else
+                                     {engine: dict(route) for engine, route in CENTRAL_ROUTES.items()})
         self.config.setdefault("routes", {})["shell"] = {"provider": "shell"}
         self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer

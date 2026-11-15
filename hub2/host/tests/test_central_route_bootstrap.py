@@ -52,6 +52,22 @@ class CentralRouteBootstrapTests(unittest.TestCase):
         self.assertEqual(nl.NativeLauncher({}).config['routes']['go'], nl.LOCAL_ROUTES['go'])
         self.assertEqual(nl.NativeLauncher({}).config['routes']['codex'], nl.LOCAL_ROUTES['codex'])
 
+    def test_explicit_route_maps_do_not_enable_or_dispatch_unlisted_providers(self):
+        for routes in ({}, {'go': {'provider': 'go'}}):
+            with self.subTest(routes=routes), tempfile.TemporaryDirectory() as directory:
+                original = {engine: dict(route) for engine, route in routes.items()}
+                runner = mock.Mock(side_effect=AssertionError('must not spawn'))
+                adapter = nl.NativeLauncher({'private_provider_homes': True, 'routes': routes}, runner=runner)
+                self.assertEqual(set(adapter.config['routes']), set(original) | {'shell'})
+                with mock.patch.object(nl, 'codex_launch_wrapper', side_effect=AssertionError('must not inspect wrapper')) as wrapper:
+                    with self.assertRaisesRegex(RuntimeError, 'native_launch_route_missing'):
+                        adapter.launch('explicit-route-policy', {'engine': 'codex', 'workspace': directory,
+                            'model': 'synthetic', 'prompt': 'p', 'interactive': False, 'timeout_seconds': 60})
+                wrapper.assert_not_called()
+                runner.assert_not_called()
+                self.assertEqual(routes, original)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_defaults_are_per_instance_and_do_not_create_unavailable_capabilities(self):
         adapter = nl.NativeLauncher({'private_provider_homes': True})
         adapter.config['routes']['go']['provider'] = 'synthetic-other'
