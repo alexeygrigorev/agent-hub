@@ -188,10 +188,30 @@ def private_directory(path):
 
 
 class Broker:
-    def __init__(self, directory, pins, *, collector_factory=None, identity=process_key):
+    def __init__(self, directory, pins, *, collector_factory=None, identity=process_key, _dispatch_factory=None):
         self.directory = Path(directory)
         self.path = self.directory / 'observer.sock'
         self.ram = ram.LiveRAM(pins, checked)
+        self._state(collector_factory,identity,_dispatch_factory)
+
+    @classmethod
+    def _selected_quota_attempt(cls,directory,selected_source,*,collector_factory,dispatch_factory,identity=process_key):
+        """Root-selected held source ONLY; no config/client admission selector.
+
+        The normal constructor remains full-source strict. Missing roles have
+        no pins and explicit UNKNOWN snapshots; no quota-pin replication.
+        """
+        from .quota_dispatch_manager import HeldSourceFD,V4QuotaManager
+        require(type(selected_source) is HeldSourceFD and callable(collector_factory)
+                and callable(dispatch_factory) and callable(identity))
+        V4QuotaManager.held_pin(selected_source,os.fstat(selected_source.fd))
+        instance=cls.__new__(cls)
+        instance.directory=Path(directory);instance.path=instance.directory/'observer.sock'
+        instance.ram=ram.LiveRAM._selected_quota_attempt(selected_source.pin,checked)
+        instance._state(collector_factory,identity,dispatch_factory)
+        return instance
+
+    def _state(self,collector_factory,identity,_dispatch_factory):
         # No independently qualified dispatcher/source-open/system/cron binding
         # exists in this increment. No hook or job is allowed to self-admit.
         self.ram.poison(ram.PRODUCERS, 'dispatch_unqualified')
@@ -208,6 +228,7 @@ class Broker:
         self.unqualified_frames = []
         self.unqualified_bytes = 0
         self.unqualified_contexts = {}
+        self.dispatch_factory, self.dispatch = _dispatch_factory, None
         self.requests = 0
         self.closed = False
 
@@ -234,6 +255,8 @@ class Broker:
                 require(set(value) == {'v','op','frame'})
                 frame = checked(value['frame'])
                 require(self.identity(peer[0]) == before)
+                if self.dispatch is not None and self.dispatch.owns(frame['invocation_id']):
+                    return self.dispatch.public_hook(frame['invocation_id'])
                 self.record_unqualified(frame, before)
                 # No admission endpoint. Unadmitted frames receive negative ACK
                 # from RAM and poison evidence instead of manufacturing counts.
@@ -281,6 +304,7 @@ class Broker:
     def drain(self):
         if self.collector is None or self.closed:
             return False
+        if self.dispatch is not None and not self.dispatch.barrier(): return False
         self.collector.barrier()
         return not self.stop_event.is_set()
 
@@ -312,8 +336,11 @@ class Broker:
             sock.setblocking(False); sock.listen(8)
             self.collector = self.factory(self.job)
             self.collector.start()
+            if self.dispatch_factory is not None:
+                self.dispatch = self.dispatch_factory(self)
             while not self.stop_event.is_set():
                 self.collector.wire.receive(0, self.collector.handle)
+                if self.dispatch is not None: self.dispatch.step()
                 ready, _, _ = select.select([sock], [], [], .01)
                 if not ready:
                     continue
@@ -335,6 +362,9 @@ class Broker:
         finally:
             self.closed = True
             self.ram.collector_lost(ram.PRODUCERS)
+            if self.dispatch is not None:
+                try: self.dispatch.close()
+                except BaseException: self.ram.collector_lost(ram.PRODUCERS)
             if self.collector is not None:
                 try:
                     self.collector.close()
