@@ -1,10 +1,10 @@
 name: Canonical host distribution
 on:
   pull_request:
-    paths: ['hub2/host/**', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
+    paths: ['hub2/host/**', 'deploy/host-install.ps1', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
   push:
     branches: [main]
-    paths: ['hub2/host/**', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
+    paths: ['hub2/host/**', 'deploy/host-install.ps1', 'pyproject.toml', 'uv.lock', 'scripts/ci/test_root_distribution.py', '.github/workflows/host-canary.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -24,3 +24,20 @@ jobs:
         with:
           version: '0.10.11'
       - run: python scripts/ci/test_root_distribution.py
+      # Intake 41ef7048: the Windows host installer/updater must parse under
+      # Windows PowerShell 5.1, and the host lifecycle helpers must pass on Windows.
+      - name: Parse Windows host installer (Windows PowerShell)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'deploy\host-install.ps1').Path, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_.ToString() }; exit 1 }
+          Write-Host 'host-install.ps1 parses'
+      - name: Windows host lifecycle tests
+        if: runner.os == 'Windows'
+        env:
+          PYTHONPATH: hub2/host;hub2/host/tests
+        run: |
+          python -m pip install pytest "websockets==16.0"
+          python -m pytest -q -p no:cacheprovider hub2/host/tests/test_windows_host.py

@@ -7,7 +7,13 @@ sessions, a recovery start is refused, or the session cannot be recovered
 (lost host, launch failure). This poller finds those intakes across projects,
 mails each alert once through the dev-mail helper and remembers it in a private
 receipt journal. It runs every five minutes from ops/systemd/hub-intake-recovery-alerts.timer.
+
+It also mails each Hub2 host_disconnected alert once per disconnect episode: a
+host that keeps heartbeating (or holds live sessions) without its socket for
+more than 15 minutes (intake 41ef7048 AC2, t1801u). Hub2 publishes those on
+/api/fleet/routing/machines as `host_alert`.
 """
+import datetime
 import argparse
 import json
 import os
@@ -62,6 +68,33 @@ def pending_alerts(transport):
                 break
 
 
+def host_alerts(transport):
+    """Yield (key, machine, alert) for hosts Hub2 reports running but disconnected."""
+    page = transport.get('/api/fleet/routing/machines')
+    for machine in page.get('machines') or []:
+        alert = machine.get('host_alert') if isinstance(machine, dict) else None
+        machine_id = str((machine or {}).get('machine_id', ''))
+        if (not isinstance(alert, dict) or alert.get('kind') != 'host_disconnected'
+                or machine.get('connected') is not False or not machine_id
+                or not all(c.isalnum() or c in '-_.' for c in machine_id)):
+            continue
+        yield 'host:' + machine_id + ':' + str(alert.get('disconnected_since')), machine, alert
+
+
+def render_host(machine, alert, now=None):
+    since = alert.get('disconnected_since')
+    stamp, minutes = '?', '?'
+    if isinstance(since, int):
+        stamp = datetime.datetime.fromtimestamp(since / 1000, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        minutes = str(max(0, int(((now if now is not None else datetime.datetime.now().timestamp() * 1000) - since) // 60000)))
+    return ('Hub2 host {machine} is running but disconnected since {stamp} ({minutes} min; evidence: {evidence}). '
+            'Sessions routed to it cannot start. On the host: check scheduled task AgentHub2Host and '
+            '%LOCALAPPDATA%\\agent-hub2\\serve.log (Linux: journalctl --user -u agent-hub2-host); '
+            'reinstall/update: hub2 self-update. Status: hub routing-machines.').format(
+        machine=machine.get('machine_id'), stamp=stamp, minutes=minutes,
+        evidence=alert.get('evidence') or 'unknown')
+
+
 def render(item, alert):
     return ('Hub could not recover intake {id} ({project}): "{title}". Alert {kind} ({reason}) after '
             'session {session}; {depth} of {max} recovery sessions used. Status {status}. {cause}'
@@ -90,14 +123,25 @@ def save_state(path, state):
     os.replace(tmp, path)
 
 
+def all_alerts(transport, result):
+    for key, item, alert in pending_alerts(transport):
+        yield key, render(item, alert)
+    try:
+        hosts = list(host_alerts(transport))
+    except Exception:  # A host view failure must not hide intake alerts; it still fails the run.
+        result['errors'] += 1
+        return
+    for key, machine, alert in hosts:
+        yield key, render_host(machine, alert)
+
+
 def deliver(transport, state_path, helper):
     state = load_state(state_path)
     sent = set(state['sent'])
     result = {'sent': 0, 'errors': 0}
-    for key, item, alert in pending_alerts(transport):
+    for key, message in all_alerts(transport, result):
         if key in sent:
             continue
-        message = render(item, alert)
         env = dict(os.environ, PRINCIPAL_ALERT_TO=RECIPIENT, PING_ALERT_MESSAGE=message)
         completed = subprocess.run([str(helper), message], env=env, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=120, check=False)

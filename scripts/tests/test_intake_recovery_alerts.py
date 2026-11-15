@@ -14,12 +14,17 @@ ALERT = {'recipient': poller.RECIPIENT, 'kind': 'recovery_exhausted', 'reason': 
 
 
 class StubTransport:
-    def __init__(self, owner=poller.RECIPIENT):
+    def __init__(self, owner=poller.RECIPIENT, machines=None):
         self.owner = owner
+        self.machines = machines or []
         self.paths = []
 
     def get(self, path):
         self.paths.append(path)
+        if path == '/api/fleet/routing/machines':
+            if self.machines == 'fail':
+                raise OSError('routing view unavailable')
+            return {'machines': self.machines}
         if path.startswith('/api/intakes?'):
             if 'status=failed' in path:
                 return {'items': [{'id': 'abc-1', 'project': 'o/r', 'title': 'T', 'status': 'failed'}], 'next': None}
@@ -73,6 +78,33 @@ class RecoveryAlertTest(unittest.TestCase):
         self.helper.write_text('#!/bin/sh\nexit 3\n')
         self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper), {'sent': 0, 'errors': 1})
         self.assertFalse(self.state.exists())
+
+
+HOST = {'machine_id': 'DESKTOP-FP4OP26', 'connected': False, 'last_seen': 1_800_000_900_000,
+        'host_alert': {'kind': 'host_disconnected', 'recipient': 'dev@dtcdev.click',
+                       'disconnected_since': 1_800_000_000_000, 'alerted_at': 1_800_000_960_000,
+                       'evidence': 'http_heartbeat_without_socket'}}
+
+
+class HostDisconnectAlertTest(RecoveryAlertTest):
+    def test_mails_developer_once_per_disconnect_episode(self):
+        machines = [HOST, {'machine_id': 'quiet', 'connected': True},
+                    dict(HOST, machine_id='reconnected', connected=True)]
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=machines), self.state, self.helper),
+                         {'sent': 1, 'errors': 0})
+        to, message = self.log.read_text().splitlines()[0].split('|', 1)
+        self.assertEqual(to, 'dev@dtcdev.click')
+        self.assertIn('DESKTOP-FP4OP26 is running but disconnected since 2027-01-15', message)
+        self.assertIn('http_heartbeat_without_socket', message)
+        self.assertIn('AgentHub2Host', message)
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=machines), self.state, self.helper),
+                         {'sent': 0, 'errors': 0})
+        later = dict(HOST, host_alert=dict(HOST['host_alert'], disconnected_since=1_800_100_000_000))
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=[later]), self.state, self.helper),
+                         {'sent': 1, 'errors': 0}, 'a new disconnect episode alerts again')
+
+    def test_host_view_failure_keeps_intake_alerts_and_fails_the_run(self):
+        self.assertEqual(poller.deliver(StubTransport(machines='fail'), self.state, self.helper), {'sent': 1, 'errors': 1})
 
 
 if __name__ == '__main__':

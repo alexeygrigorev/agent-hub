@@ -2,6 +2,7 @@
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 import time
@@ -27,6 +28,11 @@ def main(argv=None):
     serve.add_argument("--once", action="store_true")
     serve.add_argument("--aplexer", default="a")
     serve.add_argument("--label", action="append", default=[])
+    serve.add_argument("--log-file", type=Path, default=None,
+                       help="Append daemon logs here (default on Windows: %%LOCALAPPDATA%%\\agent-hub2\\serve.log)")
+    commands.add_parser("version", help="Print this host's release identity and credential mode")
+    mode = commands.add_parser("credential-mode", help="Show or set host-owned (local) or Hub-delivered (central) provider logins")
+    mode.add_argument("mode", nargs="?", choices=["local", "central"])
     heartbeat = commands.add_parser("heartbeat", help="Report machine health without reading offers or changing sessions")
     heartbeat.add_argument("--aplexer", default="a")
     heartbeat.add_argument("--label", action="append", default=[])
@@ -43,7 +49,16 @@ def main(argv=None):
     updater.add_argument("--base-url")
     updater.add_argument("--root", type=Path, default=Path.home() / ".local/share/agent-hub2")
     updater.add_argument("--no-restart", action="store_true")
+    updater.add_argument("--force", action="store_true", help="Windows: reinstall even when already current")
     args = parser.parse_args(argv)
+    if args.command == "self-update" and os.name == "nt":
+        from .windows_host import windows_self_update
+        try:
+            config = json.loads(args.config.read_text()) if args.config.exists() else {}
+            return windows_self_update(args.base_url or config.get("server") or DEFAULT_SERVER, force=args.force)
+        except (OSError, ValueError) as error:
+            print(f"Hub2 self-update failed: {type(error).__name__}: {str(error)[:200]}", file=sys.stderr)
+            return 1
     if args.command == "self-update":
         import subprocess
         command = [sys.executable, str(args.root / "updater.py"), "--root", str(args.root)]
@@ -54,6 +69,20 @@ def main(argv=None):
         return subprocess.run(command).returncode
     try:
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
+        if args.command == "version":
+            from .windows_host import credential_mode, host_release
+            version, protocol = host_release()
+            print(json.dumps({"host_version": version, "protocol_version": protocol,
+                              "machine_id": config.get("machine_id"), "credential_mode": credential_mode(config)}))
+            return 0
+        if args.command == "credential-mode":
+            from .windows_host import credential_mode, set_credential_mode
+            if args.mode is not None:
+                config = set_credential_mode(config, args.mode)
+                save_config(args.config, config)
+            print(json.dumps({"credential_mode": credential_mode(config),
+                              "restart_required": args.mode is not None}))
+            return 0
         if args.command == "configure-host":
             from .advertisement import configure
             updated = configure(config, args.capability, args.workspace)
@@ -83,6 +112,13 @@ def main(argv=None):
             bridge.heartbeat(args.label, include_native_sessions=False)
             print(json.dumps({"ok": True}))
         elif args.command == "serve":
+            from .windows_host import configure_logging, credential_mode, default_log_file, host_release
+            log_file = configure_logging(args.log_file or default_log_file())
+            version, protocol = host_release()
+            logging.getLogger("agent_hub_host").info(
+                "Hub2 host starting machine=%s host_version=%s protocol=%s credential_mode=%s engines=%s log=%s",
+                config.get("machine_id"), version or "unreleased", protocol, credential_mode(config),
+                ",".join(config.get("engines") or []), log_file or "stderr")
             observer = None
             if 'alert_observer' in config:
                 try:
@@ -103,9 +139,14 @@ def main(argv=None):
         else:
             print(json.dumps(execute(client, args, config)))
         return 0
-    except (ApiError, OSError, ValueError, KeyError, RuntimeError):
-        # Do not echo exceptions that can contain a token, prompt, local path or response.
-        print("Hub operation failed; no successful result recorded.", file=sys.stderr)
+    except (ApiError, OSError, ValueError, KeyError, RuntimeError) as error:
+        # Do not echo exceptions that can contain a token, prompt, local path or
+        # response; name the failure class and Hub's typed code so it is diagnosable.
+        reason = (f"{error.code} (HTTP {error.status})" if isinstance(error, ApiError) and error.code
+                  else type(error).__name__)
+        if args.command == "serve":
+            logging.getLogger("agent_hub_host").error("Hub2 serve stopped: %s", reason)
+        print(f"Hub operation failed ({args.command}: {reason}); no successful result recorded.", file=sys.stderr)
         return 1
 
 

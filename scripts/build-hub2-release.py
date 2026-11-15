@@ -23,6 +23,8 @@ import zipfile
 REPO = Path(__file__).resolve().parent.parent
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
 CLI_INSTALLERS = ('install.sh', 'install.ps1')
+# Windows host installer/updater (intake 41ef7048), served at /cli/host-install.ps1.
+WINDOWS_HOST_INSTALLER = 'host-install.ps1'
 MAX_MANIFEST = 128 * 1024
 
 
@@ -65,6 +67,9 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     # original CI-pinned manifest. New builds always emit the standalone client.
     if 'hub_alert_client.py' in records:
         expected_files.add('hub_alert_client.py')
+    # Releases built before the Windows host installer stay valid rollback targets.
+    if WINDOWS_HOST_INSTALLER in records:
+        expected_files.add(WINDOWS_HOST_INSTALLER)
     if records.keys() != expected_files or {path.name for path in directory.iterdir()} != expected_files | {'host-release.json'}:
         raise ValueError('release directory has missing or unexpected files')
     for name, record in records.items():
@@ -108,7 +113,7 @@ def export_source(repo, revision, target):
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
                    'scripts/hub_alert_client.py',
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
-                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'uv.lock',
+                   'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'deploy/' + WINDOWS_HOST_INSTALLER, 'uv.lock',
                    *(f'public/cli/{name}' for name in CLI_INSTALLERS)])
     with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
         for entry in bundle:
@@ -168,6 +173,7 @@ def build(repo, revision, output):
         shutil.copyfile(source / 'scripts/hub2-enroll.py', artifacts / 'hub2-enroll.py')
         shutil.copyfile(source / 'scripts/hub_alert_client.py', artifacts / 'hub_alert_client.py')
         shutil.copyfile(source / 'deploy/host-install.sh', artifacts / 'host-install.sh')
+        shutil.copyfile(source / 'deploy' / WINDOWS_HOST_INSTALLER, artifacts / WINDOWS_HOST_INSTALLER)
         for unit in UNITS:
             shutil.copyfile(source / 'deploy' / unit, artifacts / unit)
         files = {}
