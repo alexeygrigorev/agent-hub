@@ -135,13 +135,13 @@ _CONTEXT_KEYS = ('HUB_ALERT_INVOCATION_ID','HUB_ALERT_PARENT_ID','HUB_ALERT_ROLE
 
 
 def positive_only_context(role, *, socket_path, parent_id=None, deadline=None, env=None):
-    """One top-level quota SOURCE CLAIM, never an admitted invocation.
+    """One top-level producer SOURCE CLAIM, never an admitted invocation.
 
     No environment mutation, inherited context adoption, child spawn or retry.
-    Backup/canary owner integration is deliberately outside this first splice.
+    Backup retains its separate persistent source-session integration.
     """
     env = os.environ if env is None else env
-    require(type(role) is str and role in ('quota_publish','quota_monitor') and parent_id is None)
+    require(type(role) is str and role in ('quota_publish','quota_monitor','canary') and parent_id is None)
     require(type(socket_path) is str and socket_path.startswith('/') and '\0' not in socket_path
         and len(os.fsencode(socket_path)) <= 107 and '..' not in socket_path.split('/'))
     require(not any(key in env for key in _CONTEXT_KEYS))
