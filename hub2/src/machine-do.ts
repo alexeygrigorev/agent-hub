@@ -1515,12 +1515,14 @@ export class MachineDO {
     }
     if (session) {
       const priorResult=this.parse(row.result_json) as JsonRecord|null;
+      const failedPrelaunch=row.state==='pending'&&session.state==='failed'&&session.native_id===null;
       const legacyBoundStop = session.state!=='lost' && result.stopped === true && result.evidence === undefined && !!session.native_id
         && (row.state === 'pending' && priorResult?.dispatch_native_id === session.native_id
           || row.state === 'acked' && priorResult?.evidence === 'legacy_bound_exit' && priorResult?.native_id === session.native_id);
       if (legacyBoundStop) {
         result = {...result,evidence:'legacy_bound_exit',native_id:session.native_id};
-      } else if (result.evidence === 'legacy_bound_exit' || !this.qualifiedStopResult(session,result)) {
+      } else if (result.evidence === 'legacy_bound_exit' || !this.qualifiedStopResult(session,result)
+        ||failedPrelaunch&&result.evidence!=='dispatch_fenced') {
         result = {stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'};
       }
     }
@@ -1562,6 +1564,7 @@ export class MachineDO {
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.operation_id') END=s.operation_id
         ) OR (c.kind='stop' AND (
           (s.state='lost' AND s.native_id IS NOT NULL) OR
+          (s.state='failed' AND s.native_id IS NULL) OR
           (s.state='expired' AND EXISTS(SELECT 1 FROM launch_admissions a
             WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
         ))
@@ -1579,7 +1582,7 @@ export class MachineDO {
       const view=this.commandView(command);
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
       if(command.kind==='capture'&&session&&session.state!=='running'&&session.state!=='claimed'&&!this.retainedCaptureReady(session))return;
-      if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired')) {
+      if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired' || session.state === 'failed')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
         view.pre_native=true;view.workspace=boundWorkspace(launch);view.tag=`task-hub2-${session.id}`;
       }
@@ -1913,7 +1916,8 @@ export class MachineDO {
 
   private canDispatchStop(session: SessionRow): boolean {
     return ['claimed', 'running'].includes(session.state) || (session.state === 'expired' && this.hasLaunchAdmission(session))
-      || (session.state==='lost' && !!session.native_id);
+      || (session.state==='lost' && !!session.native_id)
+      || (session.state==='failed' && session.native_id===null);
   }
 
   private async recordStopped(session:SessionRow,reason:string,observedAt:number,
@@ -1927,6 +1931,9 @@ export class MachineDO {
       const unclaimed=current&&this.unclaimedWithoutNative(current);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id||current.native_id!==session.native_id
         ||(!this.canDispatchStop(current)&&!unclaimed))return false;
+      const failedPrelaunch=current.state==='failed'&&current.native_id===null;
+      if(failedPrelaunch&&(!stopCommand||!('result_json' in stopCommand)
+        ||(this.parse(stopCommand.result_json) as JsonRecord|null)?.evidence!=='dispatch_fenced'))return false;
       const lost=current.state==='lost';
       if (lost && (!stopCommand || !('result_json' in stopCommand) || stopCommand.native_id!==current.native_id)) return false;
       if (stopCommand && 'result_json' in stopCommand) {
