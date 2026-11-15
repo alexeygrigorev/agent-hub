@@ -2200,5 +2200,23 @@ class ManagedProfileRepinTests(unittest.TestCase):
             self.assertEqual(updater.repin_managed_profiles(Path(tmp) / 'releases' / SHA), [])
 
 
+
+class RetainedSchemaReleaseTransactionTests(unittest.TestCase):
+    """Required release-tooling explicitly executes the retained transaction suite."""
+    def test_current_schema_transaction_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_schema_transaction_contract', REPO / 'scripts/tests/test_schema_release_transaction.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.SchemaReleaseTransactionTest)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained transaction suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained transaction case must execute')
+        self.assertEqual(result.skipped, [], 'retained transaction contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
 if __name__ == '__main__':
     unittest.main()
