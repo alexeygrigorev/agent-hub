@@ -182,7 +182,19 @@ class World:
     def repinned_text(self, original, old, new):
         line = 'command = ' + json.dumps(self.command_for(old))
         assert original.count(line) == 1
-        return original.replace(line, 'command = ' + json.dumps(self.command_for(new)))
+        text = original.replace(line, 'command = ' + json.dumps(self.command_for(new)))
+        # The updater also re-pins every other generated execute() profile
+        # to the installed release (intake fc36c32b).
+        import tomllib
+        updater = load_updater()
+        other = tomllib.loads(original)['profiles']['hub-test-account']
+        managed = updater.repinnable_execute_profile('hub-test-account', other)
+        if managed is not None:
+            other_line = 'command = ' + json.dumps(other['command'])
+            assert text.count(other_line) == 1
+            text = text.replace(other_line, 'command = ' + json.dumps(
+                updater.release_execute_command(new, 'test-account', managed)))
+        return text
 
     # Fake transport bound to the synthetic enrolled host.
     def request(self, method, path, payload=None):
