@@ -8,3 +8,4 @@ await import('./session-link.test.ts');
 await import('./task-completion.test.ts');
 await import('./task-completion-cli.test.ts');
 await import('./intake-relations.test.ts');
+await import('./worker-parent-intake.test.ts');
