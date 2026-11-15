@@ -168,6 +168,22 @@ def resolve_windows_program(program, environ=None):
     return found if found and ntpath.isabs(found) else program
 
 
+def windows_codex_command(argv):
+    """Execute the installed npm entry with Node, without shell expansion."""
+    if sys.platform != 'win32' or ntpath.basename(argv[0]).lower() not in {'codex', 'codex.cmd', 'codex.ps1', 'codex.exe'}:
+        return argv
+    program = argv[0] if ntpath.isabs(argv[0]) else shutil.which(argv[0])
+    if not program:
+        raise RuntimeError('native_codex_program_unavailable')
+    if Path(program).suffix.lower() == '.exe':
+        return [program, *argv[1:]]
+    script = Path(program).parent / 'node_modules' / '@openai' / 'codex' / 'bin' / 'codex.js'
+    node = shutil.which('node')
+    if not script.is_file() or not node or not ntpath.isabs(node):
+        raise RuntimeError('native_codex_program_unavailable')
+    return [node, str(script), *argv[1:]]
+
+
 def codex_launch_wrapper(environ=None, home=None):
     """Verified maintained Codex quota wrapper (resolved Linux path) or ValueError.
 
@@ -1100,7 +1116,8 @@ class NativeLauncher:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
         if provider != 'shell':
             goal = aplexer_prompt(goal)
-        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive"))
+        windows_native_codex = sys.platform == 'win32' and provider == 'codex' and not route.get('profile')
+        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive") and not windows_native_codex)
         if local:
             if codex_wrapper and not self.codex_exec_readiness(route, codex_wrapper):
                 raise RuntimeError('codex_launch_wrapper_unavailable')
@@ -1175,6 +1192,8 @@ class NativeLauncher:
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if child:
             child = [resolve_windows_program(child[0]), *child[1:]]
+            if provider == 'codex':
+                child = windows_codex_command(child)
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
