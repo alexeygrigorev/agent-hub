@@ -539,7 +539,7 @@ def check_health(args, observer=None):
                 'reason': 'state_unavailable', 'alert_sent': False, 'sink_failed': False}
 
 
-def main(argv=None):
+def main(argv=None, *, _managed_observer=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true', help='independent staleness monitor; never invokes hub/quse')
     parser.add_argument('--alert-client', type=Path, default=None, help=argparse.SUPPRESS)
@@ -567,7 +567,7 @@ def main(argv=None):
     if not 1 <= args.stale_seconds <= 900 or not 1 <= args.publish_timeout <= 120 or not 1 <= args.alert_timeout <= 30:
         parser.error('bounds: stale1..900, publish timeout1..120, alert timeout1..30 seconds')
     role = 'quota_monitor' if args.check else 'quota_publish'
-    observer = AlertObserver(args, role)
+    observer = _managed_observer if _managed_observer is not None else AlertObserver(args, role)
     observer.emit('begin')
     try:
         health = check_health(args, observer) if args.health_check else None
@@ -600,7 +600,13 @@ def main(argv=None):
         observer.fail()
         raise
     finally:
-        observer.emit('terminal')
+        if _managed_observer is not None and sys.exc_info()[0] is not None:
+            try:
+                observer.emit('terminal')
+            except BaseException:
+                pass  # Preserve original managed business/control exception.
+        else:
+            observer.emit('terminal')
 
 
 if __name__ == '__main__':
