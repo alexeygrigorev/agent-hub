@@ -700,9 +700,9 @@ EXECUTE_CODE = re.compile(
 CODEX_PROFILE = 'hub-shared-codex'
 
 
-def release_execute_command(target, label, managed_dir):
+def release_execute_command(target, label, managed_dir, *, engine=None):
     archive = target / 'hub.pyz'
-    if label == CODEX_PROFILE[4:]:
+    if engine == 'codex' and label == CODEX_PROFILE[4:]:
         # Byte-for-byte what provisioning.module_command() generates inside this
         # release; codex_exec_readiness compares the profile to exactly that.
         code = ('import sys; sys.path.insert(0, ' + repr(str(archive)) + '); sys.path.insert(0, ' + repr(str(archive))
@@ -728,7 +728,8 @@ def repinnable_execute_profile(name, table):
     # Only zipapp pins; a checkout/venv source tree is operator-maintained, except
     # the maintained shared-codex profile: a stale source-tree pin there makes the
     # host refuse every codex launch (intake f88ae417), so it follows the release.
-    if not match or ('.pyz' not in command[-2] and name != CODEX_PROFILE):
+    if not match or ('.pyz' not in command[-2]
+                     and (name != CODEX_PROFILE or table['engine'] != 'codex')):
         return None
     return match.group('managed')
 
@@ -760,7 +761,7 @@ def repin_managed_profiles(target):
             managed = repinnable_execute_profile(name, table)
             if managed is None:
                 continue
-            command = release_execute_command(target, name[4:], managed)
+            command = release_execute_command(target, name[4:], managed, engine=table['engine'])
             if command == table['command']:
                 continue
             old_line = 'command = ' + json.dumps(table['command']) + '\n'
@@ -776,7 +777,8 @@ def repin_managed_profiles(target):
         updated = before + MANAGED_BEGIN + block + MANAGED_END + after
         parsed = tomllib.loads(updated).get('profiles', {})
         if any(parsed.get(name, {}).get('command') != release_execute_command(
-                target, name[4:], repinnable_execute_profile(name, profiles[name])) for name in changed):
+                target, name[4:], repinnable_execute_profile(name, profiles[name]),
+                engine=parsed.get(name, {}).get('engine')) for name in changed):
             return []
         managed_root = Path(repinnable_execute_profile(changed[0], profiles[changed[0]]))
         lock = managed_lock(managed_root) if (managed_root / 'reconcile.lock').is_file() else contextlib.nullcontext()

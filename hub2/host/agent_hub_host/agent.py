@@ -1380,7 +1380,13 @@ class Bridge:
     def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
-        capabilities=['headless']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        # One complete mode declaration per engine; old generic/scoped hints keep
+        # their meaning for consumers and hosts that do not know this declaration.
+        modes = ['modes:v1:'+engine+':'+''.join(short for mode,short in
+                 (('headless','h'),('interactive','i')) if mode in available[engine])
+                 for engine in engines if re.fullmatch(r'[A-Za-z0-9_.-]{1,48}',engine)
+                 and available[engine].intersection({'headless','interactive'})]
+        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
         workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]
