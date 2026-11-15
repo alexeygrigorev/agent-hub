@@ -229,13 +229,15 @@ export class ProjectDO {
     const body = await bodyObject(request, 16_384);
     normalizeCriteria(body);
     if (body.code_task !== undefined && typeof body.code_task !== 'boolean') return error('invalid_code_task',400);
+    if (body.parent_intake_id !== undefined && body.parent_intake_id !== null && (typeof body.parent_intake_id !== 'string' || !body.parent_intake_id.trim())) return error('invalid_parent_intake_id', 400);
+    if (typeof body.parent_intake_id === 'string' && body.parent_intake_id.trim().length < 6) return error('prefix_too_short', 400, 'parent_intake_id prefix must be at least 6 characters');
     if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.length > 240) return error('invalid_title', 400);
     if (typeof body.text !== 'string' || body.text.trim().length < 1 || new TextEncoder().encode(body.text).byteLength > 8192) return error('invalid_text', 400);
     const criteriaProblem = criteriaError(body.acceptance_criteria);
     if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]) };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]), ...(body.parent_intake_id !== undefined ? { parent_intake_id: body.parent_intake_id } : {}) };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -248,8 +250,17 @@ export class ProjectDO {
     }
     const now = Date.now();
     const id = crypto.randomUUID();
-    const parentIntakeId = actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id
-      && !this.canProject(actor, project, 'intake:write') ? actor.resource_id : null;
+    let explicitParentId: string | null | undefined;
+    if (body.parent_intake_id !== undefined) {
+      if (!hasScope(actor, 'operator:admin')) return forbiddenScope('operator:admin', 'only an operator can set parent_intake_id');
+      const resolved = this.resolveParentIntakeId(id, body.parent_intake_id as string | null);
+      if (resolved instanceof Response) return resolved;
+      explicitParentId = resolved;
+    }
+    const parentIntakeId = explicitParentId !== undefined
+      ? explicitParentId
+      : (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id
+        && !this.canProject(actor, project, 'intake:write') ? actor.resource_id : null);
     this.transaction(() => {
       this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority,parent_intake_id)
         VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task}),2,parentIntakeId);
@@ -315,11 +326,11 @@ export class ProjectDO {
     const body = await bodyObject(request.clone(), 16384);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', 'force', 'verification', 'project', ...INTAKE_CONTEXT_FIELDS];
+    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', 'force', 'verification', 'project', 'code_task', 'parent_intake_id', ...INTAKE_CONTEXT_FIELDS];
     if (Object.keys(body).some(field => !supported.includes(field))) return error('unknown_intake_field', 400);
     const mapped: JsonRecord = { key: body.key };
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
-    for (const field of ['title', 'priority', 'acceptance_criteria', 'project', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
+    for (const field of ['title', 'priority', 'acceptance_criteria', 'project', 'code_task', 'parent_intake_id', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
       const forceClose = body.force === true || body.outcome === 'closed_unverified';
       const unverifiedSession = row.session_id !== null && row.status !== 'completed-awaiting-review' && !forceClose;

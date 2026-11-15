@@ -440,6 +440,7 @@ def add_commands(sub):
                         help='Post-DONE verifier policy (default auto: Hub decides from the change)')
     create.add_argument('--priority', choices=['high', 'normal', 'low'], default=None,
                         help='Queue priority (default normal; autonomous queue takes high before normal before low)')
+    create.add_argument('--parent', default=None, help='Operator only: parent intake id (short or full)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
@@ -486,6 +487,7 @@ def add_commands(sub):
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
     update.add_argument('--code-task', choices=['true', 'false'], help='Operator only: reclassify the intake as a code task (merge gate applies) or not')
+    update.add_argument('--parent', help='Operator only: parent intake id (short or full; pass "none" to clear)')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
     update.add_argument('--note', help='Note recorded with this update (max 4000 characters); given alone it appends a plain note')
     close = commands.add_parser('close', help='CAS status done; refused while intake worktrees are present or unmerged unless --force --reason')
@@ -780,6 +782,8 @@ def execute(args):
             body['verification'] = args.verification
         if getattr(args, 'priority', None) is not None:
             body['priority'] = args.priority
+        if getattr(args, 'parent', None) is not None:
+            body['parent_intake_id'] = None if args.parent.lower() in {'', 'none', 'null'} else args.parent
         return request('POST', BASE + '/tasks', body)
     if command == 'summary':
         params = {'project': args.project} if args.project is not None else {}
@@ -993,6 +997,8 @@ def execute(args):
             payload['note'] = _note_text(args.note)
         if getattr(args, 'code_task', None) is not None:
             payload['code_task'] = args.code_task == 'true'
+        if getattr(args, 'parent', None) is not None:
+            payload['parent_intake_id'] = None if args.parent.lower() in {'', 'none', 'null'} else args.parent
         for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
@@ -1006,7 +1012,7 @@ def execute(args):
     raise IntakeInputError('Unknown intake operation')
 
 
-UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by', 'code_task')
+UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by', 'code_task', 'parent')
 
 
 def _usage_error(message):

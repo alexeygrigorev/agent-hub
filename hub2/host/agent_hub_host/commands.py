@@ -88,6 +88,8 @@ def execute(client, args, config):
                         **({"code_task": False} if args.non_code_task else {}))
             if args.code_task is not None:
                 body["code_task"] = parse_bool(args.code_task)
+            if args.parent is not None:
+                body["parent_intake_id"] = None if args.parent.lower() in {"", "none", "null"} else args.parent
             method = "POST"
         elif action == "update":
             method = "PATCH"
