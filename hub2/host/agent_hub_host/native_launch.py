@@ -66,6 +66,10 @@ PROVIDER_CAPABILITIES = {"shell": {"headless"}, "zai": {"headless", "interactive
                          "antigravity": {"headless", "interactive", "effort"}}
 PROVIDER_BINARIES = {"zai": "zcodex", "codex": "codex", "go": "opencode", "claude": "claude", "antigravity": "agy"}
 FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex", "antigravity"}
+# Central account delivery supports these providers in providers.provision().
+# No local profile or account association: the picked account is validated there.
+CENTRAL_ROUTES = {provider: {"provider": provider} for provider in ("codex", "claude", "go", "zai")}
+
 LOCAL_ROUTES = {
     "codex": {"provider": "codex", "profile": "hub-shared-codex"},
     "go": {"provider": "go", "profile": "hub-shared-go"},
@@ -697,6 +701,9 @@ class NativeLauncher:
                 engine: {**LOCAL_ROUTES.get(engine, LOCAL_ROUTES.get(route.get("provider"), {})), **route}
                 for engine, route in configuration.get("routes", {}).items()
             }}
+        else:
+            self.config["routes"] = {**{engine: dict(route) for engine, route in CENTRAL_ROUTES.items()},
+                                     **configuration.get("routes", {})}
         self.config.setdefault("routes", {})["shell"] = {"provider": "shell"}
         self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer
