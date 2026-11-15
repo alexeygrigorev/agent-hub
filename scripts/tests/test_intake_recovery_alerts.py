@@ -5,6 +5,8 @@ import tempfile
 import types
 import shutil
 import subprocess
+import sys
+import importlib
 import unittest
 from unittest.mock import patch
 
@@ -218,6 +220,341 @@ class CopiedGuardHelperContractTest(unittest.TestCase):
         self.mta.unlink()  # Only this test's newly-created fake file.
         self.assertEqual(self.invoke(missing_mta=True).returncode, 1)
         self.assertFalse(self.mta_log.exists())
+
+
+class HookRecorder:
+    def __init__(self, fail=False):
+        self.frames, self.dirty, self.fail_emit = [], False, fail
+    def fail(self):
+        self.dirty = True
+    def emit(self, phase, **fields):
+        self.frames.append(dict(phase=phase, **fields))
+        if self.fail_emit:
+            raise OSError('SECRET callback failure')
+        return True
+
+
+class PositiveHooksTest(RecoveryAlertTest):
+    def test_both_branches_before_helper_and_journal_dedup(self):
+        observer = HookRecorder()
+        original = self.run_helper
+        def helper(argv, **kwargs):
+            self.assertEqual(observer.frames[-1]['decision'], 'alert')
+            return original(argv, **kwargs)
+        with patch.object(poller.subprocess, 'run', side_effect=helper):
+            result = poller.deliver(StubTransport(machines=[HOST]), self.state, self.helper, observer=observer)
+        self.assertEqual(result, {'sent': 2, 'errors': 0})
+        decisions = [f for f in observer.frames if f.get('decision') == 'alert']
+        self.assertEqual([f['condition'] for f in decisions], ['intake_recovery', 'host_disconnected'])
+        again = HookRecorder()
+        self.assertEqual(poller.deliver(StubTransport(machines=[HOST]), self.state, self.helper,
+                                      observer=again), {'sent': 0, 'errors': 0})
+        self.assertEqual([f['condition'] for f in again.frames if f.get('decision') == 'alert_dedup'],
+                         ['intake_recovery', 'host_disconnected'])
+        self.assertEqual(len(self.helper_calls), 2)
+
+    def test_begin_before_token_journal_and_api(self):
+        observer = HookRecorder()
+        config = Path(self.dir.name) / 'synthetic-cli.json'
+        config.write_text(json.dumps({'access_token': 'SYNTHETIC_ONLY'}))
+        original = Path.read_text
+        def read(path, *args, **kwargs):
+            self.assertEqual(observer.frames[0]['phase'], 'begin')
+            return original(path, *args, **kwargs)
+        transport = StubTransport(owner='human:x')
+        with patch.object(Path, 'read_text', read), patch.object(poller, 'Transport', return_value=transport):
+            self.assertEqual(poller.main(['--cli-json', str(config), '--helper', str(self.helper),
+                                         '--state', str(self.state)], observer=observer), 0)
+        self.assertEqual([f['phase'] for f in observer.frames], ['begin', 'decision', 'terminal'])
+        self.assertEqual(observer.frames[1]['condition'], 'mailer_scan_empty')
+
+    def test_default_off_never_loads_client(self):
+        config = Path(self.dir.name) / 'synthetic-cli.json'
+        config.write_text(json.dumps({'access_token': 'SYNTHETIC_ONLY'}))
+        with patch.object(poller, 'AlertObserver', side_effect=AssertionError('observer activated')), \
+             patch.object(poller, 'Transport', return_value=StubTransport(owner='human:x')):
+            self.assertEqual(poller.main(['--cli-json', str(config), '--helper', str(self.helper),
+                                         '--state', str(self.state)]), 0)
+
+    def test_input_failure_is_original_and_dirty_with_terminal(self):
+        observer = HookRecorder()
+        original = KeyboardInterrupt('ORIGINAL_CONTROL')
+        with patch.object(Path, 'read_text', side_effect=original):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                poller.main(['--cli-json', '/synthetic-only', '--helper', '/synthetic-helper'], observer=observer)
+        self.assertIs(caught.exception, original)
+        self.assertTrue(observer.dirty)
+        self.assertEqual(observer.frames[-1]['phase'], 'terminal')
+        self.assertFalse(observer.frames[-1]['flags']['exit_success'])
+
+    def test_observer_failure_keeps_business_once(self):
+        observer = HookRecorder(fail=True)
+        self.assertEqual(poller.deliver(StubTransport(machines=[HOST]), self.state, self.helper,
+                                      observer=observer), {'sent': 2, 'errors': 0})
+        self.assertEqual(len(self.helper_calls), 2)
+        self.assertTrue(observer.dirty)
+
+    def test_partial_host_failure_not_empty_or_complete(self):
+        observer = HookRecorder()
+        self.assertEqual(poller.deliver(StubTransport(machines='fail'), self.state, self.helper,
+                                      observer=observer), {'sent': 1, 'errors': 1})
+        self.assertTrue(observer.dirty)
+        conditions = [f.get('condition') for f in observer.frames]
+        self.assertIn('mailer_api_error', conditions)
+        self.assertNotIn('mailer_scan_empty', conditions)
+        self.assertNotIn('mailer_scan_complete', conditions)
+
+    def test_page_limit_is_incomplete_without_changing_business_result(self):
+        class FullPages(StubTransport):
+            def get(self, path):
+                if path.startswith('/api/intakes?'):
+                    self.paths.append(path)
+                    return {'items': [], 'next': 'MORE_PAGES'}
+                return super().get(path)
+        observer = HookRecorder()
+        transport = FullPages()
+        self.assertEqual(poller.deliver(transport, self.state, self.helper, observer=observer),
+                         {'sent': 0, 'errors': 0})
+        self.assertEqual(sum(p.startswith('/api/intakes?') for p in transport.paths), 2*poller.MAX_PAGES)
+        self.assertTrue(observer.dirty)
+        self.assertIn('mailer_scan_incomplete', [f.get('condition') for f in observer.frames])
+        self.assertNotIn('mailer_scan_empty', [f.get('condition') for f in observer.frames])
+        self.assertEqual(self.helper_calls, [])
+
+    def test_render_state_and_journal_errors_preserve_identity(self):
+        for target, stage in [('render','mailer_render_error'), ('load_state','mailer_state_error'),
+                              ('save_state','mailer_journal_error')]:
+            with self.subTest(target=target):
+                self.state.unlink(missing_ok=True)
+                observer = HookRecorder()
+                original = ValueError('SECRET render/state/journal')
+                with patch.object(poller, target, side_effect=original):
+                    with self.assertRaises(ValueError) as caught:
+                        poller.deliver(StubTransport(), self.state, self.helper, observer=observer)
+                self.assertIs(caught.exception, original)
+                self.assertTrue(observer.dirty)
+                self.assertIn(stage, [f.get('condition') for f in observer.frames])
+                self.assertEqual(observer.frames[-1]['phase'], 'terminal')
+
+    def test_helper_timeout_and_control_never_replay_or_journal(self):
+        for original in [subprocess.TimeoutExpired(['SECRET_ARGV'], 120), KeyboardInterrupt('CONTROL')]:
+            with self.subTest(kind=type(original).__name__):
+                observer = HookRecorder()
+                with patch.object(poller.subprocess, 'run', side_effect=original) as run:
+                    with self.assertRaises(type(original)) as caught:
+                        poller.deliver(StubTransport(), self.state, self.helper, observer=observer)
+                self.assertIs(caught.exception, original)
+                self.assertEqual(run.call_count, 1)
+                self.assertFalse(self.state.exists())
+                self.assertTrue(observer.dirty)
+
+    def test_original_exception_survives_cleanup_observer_interrupt(self):
+        class Interrupted(HookRecorder):
+            def emit(self, phase, **fields):
+                if phase != 'begin':
+                    raise SystemExit('OBSERVER_CONTROL')
+                return super().emit(phase, **fields)
+        original = KeyboardInterrupt('ORIGINAL')
+        with patch.object(poller, 'load_state', side_effect=original):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                poller.deliver(StubTransport(), self.state, self.helper, observer=Interrupted())
+        self.assertIs(caught.exception, original)
+
+    def test_sink_requested_is_not_smtp_success_and_nonzero_is_dirty(self):
+        observer = HookRecorder()
+        poller.os.environ['ALERT_LOG'] = 'SECRET_LOG_PATH'
+        self.helper_returncode = 75
+        # Override fake helper to avoid treating arbitrary test path as a file.
+        with patch.object(poller.subprocess, 'run', return_value=types.SimpleNamespace(returncode=75)):
+            self.assertEqual(poller.deliver(StubTransport(), self.state, self.helper,
+                                          observer=observer), {'sent': 0, 'errors': 1})
+        self.assertTrue(observer.dirty)
+        self.assertTrue(all(f['flags']['log_requested'] for f in observer.frames))
+        self.assertEqual(sum(f.get('decision') == 'alert' for f in observer.frames), 1)
+        self.assertFalse(self.state.exists())
+        self.assertNotIn('SECRET', json.dumps(observer.frames))
+
+    def selected_client(self):
+        spec = importlib.util.spec_from_file_location('synthetic_selected_client', REPO/'scripts/hub_alert_client.py')
+        client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(client)
+        return client
+
+    def test_frame_capacity_negative_ack_and_later_frames_never_heal(self):
+        client = self.selected_client()
+        frames = []
+        def exchange(path, request, **kwargs):
+            frame = request['frame']
+            frames.append(frame)
+            return {'seq': frame['seq'], 'ok': False}
+        args = types.SimpleNamespace(alert_client=Path('/synthetic/client'), alert_client_sha256='a'*64,
+                                     alert_broker_socket='/synthetic/socket')
+        with patch.object(poller, 'alert_client', return_value=client), patch.object(client, 'exchange', exchange):
+            observer = poller.AlertObserver(args)
+            items = [(str(i), {}, {}) for i in range(30)]
+            with patch.object(poller, 'pending_alerts', return_value=iter(items)):
+                result = poller.deliver(StubTransport(), self.state, self.helper, observer=observer)
+        self.assertEqual(result, {'sent': 30, 'errors': 0})
+        self.assertEqual(len(self.helper_calls), 30)
+        self.assertEqual(len(frames), 16)
+        self.assertEqual([f['seq'] for f in frames], list(range(16)))
+        self.assertTrue(observer.dirty)
+        self.assertTrue(frames[0]['observer_ok'])
+        self.assertTrue(all(not f['observer_ok'] for f in frames[1:]))
+        self.assertNotIn('terminal', [f['phase'] for f in frames], 'overflow cannot become clean completion')
+
+    def test_client_source_pin_and_context_refusals(self):
+        client = self.selected_client()
+        path = Path(self.dir.name) / 'client.py'
+        raw = (REPO/'scripts/hub_alert_client.py').read_bytes()
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        import hashlib
+        loaded = poller.alert_client(path, hashlib.sha256(raw).hexdigest())
+        self.assertTrue(callable(loaded.positive_only_context))
+        with self.assertRaises(ValueError):
+            poller.alert_client(path, '0'*64)
+        for role, parent, env in [('unknown',None,{}), ('intake_mailer','a'*32,{}),
+                                  ('intake_mailer',None,{'HUB_ALERT_ROLE':'quota_monitor'})]:
+            with self.assertRaises(client.Refused):
+                client.positive_only_context(role, socket_path='/synthetic/socket', parent_id=parent, env=env)
+        self.assertEqual(client.positive_only_context('intake_mailer',socket_path='/synthetic/socket',env={}).role,
+                         'intake_mailer')
+
+    def test_closed_broker_contract_retains_unqualified_claim_without_admission(self):
+        # Release-tooling CI does not install a Hub2 host package. Load the
+        # actual checkout package under a unique name, never a legacy fallback.
+        name = '_intake_mailer_real_host'
+        source = REPO/'hub2/host/agent_hub_host'
+        spec = importlib.util.spec_from_file_location(name, source/'__init__.py',
+                                                      submodule_search_locations=[str(source)])
+        package = importlib.util.module_from_spec(spec)
+        previous = {key:value for key,value in sys.modules.items() if key == name or key.startswith(name+'.')}
+        self.addCleanup(lambda: sys.modules.update(previous))
+        self.addCleanup(lambda: [sys.modules.pop(key,None) for key in list(sys.modules)
+                                 if key == name or key.startswith(name+'.')])
+        sys.modules[name] = package
+        spec.loader.exec_module(package)
+        authority = importlib.import_module(name+'.alert_authority')
+        broker = importlib.import_module(name+'.alert_broker')
+        client = self.selected_client()
+        frame = dict(v=1, invocation_id='a'*32,parent_id=None,role='intake_mailer',phase='begin',seq=0,
+                     decision=None,condition=None,flags={'log_requested':True},recipient_class='none',observer_ok=True)
+        self.assertEqual(client.checked(frame), broker.checked(frame))
+        process = authority.ProcessKey(123,456,'11111111-1111-1111-1111-111111111111')
+        pin = authority.SourcePin(1,2,'a'*64)
+        ram = authority.LiveRAM({role:pin for role in authority.ROLES}, broker.checked)
+        instance = broker.Broker.__new__(broker.Broker)
+        instance.identity=lambda _:process
+        instance.ram=ram;instance.dispatch=None
+        instance.unqualified_frames=[];instance.unqualified_contexts={};instance.unqualified_bytes=0
+        with patch.object(broker.os,'getuid',return_value=1000):
+            answer = instance.request({'v':1,'op':'hook','frame':frame},(123,1000,1000))
+        self.assertIs(answer['ok'],False)
+        self.assertEqual(len(instance.unqualified_frames),1)
+        self.assertEqual(ram.active,{})
+        self.assertNotIn('intake_mailer',authority.ROLES)
+        self.assertNotIn('intake_mailer',ram.counts)
+        partial=authority.LiveRAM._selected_quota_attempt(pin,broker.checked)
+        self.assertEqual(set(partial.pins),{'quota_monitor'})
+        self.assertNotIn('intake_mailer',partial.pins)
+        for dirty in [dict(frame,secret='PRIVATE'),dict(frame,phase='decision',decision='alert',condition='PRIVATE'),
+                      dict(frame,parent_id='b'*32),
+                      dict(frame,phase='decision',decision='alert',condition='mailer_api_error'),
+                      dict(frame,phase='decision',decision='alert',condition='intake_recovery')]:
+            with self.assertRaises(broker.Refused):broker.checked(dirty)
+
+
+
+class LoaderDescriptorCleanupTest(unittest.TestCase):
+    """Pure descriptor-number fakes; no host FD/path/config is opened."""
+    def load(self, *, close_errors=None, read_error=None, source_open_error=None):
+        import contextlib
+        import hashlib
+        import stat
+        raw = b'SYNTHETIC_CLIENT = True\n'
+        directory = types.SimpleNamespace(st_uid=1000, st_mode=stat.S_IFDIR | 0o700)
+        source = types.SimpleNamespace(st_uid=1000, st_mode=stat.S_IFREG | 0o600, st_nlink=1,
+            st_size=len(raw),st_dev=1,st_ino=2,st_mtime_ns=3,st_ctime_ns=4)
+        acquired, closed = [], []
+        errors = close_errors or {}
+        def opened(name, flags, **kwargs):
+            if name == 'client.py' and source_open_error is not None:
+                raise source_open_error
+            fd = 100 + len(acquired)
+            acquired.append(fd)
+            return fd
+        def close(fd):
+            closed.append(fd)
+            if closed.count(fd) > 1:
+                raise AssertionError('a possibly consumed descriptor was retried')
+            if fd in errors:
+                raise errors[fd]
+        def read(fd, limit):
+            if read_error is not None:
+                raise read_error
+            return raw
+        with contextlib.ExitStack() as stack:
+            for name, replacement in [('open',opened),('close',close),('read',read),
+                ('getuid',lambda:1000),('fstat',lambda fd:source if fd==102 else directory),
+                ('stat',lambda *args,**kwargs:source)]:
+                stack.enter_context(patch.object(poller.os,name,replacement))
+            try:
+                result = poller.alert_client(Path('/owned/client.py'), hashlib.sha256(raw).hexdigest())
+                error = None
+            except BaseException as caught:
+                result, error = None, caught
+        return acquired, closed, result, error
+
+    def test_old_directory_close_error_consumes_once_and_closes_new_fd(self):
+        original = OSError('synthetic consumed old descriptor')
+        acquired,closed,result,error = self.load(close_errors={100:original})
+        self.assertEqual(acquired,[100,101])
+        self.assertEqual(closed,[100,101])
+        self.assertIs(error,original)
+        self.assertIsNone(result)
+
+    def test_old_directory_close_control_is_preserved_and_new_fd_closed(self):
+        original = KeyboardInterrupt('original cleanup control')
+        _,closed,_,error = self.load(close_errors={100:original})
+        self.assertEqual(closed,[100,101])
+        self.assertIs(error,original)
+
+    def test_source_close_error_does_not_skip_directory_or_execute_module(self):
+        original = OSError('source close failed')
+        _,closed,result,error = self.load(close_errors={102:original})
+        self.assertEqual(closed,[100,102,101])
+        self.assertIs(error,original)
+        self.assertIsNone(result)
+
+    def test_source_close_control_does_not_skip_directory(self):
+        original = SystemExit('source close control')
+        _,closed,_,error = self.load(close_errors={102:original,101:OSError('later close')})
+        self.assertEqual(closed,[100,102,101])
+        self.assertIs(error,original)
+
+    def test_original_read_exception_wins_over_all_cleanup_controls(self):
+        for original in [ValueError('original read error'),KeyboardInterrupt('original read control')]:
+            with self.subTest(kind=type(original).__name__):
+                _,closed,_,error=self.load(read_error=original,
+                    close_errors={102:SystemExit('cleanup control'),101:OSError('cleanup error')})
+                self.assertEqual(closed,[100,102,101])
+                self.assertIs(error,original)
+
+    def test_source_open_failure_closes_every_acquired_fd_once(self):
+        original=OSError('source open failed')
+        acquired,closed,_,error=self.load(source_open_error=original)
+        self.assertEqual(acquired,[100,101])
+        self.assertEqual(closed,[100,101])
+        self.assertIs(error,original)
+
+    def test_normal_loader_closes_all_once_before_executing_selected_bytes(self):
+        acquired,closed,result,error=self.load()
+        self.assertEqual(acquired,[100,101,102])
+        self.assertEqual(closed,[100,102,101])
+        self.assertIsNone(error)
+        self.assertTrue(result.SYNTHETIC_CLIENT)
+
 
 
 if __name__ == '__main__':

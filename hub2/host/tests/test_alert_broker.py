@@ -49,7 +49,7 @@ class Tests(unittest.TestCase):
         return tempfile.TemporaryDirectory(prefix='b-',dir=os.environ.get('RUNNER_TEMP') or None)
 
     def test_approved_core_bytes_exact(self):
-        for name,digest in [('alert_authority.py','40ae4d17dfe160a37b48fa65816e7001415a95323856aa9ef1387ca9f2d8e19c'),
+        for name,digest in [('alert_authority.py','6ae18ac9a2347129013afff4f65939d0e434a873fd7b757e94c909b4873b44ce'),
             ('alert_collector.py','1db01dae6b1ef4187281e986a50d00521cd1d2942fef4e8e9e486b242ab84fb8')]:
             self.assertEqual(hashlib.sha256(Path(importlib.util.find_spec('agent_hub_host.'+name[:-3]).origin).read_bytes()).hexdigest(),digest)
 

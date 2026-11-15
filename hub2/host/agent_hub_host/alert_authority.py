@@ -10,6 +10,8 @@ import uuid
 
 ROLES={'canary':'start_canary','quota_publish':'quota_stale','quota_monitor':'quota_stale',
        'backup_pull':'backup','backup_notifier':'backup'}
+# Source claims only: never admitted, pinned or counted by this RAM inventory.
+CLAIM_ROLES={'intake_mailer':'intake_mailer'}
 PRODUCERS=frozenset(ROLES.values())
 DECISIONS={'observation':False,'alert':True,'alert_dedup':True,'recovery':True}
 MAX_ACTIVE=128

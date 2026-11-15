@@ -11,7 +11,7 @@ client=importlib.util.module_from_spec(spec);spec.loader.exec_module(client)
 
 class AcceptedClientContractTests(unittest.TestCase):
  def test_reviewed_real_client_is_one_composed_shared_implementation(self):
-  expected='153edbfd204bdadfd5dd5a6b20eef04f8acf91f543deade89225d91dbd7f0cc8'
+  expected='5c81a8f9585d21cd32b3d8fd9f8d2e002bc6f0f2e8e973aa9a47fb554060f50c'
   self.assertEqual(hashlib.sha256(PATH.read_bytes()).hexdigest(),expected)
   self.assertNotIn('Controller',vars(client));self.assertNotIn('FileLedger',vars(client))
   self.assertNotIn('Dispatcher',vars(client));self.assertNotIn('dispatch',vars(client))

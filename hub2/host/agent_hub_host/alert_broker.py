@@ -28,9 +28,9 @@ MAX_UNQUALIFIED_CONTEXTS = 128
 CONDITIONS = frozenset(('pass','recovering','failure_below_threshold','recovery','critical',
     'critical_dedup','lock_busy','deploy_gate','metadata_only','error','backup_failed','stale',
     'fresh','recovery_pending','quota_stale','quota_fresh','quota_recovery_pending',
-    'quota_publication','health_critical','backup_begin','backup_terminal','drill','pull_terminal'))
+    'quota_publication','health_critical','backup_begin','backup_terminal','drill','pull_terminal','intake_recovery','host_disconnected','mailer_api_error','mailer_render_error','mailer_state_error','mailer_helper_error','mailer_helper_timeout','mailer_journal_error','mailer_scan_complete','mailer_scan_empty','mailer_scan_incomplete','mailer_input_error'))
 FLAGS = frozenset(('test','drill','no_mail','dry_run','prior_stale','prior_drill','stale_drill',
-                  'repeat_due','decision_seen','exit_success'))
+                  'repeat_due','decision_seen','exit_success','intake_recovery','host_disconnected','log_requested'))
 
 
 class Refused(Exception):
@@ -68,7 +68,7 @@ def checked(frame):
         'phase','seq','decision','condition','flags','recipient_class','observer_ok'})
     require(type(frame['v']) is int and frame['v'] == 1 and ram.identity(frame['invocation_id'])
         and (frame['parent_id'] is None or ram.identity(frame['parent_id']))
-        and type(frame['role']) is str and frame['role'] in ram.ROLES
+        and type(frame['role']) is str and frame['role'] in (ram.ROLES.keys() | ram.CLAIM_ROLES.keys())
         and frame['phase'] in ('begin','decision','terminal')
         and type(frame['seq']) is int and 0 <= frame['seq'] < 16
         and type(frame['observer_ok']) is bool)
@@ -79,6 +79,20 @@ def checked(frame):
         require(frame['decision'] in ram.DECISIONS and frame['condition'] in CONDITIONS)
     else:
         require(frame['decision'] is None and frame['condition'] is None)
+    if frame['role'] in ram.CLAIM_ROLES:
+        require(frame['parent_id'] is None and set(frame['flags']) <=
+            {'log_requested','exit_success','intake_recovery','host_disconnected'})
+        if frame['phase'] == 'decision':
+            branch = frame['condition'] in ('intake_recovery','host_disconnected')
+            require((branch and frame['decision'] in ('alert','alert_dedup')
+                and frame['flags'].get(frame['condition']) is True
+                and set(frame['flags']) <= {'log_requested',frame['condition']})
+                or (not branch and frame['decision'] == 'observation'
+                    and frame['condition'].startswith('mailer_')
+                    and set(frame['flags']) <= {'log_requested'}))
+        else:
+            require(set(frame['flags']) <= ({'log_requested','exit_success'}
+                if frame['phase'] == 'terminal' else {'log_requested'}))
     return frame
 
 
