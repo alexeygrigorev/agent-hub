@@ -1089,7 +1089,7 @@ class NativeLauncher:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
         codex_wrapper = None
-        if provider == 'codex' and os.name != 'nt':
+        if provider == 'codex' and sys.platform != 'win32':
             # Resolve and verify before anything is written or spawned. The
             # operator-owned path is the only source; no raw SDK fallback.
             try:
