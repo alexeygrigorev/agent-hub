@@ -2218,5 +2218,95 @@ class RetainedSchemaReleaseTransactionTests(unittest.TestCase):
         self.assertTrue(result.wasSuccessful(), '\n'.join(
             str(case) + '\n' + detail for case, detail in result.failures + result.errors))
 
+
+class RetainedSchemaRollbackPreflightTests(unittest.TestCase):
+    """Required release-tooling explicitly executes the retained read-only preflight suite."""
+    def test_current_schema_rollback_preflight_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_schema_rollback_preflight_contract', REPO / 'scripts/tests/test_schema_rollback_preflight.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.SchemaRollbackPreflightTest)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained rollback preflight suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained rollback preflight case must execute')
+        self.assertEqual(result.skipped, [], 'retained rollback preflight contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
+
+class RetainedSchemaInstallConfigurationTests(unittest.TestCase):
+    """Required release-tooling executes the retained SchemaInstallConfigurationTests suite."""
+    def test_current_schema_install_configuration_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_test_schema_install_configuration_contract', REPO / 'scripts/tests/test_schema_install_configuration.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.SchemaInstallConfigurationTests)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained SchemaInstallConfigurationTests suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained SchemaInstallConfigurationTests case must execute')
+        self.assertEqual(result.skipped, [], 'retained SchemaInstallConfigurationTests contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
+
+class RetainedSchemaInstallerGitOwnerTests(unittest.TestCase):
+    """Required release-tooling executes the retained InstallerGitOwnerTests suite."""
+    def test_current_schema_installer_git_owner_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_test_schema_installer_git_owner_contract', REPO / 'scripts/tests/test_schema_installer_git_owner.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.InstallerGitOwnerTests)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained InstallerGitOwnerTests suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained InstallerGitOwnerTests case must execute')
+        self.assertEqual(result.skipped, [], 'retained InstallerGitOwnerTests contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
+
+class RetainedSchemaObserverSelectionTests(unittest.TestCase):
+    """Required release-tooling executes the retained ObserverSelectionTests suite."""
+    def test_current_schema_observer_selection_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_test_schema_installer_observer_selection_contract', REPO / 'scripts/tests/test_schema_installer_observer_selection.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.ObserverSelectionTests)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained ObserverSelectionTests suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained ObserverSelectionTests case must execute')
+        self.assertEqual(result.skipped, [], 'retained ObserverSelectionTests contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
+
+class RetainedSchemaDiagnosticStagingTests(unittest.TestCase):
+    """Required release-tooling executes the retained DiagnosticStaging suite."""
+    def test_current_schema_diagnostic_staging_contracts(self):
+        spec = importlib.util.spec_from_file_location(
+            'retained_test_schema_picker_diagnostic_staging_contract', REPO / 'scripts/tests/test_schema_picker_diagnostic_staging.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(fixture.DiagnosticStaging)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0, 'retained DiagnosticStaging suite must not be empty')
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual(result.testsRun, count, 'every retained DiagnosticStaging case must execute')
+        self.assertEqual(result.skipped, [], 'retained DiagnosticStaging contracts must not be skipped')
+        self.assertTrue(result.wasSuccessful(), '\n'.join(
+            str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
 if __name__ == '__main__':
     unittest.main()
