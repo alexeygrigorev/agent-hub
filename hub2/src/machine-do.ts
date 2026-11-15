@@ -2177,6 +2177,10 @@ export class MachineDO {
     const workspace = typeof body.workspace === 'string' ? body.workspace : '';
     const machine = this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if (!machine || !workspace) return json({ checked: false });
+    const capRow = this.db.one<{ capabilities_json: string }>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?', machine.machine_id);
+    let caps: string[] = [];
+    try { caps = JSON.parse(capRow?.capabilities_json || '[]'); } catch {}
+    if (!Array.isArray(caps) || !caps.includes('workspace-preflight:v1')) return json({ checked: false });
     let activeSocket: WebSocket | undefined;
     for (const socket of this.machineSockets(machine.machine_id)) {
       if (socket.readyState !== 1 || this.stopOnly(socket)) continue;

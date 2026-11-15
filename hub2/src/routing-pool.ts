@@ -283,6 +283,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   });
   const compatible = new Map(pool.map(row => [row.candidate.id, compatibleHosts(row)]));
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+  const hadCompatibleBeforeWorkspace = pool.some(row => (compatible.get(row.candidate.id) || []).length > 0);
   if (pool.some(row => compatible.get(row.candidate.id)!.length > 0))
     pool = pool.map(row => ({...row, hosts: compatible.get(row.candidate.id)!}));
   // Ordinary workspace advertisements are optional placement hints. A
@@ -300,7 +301,12 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
           machines.get(id)?.capabilities?.includes(label));
         return hosts.length ? [{...row, hosts}] : [];
       });
-      if (!pool.length) throw new HttpError('repository_checkout_missing', 400, 'no checkout under enrolled roots; pass --cwd after creating it');
+      if (!pool.length) {
+        if (hadCompatibleBeforeWorkspace) {
+          throw new HttpError('repository_checkout_missing', 400, 'no checkout under enrolled roots; pass --cwd after creating it');
+        }
+        throw new HttpError('repository_workspace_unavailable', 503);
+      }
     } else {
       // Ordinary explicit labels remain advisory: a missing observation must
       // not make every launch capability look unknown or restore an excluded engine.

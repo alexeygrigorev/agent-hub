@@ -1479,6 +1479,8 @@ class Bridge:
             # This fixed, non-configurable marker fences new repo-only routing
             # from old hosts that could otherwise advertise a matching alias.
             capabilities.append(REPOSITORY_IDENTITY_CAPABILITY)
+            if len(capabilities) < 32:
+                capabilities.append('workspace-preflight:v1')
         else:
             # Preserve the 32 non-workspace capability bound and every legacy
             # label. Without a marker slot, repo-only placement is unavailable.

@@ -77,6 +77,11 @@ test('qualified repository requirement rejects old hosts that forge its token th
 
   snapshot.machines.delete('qualified');
   assert.throws(() => buildRoutingPool(snapshot, {interactive: false, workspace: token}),
+    (err: any) => err?.code === 'repository_workspace_unavailable' && err?.status === 503);
+
+  snapshot.machines.set('qualified-no-checkout', {...snapshot.machines.get('linux')!,
+    capabilities: ['headless', 'effort:codex', 'effort:antigravity', 'repo-identity:v1']});
+  assert.throws(() => buildRoutingPool(snapshot, {interactive: false, workspace: token}),
     (err: any) => err?.code === 'repository_checkout_missing' && err?.status === 400
       && err?.detail === 'no checkout under enrolled roots; pass --cwd after creating it');
 });
