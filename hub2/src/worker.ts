@@ -236,6 +236,10 @@ const router = {
           if (typeof body?.project === 'string' && body.project) requested = body.project;
         }
         const intakeId = path.match(/^\/api\/(?:intakes|intake\/tasks)\/([^/]+)/)?.[1];
+        const boundSession = actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id;
+        // Control routes cover only a worker's own intake; its parent intake is resolved and authorized
+        // by the worker's own project object, so a denied route here is not yet final for a session.
+        let routeDenied: Response | undefined;
         if (!requested && intakeId) {
           const response = await control.fetch(
             await forwardRequest(
@@ -244,14 +248,17 @@ const router = {
               actor,
             ),
           );
-          if (!response.ok) return response;
-          const { route } = (await response.json()) as {
-            route: { id: string; owner: string };
-          };
-          requested = route.owner;
-          url.pathname = url.pathname.replace('/' + intakeId, '/' + route.id);
+          if (!response.ok && !(boundSession && (response.status === 403 || response.status === 404))) return response;
+          if (!response.ok) routeDenied = response;
+          else {
+            const { route } = (await response.json()) as {
+              route: { id: string; owner: string };
+            };
+            requested = route.owner;
+            url.pathname = url.pathname.replace('/' + intakeId, '/' + route.id);
+          }
         }
-        if (actor.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id) {
+        if (boundSession && actor.resource_id) {
           const response = await control.fetch(await forwardRequest(new Request(request.url, {headers:request.headers}), CONTROL+'/api/routes/intake/'+encodeURIComponent(actor.resource_id), actor));
           if (!response.ok) return response;
           const {route} = await response.json() as {route:{owner:string}};
@@ -261,7 +268,9 @@ const router = {
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
           const relation = await relationForward(request, env, control, actor, internalPath);
           if (relation instanceof Response) return relation;
-          return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
+          const forwarded = await env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
+          // Not the worker's own or parent intake: report Control's named refusal, not the project miss.
+          return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
         }
         if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
           return control.fetch(await forwardRequest(request, CONTROL + '/api/intakes' + url.search, actor));

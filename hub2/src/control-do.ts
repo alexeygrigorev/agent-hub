@@ -1378,7 +1378,8 @@ export class ControlDO {
     const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||(actor.kind!=='agent'&&hasScope(actor,'routing:read'));
     const bound=(r:Route)=>kind!=='message'&&hasScope(actor,'intake:read')&&((kind==='intake'&&actor.resource_id===r.id)||(kind==='session'&&!!r.bound_intake_id&&actor.resource_id===r.bound_intake_id)||hasScope(actor,'project:'+r.resource_id));
     const exact=this.db.one<Route>('SELECT '+columns+' FROM object_routes WHERE kind=? AND id=?',kind,value);
-    if(exact){if(!admin&&!bound(exact)&&!this.db.one('SELECT id FROM route_acl WHERE actor_id=? AND kind=? AND id=?',actor.id,kind,exact.id))return error('route_not_found',404);return json({route:{kind,...exact}});}
+    const denied=(id:string)=>forbiddenScope(kind==='message'?'message:read':kind==='schedule'?'schedule:read':'intake:read',`${kind} ${id} exists but is not visible to ${actor.id}; grant intake:read with project:<owner>, a route ACL, the bound or child-intake worker session, or operator:admin`);
+    if(exact){if(!admin&&!bound(exact)&&!this.db.one('SELECT id FROM route_acl WHERE actor_id=? AND kind=? AND id=?',actor.id,kind,exact.id))return denied(exact.id);return json({route:{kind,...exact}});}
     if(value.length<6)return error('prefix_too_short',400);
     const rows:Route[]=[],add=(items:Route[])=>{for(const item of items)if(!rows.some(v=>v.id===item.id))rows.push(item);};
     if(admin)add(this.db.all('SELECT '+columns+' FROM object_routes WHERE kind=? AND id>=? AND id<? ORDER BY id LIMIT 2',kind,value,value+'\uffff'));
@@ -1391,7 +1392,10 @@ export class ControlDO {
         for(const project of projects)add(this.db.all('SELECT '+columns+' FROM object_routes WHERE resource_id=? AND kind=? AND id>=? AND id<? ORDER BY id LIMIT 2',project,kind,value,value+'\uffff'));
       }
     }
-    if(rows.length>1)return error('ambiguous_prefix',409);return rows.length?json({route:{kind,...rows[0]}}):error('route_not_found',404);
+    if(rows.length>1)return error('ambiguous_prefix',409);if(rows.length)return json({route:{kind,...rows[0]}});
+    // Fail loudly: a prefix that names a real but invisible object is a scope refusal, not a miss.
+    if(!admin&&this.db.one('SELECT id FROM object_routes WHERE kind=? AND id>=? AND id<? LIMIT 1',kind,value,value+'\uffff'))return denied(value);
+    return error('route_not_found',404);
   }
 
   private directory(request:Request):Response{

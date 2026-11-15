@@ -177,7 +177,7 @@ export class ProjectDO {
       if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
       const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate))?$/);
       if (!match) return error('not_found', 404);
-      const intakeId = decodeURIComponent(match[1]);
+      const intakeId = this.resolveWorkerParentRef(actorFrom(request), decodeURIComponent(match[1]));
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
       if (match[2] === 'discard' && request.method === 'POST') return await this.discardUnused(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
@@ -266,7 +266,8 @@ export class ProjectDO {
   private listIntakes(request: Request): Response {
     const actor = actorFrom(request), query = new URL(request.url).searchParams;
     const project = query.get('project') || '';
-    if (!this.canProject(actor, project, 'intake:read')) return error('forbidden',403);
+    if (!this.canProject(actor, project, 'intake:read'))
+      return forbiddenScope('intake:read', `listing intakes of ${project || 'a project'} needs intake:read with project:${project || '<owner/name>'} or operator:admin; a worker session reads its own and parent intake by id`);
     return listProjectIntakes(this.db,query,project);
   }
 
@@ -274,7 +275,7 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
     return json({ intake: { ...this.viewIntake(row), depends_on: this.relations.prerequisites(row.id), artifacts: this.relations.artifacts(row.id) },
       task: this.taskCompat(row) }, status);
   }
@@ -289,7 +290,7 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
     const rows = this.db.all<IntakeEventRow>('SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? ORDER BY seq DESC LIMIT 50', intakeId).reverse();
     return json({ intake: this.viewIntake(row), task: this.taskCompat(row),
       events: rows.map(r => ({ seq: r.seq, actor_id: r.actor_id, kind: r.kind, at: r.at, body: this.parse(r.body_json) })) });
@@ -337,7 +338,7 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, intake)) return error('forbidden', 403);
+    if (!this.canReadIntake(actor, intake) && !(this.isWorkerParent(actor, intake) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(intake);
     const rawAfter = new URL(request.url).searchParams.get('after') || '0';
     const after = Number(rawAfter);
     if (!Number.isSafeInteger(after) || after < 0) return error('invalid_cursor', 400);
@@ -389,7 +390,8 @@ export class ProjectDO {
     const digest=await sha256Hex(JSON.stringify([body.note??null,body.evidence??null])),eventKey='append:'+intakeId+':'+key;
     return this.transaction(()=>{
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!intake)return error('intake_not_found',404);
-      if(!actor||!hasScope(actor,'operator:admin')&&!(actor.resource_id===intake.id&&hasScope(actor,'intake:append')))return error('forbidden',403);
+      if(!actor||!hasScope(actor,'operator:admin')&&!((actor.resource_id===intake.id||this.isWorkerParent(actor,intake))&&hasScope(actor,'intake:append')))
+        return forbiddenScope('intake:append',`append to intake ${intake.id} needs intake:append on that intake, its child-intake worker session, or operator:admin`);
       // A completion claim may come only from that session itself or an operator.
       const claimKind=(body.evidence as JsonRecord|undefined)?.kind;
       const claimed=['task_complete','session_finished'].includes(String(claimKind))?(body.evidence as JsonRecord).session_id:undefined;
@@ -456,7 +458,7 @@ export class ProjectDO {
     const actor=actorFrom(request);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
     if(!intake)return error('intake_not_found',404);
-    if(!this.canReadIntake(actor,intake))return error('forbidden',403);
+    if(!this.canReadIntake(actor,intake))return this.intakeReadDenied(intake);
     const gate=this.intakeMergeGate(intake);
     const completion=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined;
     return json({intake_id:intake.id,project:intake.project,status:intake.status,code_task:gate.required,
@@ -2152,6 +2154,29 @@ export class ProjectDO {
     if (!hasScope(actor, `worker_project:${intake.project}`)) return false;
     if (actor.resource_id === intake.id) return false;
     return intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id);
+  }
+
+  /**
+   * A worker session started for a child intake may read and append to that child's parent intake
+   * (fix-on-failure children report back to the work that spawned them). Nothing broader: no list,
+   * no siblings, no grandparents.
+   */
+  private isWorkerParent(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !actor.resource_id || actor.resource_id === intake.id) return false;
+    const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
+    return !!own?.parent_intake_id && own.parent_intake_id === intake.id;
+  }
+
+  /** A worker's short parent id resolves here: Control routes only cover the worker's own intake. */
+  private resolveWorkerParentRef(actor: ReturnType<typeof actorFrom>, ref: string): string {
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !actor.resource_id || ref.length < 6) return ref;
+    if (this.db.one('SELECT id FROM intakes WHERE id=?', ref)) return ref;
+    const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
+    return own?.parent_intake_id?.startsWith(ref) ? own.parent_intake_id : ref;
+  }
+
+  private intakeReadDenied(intake: IntakeRow): Response {
+    return forbiddenScope('intake:read', `read of intake ${intake.id} needs intake:read with project:${intake.project}, the intake's own or child-intake worker session, or operator:admin`);
   }
 
   private canReadIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
