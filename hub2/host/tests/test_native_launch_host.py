@@ -1583,7 +1583,8 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
 
     def test_capabilities_do_not_advertise_unusable_codex(self):
         config = {'routes': {'codex': {'provider': 'codex'}, 'opencode': {'provider': 'go'}}}
-        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b):
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value={'ok': 1}):
             self.assertIn('codex', nl.NativeLauncher(config).capabilities())
             with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
                 caps = nl.NativeLauncher(config).capabilities()
@@ -1591,6 +1592,20 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             self.assertIn('opencode', caps)
             custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
             self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
+
+    def test_codex_withdrawn_loudly_when_release_profile_proof_fails(self):
+        """Intake f88ae417: a stale profile pin must stop the host advertising codex."""
+        config = {'routes': {'codex': {'provider': 'codex'}}}
+        launcher = nl.NativeLauncher(config)
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch('sys.stderr') as err:
+            self.assertNotIn('codex', launcher.capabilities())
+            self.assertNotIn('codex', launcher.capabilities())
+            shown = ''.join(call.args[0] for call in err.write.call_args_list)
+        self.assertEqual(shown.count('ALERT hub2-host: codex_launch_wrapper_unavailable'), 1)
+        self.assertIn('profile_release_mismatch', shown)
+        self.assertEqual(proof.call_count, 1, 'proof is cached between heartbeats')
 
     def test_packaged_archive_readiness_requires_wrapper_aware_pin_and_maintained_profile(self):
         if sys.platform != 'linux':

@@ -1955,7 +1955,7 @@ class ManagedProfileRepinTests(unittest.TestCase):
                                                   ('hub-shared-codex', 'codex', source)],
                                            outside='\n[profiles.mine]\ncommand = ["x"]\n')
             with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
-                self.assertEqual(updater.repin_managed_profiles(target), ['hub-hub-antigravity'])
+                self.assertEqual(updater.repin_managed_profiles(target), ['hub-hub-antigravity', 'hub-shared-codex'])
                 self.assertEqual(updater.repin_managed_profiles(target), [])
             profiles = updater.tomllib.loads(config.read_text())['profiles']
             command = profiles['hub-hub-antigravity']['command']
@@ -1965,11 +1965,18 @@ class ManagedProfileRepinTests(unittest.TestCase):
             self.assertNotIn('recovery-cli', command[4])
             self.assertEqual(command[5], 'hub-antigravity')
             self.assertEqual(profiles['hub-hub-antigravity']['engine'], 'antigravity')
-            # The fenced Claude pin, launcher scripts, source-tree pins and
+            # The fenced Claude pin, launcher scripts and
             # operator profiles stay byte-identical.
             self.assertEqual(profiles['hub-hub-claude']['command'], claude)
             self.assertEqual(profiles['hub-shared-go']['command'], go)
-            self.assertEqual(profiles['hub-shared-codex']['command'], source)
+            # The maintained codex profile follows the release in the exact form
+            # provisioning.module_command() generates (no -I -S, archive twice).
+            archive = repr(str(target / 'hub.pyz'))
+            self.assertEqual(profiles['hub-shared-codex']['command'], [
+                str(target / 'bin/python'), '-c',
+                'import sys; sys.path.insert(0, ' + archive + '); sys.path.insert(0, ' + archive + '); import os; '
+                'os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(managed) + '; '
+                'from agent_hub_host.provisioning import execute; execute()', 'shared-codex'])
             self.assertEqual(profiles['mine']['command'], ['x'])
 
     def test_label_mismatch_or_unmanaged_profile_is_left_alone(self):
