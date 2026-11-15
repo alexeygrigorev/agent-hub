@@ -119,6 +119,32 @@ def store_identity(store):
         raise StoreRefused('store_untrusted') from None
 
 
+def verify_write_parent(store, expected_identity):
+    """Existing native parent must satisfy the unchanged private writer policy.
+
+    Read/enrollment accepts native-owned non-writable-by-others directories;
+    actual writes additionally require owner-only access before a new intent.
+    No creation, chmod, credential read or native lock operation occurs here.
+    """
+    try:
+        with private_fs.parent(Path(store) / CREDENTIAL_NAME, private=False) as anchor:
+            info = os.fstat(anchor)
+            if not _dir_safe(info):
+                raise StoreRefused('store_untrusted')
+            if (info.st_dev, info.st_ino) != expected_identity:
+                raise StoreRefused('store_changed')
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                raise StoreRefused('store_write_parent_untrusted')
+    except StoreRefused:
+        raise
+    except PermissionError:
+        raise StoreRefused('store_write_parent_untrusted') from None
+    except FileNotFoundError:
+        raise StoreRefused('store_missing') from None
+    except (OSError, ValueError):
+        raise StoreRefused('store_untrusted') from None
+
+
 def read_raw(store):
     """Bytes of the credential file, or None when absent. Refuses symlinks,
     hard links, foreign owners, non-regular and oversize files."""
@@ -195,7 +221,10 @@ def render_document(document, original_raw):
 
 def write_document(store, raw):
     """Atomic, fsynced replacement of the credential file (caller holds the locks)."""
-    private_fs.atomic_write(Path(store) / CREDENTIAL_NAME, raw, MAX_DOCUMENT, engine_owned=True)
+    try:
+        private_fs.atomic_write(Path(store) / CREDENTIAL_NAME, raw, MAX_DOCUMENT, engine_owned=True)
+    except PermissionError:
+        raise StoreRefused('store_write_untrusted') from None
     with contextlib.suppress(OSError):
         os.chmod(Path(store) / CREDENTIAL_NAME, 0o600)
 

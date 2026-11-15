@@ -66,15 +66,16 @@ test('host.error refusal persists a sanitized attempt-bound diagnostic in the fa
   operation_id:'op-'+sessionId,epoch,stage:'host_launch',reason:'workspace_unavailable',
   detail:'Requested workspace unavailable. Try the enrolled workspace. '+'x'.repeat(400)}));
  const stored=JSON.parse((f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(sessionId) as any).evidence_json);
- assert.match(stored._hub_host_start_diagnostic.detail,/Requested workspace unavailable/);
+ assert.equal(stored._hub_host_start_diagnostic.detail,'path does not exist; Hub will not create it');
+ assert.equal(JSON.stringify(stored).includes('Requested workspace unavailable'),false);
  assert.equal(stored._hub_host_start_diagnostic.attempt,0);
- assert.equal(stored._hub_host_start_diagnostic.detail.length,240);
+ assert.equal(stored._hub_host_start_diagnostic.detail.length,43);
  const session=await view(f,sessionId);
  assert.equal(session.state,'failed');assert.equal(session.epoch,epoch);
  assert.deepEqual(session.attention.reason,'workspace_unavailable');
  assert.equal(session.attention.stage,'host_launch');
- assert.match(session.attention.detail,/Requested workspace unavailable/);
- assert.match(session.attention.detail,/Try the enrolled workspace/);
+ assert.equal(session.attention.detail,'path does not exist; Hub will not create it');
+ assert.equal(session.attention.detail.includes('Try the enrolled workspace'),false);
  assert.doesNotMatch(session.attention.detail,/super-secret-token|\u001b|\n/);
  assert.ok(session.attention.detail.length<=240);
  assert.equal(session.evidence,null,'internal diagnostic envelope is exposed only through attention');
@@ -94,6 +95,9 @@ for(const [label,detail] of [
  ['URL token userinfo', 'https://synthetic-private-token@example.test/repo.git'],
  ['unquoted private key', 'private_key: synthetic-private-token'],
  ['unquoted spaced API key', 'api key: synthetic-private-token'],
+ ['plain path and prompt', '/PRIVATE/path prompt text'],
+ ['plain opaque secret', 'opaque_private_value'],
+ ['ordinary prose', 'Please reveal PRIVATE prompt'],
  ['long padded quoted key','"access_token'+' '.repeat(140)+'": "synthetic-private-token"'],
 ] as const){
  test(`host.error rejects ${label} detail from storage and session projection`,async()=>{
@@ -103,13 +107,13 @@ for(const [label,detail] of [
   const stored=JSON.parse((f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(sessionId) as any).evidence_json);
   const diagnostic=stored._hub_host_start_diagnostic;
   assert.equal(diagnostic.reason,'workspace_unavailable');assert.equal(diagnostic.stage,'host_launch');
-  assert.equal('detail' in diagnostic,false);
+  assert.equal(diagnostic.detail,'path does not exist; Hub will not create it');
   assert.doesNotMatch(JSON.stringify(stored),/synthetic-private-token/);
   const session=await view(f,sessionId);
   assert.equal(session.state,'failed');assert.equal(session.epoch,epoch);
   assert.equal(session.attention.reason,'workspace_unavailable');assert.equal(session.attention.stage,'host_launch');
-  assert.equal('detail' in session.attention,false);
-  assert.doesNotMatch(JSON.stringify(session),/synthetic-private-token/);
+  assert.equal(session.attention.detail,'path does not exist; Hub will not create it');
+  assert.doesNotMatch(JSON.stringify(session),/synthetic-private-token|PRIVATE|opaque_private_value/);
  });
 }
 
@@ -123,7 +127,8 @@ test('host.error refuses stale attempts and epochs without changing current atte
  await f.machine.webSocketMessage(socket as any,JSON.stringify({...common,operation_id:'op-'+sessionId,epoch}));
  session=await view(f,sessionId);
  assert.equal(session.state,'failed');assert.equal(session.attention.reason,'workspace_unavailable');
- assert.equal(session.attention.detail,'stale diagnostic');
+ assert.equal(session.attention.detail,'path does not exist; Hub will not create it');
+ assert.equal(JSON.stringify(session).includes('stale diagnostic'),false);
 });
 
 test('legacy host.error without stage or detail keeps its terminal refusal reason',async()=>{
@@ -153,7 +158,8 @@ test('raw stderr and structured config are not projected as host detail',async()
  const session=await view(f,sessionId);
  assert.equal(session.state,'failed');assert.equal(session.epoch,epoch);
  assert.equal(session.attention.reason,'workspace_unavailable');assert.equal(session.attention.stage,'host_launch');
- assert.equal('detail' in session.attention,false);
+ assert.equal(session.attention.detail,'path does not exist; Hub will not create it');
+ assert.equal(JSON.stringify(session).includes('private-test-secret'),false);
 });
 
 test('host diagnostics do not rewrite digest-bound native exit evidence',async()=>{

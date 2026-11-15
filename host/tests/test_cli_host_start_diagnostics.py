@@ -139,7 +139,7 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
         self.assertEqual(session['state'], 'failed')
         self.assertEqual(session['attention']['reason'], 'workspace_unavailable')
         self.assertEqual(session['attention']['stage'], 'host_launch')
-        self.assertEqual(session['attention']['detail'], 'The requested workspace is unavailable on this host.')
+        self.assertEqual(session['attention']['detail'], 'path does not exist; Hub will not create it')
 
         status, output = run_cli_wait(projection)
 
@@ -147,7 +147,8 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
         self.assertIn('session_start_failed', output)
         self.assertIn('workspace_unavailable', output)
         self.assertIn('stage=host_launch', output)
-        self.assertIn('The requested workspace is unavailable on this host.', output)
+        self.assertIn('path does not exist; Hub will not create it', output)
+        self.assertNotIn('The requested workspace is unavailable on this host.', output)
 
     def test_machine_do_and_real_cli_reject_credential_and_control_details(self):
         unsafe_details = (
@@ -172,8 +173,18 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
                 self.assertEqual(session['state'], 'failed')
                 self.assertEqual(session['attention']['reason'], 'workspace_unavailable')
                 self.assertEqual(session['attention']['stage'], 'host_launch')
-                self.assertNotIn('detail', session['attention'])
+                self.assertEqual(session['attention']['detail'], 'path does not exist; Hub will not create it')
+                self.assertNotIn(unsafe_detail, json.dumps(projection, ensure_ascii=False))
                 self.assertNotIn('synthetic-private-token', json.dumps(projection))
+
+                normalized_status, normalized_output = run_cli_wait(projection)
+                self.assertEqual(normalized_status, 1)
+                self.assertIn('session_start_failed', normalized_output)
+                self.assertIn('workspace_unavailable', normalized_output)
+                self.assertIn('stage=host_launch', normalized_output)
+                self.assertIn('path does not exist; Hub will not create it', normalized_output)
+                self.assertNotIn(unsafe_detail, normalized_output)
+                self.assertNotIn('synthetic-private-token', normalized_output)
 
                 # Exercise the real formatter against an older/malicious
                 # projection carrying the same shape before CLI sanitization.
@@ -186,6 +197,34 @@ class TestCliHostStartDiagnostics(unittest.TestCase):
                 self.assertNotIn('synthetic-private-token', output)
                 self.assertNotIn('AWS_SECRET_ACCESS_KEY', output)
                 self.assertNotIn('Authorization', output)
+
+    def test_machine_do_replaces_plain_private_path_prompt_and_controls_before_cli(self):
+        # Plain private prose need not resemble a credential assignment. The
+        # server must select a fixed description, not echo or sanitize it.
+        for supplied_detail in (
+            '/private/synthetic-workspace-sentinel/repository',
+            'Private prompt sentinel: inspect confidential business plans',
+            '\x1b]0;synthetic-title-sentinel\x07\nprivate-control-sentinel',
+        ):
+            with self.subTest(detail=supplied_detail):
+                projection = machine_do_failed_projection(supplied_detail)
+                session = projection['session']
+                self.assertEqual(session['state'], 'failed')
+                self.assertEqual(session['attention']['reason'], 'workspace_unavailable')
+                self.assertEqual(session['attention']['stage'], 'host_launch')
+                self.assertEqual(session['attention']['detail'], 'path does not exist; Hub will not create it')
+                self.assertNotIn(supplied_detail, json.dumps(projection, ensure_ascii=False))
+                status, output = run_cli_wait(projection)
+                self.assertEqual(status, 1)
+                self.assertIn('session_start_failed', output)
+                self.assertIn('workspace_unavailable', output)
+                self.assertIn('stage=host_launch', output)
+                self.assertIn('path does not exist; Hub will not create it', output)
+                self.assertNotIn(supplied_detail, output)
+                for sentinel in ('synthetic-workspace-sentinel', 'Private prompt sentinel',
+                                 'synthetic-title-sentinel', 'private-control-sentinel'):
+                    self.assertNotIn(sentinel, output)
+                    self.assertNotIn(sentinel, json.dumps(projection))
 
     def test_machine_do_fence_and_privacy_cases_run_through_required_cli_check(self):
         result = subprocess.run(

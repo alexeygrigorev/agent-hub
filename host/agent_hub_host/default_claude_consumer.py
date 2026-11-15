@@ -305,6 +305,7 @@ def _write(state, generation, oauth, incoming, store):
             if state['committed'] != {'generation': generation, 'oauth_digest': incoming} or state['pending']:
                 save_state(_committed(state, generation, incoming))
             return 'in_step'
+        native.verify_write_parent(store, (state['store_dev'], state['store_ino']))
         # Durable, digest-only intent BEFORE the replacement.
         intent = dict(state, pending={'generation': generation, 'from_digest': local, 'to_digest': incoming})
         save_state(intent)
@@ -467,6 +468,11 @@ def set_mode(mode, *, confirm_writer_handoff=False):
             raise Refused('not_enrolled')
         if mode == 'write' and state['protocol'] not in native.SUPPORTED_PROTOCOLS:
             raise Refused('protocol_unsupported')
+        if mode == 'write':
+            try:
+                native.verify_write_parent(state['store'], (state['store_dev'], state['store_ino']))
+            except native.StoreRefused as refused:
+                raise Refused(str(refused)) from None
         save_state(dict(state, mode=mode))
         return _view(dict(state, mode=mode))
 
