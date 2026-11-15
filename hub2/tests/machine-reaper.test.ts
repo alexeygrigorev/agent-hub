@@ -1305,3 +1305,70 @@ test('oversized unfiltered history refuses explicitly while selected receipts st
  const denied={'x-hub2-actor':JSON.stringify({id:'agent',kind:'agent',resource_id:'foreign',scopes:['session:read']})};
  assert.equal((await f.call('/api/sessions/'+session+'/commands?command_id='+target,'GET',undefined,denied)).status,404);
 });
+
+
+const failedStopActor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+async function failedPrelaunchFixture(label:string){
+ const f=fixture(),epoch=await startClaimed(f,label,null),frames:any[]=[];
+ f.database.prepare("UPDATE sessions SET state='failed' WHERE id=?").run(label);
+ f.database.prepare("UPDATE machine_session_operations SET state='failed' WHERE session_id=?").run(label);f.clearCache();
+ f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(v:string)=>frames.push(JSON.parse(v))});
+ return {f,epoch,frames,base:'/api/sessions/'+label+'/commands'};
+}
+
+test('failed prelaunch stop waits for exact host dispatch fence and replays without fabricating native exit',async()=>{
+ const {f,epoch,frames,base}=await failedPrelaunchFixture('failed-fenced-stop');
+ const queued=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-fenced-stop') as any).state,'failed');
+ assert.equal(frames.at(-1).command.id,command.id);assert.equal(frames.at(-1).command.pre_native,true);
+ const beforeEvents=f.events.length;f.restart();
+ const repeated=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal((await repeated.json() as any).command.id,command.id);
+ const body={epoch,result:{stopped:true,evidence:'dispatch_fenced'}};
+ assert.equal((await f.call(base+'/'+command.id+'/ack','POST',body)).status,200);
+ assert.deepEqual({...f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get('failed-fenced-stop') as any},{state:'stopped',native_id:null});
+ const stopEvents=f.events.slice(beforeEvents).filter(e=>e.body.reason==='stop_confirmed');assert.equal(stopEvents.length,1);
+ assert.equal(stopEvents[0].body.no_dispatch,true);assert.equal(stopEvents[0].body.native_id,null);
+ assert.equal(stopEvents[0].body.native_exit_confirmed,undefined);
+ assert.deepEqual(await (await f.call(base+'/'+command.id+'/ack','POST',body)).json(),{acknowledged:true,duplicate:true});
+ assert.equal(f.events.slice(beforeEvents).filter(e=>e.body.reason==='stop_confirmed').length,1);
+});
+
+test('failed prelaunch stop refuses missing proof and native-exit substitution without changing historical failure',async()=>{
+ for(const [i,result] of [{stopped:true},{stopped:true,evidence:'native_exit',native_id:'invented-native'},{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}].entries()){
+  const {f,epoch,base}=await failedPrelaunchFixture('failed-unconfirmed-'+i);
+  const response=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(response.status,201);
+  const {command}=await response.json() as any;
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',{epoch,result})).status,200);
+  const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+  assert.equal(row.state,'failed');assert.equal(JSON.parse(row.result_json).error,'stop_unconfirmed');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-unconfirmed-'+i) as any).state,'failed');
+  assert.equal(f.events.filter(e=>e.body.reason==='stop_confirmed').length,0);
+ }
+});
+
+test('failed prelaunch stop fences foreign actors stale epoch and native race',async()=>{
+ for(const mode of ['foreign','epoch','successor','native']){
+  const {f,epoch,base}=await failedPrelaunchFixture('failed-fence-'+mode);
+  const response=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(response.status,201);
+  const {command}=await response.json() as any;
+  if(mode==='native')f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('actual-native','failed-fence-'+mode);
+  if(mode==='successor')f.database.prepare('UPDATE sessions SET epoch=epoch+1 WHERE id=?').run('failed-fence-'+mode);
+  f.clearCache();
+  const headers=mode==='foreign'?{'x-hub2-actor':JSON.stringify({...machineActor,resource_id:'foreign'})}:{};
+  const ack=await f.call(base+'/'+command.id+'/ack','POST',{epoch:mode==='epoch'?epoch+1:epoch,result:{stopped:true,evidence:'dispatch_fenced'}},headers);
+  assert([200,409].includes(ack.status));
+  assert.notEqual((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'acked');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-fence-'+mode) as any).state,'failed');
+ }
+});
+
+test('failed prelaunch stop does not authorize send capture foreign owner or failed native sessions',async()=>{
+ const {f,base}=await failedPrelaunchFixture('failed-not-running');
+ for(const kind of ['send','capture'])assert.equal((await f.call(base,'POST',{kind,key:'key-'+kind,...(kind==='send'?{text:'no'}:{})},failedStopActor)).status,409);
+ const foreign={'x-hub2-actor':JSON.stringify({id:'other',kind:'operator',resource_id:'other',scopes:['session:stop']})};
+ assert.equal((await f.call(base,'POST',{kind:'stop',key:'foreign'},foreign)).status,403);
+ f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('native-existing','failed-not-running');f.clearCache();
+ assert.equal((await f.call(base,'POST',{kind:'stop',key:'native-stop'},failedStopActor)).status,409);
+});
