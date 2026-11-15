@@ -1055,11 +1055,20 @@ class Bridge:
             self.begin_command(identity, digest)
         if kind == "stop":
             try:
+                # The native may already be gone (it exited on its own, so the
+                # registry holds only its aplexer tombstone and `kill` refuses):
+                # a failed kill is then reconciled from that tombstone below,
+                # never reported as an unconfirmed stop or a command failure.
+                try:
+                    if bounded_stop:
+                        self.native("kill", native_id, timeout=remaining_stop())
+                    else:
+                        self.native("kill", native_id)
+                except RuntimeError as exc:
+                    if str(exc) != 'native_command_failed':
+                        raise
                 if bounded_stop:
-                    self.native("kill", native_id, timeout=remaining_stop())
                     remaining_stop()
-                else:
-                    self.native("kill", native_id)
                 birth = (_status or {}).get('created_at_ms')
                 while True:
                     status = (self.lookup(native_id, row, timeout=remaining_stop())

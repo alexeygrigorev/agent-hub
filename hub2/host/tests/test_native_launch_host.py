@@ -17,6 +17,28 @@ from agent_hub_host import native_launch as nl
 from agent_hub_host import provider_home as ph
 
 
+class WindowsEngineTest(unittest.TestCase):
+    def test_bare_engine_resolves_to_the_cmd_shim_on_windows_only(self):
+        with mock.patch.object(nl.os, 'name', 'nt'), \
+                mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\claude.cmd') as which:
+            self.assertEqual(nl.resolve_windows_program('claude', {'PATH': 'C:\\npm'}), 'C:\\npm\\claude.cmd')
+            which.assert_called_once_with('claude', path='C:\\npm')
+            self.assertEqual(nl.resolve_windows_program('C:\\x\\claude.exe'), 'C:\\x\\claude.exe')
+        with mock.patch.object(nl.os, 'name', 'nt'), mock.patch.object(nl.shutil, 'which', return_value=None):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+        with mock.patch.object(nl.os, 'name', 'posix'), mock.patch.object(nl.shutil, 'which', return_value='/bin/claude'):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+
+    def test_codex_is_advertised_on_windows_when_installed(self):
+        launcher = nl.NativeLauncher({})
+        route = {'provider': 'codex'}
+        with mock.patch.object(nl.os, 'name', 'nt'):
+            with mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\codex.cmd'):
+                self.assertTrue(launcher._codex_advertisable(route))
+            with mock.patch.object(nl.shutil, 'which', return_value=None):
+                self.assertFalse(launcher._codex_advertisable(route))
+
+
 class AdapterArgvTest(unittest.TestCase):
     def test_zai_route_pins_harness_flags_and_model(self):
         argv = nl.adapter_argv('zai', 'goal-text', 'glm-5.3-flash')
@@ -1556,8 +1578,10 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
                     calls, error = self.launch(interactive=interactive)
                     self.assertEqual(error, 'codex_launch_wrapper_unavailable')
                     self.assertEqual(calls, [])
+        # The maintained wrapper itself is never available off Linux.
         with mock.patch.object(nl.sys, 'platform', 'win32'):
-            self.assertEqual(self.launch(interactive=True)[1], 'codex_launch_wrapper_unavailable')
+            with self.assertRaises(ValueError):
+                nl.codex_launch_wrapper()
 
     def test_profile_not_proven_wrapper_aware_refuses_before_spawn(self):
         calls, error = self.launch(interactive=False, readiness=False)

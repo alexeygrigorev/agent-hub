@@ -7,6 +7,7 @@ external Agent Quota Launcher remains untouched for its other consumers.
 import hashlib
 import json
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -147,6 +148,20 @@ def _valid_codex_wrapper_body(text):
     if not exec_match or '..' in Path(exec_match.group(1)).parts:
         return False
     return True
+
+
+def resolve_windows_program(program, environ=None):
+    """Absolute path of a bare engine name on Windows (PATH x PATHEXT).
+
+    Windows npm installs expose only claude/claude.cmd shims; an engine spawned
+    by bare name from a process that resolves .exe alone dies "program not
+    found" (exit 127). Anything that is not a bare name, or is not found, is
+    returned unchanged. Other platforms never rewrite."""
+    if os.name != 'nt' or not isinstance(program, str) or not program or any(c in program for c in '/\\:'):
+        return program
+    environ = os.environ if environ is None else environ
+    found = shutil.which(program, path=environ.get('PATH'))
+    return found if found and ntpath.isabs(found) else program
 
 
 def codex_launch_wrapper(environ=None, home=None):
@@ -890,6 +905,10 @@ class NativeLauncher:
         only headless support; interactive work uses the direct wrapper path.
         Report a fixed diagnostic once per change of reason."""
         reason = None
+        if os.name == 'nt':
+            # Windows hosts have no maintained quota wrapper or release-pinned
+            # profile: the installed Codex CLI with its own login is the route.
+            return bool(shutil.which(PROVIDER_BINARIES['codex']))
         try:
             wrapper = str(codex_launch_wrapper())
         except ValueError:
@@ -1029,7 +1048,7 @@ class NativeLauncher:
             raise RuntimeError("native_launch_route_missing")
         provider = route["provider"]
         codex_wrapper = None
-        if provider == 'codex':
+        if provider == 'codex' and os.name != 'nt':
             # Resolve and verify before anything is written or spawned. The
             # operator-owned path is the only source; no raw SDK fallback.
             try:
@@ -1129,6 +1148,8 @@ class NativeLauncher:
             claude_goal.approve_external_includes(child_env.get('CLAUDE_CONFIG_DIR'), Path(specification['workspace']).resolve())
         tmpdir = Path(child_env["TMPDIR"])
         tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if child:
+            child = [resolve_windows_program(child[0]), *child[1:]]
         argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],

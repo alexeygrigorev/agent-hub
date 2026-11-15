@@ -6,6 +6,7 @@ had no supported install/update path or reported release identity.
 import contextlib
 import hashlib
 import io
+import re
 import json
 import logging
 import os
@@ -198,8 +199,23 @@ class InstallerScriptTests(unittest.TestCase):
             self.assertIn(needle, text)
         self.assertNotRegex(text, r'(?im)^\s*param\s*\(', 'must run under irm | iex')
         self.assertNotRegex(text, r'(?i)Stop-Process[^\n]*(codex|claude)')
-        self.assertNotRegex(text, r'(?i)Unregister-ScheduledTask|Remove-Item')
+        self.assertNotRegex(text, r'(?i)Unregister-ScheduledTask')
+        # Only the throwaway preflight venv is ever deleted.
+        self.assertEqual(set(re.findall(r'Remove-Item -LiteralPath (\$\w+)', text)), {'$Preflight'})
         self.assertIn("$tag -like 'hub-controller-*' -and $engine -eq 'shell'", text)
+
+    def test_serve_is_stopped_only_after_a_preflight_install_and_pip_is_ensured(self):
+        text = self.SCRIPT.read_text(encoding='utf-8')
+        self.assertLess(text.index("'preflight install succeeded'"), text.index('\nStop-Hub2Host'))
+        self.assertIn("'ensurepip'", text)
+        self.assertIn('New-Venv $Path -Clear', text)
+        # A failure after serve was stopped restarts it.
+        self.assertIn('Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue', text)
+
+    def test_survivor_controller_session_is_escalated_and_fatal(self):
+        text = self.SCRIPT.read_text(encoding='utf-8')
+        self.assertIn("'taskkill.exe'", text)
+        self.assertIn('still running and holds journal', text)
 
 
 if __name__ == '__main__':
