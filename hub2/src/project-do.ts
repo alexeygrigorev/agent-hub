@@ -696,6 +696,9 @@ export class ProjectDO {
     const modelInput = body.model;
     const effortInput = body.effort;
     const purpose = sessionPurpose(body.purpose);
+    const intakeWorktree = body.intake_worktree === undefined ? undefined : body.intake_worktree;
+    if (intakeWorktree !== undefined && intakeWorktree !== 'detached' && intakeWorktree !== 'successor')
+      return error('invalid_intake_worktree', 400);
     if(verificationOf!==undefined&&purpose!=='review')return error('verification_purpose_required',400);
     const reasonInput = body.override_reason === undefined ? body.reason : body.override_reason;
     const prompt = typeof body.prompt === 'string' ? body.prompt : intake.text;
@@ -737,6 +740,7 @@ export class ProjectDO {
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
+      ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
         verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
@@ -826,6 +830,19 @@ export class ProjectDO {
       if(host.connected!==true||!Array.isArray(host.capabilities)||!host.capabilities.includes('managed:hub-claude:opus:medium:v1'))
         return error('managed_exec_unavailable',409);
     }
+    if (absoluteWorkspace) {
+      try {
+        const preflightResponse = await this.env.MACHINES.get(this.env.MACHINES.idFromName(route.machine_id)).fetch(
+          'https://machine.internal/_internal/workspace-preflight',
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(actor) }, body: JSON.stringify({ workspace }) },
+        );
+        if (preflightResponse.ok) {
+          const preflight = await preflightResponse.json() as { checked?: boolean; ok?: boolean; reason?: string; detail?: string };
+          if (preflight.checked === true && preflight.ok === false)
+            return error(preflight.reason || 'workspace_unavailable', 400, preflight.detail || 'path does not exist; Hub will not create it');
+        }
+      } catch {}
+    }
     const picker=buildStartPickerEvidence(route,diagnostics);
     const raced = this.idempotent(scope, key, digest);
     if (raced instanceof Response) return raced;
@@ -840,6 +857,7 @@ export class ProjectDO {
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
+      ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };

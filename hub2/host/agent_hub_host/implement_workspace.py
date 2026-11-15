@@ -272,7 +272,7 @@ def _owner(root):
         raise ValueError('implement_worktree_owner_invalid')
     if marker.exists():
         try:
-            return json.loads(marker.read_text())
+            return json.loads(marker.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             raise ValueError('implement_worktree_owner_invalid') from None
     return None
@@ -586,10 +586,10 @@ def _ensure_unlocked_worktree(root, target_path, session_is_dead):
                 raise ValueError(f'implement_worktree_locked worktree={entry["path"]}{_lock_detail(entry)}')
 
 
-def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_dead=None, allowed_roots=None):
+def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_dead=None, allowed_roots=None, intake_worktree=None):
     """A bound continuation preserves all commits and dirty files, even offline."""
     root = Path(workspace).resolve(strict=True)
-    if purpose in {'review', 'think'}:
+    if purpose in {'review', 'think'} or intake_worktree == 'detached':
         return root
     if purpose not in {None, 'implement', 'fix'}:
         raise ValueError('invalid_session_purpose')

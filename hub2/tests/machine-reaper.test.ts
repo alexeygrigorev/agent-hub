@@ -1372,3 +1372,23 @@ test('failed prelaunch stop does not authorize send capture foreign owner or fai
  f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('native-existing','failed-not-running');f.clearCache();
  assert.equal((await f.call(base,'POST',{kind:'stop',key:'native-stop'},failedStopActor)).status,409);
 });
+
+test('finishWithoutDispatch surfaces attention and events on sessions show and events',async()=>{
+ const f=fixture(),session='no-dispatch-events',epoch=await startClaimed(f,session,null);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());
+ f.clearCache();
+ const reply=await f.call('/api/sessions/'+session+'/finish','POST',{
+  operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+  failure_reason:'native_launch_route_missing',detail:'RuntimeError: native_launch_route_missing'});
+ assert.equal(reply.status,200);
+ const admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const shown=await f.call('/api/sessions/'+session,'GET',undefined,admin);
+ assert.equal(shown.status,200);
+ const view=(await shown.json() as any).session;
+ assert.equal(view.attention?.reason,'native_launch_route_missing');
+ assert.equal(view.attention?.detail,'RuntimeError: native_launch_route_missing');
+ const eventsRes=await f.call('/api/sessions/'+session+'/events','GET',undefined,admin);
+ assert.equal(eventsRes.status,200);
+ const eventsBody=(await eventsRes.json() as any);
+ assert.ok(eventsBody.events.some((e:any)=>e.kind==='attention'&&e.reason==='native_launch_route_missing'));
+});

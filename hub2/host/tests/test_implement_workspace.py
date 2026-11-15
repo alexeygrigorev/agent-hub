@@ -121,6 +121,11 @@ class ImplementWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.git(wt, 'rev-parse', 'HEAD'), expected)
         self.assertEqual((wt / 'tracked').read_text(), 'master')
 
+    def test_detached_intake_worktree_uses_enrolled_root_without_nested_worktree(self):
+        wt = prepare_workspace(self.shared, 'implement', 'intake-detached', 'org/repo', intake_worktree='detached')
+        self.assertEqual(wt, self.shared.resolve())
+        self.assertFalse((self.shared / '.local' / 'hub-worktrees').exists())
+
 
 if __name__ == '__main__':
     unittest.main()
