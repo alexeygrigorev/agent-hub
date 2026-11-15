@@ -68,6 +68,10 @@ def main(argv=None):
             command.append("--no-restart")
         return subprocess.run(command).returncode
     try:
+        if args.command == "enroll":
+            roots = [str(Path(root).resolve(strict=True)) for root in args.root]
+            if not all(Path(root).is_dir() for root in roots):
+                raise ValueError("workspace roots must be directories")
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
         if args.command == "version":
             from .windows_host import credential_mode, host_release
@@ -98,7 +102,7 @@ def main(argv=None):
             code = os.environ.get(args.code_env) or getpass.getpass("Pairing code: ")
             enrolled = client.request("POST", "/api/enrollments/complete", {"code": code})
             config = {"server": server, "token": enrolled["token"], "machine_id": enrolled["machine_id"],
-                      "roots": [str(Path(root).resolve(strict=True)) for root in args.root],
+                      "roots": roots,
                       "engines": args.engine}
             save_config(args.config, config)
             print(json.dumps({"enrolled": config["machine_id"]}))
