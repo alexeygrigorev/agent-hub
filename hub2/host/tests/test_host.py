@@ -2153,7 +2153,8 @@ class NativeObservationIsolationTests(unittest.TestCase):
                 self.assertNotIn('private ',json.dumps(self.frames))
         for error in [KeyError('programming'),sqlite3.OperationalError('database')]:
             with self.subTest(kind=type(error).__name__),patch.object(self.bridge,'lookup',side_effect=error):
-                with self.assertRaises(type(error)):self.bridge.live_sessions()
+                # live_sessions feeds the heartbeat: it must log and continue, never kill the host.
+                self.assertNotIn('a-poison',[r['session_id'] for r in self.bridge.live_sessions()])
                 with self.assertRaises(type(error)):self.bridge.reconcile()
 
     def test_reports_are_bounded_deduplicated_safe_and_reconnect_retries_failure(self):
