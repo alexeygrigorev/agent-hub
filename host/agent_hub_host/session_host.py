@@ -1006,6 +1006,12 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
         next_worktree_commands = 0
         oncall_alerts_thread = None
         next_oncall_alerts = 0
+        next_status = 0
+        next_metrics = 0
+        next_disk = 0
+        next_host_health = 0
+        next_role_consumer = 0
+        next_token = 0
         count = 0
         # Operator fleet settings (workspaces map, workspace_roots,
         # subscriptions, launcher) are re-read when the file changes, so a
@@ -1127,23 +1133,34 @@ def run(settings_path, journal_dir, *, interval=2, fleet_interval=20, cycles=Non
                         (str(journal),), 'oncall-alerts')
                     next_oncall_alerts = time.monotonic() + ONCALL_ALERTS_POLL_S
                 # Status observation never blocks commands/quota: one bounded
-                # single-inflight daemon thread, skipped while alive.
-                status_thread = maybe_start_status_thread(status_thread, status_collector)
+                # single-inflight daemon thread, gated to its 60s cadence.
+                now = time.monotonic()
+                if now >= next_status:
+                    status_thread = maybe_start_status_thread(status_thread, status_collector)
+                    next_status = now + 60
                 # Metrics production never blocks commands/quota: one bounded
-                # single-inflight daemon thread, skipped while alive.
-                metrics_thread = maybe_start_metrics_thread(metrics_thread, metrics_collector)
+                # single-inflight daemon thread, gated to its >=60s cadence.
+                if now >= next_metrics:
+                    metrics_thread = maybe_start_metrics_thread(metrics_thread, metrics_collector)
+                    next_metrics = now + 60
                 # Disk monitoring never blocks commands/quota: one bounded
-                # single-inflight daemon thread, skipped while alive.
-                disk_thread = maybe_start_disk_thread(disk_thread, disk_collector)
+                # single-inflight daemon thread, gated to its >=60s cadence.
+                if now >= next_disk:
+                    disk_thread = maybe_start_disk_thread(disk_thread, disk_collector)
+                    next_disk = now + 60
                 # Host health monitoring never blocks commands/quota: one bounded
-                # single-inflight daemon thread, skipped while alive.
-                host_health_thread = maybe_start_host_health_thread(host_health_thread, host_health_collector)
-                # Role consumption never blocks commands/quota: one bounded
-                # single-inflight daemon thread, skipped while alive.
-                role_consumer_thread = maybe_start_role_consumer_thread(role_consumer_thread, role_consumer)
-                # Native token collection never blocks commands/quota: one
-                # bounded single-inflight daemon thread, skipped while alive.
-                token_thread = maybe_start_token_thread(token_thread, token_collector)
+                # single-inflight daemon thread, gated to its >=60s cadence.
+                if now >= next_host_health:
+                    host_health_thread = maybe_start_host_health_thread(host_health_thread, host_health_collector)
+                    next_host_health = now + 60
+                # Role consumption never blocks commands/quota: only when enabled.
+                if rc_enabled and now >= next_role_consumer:
+                    role_consumer_thread = maybe_start_role_consumer_thread(role_consumer_thread, role_consumer)
+                    next_role_consumer = now + rc_interval
+                # Native token collection never blocks commands/quota: hourly collector.
+                if now >= next_token:
+                    token_thread = maybe_start_token_thread(token_thread, token_collector)
+                    next_token = now + 300
                 count += 1
                 if cycles is None or count < cycles:
                     stop.wait(interval)

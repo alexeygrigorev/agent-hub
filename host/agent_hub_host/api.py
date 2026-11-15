@@ -8,6 +8,7 @@ import ssl
 import struct
 import io
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -67,11 +68,29 @@ def _legacy_bootstrap_error(req, response):
     print(message, file=sys.stderr, flush=True)
     raise LegacyHubEndpointError(message) from None
 
+_SSL_CONTEXT = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def _get_ssl_context():
+    """Reuse one default SSLContext per process instead of reloading OS CA stores per request."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        with _SSL_CONTEXT_LOCK:
+            if _SSL_CONTEXT is None:
+                _SSL_CONTEXT = ssl.create_default_context()
+    return _SSL_CONTEXT
+
+
 def _get_opener():
     # Never route Hub traffic through HTTP(S)_PROXY from the user environment: a
     # dead engine proxy (codex-vpn on 127.0.0.1:8899) made every check-in fail with
     # WinError 10061 and Hub showed the host offline for 70+ minutes (2026-11-02).
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirectHandler())
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=_get_ssl_context()),
+        NoRedirectHandler(),
+    )
     opener.addheaders = [("User-Agent", USER_AGENT)]
     return opener
 

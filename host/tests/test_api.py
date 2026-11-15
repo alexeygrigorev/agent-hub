@@ -224,3 +224,21 @@ def test_package_import_adds_hub_to_no_proxy():
     ensure_hub_no_proxy(env)
     assert env['NO_PROXY'] == 'localhost,hub.dtcdev.click,.dtcdev.click'
     assert env['no_proxy'] == 'hub.dtcdev.click,.dtcdev.click'
+
+
+def test_get_opener_reuses_default_ssl_context():
+    import urllib.request
+    from unittest import mock
+    from agent_hub_host import api
+    api._SSL_CONTEXT = None
+    try:
+        with mock.patch.object(api.ssl, 'create_default_context', wraps=api.ssl.create_default_context) as create_ctx:
+            opener1 = api._get_opener()
+            opener2 = api._get_opener()
+            self_ctxs1 = [h._context for h in opener1.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+            self_ctxs2 = [h._context for h in opener2.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+            assert create_ctx.call_count == 1
+            assert len(self_ctxs1) == 1 and len(self_ctxs2) == 1
+            assert self_ctxs1[0] is self_ctxs2[0]
+    finally:
+        api._SSL_CONTEXT = None
