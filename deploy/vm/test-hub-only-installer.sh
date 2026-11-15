@@ -166,7 +166,8 @@ with tempfile.TemporaryDirectory(prefix="hub-installer-readiness-", dir=scratch)
     proc, curls, sleeps, _, curl_args = run_services(hub_only="true", fail_curl_first=15, deadline_s=2, curl_delay_s=1)
     require(proc.returncode != 0, "elapsed deadline exhaustion must fail closed")
     require(1 <= curls <= 3 and curls < 15, f"expected elapsed 2s deadline to stop well before 15 attempts, got {curls}")
-    require(sleeps == curls - 1, f"expected sleeps == curls - 1 before deadline expired, got sleeps={sleeps} curls={curls}")
+    # The deadline may pass after the final sleep, before the next curl begins.
+    require(sleeps in (curls - 1, curls), f"expected one sleep per failed curl except possibly the last, got sleeps={sleeps} curls={curls}")
     max_times = [int(m.group(1)) for line in curl_args if (m := re.search(r"--max-time\s+(\d+)", line))]
     require(
         len(max_times) == curls and all(1 <= t <= 2 for t in max_times),
