@@ -2,6 +2,7 @@
 import json,os,re,select,socket,struct,time,uuid
 class ram:
     ROLES={'canary':'start_canary','quota_publish':'quota_stale','quota_monitor':'quota_stale','backup_pull':'backup','backup_notifier':'backup'}
+    CLAIM_ROLES={'intake_mailer':'intake_mailer'}
     DECISIONS={'observation':False,'alert':True,'alert_dedup':True,'recovery':True}
     @staticmethod
     def identity(value):return type(value) is str and re.fullmatch('[0-9a-f]{32}',value) is not None
@@ -12,9 +13,9 @@ REPLY = 8192
 
 BUDGET = 0.15
 
-CONDITIONS = frozenset(('pass', 'recovering', 'failure_below_threshold', 'recovery', 'critical', 'critical_dedup', 'lock_busy', 'deploy_gate', 'metadata_only', 'error', 'backup_failed', 'stale', 'fresh', 'recovery_pending', 'quota_stale', 'quota_fresh', 'quota_recovery_pending', 'quota_publication', 'health_critical', 'backup_begin', 'backup_terminal', 'drill', 'pull_terminal'))
+CONDITIONS = frozenset(('pass', 'recovering', 'failure_below_threshold', 'recovery', 'critical', 'critical_dedup', 'lock_busy', 'deploy_gate', 'metadata_only', 'error', 'backup_failed', 'stale', 'fresh', 'recovery_pending', 'quota_stale', 'quota_fresh', 'quota_recovery_pending', 'quota_publication', 'health_critical', 'backup_begin', 'backup_terminal', 'drill', 'pull_terminal', 'intake_recovery','host_disconnected','mailer_api_error','mailer_render_error','mailer_state_error','mailer_helper_error','mailer_helper_timeout','mailer_journal_error','mailer_scan_complete','mailer_scan_empty','mailer_scan_incomplete','mailer_input_error'))
 
-FLAGS = frozenset(('test', 'drill', 'no_mail', 'dry_run', 'prior_stale', 'prior_drill', 'stale_drill', 'repeat_due', 'decision_seen', 'exit_success'))
+FLAGS = frozenset(('test', 'drill', 'no_mail', 'dry_run', 'prior_stale', 'prior_drill', 'stale_drill', 'repeat_due', 'decision_seen', 'exit_success', 'intake_recovery', 'host_disconnected', 'log_requested'))
 
 class Refused(Exception):
     pass
@@ -41,12 +42,26 @@ def encode(value, limit):
 
 def checked(frame):
     require(type(frame) is dict and set(frame) == {'v', 'invocation_id', 'parent_id', 'role', 'phase', 'seq', 'decision', 'condition', 'flags', 'recipient_class', 'observer_ok'})
-    require(type(frame['v']) is int and frame['v'] == 1 and ram.identity(frame['invocation_id']) and (frame['parent_id'] is None or ram.identity(frame['parent_id'])) and (type(frame['role']) is str) and (frame['role'] in ram.ROLES) and (frame['phase'] in ('begin', 'decision', 'terminal')) and (type(frame['seq']) is int) and (0 <= frame['seq'] < 16) and (type(frame['observer_ok']) is bool))
+    require(type(frame['v']) is int and frame['v'] == 1 and ram.identity(frame['invocation_id']) and (frame['parent_id'] is None or ram.identity(frame['parent_id'])) and (type(frame['role']) is str) and (frame['role'] in (ram.ROLES.keys() | ram.CLAIM_ROLES.keys())) and (frame['phase'] in ('begin', 'decision', 'terminal')) and (type(frame['seq']) is int) and (0 <= frame['seq'] < 16) and (type(frame['observer_ok']) is bool))
     require(type(frame['flags']) is dict and set(frame['flags']) <= FLAGS and all((type(v) is bool for v in frame['flags'].values())) and (frame['recipient_class'] in ('dev', 'none')))
     if frame['phase'] == 'decision':
         require(frame['decision'] in ram.DECISIONS and frame['condition'] in CONDITIONS)
     else:
         require(frame['decision'] is None and frame['condition'] is None)
+    if frame['role'] in ram.CLAIM_ROLES:
+        require(frame['parent_id'] is None and set(frame['flags']) <=
+            {'log_requested','exit_success','intake_recovery','host_disconnected'})
+        if frame['phase'] == 'decision':
+            branch = frame['condition'] in ('intake_recovery','host_disconnected')
+            require((branch and frame['decision'] in ('alert','alert_dedup')
+                and frame['flags'].get(frame['condition']) is True
+                and set(frame['flags']) <= {'log_requested',frame['condition']})
+                or (not branch and frame['decision'] == 'observation'
+                    and frame['condition'].startswith('mailer_')
+                    and set(frame['flags']) <= {'log_requested'}))
+        else:
+            require(set(frame['flags']) <= ({'log_requested','exit_success'}
+                if frame['phase'] == 'terminal' else {'log_requested'}))
     return frame
 
 def left(deadline):
@@ -135,13 +150,13 @@ _CONTEXT_KEYS = ('HUB_ALERT_INVOCATION_ID','HUB_ALERT_PARENT_ID','HUB_ALERT_ROLE
 
 
 def positive_only_context(role, *, socket_path, parent_id=None, deadline=None, env=None):
-    """One top-level quota SOURCE CLAIM, never an admitted invocation.
+    """One top-level quota/mailer SOURCE CLAIM, never an admitted invocation.
 
     No environment mutation, inherited context adoption, child spawn or retry.
     Backup/canary owner integration is deliberately outside this first splice.
     """
     env = os.environ if env is None else env
-    require(type(role) is str and role in ('quota_publish','quota_monitor') and parent_id is None)
+    require(type(role) is str and role in ('quota_publish','quota_monitor','intake_mailer') and parent_id is None)
     require(type(socket_path) is str and socket_path.startswith('/') and '\0' not in socket_path
         and len(os.fsencode(socket_path)) <= 107 and '..' not in socket_path.split('/'))
     require(not any(key in env for key in _CONTEXT_KEYS))
