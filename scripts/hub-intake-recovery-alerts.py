@@ -145,7 +145,9 @@ def deliver(transport, state_path, helper):
         env = dict(os.environ, PRINCIPAL_ALERT_TO=RECIPIENT, PING_ALERT_MESSAGE=message)
         completed = subprocess.run([str(helper), message], env=env, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=120, check=False)
-        if completed.returncode:
+        # Preserve deliberate render-only routing, but exit0 from that sink is
+        # not mail delivery and must never suppress a later real notification.
+        if completed.returncode or env.get('ALERT_LOG'):
             result['errors'] += 1
             continue
         state['sent'].append(key)
