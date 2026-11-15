@@ -1562,6 +1562,10 @@ export class MachineDO {
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
         unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId, row.epoch);
+      if (unconfirmed && session && session.native_id && ['claimed', 'running'].includes(session.state)) {
+        const absentObservedAt = this.deadNativeObservation(session, now);
+        if (absentObservedAt !== null) await this.recordNativeProcessAbsent(session, absentObservedAt);
+      }
     }
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });
@@ -1895,6 +1899,12 @@ export class MachineDO {
         if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
       }
+      if(reason==='dead'&&session.native_id&&this.hasUnconfirmedStop(session)){
+        if(await this.recordNativeProcessAbsent(session,live.observed_at)){
+          reaped++;actions.push({session_id:session.id,action:'marked_failed',reason:'native_process_absent'});
+        }
+        continue;
+      }
       if(session.native_id||live?.native_id||!!(live&&['launching','starting'].includes(live.phase))){
         const pending=this.db.one<{id:string}>("SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending' ORDER BY created_at DESC LIMIT 1",
           session.id,session.machine_id,session.epoch);
@@ -1915,6 +1925,57 @@ export class MachineDO {
     }
     return {machine_id:machine.machine_id,dry_run:false,active_count:active,
       active_count_after:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,reaped,stop_requested:stopRequested,actions};
+  }
+
+  private deadNativeObservation(session: SessionRow, now: number): number | null {
+    if (!session.native_id) return null;
+    const inventory = this.db.one<{ observed_at: number }>('SELECT observed_at FROM machine_liveness WHERE singleton=1');
+    if (!inventory || inventory.observed_at > now + 5_000 || now - inventory.observed_at > LIVE_SNAPSHOT_TTL_MS) return null;
+    const live = this.liveSessions().find(row => row.session_id === session.id);
+    if (!live) return null;
+    if (live.phase === 'exited' && live.containment_empty === true) return null;
+    const reason = inactiveReason({ ...live, last_activity_at: live.last_activity_at ?? session.created_at }, now);
+    return reason === 'dead' ? live.observed_at : null;
+  }
+
+  private hasUnconfirmedStop(session: SessionRow): boolean {
+    const row = this.db.one<{ result_json: string | null }>(
+      "SELECT result_json FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='failed' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+      session.id, session.machine_id, session.epoch);
+    try {
+      const parsed = row?.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
+      return parsed?.stopped === false && parsed?.error === 'stop_unconfirmed';
+    } catch { return false; }
+  }
+
+  private async recordNativeProcessAbsent(session: SessionRow, observedAt: number): Promise<boolean> {
+    const now = Date.now(), reason = 'native_process_absent', key = `reaped:${session.operation_id}:${session.epoch}`;
+    const payload = {
+      operation_id: session.dispatch_id, attempt_operation_id: session.operation_id, session_id: session.id,
+      intake_id: session.intake_id, machine_id: session.machine_id, epoch: session.epoch, native_id: session.native_id,
+      reason, observed_at: observedAt, stopped: false, unconfirmed: true, reaped: true,
+    };
+    const applied = this.db.transaction(this.ctx, () => {
+      const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', session.id);
+      if (!current || current.epoch !== session.epoch || current.operation_id !== session.operation_id
+        || current.native_id !== session.native_id || !['claimed', 'running'].includes(current.state)) return false;
+      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=?", now, session.id);
+      this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",
+        session.operation_id, session.id, session.epoch);
+      this.settlePendingCommands(session, now, reason, null);
+      this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
+        session.id, reason, session.operation_id, now);
+      this.insertOutbox(key, 'reaped', session.operation_id, session.project_id, payload, now);
+      return true;
+    });
+    if (applied) {
+      await this.flushOne(key);
+      console.error('[hub2] SESSION_NATIVE_PROCESS_ABSENT', JSON.stringify({
+        session_id: session.id, machine_id: session.machine_id, intake_id: session.intake_id,
+        epoch: session.epoch, native_id: session.native_id, reason,
+      }));
+    }
+    return applied;
   }
 
   private qualifiedStopResult(session: SessionRow, result: JsonRecord): boolean {

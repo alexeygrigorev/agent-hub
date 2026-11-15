@@ -1148,12 +1148,16 @@ export class ProjectDO {
     const body=await bodyObject(request,12_288);
     if(body.reason==='legacy_launch_unobserved')return this.legacyLaunchUnobserved(body,reaped);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
-      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale'].includes(String(body.reason)))
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale','native_process_absent'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
     const launchTimedOut=['launch_timeout_no_native','host_no_response'].includes(String(body.reason));
     const launchRefused=body.reason==='host_launch_refused';
     const launchFailed=launchTimedOut||launchRefused;
     const lost=body.reason==='host_inventory_stale';
+    const nativeAbsent=body.reason==='native_process_absent';
+    if (nativeAbsent && (!reaped || body.stopped !== false || body.unconfirmed !== true
+      || typeof body.native_id !== 'string' || body.native_id.length < 8 || body.native_id.length > 128
+      || !Number.isSafeInteger(body.observed_at))) return error('invalid_stopped_receipt', 400);
     if (lost && (!reaped || body.lost!==true || body.stopped!==undefined
       || typeof body.native_id!=='string' || body.native_id.length<8 || body.native_id.length>128
       || !Number.isSafeInteger(body.observed_at)
@@ -1174,7 +1178,7 @@ export class ProjectDO {
       return json({lost:true,duplicate:true,session_id:saga.session_id});
     }
     if (lost && !['offered','claimed','admitted','running'].includes(saga.state)) return error('stale_lost_receipt',409);
-    if(saga.state==='complete')return ['launch_timeout_no_native','host_no_response','host_launch_refused'].includes(String(saga.last_reason))
+    if(saga.state==='complete')return ['launch_timeout_no_native','host_no_response','host_launch_refused','native_process_absent'].includes(String(saga.last_reason))
       ?json({failed:true,duplicate:true,session_id:saga.session_id,reason:saga.last_reason}):json({stopped:true,duplicate:true});
     if(launchTimedOut&&(!['staged','offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true))return error('invalid_launch_timeout_receipt',409);
     if(launchRefused&&(!reaped||!['offered','claimed','admitted'].includes(saga.state)||saga.native_id!==null||body.native_id!==null||body.launch_failed!==true
@@ -1196,17 +1200,17 @@ export class ProjectDO {
       if(this.completionControlled(current)){
         const claim=launchFailed?undefined:this.findCompletionClaim(intake,saga);
         if(claim)status='completed-awaiting-review';
-        completion=this.completionOutcome(intake,saga,claim,launchFailed?'launch_failed':'session_'+String(body.reason),
-          !launchFailed&&!lost&&['dead','idle'].includes(String(body.reason)),true,now);
+        completion=this.completionOutcome(intake,saga,claim,launchFailed?'launch_failed':nativeAbsent?'native_process_absent':'session_'+String(body.reason),
+          !launchFailed&&!lost&&!nativeAbsent&&['dead','idle'].includes(String(body.reason)),true,now);
       }
       this.db.run("UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?",status,
-        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
+        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at}:nativeAbsent?{stopped:false,native_process_absent:true,stop_unconfirmed:true}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
           native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{})}),now,intake.id);
       this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchFailed?'session_launch_failed':lost?'session_lost':reaped?'session_reaped':'session_stopped',
         {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null,
-          ...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
+          ...(nativeAbsent?{stop_unconfirmed:true}:{}),...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
       return true;
     });
     if(!applied)return error('stale_stopped_receipt',409);
@@ -1219,7 +1223,7 @@ export class ProjectDO {
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:saga.operation_id,session_id:saga.session_id}),
     }).catch(()=>undefined);
     await this.scheduleNext();
-    return launchFailed?json({failed:true,reaped,session_id:saga.session_id,reason:body.reason,
+    return (launchFailed||nativeAbsent)?json({failed:true,reaped,session_id:saga.session_id,reason:body.reason,
       ...(launchRefused?{failure_reason:body.failure_reason}:{})}):json({stopped:true,reaped,session_id:saga.session_id});
   }
 

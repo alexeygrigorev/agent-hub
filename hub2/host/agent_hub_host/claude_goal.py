@@ -111,7 +111,7 @@ def approve_external_includes(config_dir, workspace):
         temp = path.with_name(path.name + '.hub-%d.tmp' % os.getpid())
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf8') as stream:
             json.dump(config, stream, indent=2)
         os.replace(temp, path)
         return True

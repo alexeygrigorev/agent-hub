@@ -1819,3 +1819,30 @@ class NoneOutputTest(unittest.TestCase):
         out = launcher.native('status', 'x', '--json')
         self.assertEqual((out.stdout, out.stderr), ("", ""))
         self.assertIsNone(launcher.status('x'))
+
+
+class ProfileCommandUtf8PromptTest(unittest.TestCase):
+    def test_profile_command_writes_utf8_prompt_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = nl.NativeLauncher({'routes': {'claude': {'provider': 'claude'}}})
+            prompt = 'AC1 «Каждый час смотри чтобы был прогресс» — test'
+            spec = {
+                'workspace': tmp,
+                'engine': 'claude',
+                'model': 'opus',
+                'timeout_seconds': 600,
+                'operation_id': 'op-utf8',
+                'epoch': 1,
+            }
+            real_fdopen = os.fdopen
+            seen_encodings = []
+
+            def checked_fdopen(fd, mode='r', *args, **kwargs):
+                seen_encodings.append(kwargs.get('encoding'))
+                return real_fdopen(fd, mode, *args, **kwargs)
+
+            with mock.patch.object(nl.os, 'fdopen', side_effect=checked_fdopen):
+                argv = launcher.profile_command('hub2-utf8', spec, {'provider': 'claude', 'engine': 'claude'}, prompt)
+            self.assertTrue(any(enc in ('utf8', 'utf-8') for enc in seen_encodings))
+            prompt_file = Path(argv[argv.index('--prompt-file') + 1])
+            self.assertEqual(prompt_file.read_text(encoding='utf-8'), prompt)

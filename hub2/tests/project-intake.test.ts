@@ -321,6 +321,31 @@ test('pre-claim host launch refusal fails clearly and is not silently re-offered
  assert.equal(retry.status,201,JSON.stringify(await retry.clone().json()));
  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,2);
 });
+
+test('native_process_absent reaped receipt fails intake, alerts developer, and unblocks subsequent start',async()=>{
+ const f=fixture({modelCandidates:[{id:'claude-opus-medium',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true}]}),own=await intake(f,'native-absent'),start={key:'native-absent-first',workspace:'relay',engine:'claude',model:'opus',machine_id:'h1',override_reason:'Synthetic semantic test'};
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ f.sql.prepare("UPDATE dispatch_sagas SET state='running',native_id='native-absent-1' WHERE operation_id=?").run(saga.operation_id);
+ f.sql.prepare("UPDATE intakes SET status='running' WHERE id=?").run(own.id);
+ f.restart();
+ const conflict=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'native-absent-conflict'});
+ assert.equal(conflict.status,409);
+ const reaped=await f.call('/_internal/reaped','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
+  session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:'native-absent-1',
+  reason:'native_process_absent',stopped:false,unconfirmed:true,reaped:true,observed_at:Date.now()});
+ assert.equal(reaped.status,200);
+ const receipt=await body(reaped);
+ assert.equal(receipt.failed,true);assert.equal(receipt.reason,'native_process_absent');
+ const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
+ assert.equal(intakeRow.status,'failed');
+ const proof=JSON.parse(intakeRow.final_evidence_json);
+ assert.equal(proof.native_process_absent,true);assert.equal(proof.stop_unconfirmed,true);
+ const history=await body(await f.call('/api/intakes/'+own.id+'/history'));
+ assert(history.events.some((event:any)=>event.kind==='developer_alert_raised'&&event.body.reason==='native_process_absent'));
+ const retry=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,key:'native-absent-retry'});
+ assert.equal(retry.status,201,JSON.stringify(await retry.clone().json()));
+});
 test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
