@@ -13,6 +13,14 @@ ACTIONS = {
 }
 
 
+def parse_bool(value):
+    if value.lower() in {"true", "yes", "1"}:
+        return True
+    if value.lower() in {"false", "no", "0"}:
+        return False
+    raise ValueError("--code-task must be true or false")
+
+
 def add_commands(subparsers):
     for group, actions in ACTIONS.items():
         parser = subparsers.add_parser(group)
@@ -20,7 +28,7 @@ def add_commands(subparsers):
         parser.add_argument("identity", nargs="?")
         for flag in ("project", "status", "after", "cursor", "search", "title", "text", "text-file", "acceptance-criteria-file",
                      "intake-task-id", "machine", "machine-id", "key", "body-file", "prompt", "file", "to",
-                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at", "repo", "pr"):
+                     "body", "mailbox", "thread", "state", "workspace", "tier", "engine", "model", "effort", "reason", "at", "repo", "pr", "code-task", "note"):
             parser.add_argument("--" + flag)
         parser.add_argument("--acceptance-criteria", action="append", default=[])
         parser.add_argument("--required-capability", action="append", default=[])
@@ -77,11 +85,18 @@ def execute(client, args, config):
                 raw = file_text(args.acceptance_criteria_file)
                 criteria += json.loads(raw) if raw.lstrip().startswith("[") else raw.splitlines()
             body.update(title=args.title, text=text, acceptance_criteria=criteria, key=key,
-                        code_task=not args.non_code_task)
+                        **({"code_task": False} if args.non_code_task else {}))
+            if args.code_task is not None:
+                body["code_task"] = parse_bool(args.code_task)
             method = "POST"
         elif action == "update":
             method = "PATCH"
-            body.update({k: v for k, v in {"status": args.status, "title": args.title, "text": text}.items() if v is not None})
+            body.setdefault("key", key)
+            body.update({k: v for k, v in {"status": args.status, "title": args.title, "text": text, "note": args.note}.items() if v is not None})
+            if args.code_task is not None:
+                body["code_task"] = parse_bool(args.code_task)
+            elif args.non_code_task:
+                body["code_task"] = False
         elif action == "merge-check":
             if not identity:
                 raise ValueError("intake required")

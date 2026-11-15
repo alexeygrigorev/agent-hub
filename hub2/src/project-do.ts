@@ -11,7 +11,7 @@ import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
-import { codeTask, mergeEvidenceShapeError, mergeGate, mergeGaps } from './merge-gate';
+import { codeTask, mergeEvidenceShapeError, mergeGate, mergeGaps, readOnlyBrief } from './merge-gate';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
@@ -232,7 +232,7 @@ export class ProjectDO {
     if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:body.code_task!==false };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]) };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -526,8 +526,9 @@ export class ProjectDO {
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const editable=['title','text','acceptance_criteria','status','priority','note','project',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
+    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
     if(!editable.some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    if(body.code_task!==undefined&&typeof body.code_task!=='boolean')return error('invalid_code_task',400);
     if(body.project!==undefined&&(typeof body.project!=='string'||!/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(body.project)))return error('invalid_intake_project',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
     if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
@@ -540,6 +541,7 @@ export class ProjectDO {
       if(replay)return json({intake:this.viewIntake(row),duplicate:true});
       if(body.project!==undefined&&body.project!==row.project&&!this.canProject(actor,body.project as string,'intake:write'))return error('forbidden',403);
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
+      if(body.code_task!==undefined&&!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can reclassify an intake');
       if(body.status==='accepted'){
         const gate=this.intakeMergeGate(row);
         if(!gate.ok){
@@ -568,6 +570,11 @@ export class ProjectDO {
         const context={...this.intakeContext(row.id)};
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
         this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
+      }
+      if(typeof body.code_task==='boolean'){
+        const source=(this.parse(row.source_json) as JsonRecord|null)??{},was=codeTask(source);
+        this.db.run('UPDATE intakes SET source_json=? WHERE id=?',JSON.stringify({...source,code_task:body.code_task}),row.id);
+        this.appendEvent(row.id,'code-task:'+row.id+':'+key,actor!.id,'intake_reclassified',{code_task:body.code_task,was,...(body.note?{note:body.note}:{})},at);
       }
       this.appendEvent(row.id,'edit:'+row.id+':'+key,actor!.id,'intake_updated',{...next,...(body.note?{note:body.note}:{})},at);
       this.db.run('INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',scope,key,digest,JSON.stringify({id:row.id}),at,at+180*86400000);

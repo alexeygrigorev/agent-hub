@@ -1327,3 +1327,30 @@ test('hub intake close succeeds on an already-accepted verified intake while unv
     assert.equal((await json(badLegacyClose)).error,'review_required');
   }finally{f.close();}
 });
+
+test('read-only briefs are not code tasks, and an operator can reclassify and reevaluate',async()=>{
+  const f=fixture();
+  try{
+    const make=async(key:string,title:string,text:string,ac:string[],extra:object={})=>{
+      const r=await f.call('/api/intakes?project=org/completion','POST',{key,title,text,acceptance_criteria:ac,...extra});
+      assert.equal(r.status,201);return (await json(r)).intake.id as string;};
+    const report=await make('ro1','DTC migration status','Read-only report, no code.',['Report states migration status']);
+    assert.equal(JSON.parse(intakeRow(f,report).source_json).code_task,false,'report-only brief is classified non-code');
+    const draft=await make('ro2','Draft email','Draft-only email task.',['Draft is written']);
+    assert.equal(JSON.parse(intakeRow(f,draft).source_json).code_task,false);
+    const code=await make('ro3','Fix bug','Implement fix and open a PR; read-only follow-up later.',['PR merged']);
+    assert.equal(JSON.parse(intakeRow(f,code).source_json).code_task,true,'delivery wording keeps the gate');
+    const forced=await make('ro4','Status','Read-only report.',['Report'],{code_task:true});
+    assert.equal(JSON.parse(intakeRow(f,forced).source_json).code_task,true,'explicit value wins');
+
+    const worker={id:'session:x',kind:'agent',resource_id:forced,scopes:['intake:append']};
+    assert.notEqual((await f.call('/api/intakes/'+forced,'PATCH',{key:'w1',code_task:false},worker)).status,200,'workers cannot reclassify');
+    assert.equal((await f.call('/api/intakes/'+forced,'PATCH',{key:'c0',code_task:'no'})).status,400);
+    const res=await f.call('/api/intakes/'+forced,'PATCH',{key:'c1',code_task:false,note:'read-only report'});
+    assert.equal(res.status,200,await res.clone().text());
+    assert.equal(JSON.parse(intakeRow(f,forced).source_json).code_task,false);
+    assert.ok(events(f,forced).some(e=>e.kind==='intake_reclassified'&&e.body.was===true&&e.body.code_task===false));
+    const state=await json(await f.call('/api/intakes/'+forced+'/merge-state'));
+    assert.equal(state.merge_gate.required,false);assert.equal(state.merge_gate.ok,true);
+  }finally{f.close();}
+});
