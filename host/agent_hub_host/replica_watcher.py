@@ -450,6 +450,18 @@ class ReplicaWatcher:
     def interval(self):
         return CATCHUP_POLL_S if self.clock() < self.catchup_until else POLL_S
 
+    def _stat_signatures(self):
+        """Return ({agent_id: [size, mtime_ns]}, skipped) without reading or parsing blobs."""
+        signatures, skipped = {}, 0
+        for agent_id, path in list_replicas(self.root):
+            try:
+                stat = os.stat(_long(path))
+            except OSError:
+                skipped += 1
+                continue
+            signatures[agent_id] = [stat.st_size, int(stat.st_mtime_ns)]
+        return signatures, skipped
+
     def snapshot(self):
         """Per-agent window plus messages not yet acknowledged by the Hub."""
         agents, signatures, skipped = [], {}, 0
@@ -496,6 +508,10 @@ class ReplicaWatcher:
         now = self.clock()
         if now < self.next_attempt_at:
             return {'skipped': 'backoff'}
+        if self.reason == 'poll' and now - self.last_post_at < HEARTBEAT_S:
+            signatures, _ = self._stat_signatures()
+            if signatures == self.state.get('signatures'):
+                return {'skipped': 'unchanged', 'agents': len(signatures)}
         agents, signatures, skipped = self.snapshot()
         changed = (signatures != self.state.get('signatures') or self.reason != 'poll'
                    or any(a['messages'] or a['gap'] for a in agents))
