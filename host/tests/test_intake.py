@@ -542,6 +542,14 @@ class TestIntakeCli(unittest.TestCase):
         self.assertNotEqual(code, 0)
         transport.assert_not_called()
 
+    def test_update_can_reclassify_code_task(self):
+        for value, expected in (('false', False), ('true', True)):
+            with patch.object(intake, 'request', return_value={}) as transport:
+                code, _, error = self.run_cli('intake', 'update', 'task-1', '--version', '2', '--key', 'k-' + value,
+                                              '--code-task', value, '--note', 'read-only report')
+            self.assertEqual(code, 0, error)
+            self.assertIs(transport.call_args.args[2]['code_task'], expected)
+
     def test_close_outcome_closed_unverified_requires_reason(self):
         with patch.object(intake, 'request', return_value={}) as transport:
             code, _, _ = self.run_cli('intake', 'close', 'task-1', '--version', '2', '--key', 'cu-no-reason',
