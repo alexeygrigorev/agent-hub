@@ -1458,7 +1458,8 @@ test('qualified native exits tolerate bounded host clock skew without relaxing t
    source:'aplexer_retirement',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
    native_exit:{code:127,signal:null,exited_at_ms:admitted-skew},native_deadline:{deadline_ms:admitted+1800_000,exceeded:false},
   }});
-  assert.equal(response.status,skew<=5000?200:409,await response.clone().text());
+  assert.equal(response.status,skew<=5000?201:409,await response.clone().text());
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,skew<=5000?'failed':'running');
  }
 });
 

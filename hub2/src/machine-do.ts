@@ -1079,6 +1079,8 @@ export class MachineDO {
     }
     const nativeDeadline=evidence.native_deadline as JsonRecord|undefined;
     const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
+    // Native exit timestamps use the host clock. Apply the same bounded skew
+    // allowance on both sides; the exact server-issued deadline stays fenced.
     if(!nativeDeadline||!Number.isSafeInteger(nativeDeadline.deadline_ms)||typeof nativeDeadline.exceeded!=='boolean'||!admission
       ||nativeDeadline.deadline_ms!==admission.observed_at+Number(launch.timeout_seconds)*1000
       ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at-5000||Number(nativeExit.exited_at_ms)>Date.now()+5000
