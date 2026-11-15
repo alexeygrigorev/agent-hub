@@ -106,14 +106,32 @@ function persistTimerLateness(start:number|undefined,budget:number):PersistTimer
   // Diagnostic tolerance only, NEVER a timeout extension or cause attribution.
   return end-start<=budget+50?'on_tick':'delayed';
 }
+type PersistAgeBucket = 'under_25'|'25_to_74'|'75_to_149'|'150_or_more'|'unspecified';
+type PersistBudget = {before_stage:PersistAgeBucket;stage_await:PersistAgeBucket};
+function persistAge(value:number|undefined):PersistAgeBucket{
+  if(value===undefined||!Number.isFinite(value)||value<0)return 'unspecified';
+  return value<25?'under_25':value<75?'25_to_74':value<150?'75_to_149':'150_or_more';
+}
+function persistBudget(trace:PersistTrace):PersistBudget{
+  const now=persistClock(),start=trace.budgetStart,stage=trace.stageStart;
+  // These are JS operation-boundary observations, never kernel IO latency.
+  // Invalid ordering cannot be projected as a short or successful operation.
+  if(start===undefined||stage===undefined||now===undefined||stage<start||now<stage)
+    return {before_stage:'unspecified',stage_await:'unspecified'};
+  return {before_stage:persistAge(stage-start),stage_await:persistAge(now-stage)};
+}
+function persistBudgetFields(budget:PersistBudget|undefined){
+  return budget?{unavailable_persist_before_stage:budget.before_stage,
+    unavailable_persist_stage_await:budget.stage_await}:{};
+}
 function firstPersistFailure(trace:PersistTrace|undefined,stage:EvidencePersistStage,error:unknown,timer?:PersistTimerLateness){
-  if(trace&&!trace.first)trace.first={stage,error,
+  if(trace&&!trace.first)trace.first={stage,error,budget:persistBudget(trace),
     ...(stage==='artifacts'?{artifacts:freezeArtifactProgress(trace.artifacts)}:{}),...(timer?{timer}:{})};
 }
 const ownDeadlines = new WeakSet<object>();
-type PersistTrace = { stage: EvidencePersistStage; artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
+type PersistTrace = { stage: EvidencePersistStage; budgetStart?:number;stageStart?:number;artifacts?:ArtifactProgress; first?: {stage:EvidencePersistStage;error:unknown;budget?:PersistBudget;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} };
 async function persistStep<T>(trace:PersistTrace|undefined,stage:EvidencePersistStage,work:()=>Promise<T>):Promise<T>{
-  if(trace)trace.stage=stage;
+  if(trace){trace.stage=stage;trace.stageStart=persistClock();}
   try{return await work();}
   catch(error){firstPersistFailure(trace,stage,error);throw error;}
 }
@@ -354,7 +372,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   readonly boot: string;
   private dirty = false;
   private firstFailure: string | undefined;
-  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} | undefined;
+  private firstPersist: {stage:EvidencePersistStage;error:EvidencePersistError;budget?:PersistBudget;artifacts?:ArtifactProgressSnapshot;timer?:PersistTimerLateness} | undefined;
   private pending = 0;
   private active = new Set<number>();
   private requests = 0;
@@ -395,6 +413,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
   private async bounded(work: Promise<void>, trace?:PersistTrace) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timerStart=trace?persistClock():undefined;
+    if(trace)trace.budgetStart=timerStart;
     try { await Promise.race([work, new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         const error=new Error('observer_timeout');ownDeadlines.add(error);
@@ -426,7 +445,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
       } catch(error) {
         if(!this.dirty){
           const first=trace.first??{stage:trace.stage,error};
-          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
+          this.firstPersist={stage:first.stage,error:classifyPersistFailure(first.error),...('budget' in first?{budget:first.budget}:{}),...('artifacts' in first?{artifacts:first.artifacts}:{}),...('timer' in first?{timer:first.timer}:{})};
         }
         this.invalidate('persist_failed');
       }
@@ -469,7 +488,7 @@ export class AlertEvidence implements CredentialMonitorEvidence {
     const unavailable = () => ({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce,
       unavailable_phase: 'runtime', unavailable_reason: this.firstFailure ??
         (this.pending ? 'pending_write' : this.active.size ? 'active_invocation' : 'snapshot_raced'),
-      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
+      ...(this.firstFailure==='persist_failed'?{...persistDiagnosticFields(this.firstPersist?.stage,this.firstPersist?.error),...persistBudgetFields(this.firstPersist?.budget),...artifactDiagnosticFields(this.firstPersist?.artifacts),...(this.firstPersist?.timer?{unavailable_persist_timer:this.firstPersist.timer}:{})}:{})});
     if (this.dirty || this.pending || this.active.size) return unavailable();
     const version = canonical(this.journal);
     try {

@@ -175,7 +175,7 @@ function artifactHarness(options:any={}) {
     }};
   };
   const body=stripTypeScriptTypes(source.slice(source.indexOf('const LIMIT ='),source.indexOf('type Producer ='))+helpers+projections+progress+persistence+source.slice(start,end)+failures+
-    '\nclass Methods{'+methods+'};')+'\nreturn {verifyArtifacts,methods:Methods.prototype,freezeArtifactProgress,artifactDiagnosticFields,classifyPersistFailure,persistTimerLateness};';
+    '\nclass Methods{'+methods+'};')+'\nreturn {verifyArtifacts,methods:Methods.prototype,freezeArtifactProgress,artifactDiagnosticFields,classifyPersistFailure,persistTimerLateness,persistStep,persistAge:typeof persistAge==="function"?persistAge:undefined,persistBudget:typeof persistBudget==="function"?persistBudget:undefined};';
   const actual=new Function('open','constants','isAbsolute','requiredArtifacts','diagnosticArtifacts','createHash','utilTypes','performance',body)
     (open,artifactConstants,artifactIsAbsolute,names.slice(0,3),names,injectedHash,utilTypes,
       {now:()=>options.clock?options.clock():0});
@@ -186,7 +186,7 @@ function artifactHarness(options:any={}) {
   const observer=Object.assign(Object.create(actual.methods),{store,enrollment:entry,journal,writer:undefined,timeoutMs:timeout,
     loaded,boot:'synthetic',dirty:false,pending:0,active:new Set(),requests:0,queue:Promise.resolve()});
   return {verify:(trace?:any)=>actual.verifyArtifacts(entry,loaded,trace),entry,loaded,names,bytes,opened,closed,waiting,observer,
-    project:actual.artifactDiagnosticFields,freeze:actual.freezeArtifactProgress,lateness:actual.persistTimerLateness,
+    project:actual.artifactDiagnosticFields,freeze:actual.freezeArtifactProgress,lateness:actual.persistTimerLateness,step:actual.persistStep,age:actual.persistAge,budget:actual.persistBudget,
     stats:()=>({active,maximum}),bounded:(work:Promise<void>,trace:any)=>actual.methods.bounded.call({timeoutMs:timeout},work,trace),timeout};
 }
 async function artifactMicrotasks(){for(let i=0;i<40;i++)await Promise.resolve();}
@@ -200,6 +200,56 @@ async function drainArtifactFake(h:any){
 }
 
 async function defineTests() {
+
+  test('persist budget distinguishes time spent before sync from pending sync without extending timeout',async t=>{
+    for(const [entry,expected] of [[140,['75_to_149','under_25']],[10,['under_25','75_to_149']]] as const){
+      let clock=0,release!:()=>void;const h=artifactHarness({clock:()=>clock});
+      const held=new Promise<void>(yes=>release=yes);
+      h.observer.store.write=async(_value:any,_writer:any,trace:any)=>{
+        clock=entry;await h.step(trace,'snapshot_sync',()=>held);
+        clock=999;await h.step(trace,'snapshot_close',async()=>{});
+      };
+      t.mock.timers.enable({apis:['setTimeout']});
+      try{
+        h.observer.begin();await artifactMicrotasks();clock=150;t.mock.timers.tick(150);
+        await artifactMicrotasks();await h.observer.queue;
+        const first=await h.observer.snapshot(NONCE);
+        assert.equal(first.unavailable_reason,'persist_failed');assert.equal(first.unavailable_persist_stage,'snapshot_sync');
+        assert.equal(first.unavailable_persist_error,'deadline');assert.equal(first.unavailable_persist_timer,'on_tick');
+        assert.equal(first.unavailable_persist_before_stage,expected[0]);assert.equal(first.unavailable_persist_stage_await,expected[1]);
+        assert.equal(h.timeout,150);
+        release();await artifactMicrotasks();h.observer.invalidate('snapshot_route_rejected');
+        assert.deepEqual(await h.observer.snapshot(NONCE),first,'late sync/close/fault cannot rewrite first frozen ages');
+        assert.ok(!JSON.stringify(first).includes('999'));assert.ok(!JSON.stringify(first).includes('/synthetic/'));
+      }finally{release();await artifactMicrotasks();t.mock.timers.reset();}
+    }
+  });
+  test('persist budget projects closed ages and invalid mock clocks as unspecified',()=>{
+    let clock:any=150;const h=artifactHarness({clock:()=>clock});
+    for(const [value,bucket] of [[0,'under_25'],[24.9,'under_25'],[25,'25_to_74'],[74.9,'25_to_74'],
+      [75,'75_to_149'],[149.9,'75_to_149'],[150,'150_or_more'],[9000,'150_or_more'],[-1,'unspecified'],[NaN,'unspecified'],[Infinity,'unspecified'],[undefined,'unspecified']] as const)
+      assert.equal(h.age(value),bucket);
+    const unknown={before_stage:'unspecified',stage_await:'unspecified'};
+    for(const trace of [{},{budgetStart:1},{budgetStart:5,stageStart:4},{budgetStart:0,stageStart:151}])assert.deepEqual(h.budget(trace),unknown);
+    for(const value of [NaN,Infinity,-1]){clock=value;assert.deepEqual(h.budget({budgetStart:0,stageStart:10}),unknown);}
+    const bad=artifactHarness({clock:()=>{throw new Error('SECRET /private/path');}});
+    assert.deepEqual(bad.budget({budgetStart:0,stageStart:10}),unknown);
+  });
+  test('persist budget preserves earlier primary faults and healthy seventeen-field response',async t=>{
+    let clock=0;const h=artifactHarness({clock:()=>clock});
+    const healthy=await h.observer.snapshot(NONCE);assert.equal(healthy.complete,true);assert.equal(Object.keys(healthy).length,17);
+    assert.ok(!Object.keys(healthy).some(key=>key.startsWith('unavailable_')));
+    let release!:()=>void;const held=new Promise<void>(yes=>release=yes);
+    h.observer.store.write=async(_v:any,_w:any,trace:any)=>{clock=10;await h.step(trace,'snapshot_sync',()=>held);};
+    t.mock.timers.enable({apis:['setTimeout']});
+    try{
+      h.observer.begin();await artifactMicrotasks();h.observer.invalidate('picker_pool_failed');clock=150;t.mock.timers.tick(150);
+      await artifactMicrotasks();await h.observer.queue;
+      const proof=await h.observer.snapshot(NONCE);assert.equal(proof.unavailable_reason,'picker_pool_failed');
+      assert.ok(!Object.keys(proof).some(key=>key.startsWith('unavailable_persist')));
+    }finally{release();await artifactMicrotasks();t.mock.timers.reset();}
+  });
+
   test('artifact progress freezes each controlled IO slot at the original deadline',async t=>{
     t.mock.timers.enable({apis:['setTimeout']});
     try{
