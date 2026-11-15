@@ -956,3 +956,117 @@ def test_runtime_uses_the_pinned_executable_not_the_ambient_path(writing, monkey
     os.chmod(fake, 0o755)
     monkeypatch.setenv('PATH', str(other) + os.pathsep + os.environ['PATH'])
     assert dcc.deliver(request(8))['status'] == 'materialized'
+
+
+@pytest.mark.parametrize('mode', [0o755, 0o750])
+def test_write_parent_enrollment_remains_observe_but_enable_refuses_before_state_change(world, mode):
+    world.put(oauth(7)); world.store.chmod(mode)
+    identity = native.store_identity(world.store)
+    world.enroll(7)
+    before, raw = world.state(), world.raw()
+    assert dcc.deliver(request(8)) == {'status': 'observe_only', 'enabled': False}
+    with pytest.raises(dcc.Refused, match='^store_write_parent_untrusted$'):
+        world.write_mode()
+    assert world.state() == before and world.raw() == raw
+    assert native.store_identity(world.store) == identity
+    assert world.store.stat().st_mode & 0o777 == mode
+
+
+@pytest.mark.parametrize('mode', [0o755, 0o750])
+def test_write_parent_runtime_refuses_before_new_intent_then_same_inode_repair_delivers(writing, mode):
+    identity = native.store_identity(writing.store)
+    before, raw = writing.state(), writing.raw()
+    writing.store.chmod(mode)
+    assert dcc.deliver(request(8)) == {'status': 'store_write_parent_untrusted', 'enabled': True}
+    assert writing.state() == before and writing.state()['pending'] is None
+    assert writing.raw() == raw
+    assert native.store_identity(writing.store) == identity
+    # Test-only repair of this owned synthetic fixture, never a real native home.
+    writing.store.chmod(0o700)
+    assert native.store_identity(writing.store) == identity
+    assert dcc.deliver(request(8)) == {'status': 'materialized', 'enabled': True}
+    assert writing.state()['committed']['generation'] == 8 and writing.state()['pending'] is None
+    assert writing.doc()['claudeAiOauth'] == oauth(8)
+    assert all(writing.doc()[key] == value for key, value in MCP.items())
+    assert dcc.check(lambda: view(8)) == {'status': 'in_step', 'enabled': True, 'generation': 8}
+
+
+def test_write_parent_preflight_does_not_heal_or_replace_an_existing_pending_intent(writing):
+    state = writing.state()
+    incoming = native.oauth_digest(oauth(8))
+    pending = dict(state, pending={'generation': 8, 'from_digest': state['committed']['oauth_digest'], 'to_digest': incoming})
+    dcc.save_state(pending)
+    writing.store.chmod(0o755)
+    assert dcc.deliver(request(8)) == {'status': 'store_write_parent_untrusted', 'enabled': True}
+    assert writing.state() == pending
+    writing.store.chmod(0o700)
+    assert dcc.deliver(request(8)) == {'status': 'materialized', 'enabled': True}
+    assert writing.state()['committed']['generation'] == 8 and writing.state()['pending'] is None
+
+
+def test_write_parent_guard_does_not_weaken_private_managed_filesystem(world):
+    from agent_hub_host import private_fs
+    target = world.tmp / 'managed-private'; target.mkdir(mode=0o700); target.chmod(0o755)
+    with pytest.raises(PermissionError):
+        private_fs.atomic_write(target / 'synthetic.json', b'{}', 100, engine_owned=True)
+    assert not (target / 'synthetic.json').exists()
+
+
+def test_write_parent_preflight_binds_identity_and_rejects_replaced_or_symlink_directory(world):
+    world.put(oauth(7)); identity = native.store_identity(world.store)
+    replacement = world.home / 'replacement'; replacement.mkdir(mode=0o700)
+    held = world.home / 'held'; world.store.rename(held); replacement.rename(world.store)
+    with pytest.raises(native.StoreRefused, match='^store_changed$'):
+        native.verify_write_parent(world.store, identity)
+    world.store.rmdir(); world.store.symlink_to(held, target_is_directory=True)
+    with pytest.raises(native.StoreRefused, match='^store_untrusted$'):
+        native.verify_write_parent(world.store, identity)
+
+
+def test_write_parent_permission_exception_is_closed_without_message_or_intent(writing, monkeypatch):
+    original = native.private_fs.parent
+    before = writing.state()
+    def parent(path, *args, **kwargs):
+        if str(path) == str(writing.store / native.CREDENTIAL_NAME) and kwargs.get('private') is False:
+            # Skip identity/read checks so only this preflight is exercised below.
+            raise PermissionError('synthetic-private-path-and-message')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(native.private_fs, 'parent', parent)
+    with pytest.raises(native.StoreRefused, match='^store_write_parent_untrusted$'):
+        native.verify_write_parent(writing.store, (before['store_dev'], before['store_ino']))
+    assert writing.state() == before
+
+
+def test_write_parent_guard_preserves_already_written_pending_commit_without_native_rewrite(writing):
+    state = writing.state()
+    incoming = native.oauth_digest(oauth(8))
+    dcc.save_state(dict(state, pending={'generation': 8, 'from_digest': state['committed']['oauth_digest'], 'to_digest': incoming}))
+    writing.put(oauth(8)); writing.store.chmod(0o755)
+    before = writing.raw()
+    assert dcc.deliver(request(8)) == {'status': 'in_step', 'enabled': True}
+    assert writing.raw() == before and writing.store.stat().st_mode & 0o777 == 0o755
+    assert writing.state()['committed']['generation'] == 8 and writing.state()['pending'] is None
+
+
+def test_write_parent_late_permission_refusal_keeps_existing_pending_and_never_claims_delivery(writing, monkeypatch):
+    original = native.private_fs.atomic_write
+    before, raw = writing.state(), writing.raw()
+    def atomic(path, *args, **kwargs):
+        if str(path) == str(writing.cred):
+            raise PermissionError('synthetic-private-path-secret')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(native.private_fs, 'atomic_write', atomic)
+    assert dcc.deliver(request(8)) == {'status': 'store_write_untrusted', 'enabled': True}
+    assert writing.state()['committed'] == before['committed']
+    assert writing.state()['pending']['generation'] == 8
+    assert writing.raw() == raw
+
+
+def test_write_parent_preflight_requires_exact_owner_rwx_not_only_absence_of_group_bits(world):
+    identity = native.store_identity(world.store)
+    world.store.chmod(0o500)
+    try:
+        with pytest.raises(native.StoreRefused, match='^store_write_parent_untrusted$'):
+            native.verify_write_parent(world.store, identity)
+    finally:
+        world.store.chmod(0o700)

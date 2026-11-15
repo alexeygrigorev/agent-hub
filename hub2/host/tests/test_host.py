@@ -895,7 +895,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(json.loads(receipt[0]), {"operation_id": offer["operation_id"], "epoch": offer["epoch"],
                                                 "native_id": None, "launch_failed": True, "no_dispatch": True,
                                                 "failure_reason": "native_dispatch_not_started",
-                                                "detail": "TypeError: adapter_preparation_failed"})
+                                                "detail": "Native launch did not start."})
 
     def test_preflight_workspace_checks_missing_and_outside_paths(self):
         missing = self.root / "does-not-exist"
@@ -1173,7 +1173,8 @@ class HostTests(unittest.TestCase):
                 self.insert_orphan_launch(session, operation, 7, state)
                 result = self.bridge.command({"id": command_id, "session_id": session, "epoch": 7, "kind": "stop"})
                 self.assertEqual(result, {"stopped": False, "error": "stop_unconfirmed",
-                                          "reason": "stop_unconfirmed", "stage": "host_stop"})
+                                          "reason": "stop_unconfirmed", "stage": "host_stop",
+                                          "native_control_stage":"stop_status", "native_control_error":"unavailable"})
                 self.assertFalse(any(args[1] == "kill" for args, _ in self.native.calls))
                 self.journal.flush(self.client)
                 self.assertIn(("POST", f"/api/sessions/{session}/commands/{command_id}/ack?safety=operator_stop",
@@ -1481,16 +1482,18 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[-1]["stage"], "host_launch")
         self.assertEqual(sent[-1]["reason"], "workspace_unavailable")
         self.assertEqual(sent[-1]["epoch"], offer["epoch"])
-        self.assertIn(f"path={missing}", sent[-1]["detail"])
+        self.assertEqual(sent[-1]["detail"], "path does not exist; Hub will not create it")
+        self.assertNotIn(str(missing), json.dumps(sent[-1]))
 
         with patch("agent_hub_host.agent.prepare_workspace",
                    side_effect=ValueError("implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")):
             offer2 = self.offer(session_id="sess-wt-in-use", operation_id="op-wt-in-use:0")
             with self.assertLogs("agent_hub_host.agent", level="ERROR"):
                 self.bridge.dispatch({"type": "session.offer", "offer": offer2}, Socket(), None)
-        self.assertEqual(sent[-1]["reason"], "implement_worktree_branch_in_use")
+        self.assertEqual(sent[-1]["reason"], "host_operation_failed")
         self.assertEqual(sent[-1]["stage"], "host_launch")
-        self.assertEqual(sent[-1]["detail"], "implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")
+        self.assertEqual(sent[-1]["detail"], "Host operation failed.")
+        self.assertNotIn("/wt/stale", json.dumps(sent[-1]))
 
     def test_validate_launch_unwraps_missing_implement_worktree_to_parent_checkout(self):
         from agent_hub_host.implement_workspace import _identity_and_ref
@@ -1536,8 +1539,63 @@ class HostTests(unittest.TestCase):
             self.assertFalse(self.bridge.is_session_dead("remote-503"))
 
 
+    def test_launch_privacy_closed_typed_codes_and_hostile_exception(self):
+        from agent_hub_host.agent import closed_host_failure
+        class Hostile(RuntimeError):
+            def __str__(self):
+                raise AssertionError('must never stringify private error')
+        for error in [RuntimeError('opaque_secret'), ValueError('workspace_unavailable path=/PRIVATE/prompt'),
+                      TypeError('PRIVATE credential prompt'), Hostile('PRIVATE'),
+                      RuntimeError({'private': 'PRIVATE'})]:
+            fields = self.bridge._undispatched_failure_fields(error)
+            self.assertEqual(fields, {'failure_reason':'native_dispatch_not_started',
+                                     'detail':'Native launch did not start.'})
+            self.assertEqual(closed_host_failure(error), ('host_operation_failed','Host operation failed.'))
+        self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('workspace_unavailable')),
+                         {'failure_reason':'workspace_unavailable','detail':'path does not exist; Hub will not create it'})
+        self.assertEqual(closed_host_failure(ApiError('PRIVATE',code='provider_auth_failed')),
+                         ('provider_auth_failed','Provider credential preparation was refused.'))
+        for code in ['headless_effort_unsupported','implement_worktree_path_untrusted']:
+            self.assertEqual(closed_host_failure(ValueError(code)), (code,'Launch preparation was refused.'))
+        self.assertEqual(self.bridge._undispatched_failure_fields(None), {})
+
+    def test_launch_privacy_actual_undispatched_receipt_has_no_private_payload(self):
+        class Hostile(RuntimeError):
+            def __str__(self):raise AssertionError('no coercion')
+        for index, error in enumerate([TypeError('PRIVATE /secret/path prompt body'),
+                                      RuntimeError('opaque_secret'), Hostile('PRIVATE')]):
+            offer=self.offer(session_id='privacy-'+str(index),operation_id='privacy-op-'+str(index))
+            with patch.object(self.bridge.launcher, 'launch', side_effect=error):
+                self.assertIsNone(self.bridge.offer(offer,None))
+            row=self.journal.db.execute('SELECT payload FROM outbox WHERE key LIKE ?',
+                                       ('no-dispatch:'+offer['operation_id']+':%',)).fetchone()
+            payload=json.loads(row[0])
+            self.assertEqual(payload['failure_reason'],'native_dispatch_not_started')
+            self.assertEqual(payload['detail'],'Native launch did not start.')
+            self.assertTrue(payload['no_dispatch']);self.assertIsNone(payload['native_id'])
+            self.assertNotIn('PRIVATE',row[0]);self.assertNotIn('opaque_secret',row[0])
+        self.assertEqual(self.native.calls,[])
+
+    def test_launch_privacy_dispatch_socket_never_formats_hostile_error(self):
+        class Hostile(RuntimeError):
+            def __str__(self):raise AssertionError('no coercion')
+        sent=[]
+        class Socket:
+            def send(self,value):sent.append(json.loads(value))
+        offer=self.offer()
+        with patch.object(self.bridge,'offer',side_effect=Hostile('PRIVATE /secret/path prompt')):
+            with self.assertLogs('agent_hub_host.agent',level='ERROR'):
+                self.bridge.dispatch({'type':'session.offer','offer':offer},Socket(),None)
+        self.assertEqual(sent[-1]['reason'],'host_operation_failed')
+        self.assertEqual(sent[-1]['stage'],'host_launch')
+        self.assertEqual(sent[-1]['detail'],'Host operation failed.')
+        self.assertNotIn('PRIVATE',json.dumps(sent))
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 class RetiredLookupRowTest(unittest.TestCase):
@@ -1828,7 +1886,8 @@ class RetainedManagedCaptureTests(unittest.TestCase):
             return original(*args,**kwargs)
         self.bridge.native=failing_capture
         result=self.bridge.command(command)
-        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed'})
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'unknown'})
         calls=list(self.native.calls)
         self.assertEqual(self.bridge.command(command),result)
         self.assertEqual(self.native.calls,calls);self.assertEqual(len(captures),1)
@@ -2215,3 +2274,110 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertEqual(len(attempts),1)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
         self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+
+
+class NativeControlDiagnosticsTests(unittest.TestCase):
+    setUp=HostTests.setUp
+    tearDown=HostTests.tearDown
+
+    def command(self,kind='capture'):
+        offer=HostTests.offer(self)
+        self.bridge.offer(offer)
+        return {'id':'diagnostic-'+kind,'session_id':offer['session_id'],'epoch':offer['epoch'],
+                'kind':kind, **({'mode':'screen'} if kind=='capture' else {})}
+
+    def test_native_control_diagnostic_capture_rpc_error_is_closed_and_replayed(self):
+        command=self.command();original=self.bridge.native;calls=[]
+        def native(*args,**kwargs):
+            if args[0]=='capture':
+                calls.append(args);raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'native_nonzero'})
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(len(calls),1)
+
+    def test_native_control_diagnostic_capture_status_timeout(self):
+        command=self.command()
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE_ARGV',30)):
+            result=self.bridge.command(command)
+        self.assertEqual(result['error'],'capture_failed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_status','timeout'))
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
+    def test_native_control_diagnostic_retained_failure_preserves_binding(self):
+        command=RetainedManagedCaptureTests.seed(self)
+        self.stdout.unlink()
+        result=self.bridge.command(command)
+        self.assertEqual(result['reason'],'task_output_unavailable')
+        self.assertEqual(result['capture_binding'],command['capture_binding'])
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_retained','unavailable'))
+        self.assertEqual(self.native.calls,[])
+
+    def test_native_control_diagnostic_stop_status_timeout_no_kill(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        calls=len(self.native.calls)
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE',5)):
+            result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual(result['reason'],'stop_unconfirmed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_status','timeout'))
+        self.assertEqual(len(self.native.calls),calls)
+
+    def test_native_control_diagnostic_stop_kill_timeout(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':
+                self.assertLessEqual(kwargs['timeout'],5)
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_kill','timeout'))
+        self.assertEqual(self.native.process['phase'],'running')
+
+    def test_native_control_diagnostic_stop_verify_timeout_cannot_infer_exit(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.lookup;calls=[]
+        def lookup(*args,**kwargs):
+            calls.append(args)
+            if len(calls)>1:
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.lookup=lookup
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_verify','timeout'))
+        self.assertEqual(self.native.process['phase'],'exited','fakekill alone must not grant proof')
+
+    def test_native_control_diagnostic_stop_qualification_and_success_unchanged(self):
+        command=self.command('stop');original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_qualification','unqualified'))
+        # A different original command, same owned binding: successful proof has
+        # exactly the old fields, no failure metadata and no inferred exit.
+        self.bridge.native=original
+        result=self.bridge.command(dict(command,id='diagnostic-qualified-stop'))
+        self.assertEqual(result,{'stopped':True,'evidence':'native_exit','native_id':self.native.process['id']})
+
+    def test_native_control_diagnostic_classifier_never_stringifies_unknown_error(self):
+        from agent_hub_host.agent import native_control_error
+        class PrivateError(Exception):
+            def __str__(self):raise AssertionError('secret stringification')
+        for error in [PrivateError('SECRET'),RuntimeError('SECRET'),ValueError('SECRET')]:
+            self.assertEqual(native_control_error(error),'unknown')
+        control=KeyboardInterrupt('ORIGINAL_CONTROL')
+        from agent_hub_host.agent import native_control_step
+        def cancelled():raise control
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            native_control_step({},'capture_rpc',cancelled)
+        self.assertIs(raised.exception,control)

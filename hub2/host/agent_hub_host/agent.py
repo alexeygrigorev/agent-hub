@@ -166,6 +166,194 @@ class OfferAcknowledgement:
         return self.binding_verified
 
 
+
+
+HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential preparation was refused.',
+ 'account_unconfigured': 'Provider credential preparation was refused.',
+ 'active_native_bound_exceeded': 'Launch preparation was refused.',
+ 'antigravity_settings_unverified': 'Launch preparation was refused.',
+ 'antigravity_workspace_trust_unverified': 'Launch preparation was refused.',
+ 'capture_fence_conflict': 'Launch preparation was refused.',
+ 'capture_identity_unavailable': 'Launch preparation was refused.',
+ 'child_context_binding_unverified': 'Child context binding is unverified.',
+ 'child_context_path_untrusted': 'Child context path is untrusted.',
+ 'child_context_unverified': 'Child context is unverified.',
+ 'child_credential_unavailable': 'Provider credential preparation was refused.',
+ 'child_credential_unverified': 'Provider credential preparation was refused.',
+ 'claim_ack_unverified': 'Claim acknowledgement is unverified.',
+ 'claimed_offer_without_local_intent': 'Launch preparation was refused.',
+ 'codex_launch_wrapper_unavailable': 'Codex launch wrapper is unavailable.',
+ 'command_fence_conflict': 'Launch preparation was refused.',
+ 'command_id_conflict': 'Launch preparation was refused.',
+ 'command_not_allowed': 'Launch preparation was refused.',
+ 'command_outcome_uncertain': 'Launch preparation was refused.',
+ 'credential_decryption_failed': 'Provider credential preparation was refused.',
+ 'credential_generation_conflict': 'Provider credential preparation was refused.',
+ 'credential_generation_rejected': 'Provider credential preparation was refused.',
+ 'credential_key_unavailable': 'Provider credential preparation was refused.',
+ 'credential_missing': 'Provider credential preparation was refused.',
+ 'credentials_unavailable': 'Provider credential preparation was refused.',
+ 'duplicate_receipt_field': 'Launch preparation was refused.',
+ 'duplicate_terminal_field': 'Launch preparation was refused.',
+ 'engine_not_allowed': 'Engine is not allowed.',
+ 'generation_conflict': 'Provider credential preparation was refused.',
+ 'glm_model_route_refused': 'Launch preparation was refused.',
+ 'goal_brief_path_untrusted': 'Launch preparation was refused.',
+ 'goal_brief_pointer_not_single_line': 'Launch preparation was refused.',
+ 'goal_brief_pointer_too_large': 'Launch preparation was refused.',
+ 'goal_brief_too_large': 'Launch preparation was refused.',
+ 'headless_effort_unsupported': 'Launch preparation was refused.',
+ 'headless_send_refused': 'Launch preparation was refused.',
+ 'host_command_queue_full': 'Launch preparation was refused.',
+ 'host_identity_required': 'Host identity is required.',
+ 'host_launch_queue_full': 'Launch preparation was refused.',
+ 'host_not_approved': 'Provider credential preparation was refused.',
+ 'host_operation_failed': 'Host operation failed.',
+ 'implement_worktree_branch_ambiguous': 'Launch preparation was refused.',
+ 'implement_worktree_branch_changed': 'Launch preparation was refused.',
+ 'implement_worktree_branch_missing': 'Launch preparation was refused.',
+ 'implement_worktree_identity_required': 'Launch preparation was refused.',
+ 'implement_worktree_owner_conflict': 'Launch preparation was refused.',
+ 'implement_worktree_owner_durability_failed': 'Launch preparation was refused.',
+ 'implement_worktree_owner_invalid': 'Launch preparation was refused.',
+ 'implement_worktree_path_untrusted': 'Launch preparation was refused.',
+ 'implement_worktree_preparation_busy': 'Launch preparation was refused.',
+ 'implement_worktree_provenance_invalid': 'Launch preparation was refused.',
+ 'implement_worktree_ref_mismatch': 'Launch preparation was refused.',
+ 'implement_worktree_tip_mismatch': 'Launch preparation was refused.',
+ 'interactive_adapter_shape_unverified': 'Launch preparation was refused.',
+ 'interactive_effort_unsupported': 'Launch preparation was refused.',
+ 'interactive_explicit_model_required': 'Launch preparation was refused.',
+ 'interactive_model_unverified': 'Launch preparation was refused.',
+ 'interactive_provider_unsupported': 'Launch preparation was refused.',
+ 'invalid_command_id': 'Launch preparation was refused.',
+ 'invalid_command_text': 'Launch preparation was refused.',
+ 'invalid_effort': 'Effort is invalid.',
+ 'invalid_goal_mode': 'Goal mode is invalid.',
+ 'invalid_managed_credential_route': 'Managed credential route is invalid.',
+ 'invalid_model': 'Model is invalid.',
+ 'invalid_native_command': 'Launch preparation was refused.',
+ 'invalid_native_send': 'Launch preparation was refused.',
+ 'invalid_native_status': 'Native status is invalid.',
+ 'invalid_offer_epoch': 'Offer epoch is invalid.',
+ 'invalid_offer_identity': 'Offer identity is invalid.',
+ 'invalid_prompt': 'Prompt is invalid.',
+ 'invalid_session_purpose': 'Launch preparation was refused.',
+ 'invalid_task_timeout': 'Task timeout is invalid.',
+ 'invalid_workspace': 'invalid workspace path',
+ 'launch_outcome_uncertain': 'Launch outcome is uncertain.',
+ 'launch_specification_required': 'Launch specification is required.',
+ 'launcher_capability_unavailable': 'Launcher capability is unavailable.',
+ 'legacy_launch_identity_unverified': 'Launch preparation was refused.',
+ 'managed_exec_unavailable': 'Managed execution is unavailable.',
+ 'native_abort_pending': 'Native abort is pending.',
+ 'native_census_stale': 'Launch preparation was refused.',
+ 'native_command_deadline': 'Launch preparation was refused.',
+ 'native_command_failed': 'Native command failed.',
+ 'native_command_outcome_uncertain': 'Native command outcome is uncertain.',
+ 'native_dispatch_fence_conflict': 'Native dispatch fence conflicts.',
+ 'native_dispatch_not_started': 'Native launch did not start.',
+ 'native_effort_mismatch': 'Launch preparation was refused.',
+ 'native_first_action_unverified': 'Launch preparation was refused.',
+ 'native_goal_delivery_unverified': 'Launch preparation was refused.',
+ 'native_goal_identity_unverified': 'Launch preparation was refused.',
+ 'native_goal_objective_conflict': 'Launch preparation was refused.',
+ 'native_goal_objective_invalid': 'Launch preparation was refused.',
+ 'native_goal_provider_unsupported': 'Launch preparation was refused.',
+ 'native_goal_registration_unverified': 'Launch preparation was refused.',
+ 'native_identity_mismatch': 'Native identity does not match.',
+ 'native_interactive_command_mismatch': 'Launch preparation was refused.',
+ 'native_launch_recovery_unverified': 'Launch preparation was refused.',
+ 'native_launch_route_missing': 'Native launch route is unavailable.',
+ 'native_mail_outcome_uncertain': 'Native mail outcome is uncertain.',
+ 'native_managed_engine_unverified': 'Launch preparation was refused.',
+ 'native_model_mismatch': 'Launch preparation was refused.',
+ 'native_observation_unverified': 'Native observation is unverified.',
+ 'native_outcome_unconfirmed': 'Native outcome is unconfirmed.',
+ 'native_profile_command_mismatch': 'Launch preparation was refused.',
+ 'native_prompt_invalid': 'Launch preparation was refused.',
+ 'native_reconciliation_required': 'Native reconciliation is required.',
+ 'native_recovery_evidence_too_large': 'Launch preparation was refused.',
+ 'native_recovery_mode_unverified': 'Launch preparation was refused.',
+ 'native_response_too_large': 'Launch preparation was refused.',
+ 'native_retirement_unverified': 'Launch preparation was refused.',
+ 'native_runtime_deadline_unverified': 'Launch preparation was refused.',
+ 'native_start_ambiguous': 'Launch preparation was refused.',
+ 'native_start_identity_invalid': 'Launch preparation was refused.',
+ 'native_start_refused': 'Launch preparation was refused.',
+ 'native_start_uncertain': 'Launch preparation was refused.',
+ 'native_target_identity_mismatch': 'Launch preparation was refused.',
+ 'native_target_managed': 'Launch preparation was refused.',
+ 'native_target_ownership_unavailable': 'Launch preparation was refused.',
+ 'native_target_unavailable': 'Launch preparation was refused.',
+ 'native_target_workspace_unavailable': 'Launch preparation was refused.',
+ 'offer_expired': 'Offer expired.',
+ 'offer_fence_conflict': 'Offer fence conflicts.',
+ 'prompt_delivery_uncertain': 'Prompt delivery is uncertain.',
+ 'prompt_path_untrusted': 'Launch preparation was refused.',
+ 'provider_access_lifetime_insufficient': 'Provider credential preparation was refused.',
+ 'provider_account_required': 'Provider credential preparation was refused.',
+ 'provider_auth_failed': 'Provider credential preparation was refused.',
+ 'provider_engine_bundle_invalid': 'Launch preparation was refused.',
+ 'provider_engine_bundle_unavailable': 'Launch preparation was refused.',
+ 'provider_engine_version_report_unverified': 'Launch preparation was refused.',
+ 'provider_fable_smoke_failed': 'Launch preparation was refused.',
+ 'provider_generation_ack_unverified': 'Provider credential preparation was refused.',
+ 'provider_materialization_refused': 'Provider credential preparation was refused.',
+ 'provider_route_mismatch': 'Provider credential preparation was refused.',
+ 'provider_route_unsupported': 'Launch preparation was refused.',
+ 'provider_sdk_install_refused': 'Launch preparation was refused.',
+ 'provider_sdk_native_binary_missing': 'Launch preparation was refused.',
+ 'provider_unauthorized': 'Provider credential preparation was refused.',
+ 'refresh_in_progress': 'Provider credential preparation was refused.',
+ 'refresh_invalid': 'Provider credential preparation was refused.',
+ 'refresh_outcome_uncertain': 'Provider credential preparation was refused.',
+ 'refresh_refused': 'Provider credential preparation was refused.',
+ 'task_output_unavailable': 'Task output is unavailable.',
+ 'unsupported_opencode_model': 'Launch preparation was refused.',
+ 'unverified_receipt': 'Launch preparation was refused.',
+ 'workspace_identity_unavailable': 'Workspace identity is unavailable.',
+ 'workspace_label_ambiguous': 'Workspace label is ambiguous.',
+ 'workspace_label_unavailable': 'Workspace label is unavailable.',
+ 'workspace_outside_allowlist': 'workspace is outside enrolled roots',
+ 'workspace_unavailable': 'path does not exist; Hub will not create it'}
+
+def closed_host_failure(error, fallback="host_operation_failed"):
+    """Fixed typed codes only; never coerce exceptions or arbitrary attributes."""
+    code = None
+    if type(error) in (ValueError, RuntimeError) and len(error.args) == 1 and type(error.args[0]) is str:
+        code = error.args[0]
+    elif type(error) is ApiError and type(error.code) is str:
+        code = error.code
+    reason = code if type(code) is str and code in HOST_FAILURE_DETAILS else fallback
+    return reason, HOST_FAILURE_DETAILS[reason]
+
+def native_control_error(error):
+    """Closed metadata only; never stringify exception messages or attributes."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'timeout'
+    if isinstance(error, json.JSONDecodeError):
+        return 'invalid_response'
+    if type(error) is RuntimeError and len(error.args) == 1 and type(error.args[0]) is str:
+        return {'native_command_failed':'native_nonzero', 'invalid_native_status':'invalid_response',
+                'native_identity_mismatch':'identity_mismatch', 'capture_fence_conflict':'identity_mismatch',
+                'capture_identity_unavailable':'unavailable', 'task_output_unavailable':'unavailable'}.get(error.args[0], 'unknown')
+    if isinstance(error, OSError):
+        return 'os_error'
+    return 'unknown'
+
+
+def native_control_step(diagnostic, stage, operation, *args, **kwargs):
+    if diagnostic is not None:
+        diagnostic.update(native_control_stage=stage, native_control_error='unknown')
+    try:
+        return operation(*args, **kwargs)
+    except Exception as error:
+        if diagnostic is not None:
+            diagnostic['native_control_error'] = native_control_error(error)
+        raise
+
+
 class Bridge:
     def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None,alert_observer=None):
         self.client, self.journal, self.runner = client, journal, runner
@@ -227,7 +415,8 @@ class Bridge:
         try:
             workspace = self.resolve_workspace(launch.get("workspace"))
         except ValueError as exc:
-            if not str(exc).startswith("workspace_unavailable "):
+            if not (type(exc) is ValueError and len(exc.args) == 1
+                    and type(exc.args[0]) is str and exc.args[0] == "workspace_unavailable"):
                 raise
             workspace = self._unwrap_missing_implement_worktree(
                 launch.get("workspace"),
@@ -305,11 +494,11 @@ class Bridge:
             try:
                 workspace = candidate.resolve(strict=True)
             except OSError:
-                raise ValueError(f"workspace_unavailable path={value} path does not exist; Hub will not create it") from None
+                raise ValueError("workspace_unavailable") from None
             if not workspace.is_dir():
-                raise ValueError(f"workspace_unavailable path={value} path does not exist; Hub will not create it")
+                raise ValueError("workspace_unavailable")
             if not any(workspace.is_relative_to(root) for root in self.roots):
-                raise ValueError(f"workspace_outside_allowlist path={workspace}")
+                raise ValueError("workspace_outside_allowlist")
             return workspace
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value):
             raise ValueError("invalid_workspace")
@@ -535,7 +724,7 @@ class Bridge:
                     if throttled:
                         raise
                     return None
-                logging.getLogger(__name__).exception('Native launch failed session=%s', session)
+                logging.getLogger(__name__).error('Native launch failed session=%s', session)
                 if current and current['native_dispatch_started']==0:
                     self.settle_undispatched_launch(current, error)
                     if throttled:
@@ -651,13 +840,8 @@ class Bridge:
     def _undispatched_failure_fields(error):
         if error is None:
             return {}
-        text = str(error)
-        token = text.split()[0] if text.split() else ""
-        reason = (token if isinstance(error, (ValueError, RuntimeError))
-                  and re.fullmatch(r"[a-z][a-z0-9_.:-]{0,79}", token)
-                  else "native_dispatch_not_started")
-        detail = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", f"{type(error).__name__}: {text}").strip()[:300]
-        return {"failure_reason": reason, **({"detail": detail} if detail else {})}
+        reason, detail = closed_host_failure(error, 'native_dispatch_not_started')
+        return {"failure_reason": reason, "detail": detail}
 
     def preflight_workspace(self, value):
         if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
@@ -923,7 +1107,7 @@ class Bridge:
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
-    def bound_capture(self, command, row):
+    def bound_capture(self, command, row, *, diagnostic=None):
         """Read only this exact attempt; a finished task never falls back to a pane."""
         from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
         binding = command.get('capture_binding')
@@ -941,27 +1125,35 @@ class Bridge:
             try:
                 # Use private retained-file guards even if completion races the
                 # journal snapshot taken above.
-                output = capture_task_output('hub2-'+row['session_id'],row,row['native_id'],limit=CAPTURE_OUTPUT_BYTES,retained_only=True)
+                output = native_control_step(diagnostic,'capture_retained',capture_task_output,
+                    'hub2-'+row['session_id'],row,row['native_id'],limit=CAPTURE_OUTPUT_BYTES,retained_only=True)
             except RuntimeError as exc:
                 if not terminal and str(exc)=='task_output_unavailable':
                     output = None
                 else:
                     raise
             if output is None:
+                if diagnostic is not None:
+                    diagnostic.update(native_control_stage='capture_qualification',native_control_error='unqualified')
                 # Running legacy/central launches retain their existing native
                 # capture path. Completion never reaches this branch.
                 if not self._workspace_is_available(row['workspace']):
                     raise RuntimeError('task_output_unavailable')
-                native_id,status = self.resolve_launch_native(row)
+                native_id,status = native_control_step(diagnostic,'capture_status',self.resolve_launch_native,row)
+                if diagnostic is not None:
+                    diagnostic.update(native_control_stage='capture_qualification',native_control_error='unqualified')
                 current=self.journal.db.execute('SELECT state,epoch,native_id,operation_id FROM launches WHERE session_id=?',(row['session_id'],)).fetchone()
                 if (not native_id or not status or status.get('phase',status.get('state'))!='running'
                         or not current or current['state']!='running' or current['epoch']!=row['epoch']
                         or current['native_id']!=row['native_id'] or current['operation_id']!=row['operation_id']):
                     raise RuntimeError('task_output_unavailable')
-                output = capture_tail(self.native('capture',native_id,'--screen','--plain').stdout)
+                output = capture_tail(native_control_step(diagnostic,'capture_rpc',self.native,
+                    'capture',native_id,'--screen','--plain').stdout)
                 metadata['capture_source'] = 'native_pane'
             return {**metadata,'output':bounded_capture(output,metadata)}
         except (OSError,ValueError,RuntimeError) as exc:
+            if diagnostic is not None:
+                diagnostic['native_control_error'] = native_control_error(exc)
             reason = str(exc) if isinstance(exc,RuntimeError) and re.fullmatch('[a-z_]{1,80}',str(exc)) else 'task_output_unavailable'
             return {**metadata,'error':reason,'reason':reason}
 
@@ -1037,14 +1229,20 @@ class Bridge:
             # change the command digest on replay or introduce a native effect.
             with db:
                 self.begin_command(identity,digest)
+            diagnostic = {'native_control_stage':'capture_binding','native_control_error':'unknown'}
             try:
-                result = self.bound_capture(command,row) if command.get('capture_binding') is not None else self.legacy_capture(command,row)
-            except Exception:
+                result = (self.bound_capture(command,row,diagnostic=diagnostic) if command.get('capture_binding') is not None
+                          else self.legacy_capture(command,row,diagnostic=diagnostic))
+            except Exception as error:
+                diagnostic['native_control_error'] = native_control_error(error)
                 result = self.capture_failure(command,'capture_failed')
                 logging.getLogger(__name__).warning('Capture failed command_id=%s',identity)
+            if result.get('error') is not None:
+                result = {**result, **diagnostic}
             with db:
                 self.finish_command(identity,command,result)
             return result
+        diagnostic = {'native_control_stage':'stop_status','native_control_error':'unknown'}
         deadline = command.get('deadline_ms')
         bounded_stop = kind == 'stop' and type(deadline) is int
         until = time.monotonic() + min(5, max(0, (deadline - time.time() * 1000) / 1000)) if bounded_stop else None
@@ -1056,23 +1254,25 @@ class Bridge:
             return left
 
         def unconfirmed_stop():
-            return {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+            return {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop', **diagnostic}
 
         try:
-            native_id, _status = (self.resolve_launch_native(row, timeout=remaining_stop())
-                                  if bounded_stop else self.resolve_launch_native(row))
+            native_id, _status = (native_control_step(diagnostic,'stop_status',self.resolve_launch_native,row,timeout=remaining_stop())
+                                  if bounded_stop else native_control_step(diagnostic,'stop_status',self.resolve_launch_native,row))
             if bounded_stop:
                 remaining_stop()
         except subprocess.TimeoutExpired:
             if not bounded_stop:
                 raise
+            diagnostic['native_control_error'] = 'timeout'
             result = unconfirmed_stop()
             with db:
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
             return result
         if not native_id and kind == 'stop' and row['state'] in {'launching', 'aborting', 'deadline_stopping'}:
-            result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+            diagnostic['native_control_error'] = 'unavailable'
+            result = unconfirmed_stop()
             with db:
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
@@ -1084,6 +1284,7 @@ class Bridge:
         with db:
             self.begin_command(identity, digest)
         if kind == "stop":
+            diagnostic.update(native_control_stage='stop_kill',native_control_error='unknown')
             try:
                 # The native may already be gone (it exited on its own, so the
                 # registry holds only its aplexer tombstone and `kill` refuses):
@@ -1091,9 +1292,9 @@ class Bridge:
                 # never reported as an unconfirmed stop or a command failure.
                 try:
                     if bounded_stop:
-                        self.native("kill", native_id, timeout=remaining_stop())
+                        native_control_step(diagnostic,'stop_kill',self.native,"kill",native_id,timeout=remaining_stop())
                     else:
-                        self.native("kill", native_id)
+                        native_control_step(diagnostic,'stop_kill',self.native,"kill",native_id)
                 except RuntimeError as exc:
                     if str(exc) != 'native_command_failed':
                         raise
@@ -1101,8 +1302,9 @@ class Bridge:
                     remaining_stop()
                 birth = (_status or {}).get('created_at_ms')
                 while True:
-                    status = (self.lookup(native_id, row, timeout=remaining_stop())
-                              if bounded_stop else self.lookup(native_id, row))
+                    diagnostic.update(native_control_stage='stop_verify',native_control_error='unknown')
+                    status = (native_control_step(diagnostic,'stop_verify',self.lookup,native_id,row,timeout=remaining_stop())
+                              if bounded_stop else native_control_step(diagnostic,'stop_verify',self.lookup,native_id,row))
                     if bounded_stop:
                         remaining_stop()
                     if (status and status.get("phase", status.get("state")) == "exited"
@@ -1117,11 +1319,13 @@ class Bridge:
                             remaining_stop()
                         result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
                         break
+                    diagnostic.update(native_control_stage='stop_qualification',native_control_error='unqualified')
                     if not bounded_stop:
                         result = unconfirmed_stop()
                         break
                     time.sleep(min(.1, remaining_stop()))
             except subprocess.TimeoutExpired:
+                diagnostic['native_control_error'] = 'timeout'
                 result = unconfirmed_stop()
         else:
             text = command.get("text")
@@ -1205,15 +1409,15 @@ class Bridge:
             self.finish_command(identity, command, result)
         return result
 
-    def legacy_capture(self, command, row):
+    def legacy_capture(self, command, row, *, diagnostic=None):
         from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
-        native_id, _status = self.resolve_launch_native(row)
+        native_id, _status = native_control_step(diagnostic,'capture_status',self.resolve_launch_native,row)
         if not native_id:
             raise RuntimeError('capture_identity_unavailable')
         output = (None if command.get('mode') == 'screen' else
-                  capture_task_output('hub2-' + row['session_id'], row, native_id, limit=CAPTURE_OUTPUT_BYTES))
+                  native_control_step(diagnostic,'capture_retained',capture_task_output,'hub2-' + row['session_id'],row,native_id,limit=CAPTURE_OUTPUT_BYTES))
         if output is None:
-            output = capture_tail(self.native('capture', native_id, '--screen', '--plain').stdout)
+            output = capture_tail(native_control_step(diagnostic,'capture_rpc',self.native,'capture',native_id,'--screen','--plain').stdout)
         return {'output': bounded_capture(output)}
 
     @staticmethod
@@ -1259,15 +1463,11 @@ class Bridge:
             command_id=command.get('id') if event.get('type')=='session.command' and isinstance(command,dict) else None
             if not isinstance(command_id,str) or not re.fullmatch('[A-Za-z0-9-]{1,80}',command_id):
                 command_id=None
-            logging.getLogger(__name__).exception('Host event failed type=%s command_id=%s', event.get('type'),command_id)
+            logging.getLogger(__name__).error('Host event failed command_id=%s',command_id)
             if isinstance(error,ApiError) and error.retry_at:
                 self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
-            raw = error.code if isinstance(error, ApiError) and error.code else str(error)
-            cleaned = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(raw or '')).strip()
-            head = cleaned.split(None, 1)[0] if cleaned else ''
-            reason = head if re.fullmatch(r"[a-z_]{1,80}", head) else "host_operation_failed"
-            detail = (cleaned or reason)[:240]
+            reason, detail = closed_host_failure(error)
             target = event.get("command") or event.get("message") or event.get("offer") or {}
             stage = 'host_command'
             if event.get('type') == 'session.offer':

@@ -338,7 +338,7 @@ class DefaultConsumerAckTests(DeliveryCase):
         self.assertEqual(self.calls(), ['materialize', 'check'])
 
     def test_enabled_default_must_hold_before_the_ack(self):
-        for status in ('diverged', 'generation_refused', 'lock_busy', 'protocol_unsupported', 'store_changed'):
+        for status in ('diverged', 'generation_refused', 'lock_busy', 'protocol_unsupported', 'store_changed', 'store_write_parent_untrusted', 'store_write_untrusted'):
             with self.subTest(status=status):
                 self.script([held('materialized', status, True)], [held('in_step', 'in_step', True)])
                 self.run_once(now=10**12 + len(self.client.calls) * 10**9)

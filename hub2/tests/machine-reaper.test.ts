@@ -1386,69 +1386,206 @@ test('finishWithoutDispatch surfaces attention and events on sessions show and e
  assert.equal(shown.status,200);
  const view=(await shown.json() as any).session;
  assert.equal(view.attention?.reason,'native_launch_route_missing');
- assert.equal(view.attention?.detail,'RuntimeError: native_launch_route_missing');
+ assert.equal(view.attention?.detail,'Native launch route is unavailable.');
  const eventsRes=await f.call('/api/sessions/'+session+'/events','GET',undefined,admin);
  assert.equal(eventsRes.status,200);
  const eventsBody=(await eventsRes.json() as any);
  assert.ok(eventsBody.events.some((e:any)=>e.kind==='attention'&&e.reason==='native_launch_route_missing'));
 });
 
-test('missing native process with stop_unconfirmed becomes terminal failed with attention and reaped event',async()=>{
- const f=fixture(),session='missing-stop-unconfirmed',epoch=await startClaimed(f,session,'native-absent');
- assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
-  session_id:session,native_id:'native-absent',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
- }]})).status,200);
- const dry=await f.call('/_internal/reap','POST',{dry_run:true});
- assert((await dry.json() as any).candidates.some((c:any)=>c.session_id===session&&c.reason==='dead'));
- const reap1=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
- assert.equal(reap1.stop_requested,1);assert.equal(reap1.reaped,0);
- const cmd=f.database.prepare("SELECT id FROM session_commands WHERE session_id=? AND kind='stop' AND state='pending'").get(session) as any;
- assert(cmd);
- const ack=await f.call(`/api/sessions/${session}/commands/${cmd.id}/ack`,'POST',{
-  epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'},
- });
- assert.equal(ack.status,200);
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
- assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any)?.reason,'native_process_absent');
- const reaped=f.events.filter(e=>e.path==='/_internal/reaped');
- assert.equal(reaped.length,1);
- assert.equal(reaped[0].body.reason,'native_process_absent');
- assert.equal(reaped[0].body.stopped,false);
- assert.equal(reaped[0].body.unconfirmed,true);
- assert.equal(reaped[0].body.native_id,'native-absent');
+// Missing status is an observation failure, not authority to retire the bound native.
+test('unconfirmed custody survives missing null foreign and partial native observations',async()=>{
+ for(const observed of ['native-original',null,'native-foreign','omitted']){
+  const f=fixture(),session='custody-'+String(observed),epoch=await startClaimed(f,session,'native-original');
+  const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+  const queued=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'first-stop',kind:'stop'},actor);
+  const {command}=await queued.json() as any;
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:observed==='omitted'?[]:[{
+   session_id:session,native_id:observed,phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+  }]})).status,200);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+  const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+  assert.equal(reap.reaped,0);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  const later=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'qualified-stop',kind:'stop'},actor);
+  assert.equal(later.status,201);
+  const next=(await later.json() as any).command;
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${next.id}/ack`,'POST',{epoch:epoch+1,result:{stopped:true,evidence:'native_exit',native_id:'native-original'}})).status,409);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${next.id}/ack`,'POST',{epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-foreign'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(next.id) as any).state,'failed');
+  const final=(await (await f.call(`/api/sessions/${session}/commands`,'POST',{key:'final-qualified-stop',kind:'stop'},actor)).json() as any).command;
+  assert(final);
+  const proof={epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-original'}};
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${final.id}/ack`,'POST',proof)).status,200);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${final.id}/ack`,'POST',proof)).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+ }
 });
 
-test('missing native after startup grace fails with attention without waiting for a stop command',async()=>{
+
+test('native control diagnostics retain closed failures without qualifying stop or changing old ACKs',async()=>{
+ for(const kind of ['stop','capture']){
+  const f=fixture(),session='native-diagnostic-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'diagnostic-'+kind},actor);
+   assert.equal(response.status,201);const command=(await response.json() as any).command;
+   const diagnostic={native_control_stage:kind==='stop'?'stop_verify':'capture_retained',native_control_error:'timeout'};
+   const result=kind==='stop'?{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...diagnostic}
+     :{error:'task_output_unavailable',reason:'task_output_unavailable',...diagnostic};
+   const ack=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(ack.status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'failed');const stored=JSON.parse(row.result_json);
+   assert.equal(stored.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(stored.native_control_error,'timeout');
+   const listing=await (await f.call(`/api/sessions/${session}/commands`,'GET',undefined,actor)).json() as any;
+   const listed=listing.commands.find((item:any)=>item.id===command.id);
+   assert.equal(listed.ack.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(listed.ack.native_control_error,'timeout');
+   if(kind==='stop')assert.equal(listed.ack.confirmed_exit,false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+   const duplicate=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(duplicate.status,200);
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics strip arbitrary fields and preserve old missing metadata',async()=>{
+ for(const extra of [{},{native_control_stage:'PRIVATE_PATH',native_control_error:'PRIVATE_TOKEN'},
+                     {native_control_stage:'stop_verify',native_control_error:true}]){
+  const f=fixture(),session='native-private-diagnostic',native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind:'stop',key:'private-diagnostic'},actor);
+   const command=(await response.json() as any).command;
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...extra}})).status,200);
+   const stored=JSON.parse((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(command.id) as any).result_json);
+   assert.equal(JSON.stringify(stored).includes('PRIVATE'),false);
+   if(Object.keys(extra).length){assert.equal(stored.native_control_stage,'unknown');assert.equal(stored.native_control_error,'unknown');}
+   else assert.deepEqual(stored,{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'});
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics never alter successful qualified control wire',async()=>{
+ for(const kind of ['capture','stop']){
+  const f=fixture(),session='native-healthy-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'healthy-'+kind},actor);
+   const command=(await response.json() as any).command;
+   const result=kind==='stop'?{stopped:true,evidence:'native_exit',native_id:native}:{output:'synthetic returned output'};
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{...result,native_control_stage:kind==='stop'?'stop_verify':'capture_rpc',native_control_error:'timeout'}})).status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'acked');const stored=JSON.parse(row.result_json);
+   assert.equal('native_control_stage' in stored,false);assert.equal('native_control_error' in stored,false);
+   for(const [key,value] of Object.entries(result))assert.deepEqual(stored[key],value);
+  }finally{f.database.close();}
+ }
+});
+
+
+test('launch privacy closes receipt reason and detail before actual public persistence',async()=>{
+ const admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ for(const [i,reason] of ['opaque_secret','/PRIVATE/path prompt','workspace_unavailable','headless_effort_unsupported'].entries()){
+  const f=fixture(),session='privacy-receipt-'+i;
+  try{
+   const epoch=await startClaimed(f,session,null);
+   f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());f.clearCache();
+   const response=await f.call('/api/sessions/'+session+'/finish','POST',{
+    operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+    failure_reason:reason,detail:'PRIVATE /secret/path prompt and opaque_secret'});
+   assert.equal(response.status,200);
+   const expected=['workspace_unavailable','headless_effort_unsupported'].includes(reason)?reason:'native_dispatch_not_started';
+   const stored=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+   assert.equal(stored.reason,expected);
+   const view=await (await f.call('/api/sessions/'+session,'GET',undefined,admin)).json() as any;
+   const events=await (await f.call('/api/sessions/'+session+'/events','GET',undefined,admin)).json() as any;
+   assert.equal(view.session.attention.reason,expected);
+   const publicText=JSON.stringify({view,events,forwarded:f.events});
+   for(const value of ['PRIVATE','/secret/path','opaque_secret','prompt and'])assert.equal(publicText.includes(value),false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+   assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{
+    operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+    failure_reason:reason,detail:'PRIVATE'})).status,200);
+  }finally{f.database.close();}
+ }
+});
+
+test('launch privacy projects historical stored diagnostics without changing rows',async()=>{
+ const f=fixture(),session='privacy-legacy',admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ try{
+  const epoch=await startClaimed(f,session,null);
+  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());f.clearCache();
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{
+   operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true})).status,200);
+  const row=f.database.prepare('SELECT attempt FROM sessions WHERE id=?').get(session) as any;
+  f.database.prepare('UPDATE attention SET reason=? WHERE session_id=?').run('opaque_secret',session);
+  f.database.prepare('UPDATE sessions SET evidence_json=? WHERE id=?').run(JSON.stringify({_hub_host_start_diagnostic:{
+   operation_id:'op-'+session,attempt:row.attempt,epoch,reason:'opaque_secret',stage:'host_launch',detail:'PRIVATE /secret/path prompt'}}),session);
+  f.database.prepare('UPDATE machine_outbox SET payload_json=? WHERE operation_id=?').run(JSON.stringify({
+   session_id:session,reason:'opaque_secret',failure_reason:'opaque_secret',detail:'PRIVATE /secret/path prompt'}),'op-'+session);
+  f.clearCache();
+  const before=JSON.stringify(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session));
+  const view=await (await f.call('/api/sessions/'+session,'GET',undefined,admin)).json();
+  const events=await (await f.call('/api/sessions/'+session+'/events','GET',undefined,admin)).json();
+  for(const value of ['PRIVATE','/secret/path','opaque_secret'])assert.equal(JSON.stringify({view,events}).includes(value),false);
+  assert.equal(JSON.stringify(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)),before);
+ }finally{f.database.close();}
+});
+
+test('launch privacy closes authenticated host attention while retaining known fallback',async()=>{
+ for(const reason of ['opaque_secret','workspace_label_unavailable','provider_auth_failed']){
+  const f=fixture(),session='privacy-attention';
+  try{
+   await startOffered(f,session);
+   const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+   f.sockets.push(socket);
+   await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:session,
+    operation_id:'op-'+session,stage:'host_launch',reason,detail:'PRIVATE /secret/path prompt'}));
+   const stored=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+   assert.equal(stored.reason,reason==='opaque_secret'?'host_operation_failed':reason);
+   assert.equal(JSON.stringify(f.events).includes('PRIVATE'),false);
+   assert.equal(JSON.stringify(f.events).includes('opaque_secret'),false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,
+                reason==='provider_auth_failed'?'expired':'failed');
+  }finally{f.database.close();}
+ }
+});
+
+test('missing native after startup grace retains custody and requests qualified STOP',async()=>{
  const f=fixture(),session='missing-after-start-grace';await startClaimed(f,session,'native-absent');
  f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000,session);
  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
   session_id:session,native_id:'native-absent',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
  }]})).status,200);
  const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
- assert.equal(reap.reaped,1);assert.equal(reap.stop_requested,0);
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
- assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any).reason,'native_process_absent');
- assert.equal(f.events.at(-1)?.body.stopped,false);assert.equal(f.events.at(-1)?.body.unconfirmed,true);
+ assert.equal(reap.reaped,0);assert.equal(reap.stop_requested,1);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+ assert.equal(f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session),undefined);
  const again=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
  assert.equal(again.reaped,0);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ const command=f.database.prepare("SELECT id,epoch FROM session_commands WHERE session_id=? AND kind='stop' AND state='pending'").get(session) as any;
+ assert(command);
+ const proof={epoch:command.epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-absent'}};
+ assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',proof)).status,200);
+ assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',proof)).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+ assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
 });
 
-test('a complete census fails an omitted native after grace but incomplete or stale census cannot',async()=>{
- for(const mode of ['complete','incomplete','stale','present','new-start','predates-start']){
-  const f=fixture(),session='census-omitted-'+mode,native='11111111-2222-4333-8444-555555555555';
-  await startClaimed(f,session,native);
-  const old=Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
-  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,mode==='new-start'?Date.now():old,session);
-  const observed=mode==='stale'?Date.now()-100_000:Date.now();
-  const started=mode==='predates-start'?old-1:observed-1;
-  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',started_at_ms:started,observed_at_ms:observed}));
-  if(mode==='present')f.database.prepare('INSERT INTO native_inventory_rows VALUES(?,?)').run(native,'{}');
-  const result=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
-  assert.equal(result.reaped,mode==='complete'?1:0);
-  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,mode==='complete'?'failed':'running');
-  if(mode==='complete'){assert.equal(f.events.at(-1)?.body.stopped,false);assert.equal(f.events.at(-1)?.body.reason,'native_process_absent');}
- }
-});
 
 test('qualified native exits tolerate bounded host clock skew without relaxing the deadline fence',async()=>{
  for(const skew of [300,5000,5001]){
@@ -1465,24 +1602,40 @@ test('qualified native exits tolerate bounded host clock skew without relaxing t
  }
 });
 
-test('reap immediately fails a dead native session that already has a failed stop_unconfirmed command',async()=>{
- const f=fixture(),session='already-unconfirmed-stop',epoch=await startClaimed(f,session,'native-gone');
- const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
- const queued=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'prior-stop',kind:'stop'},actor);
- assert.equal(queued.status,201);
- const {command}=await queued.json() as any;
- assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
-  epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'},
- })).status,200);
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
- assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
-  session_id:session,native_id:'native-gone',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
- }]})).status,200);
- const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
- assert.equal(reap.reaped,1);assert.equal(reap.stop_requested,0);
- assert.equal(reap.actions[0].action,'marked_failed');assert.equal(reap.actions[0].reason,'native_process_absent');
- assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
- assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any)?.reason,'native_process_absent');
- assert.equal(f.events.at(-1)?.path,'/_internal/reaped');
- assert.equal(f.events.at(-1)?.body.reason,'native_process_absent');
+
+test('complete census omission retains custody in all six modes until qualified STOP',async()=>{
+ for(const mode of ['complete','incomplete','stale','present','new-start','predates-start']){
+  const f=fixture(),session='census-omitted-'+mode,native='11111111-2222-4333-8444-555555555555';
+  const epoch=await startClaimed(f,session,native);
+  const old=Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
+  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,mode==='new-start'?Date.now():old,session);
+  const observed=mode==='stale'?Date.now()-100_000:Date.now();
+  const started=mode==='predates-start'?old-1:observed-1;
+  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',started_at_ms:started,observed_at_ms:observed}));
+  if(mode==='present')f.database.prepare('INSERT INTO native_inventory_rows VALUES(?,?)').run(native,'{}');
+  const revokedBefore=f.revocations.length;
+  const result=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+  assert.equal(result.reaped,0);
+  assert.equal(result.stop_requested,0,'omission alone must not invent a missing row');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0,
+               'no terminal/cap-release message may cross into Project');
+  assert.equal(f.revocations.length,revokedBefore,'unknown omission cannot revoke the worker');
+  const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+  const path='/api/sessions/'+session+'/commands';
+  const first=(await (await f.call(path,'POST',{kind:'stop',key:'census-unconfirmed'},actor)).json() as any).command;
+  assert(first);
+  assert.equal((await f.call(path+'/'+first.id+'/ack','POST',{epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0);
+  const final=(await (await f.call(path,'POST',{kind:'stop',key:'census-qualified'},actor)).json() as any).command;
+  assert(final);
+  const proof={epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+  assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+  assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+  assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+  f.database.close();
+ }
 });

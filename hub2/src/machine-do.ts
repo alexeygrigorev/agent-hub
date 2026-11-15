@@ -17,24 +17,166 @@ const CAPTURE_RESULT_JSON_BYTES = 400 * 1024;
 const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
 const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
 const HOST_START_DIAGNOSTIC_KEY = '_hub_host_start_diagnostic';
-const UNSAFE_DETAIL_CONTROL=/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const CREDENTIAL_ASSIGNMENT=/\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[ _-]?key|private[ _-]?key|password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["'`]?\s*[:=]/i;
-const QUOTED_ASSIGNMENT=/["'`][^"'`\r\n]*["'`]\s*[:=]/;
-const INLINE_CREDENTIAL=/\b(?:Bearer|Basic)\s+\S/i;
-const URL_CREDENTIAL=/https?:\/\/[^\s/@]+@/i;
-const TOKEN_CREDENTIAL=/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b/;
-
-function sanitizedHostDetail(value: unknown): string | undefined {
-  if(typeof value!=='string'||!value.trim())return undefined;
-  // Fail closed before normalizing controls: stripping a NUL from a broken-up
-  // authorization header can expose the credential that followed it.
-  const input=value.slice(0,2048);
-  if(UNSAFE_DETAIL_CONTROL.test(input)||CREDENTIAL_ASSIGNMENT.test(input)||QUOTED_ASSIGNMENT.test(input)||INLINE_CREDENTIAL.test(input)
-    ||URL_CREDENTIAL.test(input)||TOKEN_CREDENTIAL.test(input))return undefined;
-  if(/\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b/i.test(input)
-    ||/[{}\[\]]/.test(input)||/\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*\S/.test(input))return undefined;
-  const detail=input.replace(/\s+/g,' ').trim().slice(0,240).trim();
-  return detail||undefined;
+const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
+  "native_dispatch_not_started": "Native launch did not start.",
+  "host_operation_failed": "Host operation failed.",
+  "workspace_unavailable": "path does not exist; Hub will not create it",
+  "workspace_outside_allowlist": "workspace is outside enrolled roots",
+  "invalid_workspace": "invalid workspace path",
+  "workspace_identity_unavailable": "Workspace identity is unavailable.",
+  "workspace_label_unavailable": "Workspace label is unavailable.",
+  "workspace_label_ambiguous": "Workspace label is ambiguous.",
+  "native_launch_route_missing": "Native launch route is unavailable.",
+  "codex_launch_wrapper_unavailable": "Codex launch wrapper is unavailable.",
+  "launcher_capability_unavailable": "Launcher capability is unavailable.",
+  "managed_exec_unavailable": "Managed execution is unavailable.",
+  "invalid_offer_identity": "Offer identity is invalid.",
+  "invalid_offer_epoch": "Offer epoch is invalid.",
+  "offer_expired": "Offer expired.",
+  "launch_specification_required": "Launch specification is required.",
+  "engine_not_allowed": "Engine is not allowed.",
+  "invalid_prompt": "Prompt is invalid.",
+  "invalid_model": "Model is invalid.",
+  "invalid_task_timeout": "Task timeout is invalid.",
+  "invalid_goal_mode": "Goal mode is invalid.",
+  "invalid_effort": "Effort is invalid.",
+  "invalid_managed_credential_route": "Managed credential route is invalid.",
+  "native_reconciliation_required": "Native reconciliation is required.",
+  "offer_fence_conflict": "Offer fence conflicts.",
+  "native_dispatch_fence_conflict": "Native dispatch fence conflicts.",
+  "child_context_path_untrusted": "Child context path is untrusted.",
+  "child_context_unverified": "Child context is unverified.",
+  "child_context_binding_unverified": "Child context binding is unverified.",
+  "host_identity_required": "Host identity is required.",
+  "claim_ack_unverified": "Claim acknowledgement is unverified.",
+  "launch_outcome_uncertain": "Launch outcome is uncertain.",
+  "prompt_delivery_uncertain": "Prompt delivery is uncertain.",
+  "native_abort_pending": "Native abort is pending.",
+  "native_mail_outcome_uncertain": "Native mail outcome is uncertain.",
+  "native_outcome_unconfirmed": "Native outcome is unconfirmed.",
+  "native_observation_unverified": "Native observation is unverified.",
+  "native_command_outcome_uncertain": "Native command outcome is uncertain.",
+  "native_command_failed": "Native command failed.",
+  "invalid_native_status": "Native status is invalid.",
+  "native_identity_mismatch": "Native identity does not match.",
+  "task_output_unavailable": "Task output is unavailable.",
+  "provider_auth_failed": "Provider credential preparation was refused.",
+  "provider_unauthorized": "Provider credential preparation was refused.",
+  "provider_route_mismatch": "Provider credential preparation was refused.",
+  "provider_account_required": "Provider credential preparation was refused.",
+  "provider_materialization_refused": "Provider credential preparation was refused.",
+  "provider_generation_ack_unverified": "Provider credential preparation was refused.",
+  "credential_generation_rejected": "Provider credential preparation was refused.",
+  "credential_generation_conflict": "Provider credential preparation was refused.",
+  "credentials_unavailable": "Provider credential preparation was refused.",
+  "account_unconfigured": "Provider credential preparation was refused.",
+  "access_lifetime_insufficient": "Provider credential preparation was refused.",
+  "provider_access_lifetime_insufficient": "Provider credential preparation was refused.",
+  "child_credential_unavailable": "Provider credential preparation was refused.",
+  "child_credential_unverified": "Provider credential preparation was refused.",
+  "credential_key_unavailable": "Provider credential preparation was refused.",
+  "credential_decryption_failed": "Provider credential preparation was refused.",
+  "credential_missing": "Provider credential preparation was refused.",
+  "refresh_refused": "Provider credential preparation was refused.",
+  "refresh_invalid": "Provider credential preparation was refused.",
+  "refresh_in_progress": "Provider credential preparation was refused.",
+  "refresh_outcome_uncertain": "Provider credential preparation was refused.",
+  "generation_conflict": "Provider credential preparation was refused.",
+  "host_not_approved": "Provider credential preparation was refused.",
+  "native_response_too_large": "Launch preparation was refused.",
+  "legacy_launch_identity_unverified": "Launch preparation was refused.",
+  "active_native_bound_exceeded": "Launch preparation was refused.",
+  "capture_fence_conflict": "Launch preparation was refused.",
+  "invalid_command_id": "Launch preparation was refused.",
+  "command_not_allowed": "Launch preparation was refused.",
+  "command_fence_conflict": "Launch preparation was refused.",
+  "headless_send_refused": "Launch preparation was refused.",
+  "invalid_native_command": "Launch preparation was refused.",
+  "capture_identity_unavailable": "Launch preparation was refused.",
+  "claimed_offer_without_local_intent": "Launch preparation was refused.",
+  "command_outcome_uncertain": "Launch preparation was refused.",
+  "invalid_command_text": "Launch preparation was refused.",
+  "command_id_conflict": "Launch preparation was refused.",
+  "duplicate_terminal_field": "Launch preparation was refused.",
+  "host_launch_queue_full": "Launch preparation was refused.",
+  "host_command_queue_full": "Launch preparation was refused.",
+  "antigravity_settings_unverified": "Launch preparation was refused.",
+  "invalid_native_send": "Launch preparation was refused.",
+  "native_prompt_invalid": "Launch preparation was refused.",
+  "native_goal_objective_invalid": "Launch preparation was refused.",
+  "glm_model_route_refused": "Launch preparation was refused.",
+  "provider_route_unsupported": "Launch preparation was refused.",
+  "interactive_explicit_model_required": "Launch preparation was refused.",
+  "interactive_provider_unsupported": "Launch preparation was refused.",
+  "native_goal_provider_unsupported": "Launch preparation was refused.",
+  "interactive_adapter_shape_unverified": "Launch preparation was refused.",
+  "interactive_model_unverified": "Launch preparation was refused.",
+  "antigravity_workspace_trust_unverified": "Launch preparation was refused.",
+  "goal_brief_pointer_not_single_line": "Launch preparation was refused.",
+  "goal_brief_path_untrusted": "Launch preparation was refused.",
+  "goal_brief_too_large": "Launch preparation was refused.",
+  "goal_brief_pointer_too_large": "Launch preparation was refused.",
+  "native_first_action_unverified": "Launch preparation was refused.",
+  "native_goal_registration_unverified": "Launch preparation was refused.",
+  "native_retirement_unverified": "Launch preparation was refused.",
+  "unsupported_opencode_model": "Launch preparation was refused.",
+  "headless_effort_unsupported": "Launch preparation was refused.",
+  "native_target_identity_mismatch": "Launch preparation was refused.",
+  "native_census_stale": "Launch preparation was refused.",
+  "native_target_ownership_unavailable": "Launch preparation was refused.",
+  "native_target_managed": "Launch preparation was refused.",
+  "native_command_deadline": "Launch preparation was refused.",
+  "native_target_workspace_unavailable": "Launch preparation was refused.",
+  "native_target_unavailable": "Launch preparation was refused.",
+  "native_runtime_deadline_unverified": "Launch preparation was refused.",
+  "native_start_refused": "Launch preparation was refused.",
+  "native_start_identity_invalid": "Launch preparation was refused.",
+  "native_model_mismatch": "Launch preparation was refused.",
+  "native_effort_mismatch": "Launch preparation was refused.",
+  "native_profile_command_mismatch": "Launch preparation was refused.",
+  "native_interactive_command_mismatch": "Launch preparation was refused.",
+  "prompt_path_untrusted": "Launch preparation was refused.",
+  "native_goal_identity_unverified": "Launch preparation was refused.",
+  "native_goal_delivery_unverified": "Launch preparation was refused.",
+  "native_recovery_evidence_too_large": "Launch preparation was refused.",
+  "native_launch_recovery_unverified": "Launch preparation was refused.",
+  "interactive_effort_unsupported": "Launch preparation was refused.",
+  "unverified_receipt": "Launch preparation was refused.",
+  "native_start_uncertain": "Launch preparation was refused.",
+  "native_start_ambiguous": "Launch preparation was refused.",
+  "native_goal_objective_conflict": "Launch preparation was refused.",
+  "native_recovery_mode_unverified": "Launch preparation was refused.",
+  "duplicate_receipt_field": "Launch preparation was refused.",
+  "native_managed_engine_unverified": "Launch preparation was refused.",
+  "implement_worktree_path_untrusted": "Launch preparation was refused.",
+  "implement_worktree_branch_ambiguous": "Launch preparation was refused.",
+  "implement_worktree_branch_changed": "Launch preparation was refused.",
+  "implement_worktree_owner_invalid": "Launch preparation was refused.",
+  "implement_worktree_identity_required": "Launch preparation was refused.",
+  "implement_worktree_owner_conflict": "Launch preparation was refused.",
+  "implement_worktree_provenance_invalid": "Launch preparation was refused.",
+  "implement_worktree_ref_mismatch": "Launch preparation was refused.",
+  "implement_worktree_tip_mismatch": "Launch preparation was refused.",
+  "invalid_session_purpose": "Launch preparation was refused.",
+  "implement_worktree_preparation_busy": "Launch preparation was refused.",
+  "implement_worktree_owner_durability_failed": "Launch preparation was refused.",
+  "implement_worktree_branch_missing": "Launch preparation was refused.",
+  "provider_engine_bundle_unavailable": "Launch preparation was refused.",
+  "provider_engine_bundle_invalid": "Launch preparation was refused.",
+  "provider_engine_version_report_unverified": "Launch preparation was refused.",
+  "provider_sdk_native_binary_missing": "Launch preparation was refused.",
+  "provider_fable_smoke_failed": "Launch preparation was refused.",
+  "provider_sdk_install_refused": "Launch preparation was refused."
+};
+const HOST_EVENT_REASONS=new Set([...Object.keys(HOST_FAILURE_DETAILS),"host_launch_refused","native_process_absent","launch_timeout_no_native","stop_confirmed","native_exit","stop_unconfirmed","host_inventory_lost","host_operation_failed","native_mail_outcome_uncertain","connected","dead","idle","host_no_response","host_inventory_stale","legacy_launch_unobserved","machine_not_enrolled"]);
+function closedHostReason(value:unknown):string {
+  return typeof value==='string' && HOST_EVENT_REASONS.has(value) ? value : 'host_operation_failed';
+}
+function closedLaunchReason(value:unknown):string {
+  return typeof value==='string' && Object.hasOwn(HOST_FAILURE_DETAILS,value) ? value : 'native_dispatch_not_started';
+}
+function fixedHostDetail(reason:unknown):string {
+  return HOST_FAILURE_DETAILS[closedLaunchReason(reason)];
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -1240,9 +1382,8 @@ export class MachineDO {
     const current=row.operation_id===operationId&&row.epoch===epoch;
     if(current&&row.native_id!==null)return error('stale_no_dispatch_receipt',409);
     if(current&&['offered','claimed'].includes(row.state)){
-      const failureReason = typeof body.failure_reason === 'string' && /^[a-z0-9_.:-]{1,80}$/.test(body.failure_reason)
-        ? body.failure_reason : 'native_dispatch_not_started';
-      const detail = sanitizedHostDetail(body.detail);
+      const failureReason = closedLaunchReason(body.failure_reason);
+      const detail = body.detail === undefined ? undefined : fixedHostDetail(failureReason);
       await this.recordLaunchRefusal(row, failureReason, true, detail);
     }else{
       const settled=current ? ['failed','stopped','expired'].includes(row.state)
@@ -1490,6 +1631,18 @@ export class MachineDO {
     return command ? json({ command: this.commandView(command) }, 201) : error('command_persist_failed', 503);
   }
 
+  private nativeControlDiagnostic(result: JsonRecord, kind: string): JsonRecord {
+    if (result.native_control_stage === undefined && result.native_control_error === undefined) return {};
+    const stages = kind === 'capture'
+      ? ['capture_binding','capture_status','capture_retained','capture_rpc','capture_qualification']
+      : kind === 'stop' ? ['stop_status','stop_kill','stop_verify','stop_qualification'] : [];
+    const errors = ['timeout','native_nonzero','invalid_response','identity_mismatch','unavailable','os_error','unqualified','unknown'];
+    const valid = typeof result.native_control_stage === 'string' && stages.includes(result.native_control_stage)
+      && typeof result.native_control_error === 'string' && errors.includes(result.native_control_error);
+    return {native_control_stage:valid ? result.native_control_stage : 'unknown',
+      native_control_error:valid ? result.native_control_error : 'unknown'};
+  }
+
   private async ackCommand(request: Request, sessionId: string, commandId: string): Promise<Response> {
     const actor = actorFrom(request), machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
@@ -1507,7 +1660,9 @@ export class MachineDO {
     const session = row.kind === 'stop'
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
       : null;
-    let result=body.result as JsonRecord;
+    let result={...body.result as JsonRecord};
+    const diagnostic=this.nativeControlDiagnostic(result,row.kind);
+    delete result.native_control_stage; delete result.native_control_error;
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
     if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
       ||result.output!==undefined))return error('invalid_command_ack',400);
@@ -1542,6 +1697,9 @@ export class MachineDO {
         result = {stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'};
       }
     }
+    if (row.kind==='capture'&&result.error!==undefined || row.kind==='stop'&&result.stopped===false) {
+      result={...result,...diagnostic};
+    }
     const resultJson = JSON.stringify(result);
     if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
@@ -1564,10 +1722,6 @@ export class MachineDO {
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
         unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId, row.epoch);
-      if (unconfirmed && session && session.native_id && ['claimed', 'running'].includes(session.state)) {
-        const absentObservedAt = this.deadNativeObservation(session, now);
-        if (absentObservedAt !== null) await this.recordNativeProcessAbsent(session, absentObservedAt);
-      }
     }
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });
@@ -1721,6 +1875,7 @@ export class MachineDO {
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',body.session_id,attachment.machine_id);
     if (!row) return;
     const operation=boundedString(body.operation_id,180)?body.operation_id:null,message=boundedString(body.message_id,180)?body.message_id:null;
+    body = {...body, reason:closedHostReason(body.reason)};
     const hostLaunchEvent=(body.stage==='host_launch'||body.stage==null)&&message===null;
     const hostLaunchDiagnostic=body.stage==='host_launch'&&message===null;
     // A launch diagnostic is useful only for the exact currently-owned
@@ -1733,7 +1888,7 @@ export class MachineDO {
       const previous=this.parse(row.evidence_json);
       if(previous===null||isJsonRecord(previous)){
         const evidence=isJsonRecord(previous)?{...previous}:{};
-        const detail=sanitizedHostDetail(body.detail);
+        const detail=body.detail === undefined ? undefined : fixedHostDetail(body.reason);
         const diagnostic={operation_id:row.operation_id,attempt:row.attempt,epoch:row.epoch,reason:body.reason,stage:'host_launch',
           ...(detail?{detail}:{})};
         if(JSON.stringify(evidence[HOST_START_DIAGNOSTIC_KEY])!==JSON.stringify(diagnostic)){
@@ -1754,7 +1909,7 @@ export class MachineDO {
     // Older daemons omit stage but include the command or
     // message ID; their launch refusals carry neither.
     if((body.stage!=null&&body.stage!=='host_launch')||body.message_id!=null)return;
-    if(AUTH_FALLBACK_REASONS.has(body.reason)&&['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
+    if(AUTH_FALLBACK_REASONS.has(closedHostReason(body.reason))&&['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
       const now=Date.now(),payload={operation_id:row.dispatch_id,attempt_operation_id:row.operation_id,session_id:row.id,
         machine_id:row.machine_id,epoch:row.epoch,reason:body.reason};
       this.db.transaction(this.ctx,()=>{
@@ -1766,11 +1921,13 @@ export class MachineDO {
       await this.flushOne(`auth-fallback:${row.operation_id}:${row.epoch}`);
       await this.scheduleNext();
     } else if(['offered','claimed'].includes(row.state)&&!row.native_id&&operation===row.operation_id){
-      await this.recordLaunchRefusal(row,body.reason);
+      await this.recordLaunchRefusal(row,closedHostReason(body.reason));
     }
   }
 
   private async recordLaunchRefusal(session:SessionRow,failureReason:string,noDispatch=false,detail?:string):Promise<void>{
+    failureReason = closedLaunchReason(failureReason);
+    detail = detail === undefined ? undefined : fixedHostDetail(failureReason);
     const now=Date.now(),reason='host_launch_refused',payload={operation_id:session.dispatch_id,
       attempt_operation_id:session.operation_id,session_id:session.id,intake_id:session.intake_id,
       machine_id:session.machine_id,epoch:session.epoch,native_id:null,reason,failure_reason:failureReason,
@@ -1812,7 +1969,7 @@ export class MachineDO {
     return json({machine:machine?{id:machine.machine_id,alias:machine.alias,os:machine.os,arch:machine.arch,
       labels:this.parse(machine.labels_json),last_seen:machine.last_seen,connected:this.machineSockets(`${machine.machine_id}`).length>0}:null,
       sessions,live_active_count:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,
-      attention:this.db.all('SELECT * FROM attention ORDER BY observed_at DESC,session_id LIMIT 20'),
+      attention:this.db.all<JsonRecord>('SELECT * FROM attention ORDER BY observed_at DESC,session_id LIMIT 20').map(row=>({...row,reason:closedHostReason(row.reason)})),
       pending_notifications:this.db.all("SELECT id,kind,attempt,next_action_at FROM machine_outbox WHERE state='pending' ORDER BY next_action_at,id LIMIT 21")});
   }
 
@@ -1867,24 +2024,14 @@ export class MachineDO {
     const candidates:Array<{session:SessionRow;reason:'dead'|'idle';live:LiveSession|null}> = [];
     for(const session of rows){
       if(this.stopConfirmed(session))continue;
-      let live=bySession.get(session.id)||null;
+      const live=bySession.get(session.id)||null;
       if(!session.native_id){
         const starting=live&&['launching','starting'].includes(live.phase);
         if(starting&&now-session.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)continue;
         if(now-session.updated_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS)candidates.push({session,reason:'dead',live});
         continue;
       }
-      if(session.native_id&&!live){
-        // A bounded heartbeat omission proves nothing. A fresh complete census
-        // can prove absence, including after a rejected finish was dead-lettered.
-        // This authorizes failure only, never a successful stop or native exit.
-        const census=this.nativeInventory.status(now),observed=Number(census.observed_at_ms),started=Number(census.started_at_ms);
-        if(census.complete!==true||census.fresh!==true||!Number.isSafeInteger(observed)
-          ||!Number.isSafeInteger(started)||started<session.updated_at
-          ||observed>now+5000||observed-session.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS
-          ||this.db.one('SELECT native_id FROM native_inventory_rows WHERE native_id=?',session.native_id))continue;
-        live={session_id:session.id,native_id:session.native_id,phase:'missing',last_activity_at:null,observed_at:observed};
-      }
+      if(session.native_id&&!live)continue;  // The host snapshot is bounded.
       if(live){
         const reason=inactiveReason({...live,last_activity_at:live.last_activity_at??session.created_at},now);
         if(reason)candidates.push({session,reason,live});
@@ -1911,17 +2058,6 @@ export class MachineDO {
         if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
       }
-      // A fresh, exact missing-process observation after the startup grace is
-      // already failure evidence. Do not depend on a stop ACK to surface it;
-      // failing unconfirmed never asserts that containment has been emptied.
-      const missingAfterGrace=live.native_id===session.native_id&&['missing','dead'].includes(live.phase)
-        &&live.observed_at-session.created_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS;
-      if(reason==='dead'&&session.native_id&&(this.hasUnconfirmedStop(session)||missingAfterGrace)){
-        if(await this.recordNativeProcessAbsent(session,live.observed_at)){
-          reaped++;actions.push({session_id:session.id,action:'marked_failed',reason:'native_process_absent'});
-        }
-        continue;
-      }
       if(session.native_id||live?.native_id||!!(live&&['launching','starting'].includes(live.phase))){
         const pending=this.db.one<{id:string}>("SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending' ORDER BY created_at DESC LIMIT 1",
           session.id,session.machine_id,session.epoch);
@@ -1942,57 +2078,6 @@ export class MachineDO {
     }
     return {machine_id:machine.machine_id,dry_run:false,active_count:active,
       active_count_after:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,reaped,stop_requested:stopRequested,actions};
-  }
-
-  private deadNativeObservation(session: SessionRow, now: number): number | null {
-    if (!session.native_id) return null;
-    const inventory = this.db.one<{ observed_at: number }>('SELECT observed_at FROM machine_liveness WHERE singleton=1');
-    if (!inventory || inventory.observed_at > now + 5_000 || now - inventory.observed_at > LIVE_SNAPSHOT_TTL_MS) return null;
-    const live = this.liveSessions().find(row => row.session_id === session.id);
-    if (!live) return null;
-    if (live.phase === 'exited' && live.containment_empty === true) return null;
-    const reason = inactiveReason({ ...live, last_activity_at: live.last_activity_at ?? session.created_at }, now);
-    return reason === 'dead' ? live.observed_at : null;
-  }
-
-  private hasUnconfirmedStop(session: SessionRow): boolean {
-    const row = this.db.one<{ result_json: string | null }>(
-      "SELECT result_json FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='failed' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
-      session.id, session.machine_id, session.epoch);
-    try {
-      const parsed = row?.result_json ? JSON.parse(row.result_json) as JsonRecord : null;
-      return parsed?.stopped === false && parsed?.error === 'stop_unconfirmed';
-    } catch { return false; }
-  }
-
-  private async recordNativeProcessAbsent(session: SessionRow, observedAt: number): Promise<boolean> {
-    const now = Date.now(), reason = 'native_process_absent', key = `reaped:${session.operation_id}:${session.epoch}`;
-    const payload = {
-      operation_id: session.dispatch_id, attempt_operation_id: session.operation_id, session_id: session.id,
-      intake_id: session.intake_id, machine_id: session.machine_id, epoch: session.epoch, native_id: session.native_id,
-      reason, observed_at: observedAt, stopped: false, unconfirmed: true, reaped: true,
-    };
-    const applied = this.db.transaction(this.ctx, () => {
-      const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', session.id);
-      if (!current || current.epoch !== session.epoch || current.operation_id !== session.operation_id
-        || current.native_id !== session.native_id || !['claimed', 'running'].includes(current.state)) return false;
-      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=?", now, session.id);
-      this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",
-        session.operation_id, session.id, session.epoch);
-      this.settlePendingCommands(session, now, reason, null);
-      this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
-        session.id, reason, session.operation_id, now);
-      this.insertOutbox(key, 'reaped', session.operation_id, session.project_id, payload, now);
-      return true;
-    });
-    if (applied) {
-      await this.flushOne(key);
-      console.error('[hub2] SESSION_NATIVE_PROCESS_ABSENT', JSON.stringify({
-        session_id: session.id, machine_id: session.machine_id, intake_id: session.intake_id,
-        epoch: session.epoch, native_id: session.native_id, reason,
-      }));
-    }
-    return applied;
   }
 
   private qualifiedStopResult(session: SessionRow, result: JsonRecord): boolean {
@@ -2284,8 +2369,8 @@ export class MachineDO {
     return json({
       checked: true,
       ok: result.ok === true,
-      ...(typeof result.reason === 'string' ? { reason: result.reason } : {}),
-      ...(typeof result.detail === 'string' ? { detail: result.detail } : {}),
+      ...(typeof result.reason === 'string' ? { reason: closedLaunchReason(result.reason) } : {}),
+      ...(typeof result.detail === 'string' ? { detail: fixedHostDetail(result.reason) } : {}),
     });
   }
 
@@ -2304,7 +2389,7 @@ export class MachineDO {
     if (attention) {
       events.push({
         kind: 'attention',
-        reason: attention.reason,
+        reason: closedHostReason(attention.reason),
         operation_id: attention.operation_id,
         observed_at: new Date(attention.observed_at).toISOString(),
         ...(diagnostic ?? {}),
@@ -2319,9 +2404,9 @@ export class MachineDO {
         state: item.state,
         operation_id: item.operation_id,
         created_at: new Date(item.created_at).toISOString(),
-        ...(typeof payload?.reason === 'string' ? { reason: payload.reason } : {}),
-        ...(typeof payload?.failure_reason === 'string' ? { failure_reason: payload.failure_reason } : {}),
-        ...(typeof payload?.detail === 'string' ? { detail: payload.detail } : {}),
+        ...(typeof payload?.reason === 'string' ? { reason: closedHostReason(payload.reason) } : {}),
+        ...(typeof payload?.failure_reason === 'string' ? { failure_reason: closedLaunchReason(payload.failure_reason) } : {}),
+        ...(typeof payload?.detail === 'string' ? { detail: fixedHostDetail(payload?.failure_reason) } : {}),
       });
     }
     return json({ session_id: row.id, state: row.state, events });
@@ -2343,7 +2428,7 @@ export class MachineDO {
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
       last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
       interactive:launch.interactive,evidence:this.sessionEvidence(row),
-      attention:attention?{...attention,...(diagnostic??{})}:null};
+      attention:attention?{...attention,reason:closedHostReason(attention.reason),...(diagnostic??{})}:null};
   }
 
   private sessionEvidence(row:SessionRow):unknown{
@@ -2359,7 +2444,7 @@ export class MachineDO {
     const diagnostic=isJsonRecord(evidence)?evidence[HOST_START_DIAGNOSTIC_KEY]:null;
     if(!isJsonRecord(diagnostic)||diagnostic.operation_id!==row.operation_id||diagnostic.attempt!==row.attempt||diagnostic.epoch!==row.epoch
       ||diagnostic.reason!==reason||diagnostic.stage!=='host_launch')return null;
-    const detail=sanitizedHostDetail(diagnostic.detail);
+    const detail=diagnostic.detail === undefined ? undefined : fixedHostDetail(reason);
     return {stage:'host_launch',...(detail?{detail}:{})};
   }
 
