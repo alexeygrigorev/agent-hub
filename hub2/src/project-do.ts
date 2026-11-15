@@ -6,7 +6,7 @@ import {boundWorkspace,checkoutWorkspace,mergeWorkspaceBinding,type WorkspaceBin
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
-import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
+import { actorFrom, bodyObject, boundedString, error, forbiddenScope, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
@@ -222,7 +222,10 @@ export class ProjectDO {
   private async createIntake(request: Request): Promise<Response> {
     const actor = actorFrom(request);
     const project = new URL(request.url).searchParams.get('project') || '';
-    if (!project || project.length > 180 || !this.canProject(actor, project, 'intake:write')) return error('forbidden', 403);
+    if (!project || project.length > 180) return error('forbidden', 403);
+    if (!this.canCreateIntake(actor, project)) {
+      return forbiddenScope('intake:write', `grant intake:write with project:${project} (or worker intake:create with worker_project:${project}) or operator:admin`);
+    }
     const body = await bodyObject(request, 16_384);
     normalizeCriteria(body);
     if (body.code_task !== undefined && typeof body.code_task !== 'boolean') return error('invalid_code_task',400);
@@ -245,9 +248,11 @@ export class ProjectDO {
     }
     const now = Date.now();
     const id = crypto.randomUUID();
+    const parentIntakeId = actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id
+      && !this.canProject(actor, project, 'intake:write') ? actor.resource_id : null;
     this.transaction(() => {
-      this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority)
-        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task}),2);
+      this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority,parent_intake_id)
+        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task}),2,parentIntakeId);
       this.appendEvent(id, `intake:${id}:created`, actor?.id || 'operator', 'created', { title: normalized.title, acceptance_criteria: normalized.acceptance_criteria }, now);
       this.db.run('INSERT INTO idempotency(scope, request_key, request_digest, response_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'intake:create', key, digest, JSON.stringify({ id }), now, now + 180 * 24 * 60 * 60_000);
@@ -609,7 +614,12 @@ export class ProjectDO {
     if (!key) return error('idempotency_key_required', 400);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
-    if (!this.canProject(actor, intake.project, 'session:start')) return error('forbidden', 403);
+    if (!this.canStartIntake(actor, intake)) {
+      if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id === intake.id) {
+        return forbiddenScope('operator:admin', 'a worker session cannot start a new session on its own intake; create a child intake first or use operator:admin');
+      }
+      return forbiddenScope('session:start', `grant session:start with project:${intake.project} or operator:admin`);
+    }
     const verificationOf=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_of_session_id==='string'?body.verification_of_session_id:undefined;
     const verificationOrigin=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_origin_session_id==='string'?body.verification_origin_session_id:undefined;
     const verificationAttempt=body.verification_attempt;
@@ -2130,9 +2140,26 @@ export class ProjectDO {
     return hasScope(actor, scope) && (actor.resource_id === project || hasScope(actor, `project:${project}`));
   }
 
+  private canCreateIntake(actor: ReturnType<typeof actorFrom>, project: string): boolean {
+    if (this.canProject(actor, project, 'intake:write')) return true;
+    return !!actor && actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id
+      && hasScope(actor, 'intake:create') && hasScope(actor, `worker_project:${project}`);
+  }
+
+  private canStartIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
+    if (this.canProject(actor, intake.project, 'session:start')) return true;
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !hasScope(actor, 'session:start')) return false;
+    if (!hasScope(actor, `worker_project:${intake.project}`)) return false;
+    if (actor.resource_id === intake.id) return false;
+    return intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id);
+  }
+
   private canReadIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
     if (this.canProject(actor, intake.project, 'intake:read')) return true;
-    return !!actor && actor.resource_id === intake.id && hasScope(actor, 'intake:read');
+    if (!actor || !hasScope(actor, 'intake:read')) return false;
+    if (actor.resource_id === intake.id) return true;
+    return actor.kind === 'agent' && actor.id.startsWith('session:')
+      && (intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id));
   }
 
 

@@ -364,3 +364,28 @@ test('draw diagnostics real Worker forwards bounded query and rejects forged una
  assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
  assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
 });
+
+test('routing-machines allows routing:read and fails loudly with missing_scope when absent',async t=>{
+ const f=fixture();t.after(()=>f.database.close());
+ const {default:worker}=await import('../src/worker');
+ const token='synthetic-routing-operator-'+'x'.repeat(32);
+ const workerToken='synthetic-routing-worker-'+'y'.repeat(32);
+ const deniedToken='synthetic-routing-denied-'+'z'.repeat(32);
+ const env={...f.env,HUB2_DEV_OPERATOR_TOKEN:token};
+ const origAuth=(f.control as any).fetch.bind(f.control);
+ const customEnv={...env,CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{
+  if(new URL(r.url).pathname==='/_verify'){
+   const body=await r.clone().json() as {token?:string};
+   if(body.token===workerToken)return Response.json({actor:{id:'session:11111111-1111-4111-8111-111111111111',kind:'agent',resource_id:'intake-1',scopes:['intake:read','routing:read','worker_project:org/a']}});
+   if(body.token===deniedToken)return Response.json({actor:{id:'human:limited',kind:'operator',scopes:['intake:read']}});
+  }
+  return origAuth(r);
+ }})}};
+ const allowed=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+workerToken}}),customEnv);
+ assert.equal(allowed.status,200);
+ const denied=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+deniedToken}}),customEnv);
+ assert.equal(denied.status,403);
+ const deniedBody=await data(denied);
+ assert.equal(deniedBody.missing_scope,'routing:read');
+ assert.match(String(deniedBody.detail),/routing:read/);
+});
