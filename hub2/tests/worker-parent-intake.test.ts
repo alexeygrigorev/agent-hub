@@ -127,3 +127,35 @@ test('operator can set parent_intake_id on an existing intake (short or full id)
  const cleared=await f.direct(PROJECT,'/api/intakes/'+standalone.id,'PATCH',{key:'p-clear',parent_intake_id:null},admin);
  assert.equal(cleared.status,200);assert.equal((await data(cleared)).intake.parent_intake_id,null);
 });
+
+test('compat POST /api/intake/tasks and /api/intake/tasks/:id support parent_intake_id for operators',async t=>{
+ const f=fixture();t.after(f.close);
+ const {default:worker}=await import('../src/worker');
+ const adminToken='synthetic-admin-compat-'+'a'.repeat(32),writerToken='synthetic-writer-compat-'+'w'.repeat(32);
+ const writer={id:'human:writer',kind:'operator',scopes:['intake:read','intake:write','project:'+PROJECT]};
+ f.tokens.set(adminToken,admin);
+ f.tokens.set(writerToken,writer);
+ const call=(path:string,token:string,method='GET',b?:unknown)=>worker.fetch(new Request('http://127.0.0.1'+path,{method,headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},...(b===undefined?{}:{body:JSON.stringify(b)})}),f.env);
+
+ const parentRes=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key:'compat-parent',title:'Parent',text:'P',acceptance_criteria:['A']},admin);
+ assert.equal(parentRes.status,201);const parent=(await data(parentRes)).intake;
+
+ // Non-operator cannot set parent_intake_id on create or compat update.
+ const deniedCreate=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key:'compat-deny-create',title:'C',text:'X',acceptance_criteria:['A'],parent_intake_id:parent.id},writer);
+ assert.equal(deniedCreate.status,403);assert.equal((await data(deniedCreate)).missing_scope,'operator:admin');
+
+ // Operator creates a child directly via --parent (short ID).
+ const createdChildRes=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key:'compat-child-create',title:'Child',text:'C',acceptance_criteria:['A'],parent_intake_id:parent.id.slice(0,8)},admin);
+ assert.equal(createdChildRes.status,201);const createdChild=(await data(createdChildRes)).intake;
+ assert.equal(createdChild.parent_intake_id,parent.id);
+
+ // Operator links and clears parent_intake_id via compat POST /api/intake/tasks/:id (used by `hub intake update --parent`).
+ const standaloneRes=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key:'compat-standalone',title:'Standalone',text:'S',acceptance_criteria:['A']},admin);
+ assert.equal(standaloneRes.status,201);const standalone=(await data(standaloneRes)).intake;
+ const deniedUpdate=await f.direct(PROJECT,'/api/intakes/'+standalone.id,'POST',{key:'compat-deny-upd',parent_intake_id:parent.id},writer);
+ assert.equal(deniedUpdate.status,403);assert.equal((await data(deniedUpdate)).missing_scope,'operator:admin');
+ const linkedRes=await f.direct(PROJECT,'/api/intakes/'+standalone.id,'POST',{key:'compat-link',parent_intake_id:parent.id.slice(0,8),note:'link via compat'},admin);
+ assert.equal(linkedRes.status,200);assert.equal((await data(linkedRes)).intake.parent_intake_id,parent.id);
+ const clearedRes=await f.direct(PROJECT,'/api/intakes/'+standalone.id.slice(0,8),'POST',{key:'compat-clear',parent_intake_id:null},admin);
+ assert.equal(clearedRes.status,200);assert.equal((await data(clearedRes)).intake.parent_intake_id,null);
+});
