@@ -115,6 +115,12 @@ class NonblockingLaunchTests(unittest.TestCase):
                     self.assertIn('hub.managed=true', argv)
                     self.assertIn('hub.session=s', argv)
                     child = argv[argv.index('--') + 1:]
+                    if engine == 'codex' and __import__('sys').platform == 'win32':
+                        self.assertIn('exec', child)
+                        self.assertIn('--model', child)
+                        self.assertNotIn('task', child)
+                        launcher.wait_first_action.assert_not_called()
+                        continue
                     self.assertEqual(child[1:3], ['task', 'run'])
                     self.assertEqual(Path(child[0]).stem.lower(), 'a')
                     effective_route = launcher.config['routes'][engine]

@@ -1081,7 +1081,7 @@ export class MachineDO {
     const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
     if(!nativeDeadline||!Number.isSafeInteger(nativeDeadline.deadline_ms)||typeof nativeDeadline.exceeded!=='boolean'||!admission
       ||nativeDeadline.deadline_ms!==admission.observed_at+Number(launch.timeout_seconds)*1000
-      ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at||Number(nativeExit.exited_at_ms)>Date.now()+5000
+      ||!Number.isSafeInteger(nativeExit.exited_at_ms)||Number(nativeExit.exited_at_ms)<admission.observed_at-5000||Number(nativeExit.exited_at_ms)>Date.now()+5000
       ||(Number(nativeExit.exited_at_ms)>=Number(nativeDeadline.deadline_ms)&&nativeDeadline.exceeded!==true)
       ||(nativeDeadline.exceeded&&Number(nativeDeadline.deadline_ms)>Date.now()))return error('native_deadline_unverified',409);
     // A qualified native exit adds no new lifecycle transition after a confirmed
@@ -1865,14 +1865,23 @@ export class MachineDO {
     const candidates:Array<{session:SessionRow;reason:'dead'|'idle';live:LiveSession|null}> = [];
     for(const session of rows){
       if(this.stopConfirmed(session))continue;
-      const live=bySession.get(session.id)||null;
+      let live=bySession.get(session.id)||null;
       if(!session.native_id){
         const starting=live&&['launching','starting'].includes(live.phase);
         if(starting&&now-session.updated_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)continue;
         if(now-session.updated_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS)candidates.push({session,reason:'dead',live});
         continue;
       }
-      if(session.native_id&&!live)continue;  // The host snapshot is bounded.
+      if(session.native_id&&!live){
+        // A bounded heartbeat omission proves nothing. A fresh complete census
+        // can prove absence, including after a rejected finish was dead-lettered.
+        // This authorizes failure only, never a successful stop or native exit.
+        const census=this.nativeInventory.status(now),observed=Number(census.observed_at_ms);
+        if(census.complete!==true||census.fresh!==true||!Number.isSafeInteger(observed)
+          ||observed>now+5000||observed-session.created_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS
+          ||this.db.one('SELECT native_id FROM native_inventory_rows WHERE native_id=?',session.native_id))continue;
+        live={session_id:session.id,native_id:session.native_id,phase:'missing',last_activity_at:null,observed_at:observed};
+      }
       if(live){
         const reason=inactiveReason({...live,last_activity_at:live.last_activity_at??session.created_at},now);
         if(reason)candidates.push({session,reason,live});

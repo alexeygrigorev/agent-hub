@@ -8,12 +8,46 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from agent_hub_host.agent import Bridge
-from agent_hub_host.native_launch import NativeLauncher, native_state_directory
+from agent_hub_host.native_launch import NativeLauncher, native_state_directory, windows_codex_command
 
 
 class WindowsLaunchObservationTests(unittest.TestCase):
+    def test_windows_npm_codex_runs_node_without_shell_and_preserves_literal_arguments(self):
+        with tempfile.TemporaryDirectory() as temp, patch('sys.platform', 'win32'):
+            root = Path(temp)
+            script = root / 'node_modules/@openai/codex/bin/codex.js'
+            script.parent.mkdir(parents=True)
+            script.write_text('// fixture', encoding='utf-8')
+            shim, node = str(root / 'codex.cmd'), str(root / 'node.exe')
+            args = ['codex', 'exec', 'literal & echo %PATH% | < > "value"']
+            with patch('agent_hub_host.native_launch.shutil.which', side_effect=lambda name: shim if name == 'codex' else node):
+                self.assertEqual(windows_codex_command(args), [node, str(script), *args[1:]])
+                script.unlink()
+                with self.assertRaisesRegex(RuntimeError, 'native_codex_program_unavailable'):
+                    windows_codex_command(args)
+
+    def test_windows_native_codex_headless_does_not_use_the_task_runner(self):
+        with tempfile.TemporaryDirectory() as temp, patch('sys.platform', 'win32'):
+            calls = []
+            def runner(argv, **options):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    'id': '71ffde7c-f089-471a-93bd-9acf29c31c51', 'tag': 'task-fixture',
+                    'workspace': temp, 'command': argv[argv.index('--') + 1:],
+                }), '')
+            launcher = NativeLauncher({}, runner=runner)
+            launcher.profile_command = Mock(side_effect=AssertionError('task runner must not be used'))
+            with patch('agent_hub_host.native_launch.windows_codex_command', side_effect=lambda argv: ['node.exe', 'codex.js', *argv[1:]]):
+                result = launcher.launch('fixture', {'workspace': temp, 'engine': 'codex', 'model': 'gpt-6.1-sol',
+                    'prompt': 'Verify', 'effort': 'medium', 'timeout_seconds': 600})
+            self.assertEqual(result['session_id'], '71ffde7c-f089-471a-93bd-9acf29c31c51')
+            child = calls[0][calls[0].index('--') + 1:]
+            self.assertEqual(child[:3], ['node.exe', 'codex.js', 'exec'])
+            self.assertIn('model_reasoning_effort="medium"', child)
+
     def test_running_registry_record_with_dead_worker_is_reported_missing(self):
         bridge = Bridge.__new__(Bridge)
         row = {'session_id': 'fixture', 'state': 'running', 'workspace': 'fixture'}

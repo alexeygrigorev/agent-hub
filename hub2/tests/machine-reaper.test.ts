@@ -1433,6 +1433,35 @@ test('missing native after startup grace fails with attention without waiting fo
  assert.equal(again.reaped,0);
 });
 
+test('a complete census fails an omitted native after grace but incomplete or stale census cannot',async()=>{
+ for(const mode of ['complete','incomplete','stale','present']){
+  const f=fixture(),session='census-omitted-'+mode,native='11111111-2222-4333-8444-555555555555';
+  await startClaimed(f,session,native);
+  f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000,session);
+  const observed=mode==='stale'?Date.now()-100_000:Date.now();
+  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',observed_at_ms:observed}));
+  if(mode==='present')f.database.prepare('INSERT INTO native_inventory_rows VALUES(?,?)').run(native,'{}');
+  const result=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+  assert.equal(result.reaped,mode==='complete'?1:0);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,mode==='complete'?'failed':'running');
+  if(mode==='complete'){assert.equal(f.events.at(-1)?.body.stopped,false);assert.equal(f.events.at(-1)?.body.reason,'native_process_absent');}
+ }
+});
+
+test('qualified native exits tolerate bounded host clock skew without relaxing the deadline fence',async()=>{
+ for(const skew of [300,5000,5001]){
+  const f=fixture(),session='exit-clock-'+skew,native='native-clock',epoch=await startClaimed(f,session,native),admitted=Date.now();
+  const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+  launch.timeout_seconds=1800;f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify(launch),session);
+  f.database.prepare('INSERT OR REPLACE INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,admitted);
+  const response=await f.call('/api/sessions/'+session+'/finish','POST',{operation_id:'op-'+session,epoch,native_id:native,exit_code:127,native_exit_confirmed:true,evidence:{
+   source:'aplexer_retirement',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_exit:{code:127,signal:null,exited_at_ms:admitted-skew},native_deadline:{deadline_ms:admitted+1800_000,exceeded:false},
+  }});
+  assert.equal(response.status,skew<=5000?200:409,await response.clone().text());
+ }
+});
+
 test('reap immediately fails a dead native session that already has a failed stop_unconfirmed command',async()=>{
  const f=fixture(),session='already-unconfirmed-stop',epoch=await startClaimed(f,session,'native-gone');
  const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
