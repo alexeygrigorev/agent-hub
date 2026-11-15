@@ -1374,7 +1374,11 @@ export class MachineDO {
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
     )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,presenceDue,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
-      if (current !== next.due) { this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due); }
+      // Heartbeats recompute the periodic reaper deadline. Preserve an earlier
+      // pending wake; otherwise a connected host can postpone reaping forever.
+      if (current !== next.due && (current === null || current <= Date.now() || next.due < current)) {
+        this.db.alarmOperation(); await this.ctx.storage.setAlarm(next.due);
+      }
     } else if (current !== null) {
       this.db.alarmOperation();
       await this.ctx.storage.deleteAlarm();

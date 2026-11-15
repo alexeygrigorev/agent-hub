@@ -1450,6 +1450,27 @@ test('a complete census fails an omitted native after grace but incomplete or st
  }
 });
 
+test('recurring heartbeats cannot postpone the pending reaper alarm or hide an absent native',async(t)=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now);
+ const f=fixture(),session='heartbeat-reaper-bound',native='11111111-2222-4333-8444-555555555555';
+ await startClaimed(f,session,native);
+ const old=now-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,old,session);
+ const due=f.alarm;assert.equal(typeof due,'number');assert(Number(due)<=now+180_000);
+ while(now+15_000<Number(due)){
+  now+=15_000;
+  f.database.prepare('INSERT OR REPLACE INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({
+   snapshot_id:'fixture',started_at_ms:now-1,observed_at_ms:now,
+  }));f.clearCache();
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+  assert.equal(f.alarm,due,'a heartbeat must not push the scheduled reaper into the future');
+ }
+ now=Number(due)+1;await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any).reason,'native_process_absent');
+ assert.equal(f.events.at(-1)?.body.stopped,false);
+});
+
 test('qualified native exits tolerate bounded host clock skew without relaxing the deadline fence',async()=>{
  for(const skew of [300,5000,5001]){
   const f=fixture(),session='exit-clock-'+skew,native='native-clock',epoch=await startClaimed(f,session,native),admitted=Date.now();
