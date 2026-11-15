@@ -300,7 +300,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
           machines.get(id)?.capabilities?.includes(label));
         return hosts.length ? [{...row, hosts}] : [];
       });
-      if (!pool.length) throw new HttpError('repository_workspace_unavailable', 503);
+      if (!pool.length) throw new HttpError('repository_checkout_missing', 400, 'no checkout under enrolled roots; pass --cwd after creating it');
     } else {
       // Ordinary explicit labels remain advisory: a missing observation must
       // not make every launch capability look unknown or restore an excluded engine.

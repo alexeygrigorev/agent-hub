@@ -893,7 +893,22 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.calls, [])
         receipt = self.journal.db.execute("SELECT payload FROM outbox").fetchone()
         self.assertEqual(json.loads(receipt[0]), {"operation_id": offer["operation_id"], "epoch": offer["epoch"],
-                                                "native_id": None, "launch_failed": True, "no_dispatch": True})
+                                                "native_id": None, "launch_failed": True, "no_dispatch": True,
+                                                "failure_reason": "native_dispatch_not_started",
+                                                "detail": "TypeError: adapter_preparation_failed"})
+
+    def test_preflight_workspace_checks_missing_and_outside_paths(self):
+        missing = self.root / "does-not-exist"
+        self.assertEqual(
+            self.bridge.preflight_workspace(str(missing)),
+            {"ok": False, "reason": "workspace_unavailable", "detail": "path does not exist; Hub will not create it"},
+        )
+        outside = self.root.parent
+        self.assertEqual(
+            self.bridge.preflight_workspace(str(outside)),
+            {"ok": False, "reason": "workspace_outside_allowlist", "detail": "workspace is outside enrolled roots"},
+        )
+        self.assertEqual(self.bridge.preflight_workspace(str(self.root)), {"ok": True})
 
     def test_adapter_preparation_throttle_keeps_budget_pause_and_dispatch_proof(self):
         offer = self.offer()

@@ -347,7 +347,7 @@ const router = {
         );
       }
       const session = path.match(
-        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|link|commands(?:\/[^/]+\/ack)?))?$/,
+        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|link|events|commands(?:\/[^/]+\/ack)?))?$/,
       );
       if (session) {
         let machineId =
@@ -811,6 +811,9 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
   if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
   const createdHere = !existingIntake && intake.response.status === 201;
+  const intakeWorktree = body.intake_worktree === undefined ? undefined : text('intake_worktree');
+  if (intakeWorktree !== undefined && intakeWorktree !== 'detached' && intakeWorktree !== 'successor')
+    return error('invalid_intake_worktree', 400);
   const start: JsonRecord = {
     key, workspace, interactive, purpose, with_goal: body.with_goal === true,
     ...(brief ? { prompt: brief } : {}),
@@ -820,6 +823,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     ...(text('effort') ? { effort: text('effort') } : {}),
     ...(text('tier') ? { tier: text('tier') } : {}),
     ...(text('engine_override_reason') ? { override_reason: text('engine_override_reason') } : {}),
+    ...(intakeWorktree ? { intake_worktree: intakeWorktree } : {}),
     ...(requiredCapabilities ? { required_capabilities: requiredCapabilities } : {}),
   };
   const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);

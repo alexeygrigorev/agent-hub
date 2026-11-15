@@ -155,3 +155,12 @@ test('the discard route is not reachable through the public API', async () => {
   }
   assert.equal(f.projectCalls.length, 0);
 });
+
+test('intake_worktree is validated and forwarded to project start', async () => {
+  const f = fixture();
+  assert.equal((await f.start({ repo: 'org/app', workspace: 'app', intake_worktree: 'detached' })).status, 201);
+  assert.equal(f.projectCalls.find(call => call.path.endsWith('/start'))!.body.intake_worktree, 'detached');
+  const bad = await f.start({ repo: 'org/app', workspace: 'app', intake_worktree: 'bogus' });
+  assert.equal(bad.status, 400);
+  assert.equal(((await bad.json()) as any).error, 'invalid_intake_worktree');
+});

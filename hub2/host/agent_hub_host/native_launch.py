@@ -1265,7 +1265,7 @@ class NativeLauncher:
             raise RuntimeError('prompt_path_untrusted')
         path = directory / (task_id + '.txt')
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        with os.fdopen(fd, 'w') as stream:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             stream.write(prompt)
         profile = route.get('profile')
         from .task_output import prepare_output

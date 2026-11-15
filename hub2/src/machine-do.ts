@@ -170,7 +170,7 @@ function reportedHostRelease(query: URLSearchParams): HostRelease | undefined {
   return hostRelease(versions[0], Number(protocols[0]));
 }
 
-type OutboxRow = { id: string; kind: string; operation_id: string; project_id: string; payload_json: string; attempt: number; next_action_at: number };
+type OutboxRow = { id: string; kind: string; operation_id: string; project_id: string; payload_json: string; state: string; attempt: number; next_action_at: number; created_at: number };
 type CommandRow = { id: string; session_id: string; machine_id: string; epoch: number; request_key: string; request_digest: string; kind: string; text: string | null; capture_mode: string | null; state: string; result_json: string | null; created_at: number; updated_at: number };
 type NativeMail = {message_id:string;epoch:number;operation_id:string;session_id:string;machine_id:string;recipient:string;body:string;digest:string;state:string;receipt_digest:string|null};
 const AUTH_FALLBACK_REASONS=new Set(['provider_auth_failed','provider_unauthorized','provider_route_mismatch','provider_account_required',
@@ -195,6 +195,7 @@ export class MachineDO {
   private readonly ready:Promise<void>;
   private readonly nativeInventory:MachineNativeInventory;
   private readonly nativeCommands:MachineNativeCommands;
+  private readonly preflightWaiters = new Map<string, (result: JsonRecord) => void>();
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     const started = performance.now();
@@ -239,6 +240,7 @@ export class MachineDO {
       if (url.pathname === '/_internal/status' && request.method === 'GET') return this.machineView();
       if (url.pathname === '/_internal/routing-snapshot' && request.method === 'GET') return await this.routingView(true);
       if (url.pathname === '/_internal/routing' && request.method === 'GET') return await this.routingView();
+      if (url.pathname === '/_internal/workspace-preflight' && request.method === 'POST') return await this.workspacePreflight(request);
       if (url.pathname === '/_internal/live-sessions' && request.method === 'GET') return this.liveSessionView();
       if (url.pathname === '/_internal/reap' && request.method === 'POST') return await this.reap(request);
       if (url.pathname === '/_metrics' && request.method === 'GET') return json({ counts: this.db.snapshot(), constructor_ms: this.constructorMs });
@@ -265,6 +267,8 @@ export class MachineDO {
       if (url.pathname === '/api/sessions' && request.method === 'GET') return this.sessionList(request);
       const sessionView = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
       if (sessionView && request.method === 'GET') return this.sessionDetail(request, decodeURIComponent(sessionView[1]));
+      const sessionEvents = url.pathname.match(/^\/api\/sessions\/([^/]+)\/events$/);
+      if (sessionEvents && request.method === 'GET') return this.sessionEvents(request, decodeURIComponent(sessionEvents[1]));
       const commandAck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands\/([^/]+)\/ack$/);
       if (commandAck && request.method === 'POST') return await this.ackCommand(request, decodeURIComponent(commandAck[1]), decodeURIComponent(commandAck[2]));
       const link = url.pathname.match(/^\/api\/sessions\/([^/]+)\/link$/);
@@ -711,6 +715,13 @@ export class MachineDO {
     }
     if (body.type === 'offer_ack') {
       await this.ackOffer(socket, body,env);
+      return;
+    }
+    if (body.type === 'workspace.preflight.result') {
+      if (typeof body.request_id === 'string') {
+        const resolve = this.preflightWaiters.get(body.request_id);
+        if (resolve) { this.preflightWaiters.delete(body.request_id); resolve(body); }
+      }
       return;
     }
     if (body.type === 'host.error') { await this.recordAttention(socket, body,env); return; }
@@ -1227,7 +1238,10 @@ export class MachineDO {
     const current=row.operation_id===operationId&&row.epoch===epoch;
     if(current&&row.native_id!==null)return error('stale_no_dispatch_receipt',409);
     if(current&&['offered','claimed'].includes(row.state)){
-      await this.recordLaunchRefusal(row,'native_dispatch_not_started',true);
+      const failureReason = typeof body.failure_reason === 'string' && /^[a-z0-9_.:-]{1,80}$/.test(body.failure_reason)
+        ? body.failure_reason : 'native_dispatch_not_started';
+      const detail = sanitizedHostDetail(body.detail);
+      await this.recordLaunchRefusal(row, failureReason, true, detail);
     }else{
       const settled=current ? ['failed','stopped','expired'].includes(row.state)
         : epoch<row.epoch&&!!this.db.one("SELECT operation_id FROM machine_session_operations WHERE operation_id=? AND session_id=? AND epoch=? AND state='expired'",
@@ -1750,10 +1764,11 @@ export class MachineDO {
     }
   }
 
-  private async recordLaunchRefusal(session:SessionRow,failureReason:string,noDispatch=false):Promise<void>{
+  private async recordLaunchRefusal(session:SessionRow,failureReason:string,noDispatch=false,detail?:string):Promise<void>{
     const now=Date.now(),reason='host_launch_refused',payload={operation_id:session.dispatch_id,
       attempt_operation_id:session.operation_id,session_id:session.id,intake_id:session.intake_id,
       machine_id:session.machine_id,epoch:session.epoch,native_id:null,reason,failure_reason:failureReason,
+      ...(detail?{detail}:{}),
       launch_failed:true,...(noDispatch?{no_dispatch:true}:{}),observed_at:now};
     const key=`launch-refused:${session.operation_id}:${session.epoch}`;
     const applied=this.db.transaction(this.ctx,()=>{
@@ -1763,6 +1778,17 @@ export class MachineDO {
         now,session.id,session.operation_id,session.epoch);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
         session.operation_id,session.id,session.epoch);
+      this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
+        session.id,failureReason,session.operation_id,now);
+      if (detail && current.evidence_digest === null) {
+        const previous = this.parse(current.evidence_json);
+        if (previous === null || isJsonRecord(previous)) {
+          const evidence = isJsonRecord(previous) ? { ...previous } : {};
+          evidence[HOST_START_DIAGNOSTIC_KEY] = { operation_id: session.operation_id, attempt: current.attempt, epoch: session.epoch, reason: failureReason, stage: 'host_launch', detail };
+          this.db.run('UPDATE sessions SET evidence_json=? WHERE id=? AND operation_id=? AND attempt=? AND epoch=? AND evidence_digest IS NULL',
+            JSON.stringify(evidence), session.id, session.operation_id, current.attempt, session.epoch);
+        }
+      }
       this.settlePendingCommands(current,now,reason,noDispatch?{evidence:'dispatch_fenced'}:null);
       this.insertOutbox(key,'reaped',session.operation_id,session.project_id,payload,now);
       return true;
@@ -2146,10 +2172,77 @@ export class MachineDO {
     return json({commands,next_cursor:null});
   }
 
+  private async workspacePreflight(request: Request): Promise<Response> {
+    const body = await bodyObject(request, 4096);
+    const workspace = typeof body.workspace === 'string' ? body.workspace : '';
+    const machine = this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+    if (!machine || !workspace) return json({ checked: false });
+    let activeSocket: WebSocket | undefined;
+    for (const socket of this.machineSockets(machine.machine_id)) {
+      if (socket.readyState !== 1 || this.stopOnly(socket)) continue;
+      if (await this.authorizedAttachment(socket, 'machine:offer', false, this.env, false)) {
+        activeSocket = socket;
+        break;
+      }
+    }
+    if (!activeSocket) return json({ checked: false });
+    const requestId = crypto.randomUUID();
+    const result = await new Promise<JsonRecord | null>(resolve => {
+      const timer = setTimeout(() => { this.preflightWaiters.delete(requestId); resolve(null); }, 1500);
+      this.preflightWaiters.set(requestId, reply => { clearTimeout(timer); resolve(reply); });
+      try {
+        activeSocket!.send(JSON.stringify({ type: 'workspace.preflight', request_id: requestId, workspace }));
+      } catch {
+        clearTimeout(timer);
+        this.preflightWaiters.delete(requestId);
+        resolve(null);
+      }
+    });
+    if (!result) return json({ checked: false });
+    return json({
+      checked: true,
+      ok: result.ok === true,
+      ...(typeof result.reason === 'string' ? { reason: result.reason } : {}),
+      ...(typeof result.detail === 'string' ? { detail: result.detail } : {}),
+    });
+  }
+
   private sessionDetail(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
     return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
+  }
+
+  private sessionEvents(request: Request, id: string): Response {
+    const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
+    if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
+    const events: JsonRecord[] = [];
+    const attention = this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?', row.id);
+    const diagnostic = attention ? this.hostStartDiagnostic(row, attention.reason) : null;
+    if (attention) {
+      events.push({
+        kind: 'attention',
+        reason: attention.reason,
+        operation_id: attention.operation_id,
+        observed_at: new Date(attention.observed_at).toISOString(),
+        ...(diagnostic ?? {}),
+      });
+    }
+    const outbox = this.db.all<OutboxRow>("SELECT * FROM machine_outbox WHERE operation_id=? ORDER BY created_at ASC, id ASC LIMIT 20", row.operation_id);
+    for (const item of outbox) {
+      const payload = this.parse(item.payload_json) as JsonRecord | null;
+      if (payload?.session_id !== row.id) continue;
+      events.push({
+        kind: item.kind,
+        state: item.state,
+        operation_id: item.operation_id,
+        created_at: new Date(item.created_at).toISOString(),
+        ...(typeof payload?.reason === 'string' ? { reason: payload.reason } : {}),
+        ...(typeof payload?.failure_reason === 'string' ? { failure_reason: payload.failure_reason } : {}),
+        ...(typeof payload?.detail === 'string' ? { detail: payload.detail } : {}),
+      });
+    }
+    return json({ session_id: row.id, state: row.state, events });
   }
 
   private sessionView(row: SessionRow): JsonRecord {

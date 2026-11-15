@@ -93,6 +93,26 @@ class Advertisement:
                     origins.setdefault(token, {}).setdefault(origin, set()).add(resolved)
             if overflow:
                 break
+        if not overflow:
+            for path_str in self.workspaces.values():
+                try:
+                    resolved = self.allowed_path(path_str)
+                    marker = resolved / '.git'
+                    marker_mode = marker.lstat().st_mode
+                    if not (stat.S_ISDIR(marker_mode) or stat.S_ISREG(marker_mode)):
+                        continue
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if resolved in checkout_paths:
+                    continue
+                checkout_paths.add(resolved)
+                if len(checkout_paths) > MAX_CHECKOUT_CANDIDATES:
+                    overflow = True
+                    break
+                origin = read_git_origin(resolved, self.roots)
+                if origin:
+                    token = workspace_token_from_origin(origin)
+                    origins.setdefault(token, {}).setdefault(origin, set()).add(resolved)
         clones = {label: next(iter(paths)) for label, paths in candidates.items() if len(paths) == 1}
         return clones, origins, overflow
 

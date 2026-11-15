@@ -305,9 +305,9 @@ class Bridge:
             try:
                 workspace = candidate.resolve(strict=True)
             except OSError:
-                raise ValueError(f"workspace_unavailable path={value}") from None
+                raise ValueError(f"workspace_unavailable path={value} path does not exist; Hub will not create it") from None
             if not workspace.is_dir():
-                raise ValueError(f"workspace_unavailable path={value}")
+                raise ValueError(f"workspace_unavailable path={value} path does not exist; Hub will not create it")
             if not any(workspace.is_relative_to(root) for root in self.roots):
                 raise ValueError(f"workspace_outside_allowlist path={workspace}")
             return workspace
@@ -423,6 +423,7 @@ class Bridge:
                 offer.get('project_id'),
                 session_is_dead=self.is_session_dead,
                 allowed_roots=self.roots,
+                intake_worktree=offer['launch'].get('intake_worktree'),
             )
         launch['workspace'] = str(workspace)
         requested_workspace = offer['launch']['workspace']
@@ -506,7 +507,7 @@ class Bridge:
             # context carries the server-issued expiry; persist it for host-side
             # containment without an additional admission RPC or CLI flag.
             launch['child_config_file']=self.child_context(offer,launch)
-            launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text())['expires_at']*1000)
+            launch['runtime_deadline']=round(json.loads(Path(launch['child_config_file']).read_text(encoding='utf-8'))['expires_at']*1000)
             launch['client']=self.client
             launch['session_id']=session
             launch['operation_id']=operation
@@ -536,7 +537,7 @@ class Bridge:
                     return None
                 logging.getLogger(__name__).exception('Native launch failed session=%s', session)
                 if current and current['native_dispatch_started']==0:
-                    self.settle_undispatched_launch(current)
+                    self.settle_undispatched_launch(current, error)
                     if throttled:
                         raise
                     return None
@@ -646,7 +647,35 @@ class Bridge:
             if changed.rowcount != 1:
                 raise RuntimeError('native_dispatch_fence_conflict')
 
-    def settle_undispatched_launch(self, row):
+    @staticmethod
+    def _undispatched_failure_fields(error):
+        if error is None:
+            return {}
+        text = str(error)
+        token = text.split()[0] if text.split() else ""
+        reason = (token if isinstance(error, (ValueError, RuntimeError))
+                  and re.fullmatch(r"[a-z][a-z0-9_.:-]{0,79}", token)
+                  else "native_dispatch_not_started")
+        detail = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", f"{type(error).__name__}: {text}").strip()[:300]
+        return {"failure_reason": reason, **({"detail": detail} if detail else {})}
+
+    def preflight_workspace(self, value):
+        if not isinstance(value, str) or not value or len(value) > 1024 or "\0" in value:
+            return {"ok": False, "reason": "invalid_workspace", "detail": "invalid workspace path"}
+        candidate = Path(value)
+        if candidate.is_absolute() or re.match(r"^[A-Za-z]:\\", value):
+            try:
+                workspace = candidate.resolve(strict=True)
+            except OSError:
+                return {"ok": False, "reason": "workspace_unavailable", "detail": "path does not exist; Hub will not create it"}
+            if not workspace.is_dir():
+                return {"ok": False, "reason": "workspace_unavailable", "detail": "path does not exist; Hub will not create it"}
+            if not any(workspace.is_relative_to(root) for root in self.roots):
+                return {"ok": False, "reason": "workspace_outside_allowlist", "detail": "workspace is outside enrolled roots"}
+            return {"ok": True}
+        return {"ok": True}
+
+    def settle_undispatched_launch(self, row, error=None):
         operation, session, epoch = row['operation_id'], row['session_id'], row['epoch']
         with self.journal.db as db:
             changed = db.execute(
@@ -657,7 +686,8 @@ class Bridge:
                 return
             self.journal.enqueue(f"no-dispatch:{operation}:{epoch}", f"/api/sessions/{session}/finish",
                                  {"operation_id": operation, "epoch": epoch, "native_id": None,
-                                  "launch_failed": True, "no_dispatch": True})
+                                  "launch_failed": True, "no_dispatch": True,
+                                  **self._undispatched_failure_fields(error)})
 
     def settle_legacy_unobserved_launch(self, row, inventory):
         if (not isinstance(row['session_id'], str) or not re.fullmatch(r'[A-Za-z0-9-]{1,80}', row['session_id'])
@@ -1631,6 +1661,13 @@ class Bridge:
                                     ready = waiters.get((event.get('session_id'), event.get('epoch')))
                                     if ready:
                                         ready.reject(event)
+                            elif event.get('type') == 'workspace.preflight':
+                                result = self.preflight_workspace(event.get('workspace'))
+                                socket.send(json.dumps({
+                                    'type': 'workspace.preflight.result',
+                                    'request_id': event.get('request_id'),
+                                    **result,
+                                }))
                             elif event.get('type') == 'session.offer':
                                 session = event.get('offer', {}).get('session_id')
                                 with self._inflight_lock:
