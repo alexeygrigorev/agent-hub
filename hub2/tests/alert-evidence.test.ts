@@ -655,12 +655,19 @@ async function defineTests() {
     const late=Object.assign(new Error('synthetic late close'),{code:'EIO'});
     const h=artifactHarness({statError:original,delayed:true,delayOnlySecond:true,closeError:late});
     let rejected:any;
-    const work=h.verify().catch((error:unknown)=>{rejected=error;});
+    const failures:unknown[]=[];
+    const trace:any={stage:'artifacts',failed:(error:unknown)=>failures.push(error)};
+    const work=h.verify(trace).catch((error:unknown)=>{rejected=error;});
     try{
-      await artifactMicrotasks();assert.equal(rejected,original);
+      await artifactMicrotasks();assert.equal(trace.first.error,original);
+      assert.deepEqual(failures,[original],'failure notification is immediate');
+      assert.equal(rejected,undefined,'physical completion must join the held sibling');
       assert.equal(h.opened.length,2);assert.equal(h.stats().active,1);
     }finally{await drainArtifactFake(h);await work;}
-    assert.equal(rejected,original);assert.equal(h.closed.length,2);assert.equal(h.stats().active,0);
+    assert.equal(rejected,original);assert.equal(trace.first.error,original);
+    assert.deepEqual(failures,[original,late],'late close remains observed without replacing the primary error');
+    assert.equal(h.opened.length,2,'no next batch after the failure');
+    assert.equal(h.closed.length,2);assert.equal(h.stats().active,0);
   });
   test('artifact parallel verifier retains all descriptor hash membership and source identity refusals',async()=>{
     for(const metadata of [{mode:0o100666},{nlink:2},{uid:987654},{isFile:()=>false},{size:16*1024*1024+1}]){
