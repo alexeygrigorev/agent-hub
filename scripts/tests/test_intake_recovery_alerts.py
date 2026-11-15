@@ -405,7 +405,11 @@ class PositiveHooksTest(RecoveryAlertTest):
 
     def test_client_source_pin_and_context_refusals(self):
         client = self.selected_client()
-        path = Path(self.dir.name) / 'client.py'
+        storage = REPO / '.local/tmp'
+        storage.mkdir(mode=0o700, parents=True, exist_ok=True)
+        trusted = tempfile.TemporaryDirectory(dir=storage, prefix='trusted-alert-client-')
+        self.addCleanup(trusted.cleanup)
+        path = Path(trusted.name) / 'client.py'
         raw = (REPO/'scripts/hub_alert_client.py').read_bytes()
         path.write_bytes(raw)
         path.chmod(0o600)
@@ -420,6 +424,22 @@ class PositiveHooksTest(RecoveryAlertTest):
                 client.positive_only_context(role, socket_path='/synthetic/socket', parent_id=parent, env=env)
         self.assertEqual(client.positive_only_context('intake_mailer',socket_path='/synthetic/socket',env={}).role,
                          'intake_mailer')
+
+    def test_client_source_pin_refuses_world_writable_ancestor(self):
+        import hashlib
+        storage = REPO / '.local/tmp'
+        storage.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=storage, prefix='untrusted-alert-client-') as owned:
+            untrusted = Path(owned) / 'world-writable'
+            untrusted.mkdir(mode=0o777)
+            untrusted.chmod(0o777)
+            path = untrusted / 'client.py'
+            raw = (REPO/'scripts/hub_alert_client.py').read_bytes()
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'observer_unavailable'):
+                poller.alert_client(path, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(self.helper_calls, [])
 
     def test_closed_broker_contract_retains_unqualified_claim_without_admission(self):
         # Release-tooling CI does not install a Hub2 host package. Load the
