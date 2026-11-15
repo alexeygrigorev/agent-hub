@@ -697,8 +697,18 @@ EXECUTE_CODE = re.compile(
     r"from agent_hub_host\.provisioning import execute; execute\(\)\Z")
 
 
+CODEX_PROFILE = 'hub-shared-codex'
+
+
 def release_execute_command(target, label, managed_dir):
     archive = target / 'hub.pyz'
+    if label == CODEX_PROFILE[4:]:
+        # Byte-for-byte what provisioning.module_command() generates inside this
+        # release; codex_exec_readiness compares the profile to exactly that.
+        code = ('import sys; sys.path.insert(0, ' + repr(str(archive)) + '); sys.path.insert(0, ' + repr(str(archive))
+                + '); import os; os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(str(managed_dir)) + '; '
+                'from agent_hub_host.provisioning import execute; execute()')
+        return [str(target / 'bin/python'), '-c', code, label]
     code = ('import sys; sys.path.insert(0, ' + repr(str(archive)) + '); import os; '
             'os.environ["AGENT_HUB_MANAGED_DIR"] = ' + repr(str(managed_dir)) + '; '
             'from agent_hub_host.provisioning import execute; execute()')
@@ -715,8 +725,10 @@ def repinnable_execute_profile(name, table):
     if len(command) < 4 or command[-1] != name[4:] or command[-3] != '-c':
         return None
     match = EXECUTE_CODE.fullmatch(command[-2])
-    # Only zipapp pins; a checkout/venv source tree is operator-maintained.
-    if not match or '.pyz' not in command[-2]:
+    # Only zipapp pins; a checkout/venv source tree is operator-maintained, except
+    # the maintained shared-codex profile: a stale source-tree pin there makes the
+    # host refuse every codex launch (intake f88ae417), so it follows the release.
+    if not match or ('.pyz' not in command[-2] and name != CODEX_PROFILE):
         return None
     return match.group('managed')
 

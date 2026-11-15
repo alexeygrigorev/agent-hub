@@ -872,14 +872,45 @@ class NativeLauncher:
             if provider == 'codex':
                 # Advertise Codex only when the maintained quota wrapper (and,
                 # for a profile route, the maintained profile name) is usable.
-                try:
-                    codex_launch_wrapper()
-                    available = route.get('profile') in (None, CODEX_WRAPPER_PROFILE)
-                except ValueError:
-                    available = False
+                available = self._codex_advertisable(route)
             if supported and available:
                 result[engine] = set(supported)
         return result
+
+    def _codex_advertisable(self, route):
+        """Codex is advertised only when a launch would actually pass.
+
+        launch() needs the wrapper and, for the local profile path, the
+        release-pinned profile proof. Checking only the wrapper advertised codex
+        on a host whose profile pointed at a stale release, so the picker kept
+        routing there and every launch was refused (intake f88ae417). A failure
+        withdraws codex and logs a loud ERROR once per change of reason."""
+        reason = None
+        try:
+            wrapper = str(codex_launch_wrapper())
+        except ValueError:
+            reason = 'wrapper'
+        else:
+            if route.get('profile') not in (None, CODEX_WRAPPER_PROFILE):
+                reason = 'profile_name'
+            elif (not self.config.get('private_provider_homes', False)
+                  and route.get('profile') == CODEX_WRAPPER_PROFILE):
+                now = time.monotonic()
+                cached = getattr(self, '_codex_ready_cache', None)
+                if cached is None or now - cached[0] > 30 or cached[1] != wrapper:
+                    cached = (now, wrapper, bool(self.codex_exec_readiness(route, wrapper)))
+                    self._codex_ready_cache = cached
+                if not cached[2]:
+                    reason = 'profile_release_mismatch'
+        if getattr(self, '_codex_withdrawn_reason', None) != reason:
+            self._codex_withdrawn_reason = reason
+            if reason:
+                print('ALERT hub2-host: codex_launch_wrapper_unavailable (%s): codex withdrawn from this host\'s '
+                      'advertised engines until fixed; picks must fall back to another engine' % reason,
+                      file=sys.stderr, flush=True)
+            else:
+                print('RECOVERED hub2-host: codex advertised again', file=sys.stderr, flush=True)
+        return reason is None
 
     def _verified_release(self, release=None):
         """The exact installed release archive; no profile, credential or network probe.
