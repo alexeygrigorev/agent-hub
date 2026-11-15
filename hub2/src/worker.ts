@@ -10,6 +10,9 @@ import { ARTIFACT_BODY_LIMIT, ARTIFACT_MAX_BYTES, PREREQUISITE_HEADER } from './
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
+const HOST_INSTALLER_ALIASES = new Map<string, string>([
+  ['/host/install.ps1', '/cli/host-install.ps1'], ['/host/install.sh', '/cli/host-install.sh'],
+]);
 let devActorRegistration: Promise<boolean> | undefined;
 
 export default {
@@ -27,6 +30,16 @@ const router = {
       const cliAsset = /^\/cli\/(?:manifest\.json|host-release\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1)|hub2-(?:self-update|enroll)\.py|hub_alert_client\.py|agent-hub2-host\.service|agent-hub2-host-update\.(?:service|timer)|agent_hub_host_v2-2\.0\.0\+g[0-9a-f]{40}-py3-none-any\.whl|websockets-16\.0-py3-none-any\.whl)$/.test(path);
       if (env.ASSETS && ['GET', 'HEAD'].includes(request.method) && (path === '/' || cliAsset))
         return secureStatic(await env.ASSETS.fetch(request));
+      // Legacy hosts self-update through `irm .../host/install.ps1 | iex` (and
+      // install.sh); serve the published Hub2 host installers there so they
+      // migrate instead of failing on a dead route (intake 41ef7048).
+      const hostInstaller = HOST_INSTALLER_ALIASES.get(path);
+      if (env.ASSETS && hostInstaller && ['GET', 'HEAD'].includes(request.method)) {
+        const target = new URL(request.url);
+        target.pathname = hostInstaller;
+        target.search = '';
+        return secureStatic(await env.ASSETS.fetch(new Request(target.toString(), { method: request.method })));
+      }
       const authResponse = await publicAuthentication(request, env);
       if (authResponse) return authResponse;
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));

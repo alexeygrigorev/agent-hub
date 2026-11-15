@@ -1253,6 +1253,12 @@ class Bridge:
                     frame['native_id'] = launches[0]['native_id']
             if stage == 'host_launch' and target.get("epoch") is not None:
                 frame["epoch"] = target.get("epoch")
+            # Systems fail loudly (t1801u, intake 41ef7048): every refusal names
+            # its session, stage and typed reason in serve.log, not only on the wire.
+            logging.getLogger(__name__).error(
+                '%s session=%s operation=%s stage=%s reason=%s detail=%s',
+                'LAUNCH REFUSED' if frame['stage'] == 'host_launch' else 'HOST EVENT FAILED',
+                target.get('session_id'), target.get('operation_id'), frame['stage'], reason, detail)
             socket.send(canonical(frame))
 
     def run_engine_update(self, job):

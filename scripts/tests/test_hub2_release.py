@@ -1459,7 +1459,8 @@ class AlertClientPackagingTests(unittest.TestCase):
         names = ['hub2/host/pyproject.toml', 'host/agent_hub_host/__init__.py',
                  'config/model-routing.json', 'scripts/build-hub-cli.py',
                  'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py',
-                 'scripts/hub2-enroll.py', 'scripts/hub_alert_client.py', 'deploy/host-install.sh', 'uv.lock',
+                 'scripts/hub2-enroll.py', 'scripts/hub_alert_client.py', 'deploy/host-install.sh',
+                 'deploy/' + builder.WINDOWS_HOST_INSTALLER, 'uv.lock',
                  *(f'deploy/{name}' for name in builder.UNITS),
                  *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]
         for name in names:
@@ -1508,6 +1509,7 @@ def build(out, version):
 """
             files['scripts/build-hub-cli.py'] = cli_source.encode()
             for name in ['scripts/hub2-self-update.py', 'scripts/hub2-enroll.py', 'deploy/host-install.sh',
+                         'deploy/' + builder.WINDOWS_HOST_INSTALLER,
                          *(f'deploy/{name}' for name in builder.UNITS),
                          *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]:
                 files[name] = b'synthetic artifact, never executed\n'
@@ -1530,6 +1532,10 @@ def build(out, version):
         self.assertEqual((output / 'hub_alert_client.py').read_bytes(), self.client)
         self.assertEqual(manifest['artifacts']['hub_alert_client.py'],
                          {'sha256': hashlib.sha256(self.client).hexdigest(), 'size': len(self.client)})
+        # The Windows host installer ships in every new release (intake 41ef7048).
+        installer = (output / builder.WINDOWS_HOST_INSTALLER).read_bytes()
+        self.assertEqual(manifest['artifacts'][builder.WINDOWS_HOST_INSTALLER],
+                         {'sha256': hashlib.sha256(installer).hexdigest(), 'size': len(installer)})
         digest = hashlib.sha256((output / 'host-release.json').read_bytes()).hexdigest()
         self.assertEqual(builder.verify_bundle(output, SHA, digest), manifest)
 

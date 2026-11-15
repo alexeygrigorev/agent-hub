@@ -32,8 +32,42 @@ the runtime's central credential provisioning path. Its `--local-profiles` flag
 is reserved for hosts already configured with native logins. Enrollment must
 advertise only engines the machine can actually launch; operators should set
 the supported engine list in that private configuration before starting
-production work. The helper is portable; Windows service/update automation
-requires its separate platform adapter and live verification.
+production work. The helper is portable; Windows uses the installer below.
+
+## Windows host (intake 41ef7048)
+
+`irm https://hub.dtcdev.click/cli/host-install.ps1 | iex` installs or updates a
+Windows host. Each release ships `host-install.ps1` with its sha256 in
+`host-release.json`. The legacy `/host/install.ps1` and `/host/install.sh` self-update
+routes now serve these installers, so an old Windows host that still runs
+`package_update` migrates instead of failing on a dead route. The installer:
+
+- verifies the published wheel against the manifest and installs it into
+  `%LOCALAPPDATA%\agent-hub2\venv` (`hub2 version` prints `host_version`);
+- registers the per-user logon task `AgentHub2Host`, which runs
+  `run-host.ps1`: `hub2 serve --log-file %LOCALAPPDATA%\agent-hub2\serve.log`
+  restarts after 30 s on exit and sends an HTTP heartbeat in between;
+- registers the daily `AgentHub2HostUpdate` task (`hub2 self-update`). On
+  Windows that downloads the verified installer and runs it detached in update
+  mode, so it can stop and restart `AgentHub2Host`;
+- retires the legacy supervisor: it writes `replace-pending` and the permanent
+  `retired-by-hub2` marker in `%LOCALAPPDATA%\Programs\agent-hub\controller`,
+  disables (never deletes) `AgentHubController-*`/`AgentHubSessionHost*`, and stops
+  only the supervisor processes and `hub-controller-*` aplexer shell sessions.
+  Codex/Claude workers are never touched.
+
+`HUB2_CREDENTIAL_MODE=local` (or `hub2 credential-mode local`) makes the host use
+its own provider logins and advertise `credentials:local:*`. `central` uses
+Hub-delivered provider homes, which require the operator to add the machine to
+that account's approved hosts. Otherwise the account refuses with
+`host_not_approved`, Hub tries another allowed route, and serve.log records
+`LAUNCH REFUSED session=... reason=host_not_approved`.
+
+A running host that has been disconnected for more than 15 minutes raises
+`HOST_DISCONNECTED alert=dev@dtcdev.click`. The evidence is HTTP heartbeats
+without a socket, or live sessions. `hub routing-machines` shows the
+`host_alert`, and `scripts/hub-intake-recovery-alerts.py` mails it to the
+developer once per disconnect episode.
 
 The host user unit runs `~/.local/share/agent-hub2/current/bin/hub2 serve`.
 Its update timer checks every five minutes. Automatic activation is batched at

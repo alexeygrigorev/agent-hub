@@ -12,7 +12,7 @@ const env = {
   CONTROL: { idFromName: () => 'global', get: () => ({ fetch: async () => Response.json({ error: 'unauthorized' }, { status: 401 }) }) },
 };
 const names = ['host-release.json', 'hub.pyz', 'hub.pyz.sha256', 'manifest.json',
-  'install.sh', 'install.ps1', 'host-install.sh', 'hub2-self-update.py', 'hub2-enroll.py', 'hub_alert_client.py',
+  'install.sh', 'install.ps1', 'host-install.sh', 'host-install.ps1', 'hub2-self-update.py', 'hub2-enroll.py', 'hub_alert_client.py',
   'agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer',
   `agent_hub_host_v2-2.0.0+g${'a'.repeat(40)}-py3-none-any.whl`, 'websockets-16.0-py3-none-any.whl'];
 for (const name of names) {
@@ -25,6 +25,25 @@ for (const name of names) {
       { ...env, HUB2_RELEASE_MODE: 'bootstrap' });
     assert.equal(bootstrap.status, 200, `bootstrap ${method} ${name}`);
     assert.equal(assets, before + 2);
+  }
+}
+// Legacy hosts' dead self-update route now serves the published Hub2 installers (intake 41ef7048).
+{
+  const seen = [];
+  const aliasEnv = { ...env, ASSETS: { fetch: async (request) => { seen.push(new URL(request.url).pathname); return new Response('installer'); } } };
+  for (const [alias, target] of [['/host/install.ps1', '/cli/host-install.ps1'], ['/host/install.sh', '/cli/host-install.sh']]) {
+    for (const method of ['GET', 'HEAD']) {
+      const response = await worker.fetch(new Request('https://hub.example' + alias + '?x=1', { method }), aliasEnv);
+      assert.equal(response.status, 200, method + ' ' + alias);
+      assert.equal(response.headers.get('X-Content-Type-Options'), 'nosniff');
+      assert.equal(seen.at(-1), target);
+    }
+    assert.notEqual((await worker.fetch(new Request('https://hub.example' + alias, { method: 'POST' }), aliasEnv)).status, 200);
+  }
+  for (const path of ['/host/__proto__', '/host/constructor', '/host/install.ps1.bak', '/host/']) {
+    const before = seen.length;
+    assert.notEqual((await worker.fetch(new Request('https://hub.example' + path), aliasEnv)).status, 200, path);
+    assert.equal(seen.length, before, path);
   }
 }
 for (const path of ['/cli/hub_alert_client.py.bak', '/cli/hub_alert_client_private.py', '/cli/hub_alert_client.py/extra', '/cli/private.env', '/cli/%2e%2e/private.env', '/cli/other-1.0.whl', '/cli/agent_hub_host_v2-malformed.whl', '/api/sessions']) {
