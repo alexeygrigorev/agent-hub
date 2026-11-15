@@ -1810,3 +1810,12 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             good = self.write_wrapper(f'{name}.sh', text=body)
             with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(good)}):
                 self.assertEqual(nl.codex_launch_wrapper(), good.resolve(), name)
+
+
+class NoneOutputTest(unittest.TestCase):
+    def test_native_treats_none_stdout_and_stderr_as_empty(self):
+        result = subprocess.CompletedProcess(['a'], 0, stdout=None, stderr=None)
+        launcher = nl.NativeLauncher({}, runner=lambda *a, **k: result)
+        out = launcher.native('status', 'x', '--json')
+        self.assertEqual((out.stdout, out.stderr), ("", ""))
+        self.assertIsNone(launcher.status('x'))

@@ -1337,7 +1337,10 @@ class Bridge:
             else:
                 try:
                     native_id,status=self.resolve_launch_native(row)
-                except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
+                except Exception:
+                    # Never let one launch's resolution failure kill the host loop.
+                    logging.getLogger(__name__).exception(
+                        "resolve_launch_native failed session_id=%s; marking launch observation failed", row['session_id'])
                     self._report_native_observation(row)
                     continue
                 phase=str((status or {}).get('phase',(status or {}).get('state',
