@@ -1899,7 +1899,12 @@ export class MachineDO {
         if(await this.recordReaped(session,reason,live.observed_at)){reaped++;actions.push({session_id:session.id,action:'marked_stopped',reason});}
         continue;
       }
-      if(reason==='dead'&&session.native_id&&this.hasUnconfirmedStop(session)){
+      // A fresh, exact missing-process observation after the startup grace is
+      // already failure evidence. Do not depend on a stop ACK to surface it;
+      // failing unconfirmed never asserts that containment has been emptied.
+      const missingAfterGrace=live.native_id===session.native_id&&['missing','dead'].includes(live.phase)
+        &&live.observed_at-session.created_at>=CLAIMED_WITHOUT_NATIVE_GRACE_MS;
+      if(reason==='dead'&&session.native_id&&(this.hasUnconfirmedStop(session)||missingAfterGrace)){
         if(await this.recordNativeProcessAbsent(session,live.observed_at)){
           reaped++;actions.push({session_id:session.id,action:'marked_failed',reason:'native_process_absent'});
         }

@@ -115,10 +115,14 @@ class NonblockingLaunchTests(unittest.TestCase):
                     self.assertIn('hub.managed=true', argv)
                     self.assertIn('hub.session=s', argv)
                     child = argv[argv.index('--') + 1:]
-                    self.assertEqual(child[:3], ['a', 'task', 'run'])
-                    self.assertIn(route.get('profile', route.get('engine')), child)
+                    self.assertEqual(child[1:3], ['task', 'run'])
+                    self.assertEqual(Path(child[0]).stem.lower(), 'a')
+                    effective_route = launcher.config['routes'][engine]
+                    self.assertIn(effective_route.get('profile', effective_route.get('engine')), child)
                     self.assertIn('--engine-arg=--model', child)
-                    self.assertEqual(Path(child[child.index('--prompt-file') + 1]).read_text().splitlines()[0], 'Work')
+                    prompt_text = Path(child[child.index('--prompt-file') + 1]).read_text(encoding='utf-8')
+                    self.assertTrue(prompt_text.startswith('Work'))
+                    self.assertIn('First action (required before any other work)', prompt_text)
                     launcher.wait_first_action.assert_not_called()
 
     @unittest.skipUnless(__import__('os').name == 'posix', 'POSIX shell command contract')
