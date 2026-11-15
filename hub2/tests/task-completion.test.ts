@@ -1275,3 +1275,55 @@ test('continuations and verifiers unwrap cleaned-up intake worktrees to their pa
     assert.equal(JSON.parse(verifier.launch_spec_json).workspace,checkout);
   }finally{f.close();}
 });
+
+test('hub intake close succeeds on an already-accepted verified intake while unverified intakes still fail closed',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'close-accepted',true);
+    await start(f,id,'first');
+    const first=await run(f,id);
+    await addMergeProof(f,id);
+    await claim(f,id,first.session_id);
+    await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id);
+    await verify(f,id,verifier.session_id,'pass');
+    await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'accepted');
+
+    const shown=await json(await f.call('/api/intakes/'+id));
+    const closed=await f.call('/api/intakes/'+id,'POST',{
+      key:'close-accepted-1',
+      expected_version:shown.task.control.version,
+      status:'done',
+    });
+    assert.equal(closed.status,200);
+    assert.equal((await json(closed)).intake.status,'accepted');
+
+    // Unverified controlled intakes still fail closed with 409 acceptance_verification_required.
+    const unverified=await createIntake(f,'close-unverified',true);
+    await start(f,unverified,'first');
+    const uRun=await run(f,unverified);
+    await addMergeProof(f,unverified);
+    await finish(f,uRun,1);
+    assert.equal(intakeRow(f,unverified).status,'failed');
+    const uShown=await json(await f.call('/api/intakes/'+unverified));
+    const badClose=await f.call('/api/intakes/'+unverified,'POST',{
+      key:'close-unverified-1',
+      expected_version:uShown.task.control.version,
+      status:'done',
+    });
+    assert.equal(badClose.status,409);
+    assert.equal((await json(badClose)).error,'acceptance_verification_required');
+
+    // Non-controlled failed intakes still fail closed with 409 review_required.
+    f.db().run("UPDATE intakes SET final_evidence_json='{}' WHERE id=?",unverified);
+    const badLegacyClose=await f.call('/api/intakes/'+unverified,'POST',{
+      key:'close-unverified-2',
+      expected_version:uShown.task.control.version,
+      status:'done',
+    });
+    assert.equal(badLegacyClose.status,409);
+    assert.equal((await json(badLegacyClose)).error,'review_required');
+  }finally{f.close();}
+});

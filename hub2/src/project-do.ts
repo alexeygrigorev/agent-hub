@@ -560,7 +560,7 @@ export class ProjectDO {
       }
       const changesCore=body.title!==undefined||body.text!==undefined||body.acceptance_criteria!==undefined||body.status!==undefined;
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
-      if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
+      if(body.status==='accepted'&&(!['completed-awaiting-review','accepted'].includes(row.status)||!hasScope(actor,'operator:admin')))return error('review_required',409);
       if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
       const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
       this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
