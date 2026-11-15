@@ -166,6 +166,33 @@ class OfferAcknowledgement:
         return self.binding_verified
 
 
+
+def native_control_error(error):
+    """Closed metadata only; never stringify exception messages or attributes."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return 'timeout'
+    if isinstance(error, json.JSONDecodeError):
+        return 'invalid_response'
+    if type(error) is RuntimeError and len(error.args) == 1 and type(error.args[0]) is str:
+        return {'native_command_failed':'native_nonzero', 'invalid_native_status':'invalid_response',
+                'native_identity_mismatch':'identity_mismatch', 'capture_fence_conflict':'identity_mismatch',
+                'capture_identity_unavailable':'unavailable', 'task_output_unavailable':'unavailable'}.get(error.args[0], 'unknown')
+    if isinstance(error, OSError):
+        return 'os_error'
+    return 'unknown'
+
+
+def native_control_step(diagnostic, stage, operation, *args, **kwargs):
+    if diagnostic is not None:
+        diagnostic.update(native_control_stage=stage, native_control_error='unknown')
+    try:
+        return operation(*args, **kwargs)
+    except Exception as error:
+        if diagnostic is not None:
+            diagnostic['native_control_error'] = native_control_error(error)
+        raise
+
+
 class Bridge:
     def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None,alert_observer=None):
         self.client, self.journal, self.runner = client, journal, runner
@@ -893,7 +920,7 @@ class Bridge:
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
-    def bound_capture(self, command, row):
+    def bound_capture(self, command, row, *, diagnostic=None):
         """Read only this exact attempt; a finished task never falls back to a pane."""
         from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
         binding = command.get('capture_binding')
@@ -911,27 +938,35 @@ class Bridge:
             try:
                 # Use private retained-file guards even if completion races the
                 # journal snapshot taken above.
-                output = capture_task_output('hub2-'+row['session_id'],row,row['native_id'],limit=CAPTURE_OUTPUT_BYTES,retained_only=True)
+                output = native_control_step(diagnostic,'capture_retained',capture_task_output,
+                    'hub2-'+row['session_id'],row,row['native_id'],limit=CAPTURE_OUTPUT_BYTES,retained_only=True)
             except RuntimeError as exc:
                 if not terminal and str(exc)=='task_output_unavailable':
                     output = None
                 else:
                     raise
             if output is None:
+                if diagnostic is not None:
+                    diagnostic.update(native_control_stage='capture_qualification',native_control_error='unqualified')
                 # Running legacy/central launches retain their existing native
                 # capture path. Completion never reaches this branch.
                 if not self._workspace_is_available(row['workspace']):
                     raise RuntimeError('task_output_unavailable')
-                native_id,status = self.resolve_launch_native(row)
+                native_id,status = native_control_step(diagnostic,'capture_status',self.resolve_launch_native,row)
+                if diagnostic is not None:
+                    diagnostic.update(native_control_stage='capture_qualification',native_control_error='unqualified')
                 current=self.journal.db.execute('SELECT state,epoch,native_id,operation_id FROM launches WHERE session_id=?',(row['session_id'],)).fetchone()
                 if (not native_id or not status or status.get('phase',status.get('state'))!='running'
                         or not current or current['state']!='running' or current['epoch']!=row['epoch']
                         or current['native_id']!=row['native_id'] or current['operation_id']!=row['operation_id']):
                     raise RuntimeError('task_output_unavailable')
-                output = capture_tail(self.native('capture',native_id,'--screen','--plain').stdout)
+                output = capture_tail(native_control_step(diagnostic,'capture_rpc',self.native,
+                    'capture',native_id,'--screen','--plain').stdout)
                 metadata['capture_source'] = 'native_pane'
             return {**metadata,'output':bounded_capture(output,metadata)}
         except (OSError,ValueError,RuntimeError) as exc:
+            if diagnostic is not None:
+                diagnostic['native_control_error'] = native_control_error(exc)
             reason = str(exc) if isinstance(exc,RuntimeError) and re.fullmatch('[a-z_]{1,80}',str(exc)) else 'task_output_unavailable'
             return {**metadata,'error':reason,'reason':reason}
 
@@ -1007,14 +1042,20 @@ class Bridge:
             # change the command digest on replay or introduce a native effect.
             with db:
                 self.begin_command(identity,digest)
+            diagnostic = {'native_control_stage':'capture_binding','native_control_error':'unknown'}
             try:
-                result = self.bound_capture(command,row) if command.get('capture_binding') is not None else self.legacy_capture(command,row)
-            except Exception:
+                result = (self.bound_capture(command,row,diagnostic=diagnostic) if command.get('capture_binding') is not None
+                          else self.legacy_capture(command,row,diagnostic=diagnostic))
+            except Exception as error:
+                diagnostic['native_control_error'] = native_control_error(error)
                 result = self.capture_failure(command,'capture_failed')
                 logging.getLogger(__name__).warning('Capture failed command_id=%s',identity)
+            if result.get('error') is not None:
+                result = {**result, **diagnostic}
             with db:
                 self.finish_command(identity,command,result)
             return result
+        diagnostic = {'native_control_stage':'stop_status','native_control_error':'unknown'}
         deadline = command.get('deadline_ms')
         bounded_stop = kind == 'stop' and type(deadline) is int
         until = time.monotonic() + min(5, max(0, (deadline - time.time() * 1000) / 1000)) if bounded_stop else None
@@ -1026,23 +1067,25 @@ class Bridge:
             return left
 
         def unconfirmed_stop():
-            return {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+            return {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop', **diagnostic}
 
         try:
-            native_id, _status = (self.resolve_launch_native(row, timeout=remaining_stop())
-                                  if bounded_stop else self.resolve_launch_native(row))
+            native_id, _status = (native_control_step(diagnostic,'stop_status',self.resolve_launch_native,row,timeout=remaining_stop())
+                                  if bounded_stop else native_control_step(diagnostic,'stop_status',self.resolve_launch_native,row))
             if bounded_stop:
                 remaining_stop()
         except subprocess.TimeoutExpired:
             if not bounded_stop:
                 raise
+            diagnostic['native_control_error'] = 'timeout'
             result = unconfirmed_stop()
             with db:
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
             return result
         if not native_id and kind == 'stop' and row['state'] in {'launching', 'aborting', 'deadline_stopping'}:
-            result = {'stopped': False, 'error': 'stop_unconfirmed', 'reason': 'stop_unconfirmed', 'stage': 'host_stop'}
+            diagnostic['native_control_error'] = 'unavailable'
+            result = unconfirmed_stop()
             with db:
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
@@ -1054,6 +1097,7 @@ class Bridge:
         with db:
             self.begin_command(identity, digest)
         if kind == "stop":
+            diagnostic.update(native_control_stage='stop_kill',native_control_error='unknown')
             try:
                 # The native may already be gone (it exited on its own, so the
                 # registry holds only its aplexer tombstone and `kill` refuses):
@@ -1061,9 +1105,9 @@ class Bridge:
                 # never reported as an unconfirmed stop or a command failure.
                 try:
                     if bounded_stop:
-                        self.native("kill", native_id, timeout=remaining_stop())
+                        native_control_step(diagnostic,'stop_kill',self.native,"kill",native_id,timeout=remaining_stop())
                     else:
-                        self.native("kill", native_id)
+                        native_control_step(diagnostic,'stop_kill',self.native,"kill",native_id)
                 except RuntimeError as exc:
                     if str(exc) != 'native_command_failed':
                         raise
@@ -1071,8 +1115,9 @@ class Bridge:
                     remaining_stop()
                 birth = (_status or {}).get('created_at_ms')
                 while True:
-                    status = (self.lookup(native_id, row, timeout=remaining_stop())
-                              if bounded_stop else self.lookup(native_id, row))
+                    diagnostic.update(native_control_stage='stop_verify',native_control_error='unknown')
+                    status = (native_control_step(diagnostic,'stop_verify',self.lookup,native_id,row,timeout=remaining_stop())
+                              if bounded_stop else native_control_step(diagnostic,'stop_verify',self.lookup,native_id,row))
                     if bounded_stop:
                         remaining_stop()
                     if (status and status.get("phase", status.get("state")) == "exited"
@@ -1087,11 +1132,13 @@ class Bridge:
                             remaining_stop()
                         result = {'stopped': True, 'evidence': 'native_exit', 'native_id': native_id}
                         break
+                    diagnostic.update(native_control_stage='stop_qualification',native_control_error='unqualified')
                     if not bounded_stop:
                         result = unconfirmed_stop()
                         break
                     time.sleep(min(.1, remaining_stop()))
             except subprocess.TimeoutExpired:
+                diagnostic['native_control_error'] = 'timeout'
                 result = unconfirmed_stop()
         else:
             text = command.get("text")
@@ -1175,15 +1222,15 @@ class Bridge:
             self.finish_command(identity, command, result)
         return result
 
-    def legacy_capture(self, command, row):
+    def legacy_capture(self, command, row, *, diagnostic=None):
         from .task_output import capture_task_output, bounded_capture, capture_tail, CAPTURE_OUTPUT_BYTES
-        native_id, _status = self.resolve_launch_native(row)
+        native_id, _status = native_control_step(diagnostic,'capture_status',self.resolve_launch_native,row)
         if not native_id:
             raise RuntimeError('capture_identity_unavailable')
         output = (None if command.get('mode') == 'screen' else
-                  capture_task_output('hub2-' + row['session_id'], row, native_id, limit=CAPTURE_OUTPUT_BYTES))
+                  native_control_step(diagnostic,'capture_retained',capture_task_output,'hub2-' + row['session_id'],row,native_id,limit=CAPTURE_OUTPUT_BYTES))
         if output is None:
-            output = capture_tail(self.native('capture', native_id, '--screen', '--plain').stdout)
+            output = capture_tail(native_control_step(diagnostic,'capture_rpc',self.native,'capture',native_id,'--screen','--plain').stdout)
         return {'output': bounded_capture(output)}
 
     @staticmethod

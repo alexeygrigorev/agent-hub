@@ -1474,6 +1474,18 @@ export class MachineDO {
     return command ? json({ command: this.commandView(command) }, 201) : error('command_persist_failed', 503);
   }
 
+  private nativeControlDiagnostic(result: JsonRecord, kind: string): JsonRecord {
+    if (result.native_control_stage === undefined && result.native_control_error === undefined) return {};
+    const stages = kind === 'capture'
+      ? ['capture_binding','capture_status','capture_retained','capture_rpc','capture_qualification']
+      : kind === 'stop' ? ['stop_status','stop_kill','stop_verify','stop_qualification'] : [];
+    const errors = ['timeout','native_nonzero','invalid_response','identity_mismatch','unavailable','os_error','unqualified','unknown'];
+    const valid = typeof result.native_control_stage === 'string' && stages.includes(result.native_control_stage)
+      && typeof result.native_control_error === 'string' && errors.includes(result.native_control_error);
+    return {native_control_stage:valid ? result.native_control_stage : 'unknown',
+      native_control_error:valid ? result.native_control_error : 'unknown'};
+  }
+
   private async ackCommand(request: Request, sessionId: string, commandId: string): Promise<Response> {
     const actor = actorFrom(request), machineId = this.machineActor(actor, 'session:report');
     if (!machineId) return error('forbidden', 403);
@@ -1491,7 +1503,9 @@ export class MachineDO {
     const session = row.kind === 'stop'
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
       : null;
-    let result=body.result as JsonRecord;
+    let result={...body.result as JsonRecord};
+    const diagnostic=this.nativeControlDiagnostic(result,row.kind);
+    delete result.native_control_stage; delete result.native_control_error;
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
     if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
       ||result.output!==undefined))return error('invalid_command_ack',400);
@@ -1525,6 +1539,9 @@ export class MachineDO {
         ||failedPrelaunch&&result.evidence!=='dispatch_fenced') {
         result = {stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'};
       }
+    }
+    if (row.kind==='capture'&&result.error!==undefined || row.kind==='stop'&&result.stopped===false) {
+      result={...result,...diagnostic};
     }
     const resultJson = JSON.stringify(result);
     if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);

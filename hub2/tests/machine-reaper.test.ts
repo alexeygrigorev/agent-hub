@@ -1372,3 +1372,71 @@ test('failed prelaunch stop does not authorize send capture foreign owner or fai
  f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('native-existing','failed-not-running');f.clearCache();
  assert.equal((await f.call(base,'POST',{kind:'stop',key:'native-stop'},failedStopActor)).status,409);
 });
+
+
+test('native control diagnostics retain closed failures without qualifying stop or changing old ACKs',async()=>{
+ for(const kind of ['stop','capture']){
+  const f=fixture(),session='native-diagnostic-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'diagnostic-'+kind},actor);
+   assert.equal(response.status,201);const command=(await response.json() as any).command;
+   const diagnostic={native_control_stage:kind==='stop'?'stop_verify':'capture_retained',native_control_error:'timeout'};
+   const result=kind==='stop'?{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...diagnostic}
+     :{error:'task_output_unavailable',reason:'task_output_unavailable',...diagnostic};
+   const ack=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(ack.status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'failed');const stored=JSON.parse(row.result_json);
+   assert.equal(stored.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(stored.native_control_error,'timeout');
+   const listing=await (await f.call(`/api/sessions/${session}/commands`,'GET',undefined,actor)).json() as any;
+   const listed=listing.commands.find((item:any)=>item.id===command.id);
+   assert.equal(listed.ack.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(listed.ack.native_control_error,'timeout');
+   if(kind==='stop')assert.equal(listed.ack.confirmed_exit,false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+   const duplicate=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(duplicate.status,200);
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics strip arbitrary fields and preserve old missing metadata',async()=>{
+ for(const extra of [{},{native_control_stage:'PRIVATE_PATH',native_control_error:'PRIVATE_TOKEN'},
+                     {native_control_stage:'stop_verify',native_control_error:true}]){
+  const f=fixture(),session='native-private-diagnostic',native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind:'stop',key:'private-diagnostic'},actor);
+   const command=(await response.json() as any).command;
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...extra}})).status,200);
+   const stored=JSON.parse((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(command.id) as any).result_json);
+   assert.equal(JSON.stringify(stored).includes('PRIVATE'),false);
+   if(Object.keys(extra).length){assert.equal(stored.native_control_stage,'unknown');assert.equal(stored.native_control_error,'unknown');}
+   else assert.deepEqual(stored,{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'});
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics never alter successful qualified control wire',async()=>{
+ for(const kind of ['capture','stop']){
+  const f=fixture(),session='native-healthy-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'healthy-'+kind},actor);
+   const command=(await response.json() as any).command;
+   const result=kind==='stop'?{stopped:true,evidence:'native_exit',native_id:native}:{output:'synthetic returned output'};
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{...result,native_control_stage:kind==='stop'?'stop_verify':'capture_rpc',native_control_error:'timeout'}})).status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'acked');const stored=JSON.parse(row.result_json);
+   assert.equal('native_control_stage' in stored,false);assert.equal('native_control_error' in stored,false);
+   for(const [key,value] of Object.entries(result))assert.deepEqual(stored[key],value);
+  }finally{f.database.close();}
+ }
+});

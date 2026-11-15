@@ -1158,7 +1158,8 @@ class HostTests(unittest.TestCase):
                 self.insert_orphan_launch(session, operation, 7, state)
                 result = self.bridge.command({"id": command_id, "session_id": session, "epoch": 7, "kind": "stop"})
                 self.assertEqual(result, {"stopped": False, "error": "stop_unconfirmed",
-                                          "reason": "stop_unconfirmed", "stage": "host_stop"})
+                                          "reason": "stop_unconfirmed", "stage": "host_stop",
+                                          "native_control_stage":"stop_status", "native_control_error":"unavailable"})
                 self.assertFalse(any(args[1] == "kill" for args, _ in self.native.calls))
                 self.journal.flush(self.client)
                 self.assertIn(("POST", f"/api/sessions/{session}/commands/{command_id}/ack?safety=operator_stop",
@@ -1813,7 +1814,8 @@ class RetainedManagedCaptureTests(unittest.TestCase):
             return original(*args,**kwargs)
         self.bridge.native=failing_capture
         result=self.bridge.command(command)
-        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed'})
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'unknown'})
         calls=list(self.native.calls)
         self.assertEqual(self.bridge.command(command),result)
         self.assertEqual(self.native.calls,calls);self.assertEqual(len(captures),1)
@@ -2200,3 +2202,110 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertEqual(len(attempts),1)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
         self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+
+
+class NativeControlDiagnosticsTests(unittest.TestCase):
+    setUp=HostTests.setUp
+    tearDown=HostTests.tearDown
+
+    def command(self,kind='capture'):
+        offer=HostTests.offer(self)
+        self.bridge.offer(offer)
+        return {'id':'diagnostic-'+kind,'session_id':offer['session_id'],'epoch':offer['epoch'],
+                'kind':kind, **({'mode':'screen'} if kind=='capture' else {})}
+
+    def test_native_control_diagnostic_capture_rpc_error_is_closed_and_replayed(self):
+        command=self.command();original=self.bridge.native;calls=[]
+        def native(*args,**kwargs):
+            if args[0]=='capture':
+                calls.append(args);raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'native_nonzero'})
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(len(calls),1)
+
+    def test_native_control_diagnostic_capture_status_timeout(self):
+        command=self.command()
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE_ARGV',30)):
+            result=self.bridge.command(command)
+        self.assertEqual(result['error'],'capture_failed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_status','timeout'))
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
+    def test_native_control_diagnostic_retained_failure_preserves_binding(self):
+        command=RetainedManagedCaptureTests.seed(self)
+        self.stdout.unlink()
+        result=self.bridge.command(command)
+        self.assertEqual(result['reason'],'task_output_unavailable')
+        self.assertEqual(result['capture_binding'],command['capture_binding'])
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_retained','unavailable'))
+        self.assertEqual(self.native.calls,[])
+
+    def test_native_control_diagnostic_stop_status_timeout_no_kill(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        calls=len(self.native.calls)
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE',5)):
+            result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual(result['reason'],'stop_unconfirmed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_status','timeout'))
+        self.assertEqual(len(self.native.calls),calls)
+
+    def test_native_control_diagnostic_stop_kill_timeout(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':
+                self.assertLessEqual(kwargs['timeout'],5)
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_kill','timeout'))
+        self.assertEqual(self.native.process['phase'],'running')
+
+    def test_native_control_diagnostic_stop_verify_timeout_cannot_infer_exit(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.lookup;calls=[]
+        def lookup(*args,**kwargs):
+            calls.append(args)
+            if len(calls)>1:
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.lookup=lookup
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_verify','timeout'))
+        self.assertEqual(self.native.process['phase'],'exited','fakekill alone must not grant proof')
+
+    def test_native_control_diagnostic_stop_qualification_and_success_unchanged(self):
+        command=self.command('stop');original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_qualification','unqualified'))
+        # A different original command, same owned binding: successful proof has
+        # exactly the old fields, no failure metadata and no inferred exit.
+        self.bridge.native=original
+        result=self.bridge.command(dict(command,id='diagnostic-qualified-stop'))
+        self.assertEqual(result,{'stopped':True,'evidence':'native_exit','native_id':self.native.process['id']})
+
+    def test_native_control_diagnostic_classifier_never_stringifies_unknown_error(self):
+        from agent_hub_host.agent import native_control_error
+        class PrivateError(Exception):
+            def __str__(self):raise AssertionError('secret stringification')
+        for error in [PrivateError('SECRET'),RuntimeError('SECRET'),ValueError('SECRET')]:
+            self.assertEqual(native_control_error(error),'unknown')
+        control=KeyboardInterrupt('ORIGINAL_CONTROL')
+        from agent_hub_host.agent import native_control_step
+        def cancelled():raise control
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            native_control_step({},'capture_rpc',cancelled)
+        self.assertIs(raised.exception,control)
