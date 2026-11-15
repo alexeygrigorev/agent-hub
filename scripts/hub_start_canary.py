@@ -2096,88 +2096,16 @@ def send_mail(subject, body):
     return r.returncode == 0
 
 
-class PositiveCanaryObserver:
-    """Optional in-process source claims, not selected dispatch or authority.
-
-    The owner must supply an already immutable-verified helper module. No source
-    path/config/loader, inherited invocation adoption or activation is invented.
-    Missing selection and negative ACK remain UNKNOWN; business is never retried.
+def record_dev_alert_occurrence(sdir, mode, result, state, *, decision):
+    """Reserved integration hook for the finite Hub dev@ occurrence counter
+    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions:
+    critical/critical_dedup/recovery increment cumulative occurrences, while
+    pass/recovering/failure_below_threshold update observation coverage only).
     """
-    def __init__(self, client_module, socket_path, *, deadline=None):
-        self.child, self.dirty = None, False
-        try:
-            self.child = client_module.positive_only_context(
-                'canary', socket_path=socket_path, deadline=deadline)
-        except BaseException as error:
-            self.fail()
-            if not isinstance(error, Exception):
-                raise
-
-    def fail(self):
-        self.dirty = True
-        if self.child is not None:
-            self.child.dirty = True
-
-    def emit(self, phase, **fields):
-        try:
-            if self.child is None:
-                self.fail()
-                return False
-            self.child.dirty |= self.dirty
-            if not self.child.emit(phase, **fields):
-                self.fail()
-                return False
-            return True
-        except BaseException as error:
-            self.fail()
-            if not isinstance(error, Exception):
-                raise
-            return False
+    _ = (sdir, mode, result, state, decision)
 
 
-def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, observer=None):
-    """Fixed positive decision hook BEFORE dedup/SMTP; no occurrence authority.
-
-    Deliberately omit state/result/path/reason and mode from the API-v1 frame.
-    Local source contexts are not dispatcher IDs; even a retained claim does not
-    grant admission, source coverage, successful mail or a healthy zero-window.
-    """
-    if observer is None:
-        return False
-    mapped = {'critical': ('alert', 'dev'), 'critical_dedup': ('alert_dedup', 'dev'),
-              'recovery': ('recovery', 'dev'), 'pass': ('observation', 'none'),
-              'recovering': ('observation', 'none'),
-              'failure_below_threshold': ('observation', 'none'),
-              'lock_busy': ('observation', 'none')}
-    if type(decision) is not str or decision not in mapped:
-        observer.fail()
-        return False
-    event, recipient = mapped[decision]
-    return observer.emit('decision', decision=event, condition=decision,
-                         recipient_class=recipient)
-
-
-def apply_alerting(result, *, observer=None):
-    # This seam is deliberately default-off: main supplies no observer. A future
-    # selected installer/owner must bind the immutable companion and socket first.
-    if observer is not None:
-        observer.emit('begin')
-    try:
-        _apply_alerting(result, observer=observer)
-    except BaseException:
-        if observer is not None:
-            observer.fail()
-            try:
-                observer.emit('terminal')
-            except BaseException:
-                pass  # Preserve the original business/control exception identity.
-        raise
-    else:
-        if observer is not None:
-            observer.emit('terminal')
-
-
-def _apply_alerting(result, *, observer=None):
+def apply_alerting(result):
     sdir = state_dir()
     lock_fd = acquire_lock_fd(sdir / f"{result['mode']}.lock", 30.0, stage="lock", busy_reason="alert_state_lock_busy")
     try:
@@ -2185,7 +2113,6 @@ def _apply_alerting(result, *, observer=None):
         st = load_state(path)
         mode = result["mode"]
         if not result["ok"] and result.get("stage") == "lock" and result.get("reason") == "deploy_gate_lock_busy":
-            record_dev_alert_occurrence(sdir, mode, result, st, decision="lock_busy", observer=observer)
             st["last_lock_busy"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
             save_state(path, st)
             return
@@ -2194,16 +2121,16 @@ def _apply_alerting(result, *, observer=None):
             if st.get("incident_open"):
                 st["successes"] = st.get("successes", 0) + 1
                 if st["successes"] >= RECOVER_THRESHOLD:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery", observer=observer)
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery")
                     body = (f"Hub start canary ({mode}) recovered at {result['timestamp']}.\n"
                             f"Run id: {result['run_id']}\nIncident: {st.get('incident_id')}\n")
                     if send_mail(f"[RECOVERED] Hub start canary ({mode}) is passing again", body):
                         st.update(incident_open=False, successes=0, incident_id="-")
                 else:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering", observer=observer)
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering")
             else:
                 st["successes"] = 0
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass", observer=observer)
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass")
         else:
             st["successes"] = 0
             st["failures"] = st.get("failures", 0) + 1
@@ -2214,7 +2141,6 @@ def _apply_alerting(result, *, observer=None):
                     result,
                     st,
                     decision="critical_dedup" if st.get("incident_open") else "critical",
-                    observer=observer,
                 )
                 if not st.get("incident_open"):
                     incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
@@ -2226,7 +2152,7 @@ def _apply_alerting(result, *, observer=None):
                     if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
                         st.update(incident_open=True, incident_id=incident)
             else:
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold", observer=observer)
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold")
         st["last"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
         save_state(path, st)
     finally:
