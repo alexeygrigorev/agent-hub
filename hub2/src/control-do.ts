@@ -1393,8 +1393,9 @@ export class ControlDO {
       }
     }
     if(rows.length>1)return error('ambiguous_prefix',409);if(rows.length)return json({route:{kind,...rows[0]}});
-    // Fail loudly: a prefix that names a real but invisible object is a scope refusal, not a miss.
-    if(!admin&&this.db.one('SELECT id FROM object_routes WHERE kind=? AND id>=? AND id<? LIMIT 1',kind,value,value+'\uffff'))return denied(value);
+    // Fail loudly: a prefix that names a real but invisible intake or session is a scope refusal, not a miss.
+    // Message and schedule ids stay a plain miss so prefix probing cannot enumerate them.
+    if(!admin&&(kind==='intake'||kind==='session')&&this.db.one('SELECT id FROM object_routes WHERE kind=? AND id>=? AND id<? LIMIT 1',kind,value,value+'\uffff'))return denied(value);
     return error('route_not_found',404);
   }
 

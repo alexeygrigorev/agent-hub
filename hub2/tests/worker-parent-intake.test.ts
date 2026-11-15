@@ -59,7 +59,13 @@ test('child-intake worker session shows and appends to its parent intake by full
  }
  // A child cannot claim the parent's completion.
  const claim=await call('/api/intakes/'+parent.id+'/append',childToken,'POST',{key:'claim',evidence:{kind:'session_finished',session_id:parentSession}});
- assert.equal(claim.status,403);assert.equal((await data(claim)).error,'completion_claim_forbidden');
+ assert.equal(claim.status,403);assert.equal((await data(claim)).missing_scope,'operator:admin');
+ // Nor write records the parent's merge gate, verifier or blocker handling reads.
+ for(const kind of ['merge_gate','task_blocked','acceptance_verification']){
+  const r=await call('/api/intakes/'+parent.id+'/append',childToken,'POST',{key:'gate-'+kind,evidence:{kind,session_id:parentSession}});
+  assert.equal(r.status,403,kind);assert.equal((await data(r)).missing_scope,'operator:admin',kind);
+ }
+ assert.equal((await call('/api/intakes/'+parent.id+'/merge-state')).status,200);
 
  const named=async(r:Response,scope:string,label:string)=>{assert.equal(r.status,403,label);const b=await data(r);assert.notEqual(b.error,'route_not_found',label);assert.equal(b.missing_scope,scope,label);assert.match(String(b.detail),new RegExp(scope),label);};
  // Sibling intake in the same project, by full and short id: named intake:read refusal.
