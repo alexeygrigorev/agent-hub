@@ -179,10 +179,12 @@ class World:
         import tomllib
         return tomllib.loads(self.profile.read_text())['profiles']['hub-hub-claude']['command']
 
-    def repinned_text(self, original, old, new):
+    def repinned_text(self, original, old, new, others=True):
         line = 'command = ' + json.dumps(self.command_for(old))
         assert original.count(line) == 1
         text = original.replace(line, 'command = ' + json.dumps(self.command_for(new)))
+        if not others:
+            return text
         # The updater also re-pins every other generated execute() profile
         # to the installed release (intake fc36c32b).
         import tomllib
@@ -767,7 +769,10 @@ def test_recovery_restores_unverified_and_commits_verified_pin(world, verified):
     original = world.profile.read_text()
     world.install()
     new = world.releases / NEW
-    repinned = world.profile.read_text()
+    # A pending journal means commit_repin has not run, so the other execute
+    # profiles are not re-pinned yet (repin_managed_profiles follows the commit).
+    repinned = world.repinned_text(original, old, new, others=False)
+    world.profile.write_text(repinned)
     journal = {'schema': 1, 'release': NEW, 'previous_release': OLD, 'profile_path': str(world.profile),
                'managed_root': str(world.managed), 'previous_command': world.command_for(old),
                'command': world.command_for(new), 'generation': GENERATION, 'revision': REV, 'verified': verified}
@@ -1039,6 +1044,8 @@ def test_recovery_never_commits_a_missing_candidate(world):
     original = world.profile.read_text()
     world.install()
     candidate = world.releases / NEW
+    # Pending journal: the other execute profiles are re-pinned only after commit.
+    world.profile.write_text(world.repinned_text(original, old, candidate, others=False))
     journal = {'schema': 1, 'release': NEW, 'previous_release': OLD, 'profile_path': str(world.profile),
                'managed_root': str(world.managed), 'previous_command': world.command_for(old),
                'command': world.command_for(candidate), 'generation': GENERATION, 'revision': REV, 'verified': True}
