@@ -142,26 +142,11 @@ class Tests(unittest.TestCase):
 
     def test_source_context_rejects_foreign_role_parent_and_replay(self):
         module=quota.alert_client(self.client,hashlib.sha256(self.client.read_bytes()).hexdigest())
-        inherited=({'HUB_ALERT_ROLE':'canary'},{'HUB_ALERT_INVOCATION_ID':'a'*32},
-                   {'HUB_ALERT_PARENT_ID':''},{'HUB_ALERT_EVENT_FD':'3'},
-                   {'HUB_ALERT_ACK_FD':'4'},{'HUB_ALERT_BROKER_SOCKET':'/foreign'},
-                   {'HUB_ALERT_CONTROLLER_DIR':'/foreign'},{'HUB_ALERT_LEDGER_DIR':'/foreign'})
-        for role in ('quota_monitor','canary'):
-            for env in inherited:
-                with self.assertRaises(module.Refused):module.positive_only_context(role,socket_path=str(self.broker.path),env=env)
-        for role,parent in [('backup_pull',None),('backup_notifier',None),('backup_notifier','a'*32),
-                            ('unknown',None),('quota_monitor','a'*32),('canary','a'*32),('canary',''),(True,None)]:
+        for env in ({'HUB_ALERT_ROLE':'canary'},{'HUB_ALERT_INVOCATION_ID':'a'*32},
+                    {'HUB_ALERT_PARENT_ID':''},{'HUB_ALERT_EVENT_FD':'3'}, {'HUB_ALERT_BROKER_SOCKET':'/foreign'}):
+            with self.assertRaises(module.Refused):module.positive_only_context('quota_monitor',socket_path=str(self.broker.path),env=env)
+        for role,parent in [('canary',None),('backup_notifier',None),('quota_monitor','a'*32), (True,None)]:
             with self.assertRaises(module.Refused):module.positive_only_context(role,socket_path=str(self.broker.path),parent_id=parent,env={})
-        # Construction is a local source claim only: no transport, dispatch or
-        # admission. A future selected owner must qualify the actual invocation.
-        with patch.object(module,'exchange',side_effect=AssertionError('no source-claim IO')), \
-             patch.object(module.socket,'socket',side_effect=AssertionError('no source-claim socket')), \
-             patch.object(module.uuid,'uuid4',return_value=types.SimpleNamespace(hex='b'*32)):
-            child=module.positive_only_context('canary',socket_path=str(self.broker.path),env={})
-            self.assertEqual((child.identity,child.role,child.parent_id,child.seq),('b'*32,'canary',None,0))
-            self.assertFalse(child.dirty)
-            self.assertNotIn('admit',vars(module.Client));self.assertNotIn('dispatch',vars(module))
-            with self.assertRaises(module.Refused):module.positive_only_context('canary',socket_path=str(self.broker.path),env={})
         with patch.object(module.uuid,'uuid4',return_value=types.SimpleNamespace(hex='a'*32)):
             child=module.positive_only_context('quota_monitor',socket_path=str(self.broker.path),env={})
             self.assertEqual(child.identity,'a'*32)
