@@ -2,8 +2,23 @@
 # Install ops scripts + systemd user units. Safe to re-run after every change on main.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"; dest="$HOME/.local/share/agent-hub-ops"
+# send.sh resolves its controller beside the installed ~/bin wrappers.
+# Refuse an unknown pre-existing companion before ANY installation writes;
+# allow exact current bytes or an owned matching installed pair on upgrades.
+companion="$HOME/bin/session-ctl.sh"
+owned_regular() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && [ "$(stat -c %h "$1")" = 1 ]
+}
+if [ -e "$companion" ] || [ -L "$companion" ]; then
+  if ! owned_regular "$companion" || ! { cmp -s "$companion" "$here/lib/session-ctl.sh" ||
+      { owned_regular "$dest/session-ctl.sh" && cmp -s "$companion" "$dest/session-ctl.sh"; }; }; then
+    echo 'ops_controller_companion_conflict; existing files preserved' >&2
+    exit 1
+  fi
+fi
 mkdir -p "$dest" "$HOME/bin" "$HOME/.config/systemd/user"
 install -m755 "$here/lib/session-ctl.sh" "$here/lib/watchdog.sh" "$dest/"
+install -m755 "$here/lib/session-ctl.sh" "$companion"
 # Mails dev@ for intakes Hub could not recover itself (developer_alert_raised).
 install -m755 "$here/../scripts/hub-intake-recovery-alerts.py" "$dest/"
 install -m644 "$here"/systemd/hub-intake-recovery-alerts.service "$here"/systemd/hub-intake-recovery-alerts.timer "$HOME/.config/systemd/user/"
