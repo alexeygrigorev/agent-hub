@@ -705,7 +705,10 @@ export class ProjectDO {
     if(body.verification_summary!==undefined&&(actor?.id!==VERIFICATION_ACTOR||typeof body.verification_summary!=='string'||body.verification_summary.length>1200))
       return error('invalid_verification_summary',400);
     const interactive = body.interactive === undefined ? false : body.interactive;
-    const timeoutSeconds = body.timeout_seconds === undefined ? 1800 : body.timeout_seconds;
+    // Implementation/fix sessions do real multi-step work (PR, CI, deploy) and
+    // must not be killed at 30 minutes; review/think keep the short default.
+    const timeoutSeconds = body.timeout_seconds === undefined
+      ? (purpose === 'implement' || purpose === 'fix' ? 7200 : 1800) : body.timeout_seconds;
     const absoluteWorkspace = typeof workspace === 'string' && (workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace));
     const workspaceLabel = typeof workspace === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspace);
     if (typeof workspace !== 'string' || workspace.length > 1024
