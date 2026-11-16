@@ -1,0 +1,18 @@
+{
+  "cpu": {
+    "current_cpu_cores": 12,
+    "expected_cpu_cores": 2,
+    "ramping_cpu_cores": 1,
+    "limit_cpu_cores": 12,
+    "target_utilization": 1,
+    "psi_avg10": 99,
+    "psi_full_avg10": 6,
+    "memory_psi_full_avg10": 0,
+    "oom_kills_delta": 0,
+    "observed_at": "2026-10-26T00:00:00Z"
+  },
+  "resource_choking": {
+    "reason": "host_runtime_choking",
+    "observed_at": "2026-10-26T00:00:00Z"
+  }
+}
