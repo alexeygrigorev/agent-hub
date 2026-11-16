@@ -25,6 +25,8 @@ UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub
 CLI_INSTALLERS = ('install.sh', 'install.ps1')
 # Windows host installer/updater (intake 41ef7048), served at /cli/host-install.ps1.
 WINDOWS_HOST_INSTALLER = 'host-install.ps1'
+WINDOWS_READER_CLOSURE = ('private_fs.py', 'win32_fs.py')
+WINDOWS_ARTIFACT_ABI = 'hub2-windows-credential-artifacts-v1'
 MAX_MANIFEST = 128 * 1024
 
 
@@ -134,6 +136,16 @@ def export_source(repo, revision, target):
     return sha
 
 
+def prepare_windows_reader(package, host_source):
+    """The wheel verifier closure and zip helper originate in one Git snapshot."""
+    for name in WINDOWS_READER_CLOSURE:
+        if (package / name).read_bytes() != (host_source / name).read_bytes():
+            raise ValueError('Windows safe-reader closure differs from maintained source')
+    helper_sha = hashlib.sha256((host_source / 'managed_claude_deliver.py').read_bytes()).hexdigest()
+    (package / '_credential_artifact_binding.py').write_text(
+        f'HELPER_SOURCE_SHA256 = {helper_sha!r}\nHELPER_ABI = {WINDOWS_ARTIFACT_ABI!r}\n')
+
+
 def build(repo, revision, output):
     scratch = repo / '.local/tmp'
     scratch.mkdir(parents=True, exist_ok=True)
@@ -143,6 +155,9 @@ def build(repo, revision, output):
         source.mkdir()
         sha = export_source(repo, revision, source)
         package = source / 'hub2/host/agent_hub_host'
+        # Normal source imports and wheels use the same maintained reader bytes.
+        # Do not bootstrap archive verification by importing an unverified zip.
+        prepare_windows_reader(package, source / 'host/agent_hub_host')
         (package / '_release.py').write_text(f'HOST_VERSION = {sha!r}\nPROTOCOL_VERSION = 1\n')
         # Distinct wheel versions avoid pip treating different commits as 2.0.0.
         project = source / 'hub2/host/pyproject.toml'

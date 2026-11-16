@@ -1,0 +1,414 @@
+"""CPython 3.11+, Windows 10/11, fixed local NTFS. No shell/third-party ACL tool.
+
+Every API failure is an error. No FAT/SMB/cloud/reparse/device namespace fallback.
+This module imports on POSIX for deterministic API contract tests; only api()
+loads Windows DLLs. Handles and security descriptors always have one owner.
+"""
+from contextlib import contextmanager, ExitStack
+import ctypes as C
+import ntpath
+import os
+from pathlib import Path
+
+U32, U16, U8, PTR = C.c_uint32, C.c_uint16, C.c_ubyte, C.c_void_p
+# SYSTEM, BUILTIN\Administrators, OWNER RIGHTS (last: it stands for the owner).
+TRUSTED_DIRECTORY_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
+BOOL = C.c_int
+FULL = 0x1f01ff
+READ_CONTROL = 0x20000
+WRITE_DAC = 0x40000
+REPARSE = 0x400
+DIRECTORY = 0x10
+SE_FILE_OBJECT = 1
+DACL_SECURITY_INFORMATION = 0x4
+PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+
+
+class FileInfo(C.Structure):
+    _fields_ = [('attributes', U32), ('times', U32 * 6), ('volume', U32),
+                ('size_high', U32), ('size_low', U32), ('links', U32),
+                ('index_high', U32), ('index_low', U32)]
+
+
+class SecurityAttributes(C.Structure):
+    _fields_ = [('length', U32), ('descriptor', PTR), ('inherit', BOOL)]
+
+
+class ACL(C.Structure):
+    _fields_ = [('revision', U8), ('reserved', U8), ('size', U16),
+                ('count', U16), ('reserved2', U16)]
+
+
+class ACE(C.Structure):
+    _fields_ = [('kind', U8), ('flags', U8), ('size', U16), ('mask', U32), ('sid', U32)]
+
+
+class API:
+    def __init__(self):
+        kernel = C.WinDLL('kernel32', use_last_error=True)
+        adv = C.WinDLL('advapi32', use_last_error=True)
+        def bind(dll, name, args, result=BOOL):
+            fn = getattr(dll, name)
+            fn.argtypes, fn.restype = args, result
+            setattr(self, name, fn)
+        bind(kernel, 'CreateFileW', [C.c_wchar_p, U32, U32, PTR, U32, U32, PTR], PTR)
+        bind(kernel, 'CreateDirectoryW', [C.c_wchar_p, PTR])
+        bind(kernel, 'CloseHandle', [PTR])
+        bind(kernel, 'GetCurrentProcess', [], PTR)
+        bind(kernel, 'GetFileInformationByHandle', [PTR, C.POINTER(FileInfo)])
+        bind(kernel, 'GetFinalPathNameByHandleW', [PTR, C.c_wchar_p, U32, U32], U32)
+        bind(kernel, 'GetDriveTypeW', [C.c_wchar_p], U32)
+        bind(kernel, 'GetVolumeInformationW', [C.c_wchar_p, C.c_wchar_p, U32, PTR, PTR, PTR, C.c_wchar_p, U32])
+        bind(kernel, 'MoveFileExW', [C.c_wchar_p, C.c_wchar_p, U32])
+        bind(kernel, 'LocalFree', [PTR], PTR)
+        bind(adv, 'OpenProcessToken', [PTR, U32, C.POINTER(PTR)])
+        bind(adv, 'GetTokenInformation', [PTR, U32, PTR, U32, C.POINTER(U32)])
+        bind(adv, 'ConvertSidToStringSidW', [PTR, C.POINTER(PTR)])
+        bind(adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p, U32, C.POINTER(PTR), PTR])
+        bind(adv, 'GetSecurityInfo', [PTR, U32, U32, C.POINTER(PTR), PTR, C.POINTER(PTR), PTR, C.POINTER(PTR)], U32)
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
+        bind(adv, 'GetSecurityDescriptorControl', [PTR, C.POINTER(U16), C.POINTER(U32)])
+        bind(adv, 'GetSecurityDescriptorDacl', [PTR, C.POINTER(BOOL), C.POINTER(PTR), C.POINTER(BOOL)])
+        bind(adv, 'SetSecurityInfo', [PTR, U32, U32, PTR, PTR, PTR, PTR], U32)
+        bind(adv, 'GetAce', [PTR, U32, C.POINTER(PTR)])
+        bind(adv, 'EqualSid', [PTR, PTR])
+        bind(adv, 'ConvertStringSidToSidW', [C.c_wchar_p, C.POINTER(PTR)])
+        self.user_buffer, self.user_sid, self.sid_text = self._user()
+        self.trusted_sids = []
+        for text in TRUSTED_DIRECTORY_SIDS:
+            sid = PTR()
+            self.check(self.ConvertStringSidToSidW(text, C.byref(sid)))
+            self.trusted_sids.append(sid)  # process-lifetime singleton; never freed
+
+    def check(self, ok):
+        if not ok:
+            raise C.WinError(C.get_last_error())
+        return ok
+
+    def _user(self):
+        token, size = PTR(), U32()
+        self.check(self.OpenProcessToken(self.GetCurrentProcess(), 8, C.byref(token)))
+        try:
+            self.GetTokenInformation(token, 1, None, 0, C.byref(size))
+            if not 0 < size.value <= 65536:
+                raise PermissionError('Unknown token SID size')
+            buffer = C.create_string_buffer(size.value)
+            self.check(self.GetTokenInformation(token, 1, buffer, size.value, C.byref(size)))
+            sid = C.cast(buffer, C.POINTER(PTR))[0]
+            text = PTR()
+            self.check(self.ConvertSidToStringSidW(sid, C.byref(text)))
+            try:
+                return buffer, sid, C.wstring_at(text)
+            finally:
+                self.LocalFree(text)
+        finally:
+            self.CloseHandle(token)
+
+    @contextmanager
+    def security(self, directory=False):
+        sd = PTR()
+        flags = 'OICI' if directory else ''
+        self.check(self.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            f'O:{self.sid_text}D:P(A;{flags};FA;;;{self.sid_text})', 1, C.byref(sd), None))
+        try:
+            sa = SecurityAttributes(C.sizeof(SecurityAttributes), sd, 0)
+            yield sa
+        finally:
+            self.LocalFree(sd)
+
+    def private(self, handle, *, protected=True, inherited=False, directory=False):
+        owner, dacl, sd = PTR(), PTR(), PTR()
+        error = self.GetSecurityInfo(handle, 1, 5, C.byref(owner), None, C.byref(dacl), None, C.byref(sd))
+        if error:
+            raise OSError(error, 'Cannot verify private ACL')
+        try:
+            control, revision = U16(), U32()
+            self.check(self.GetSecurityDescriptorControl(sd, C.byref(control), C.byref(revision)))
+            if (not owner or not dacl or not self.EqualSid(owner, self.user_sid)
+                    or (protected and not control.value & 0x1000)):
+                raise PermissionError('Private owner/protected DACL required')
+            acl = C.cast(dacl, C.POINTER(ACL)).contents
+            # A directory may also carry the CPython 3.13+ os.mkdir(mode=0o700)
+            # DACL: SYSTEM, Administrators and OWNER RIGHTS (the owner is
+            # verified above). Those principals are already trusted here.
+            trusted = self.trusted_sids if directory else []
+            if not 1 <= acl.count <= 1 + len(trusted):
+                raise PermissionError('Exactly one owner-only full-control ACE required')
+            owner_ace = False
+            for index in range(acl.count):
+                ptr = PTR()
+                self.check(self.GetAce(dacl, index, C.byref(ptr)))
+                ace = C.cast(ptr, C.POINTER(ACE)).contents
+                sid = PTR(ptr.value + ACE.sid.offset)
+                if (ace.kind != 0 or ace.flags & ~(1 | 2 | (16 if inherited else 0)) or ace.mask != FULL
+                        or ace.size < ACE.sid.offset + 8):
+                    raise PermissionError('Unexpected or inherited private ACE')
+                if self.EqualSid(sid, self.user_sid) or (trusted and self.EqualSid(sid, trusted[-1])):
+                    owner_ace = True
+                elif not any(self.EqualSid(sid, other) for other in trusted):
+                    raise PermissionError('Unexpected or inherited private ACE')
+            if not owner_ace:
+                raise PermissionError('Exactly one owner-only full-control ACE required')
+            return bool(control.value & 0x1000)
+        finally:
+            if sd:
+                self.LocalFree(sd)
+
+    def restrict(self, handle, directory=False):
+        """Windows analogue of fchmod 0700/0600 on an object the user already owns.
+
+        Replaces the DACL with the protected owner-only descriptor used for
+        objects we create. Refuses objects owned by anyone else. Inheritable
+        ACEs propagate to existing children (SetSecurityInfo semantics).
+        """
+        owner, sd = PTR(), PTR()
+        error = self.GetSecurityInfo(handle, 1, 1, C.byref(owner), None, None, None, C.byref(sd))
+        if error:
+            raise OSError(error, 'Cannot verify owner')
+        try:
+            if not owner or not self.EqualSid(owner, self.user_sid):
+                raise PermissionError('Refusing to restrict an object owned by another principal')
+        finally:
+            if sd:
+                self.LocalFree(sd)
+        with self.security(directory=directory) as sa:
+            present, dacl, defaulted = BOOL(), PTR(), BOOL()
+            self.check(self.GetSecurityDescriptorDacl(sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+            if not present.value or not dacl:
+                raise PermissionError('Owner-only DACL unavailable')
+            # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            error = self.SetSecurityInfo(handle, 1, 0x4 | 0x80000000, None, None, dacl, None)
+            if error:
+                raise OSError(error, 'Cannot restrict ACL')
+
+    def info(self, handle, directory=False):
+        info = FileInfo()
+        self.check(self.GetFileInformationByHandle(handle, C.byref(info)))
+        if info.attributes & REPARSE or bool(info.attributes & DIRECTORY) != directory:
+            raise PermissionError('Reparse point or wrong object type')
+        if not directory and info.links != 1:
+            raise PermissionError('Multiply linked private file')
+        return info
+
+    def open(self, path, access, disposition=3, directory=False, security=None):
+        # Share read/write, never delete: pin ancestors/lock inode against rename.
+        handle = self.CreateFileW(str(path), access | READ_CONTROL, 3,
+                                  C.byref(security) if security is not None else None,
+                                  disposition, 0x00200000 | (0x02000000 if directory else 0), None)
+        if handle == PTR(-1).value:
+            raise C.WinError(C.get_last_error())
+        try:
+            self.info(handle, directory)
+            return handle
+        except BaseException:
+            self.CloseHandle(handle)
+            raise
+
+
+_instance = None
+
+
+def api():
+    global _instance
+    if _instance is None:
+        _instance = API()
+    return _instance
+
+
+def local_path(path):
+    text = str(path)
+    drive, tail = ntpath.splitdrive(text)
+    if (len(drive) != 2 or drive[1] != ':' or not drive[0].isascii() or not drive[0].isalpha()
+            or not tail.startswith('\\') or '/' in text or ':' in tail or '\x00' in text):
+        raise ValueError('Explicit plain absolute local drive path required')
+    parts = tail.split('\\')[1:]
+    for part in parts:
+        if (not part or part in ('.', '..') or part.endswith((' ', '.'))
+                or any(ch in '<>"|?*' or ord(ch) < 32 for ch in part)
+                or part.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$',
+                    *(f'COM{i}' for i in '¹²³'), *(f'LPT{i}' for i in '¹²³'),
+                    *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}):
+            raise ValueError('Unsafe Windows path component')
+    root = drive + '\\'
+    fs = C.create_unicode_buffer(32)
+    a = api()
+    if a.GetDriveTypeW(root) != 3:
+        raise PermissionError('Fixed local drive required')
+    a.check(a.GetVolumeInformationW(root, None, 0, None, None, None, fs, len(fs)))
+    if fs.value != 'NTFS':
+        raise PermissionError('Local NTFS proof required')
+    return root, parts
+
+
+@contextmanager
+def parent(path, *, create=False, private=True, native=False, owned=False):
+    """Pin every ancestor of path. owned=True restricts the user-owned leaf
+    directory to the protected owner-only DACL before any ACL proof, exactly as
+    POSIX callers fchmod(0o700) a directory they own (e.g. %APPDATA%\aplexer
+    created by an MSYS/Cygwin tool with a POSIX-mapped ACL)."""
+    root, parts = local_path(path)
+    if owned and len(parts) < 2:
+        raise PermissionError('Refusing to restrict a drive root')
+    a = api()
+    with ExitStack() as stack:
+        current = root
+        handles = []
+        handle = a.open(current, 0, directory=True)
+        stack.callback(a.CloseHandle, handle)
+        handles.append(handle)
+        leaf = len(parts) - 2
+        for index, component in enumerate(parts[:-1]):
+            current = ntpath.join(current, component)
+            if create:
+                with a.security(directory=True) as sa:
+                    if not a.CreateDirectoryW(current, C.byref(sa)):
+                        error = C.get_last_error()
+                        if error != 183:  # ERROR_ALREADY_EXISTS; still verify opened object
+                            raise C.WinError(error)
+            handle = a.open(current, WRITE_DAC if owned and index == leaf else 0, directory=True)
+            stack.callback(a.CloseHandle, handle)
+            handles.append(handle)
+        if owned:
+            a.restrict(handle, directory=True)
+        if native:
+            # Native Rust files may inherit their sole owner ACE. Verify the
+            # complete owner-only suffix back to a protected directory while
+            # all ancestors stay pinned; never require rewriting native state.
+            for ancestor in reversed(handles):
+                if a.private(ancestor, protected=False, inherited=True, directory=True):
+                    break
+            else:
+                raise PermissionError('Native registry lacks a protected owner-only root')
+        if private:
+            a.private(handle, directory=True)
+        yield handle
+
+
+def repair_private_tree(root, *, max_entries=1024, max_depth=8):
+    """Re-protect an existing owner-owned directory tree; protected entries
+    are left untouched. Returns the number of re-protected entries.
+
+    An older journal directory may predate CPython's os.mkdir(mode=0o700)
+    protected-DACL behavior and inherit ambient ancestors' ACEs; every
+    private_fs operation on it then fails closed forever because applying a
+    new protected parent DACL never rewrites children's inherited entries.
+    Each entry is therefore re-protected from its own pinned WRITE_DAC handle
+    and re-verified in place. Bounded; every failure is an error (never a
+    silent partial repair). Non-owner entries refuse the repair: another
+    principal's tree is not ours to fix.
+    """
+    local_path(root)
+    a = api()
+    repaired, visited = 0, 0
+
+    def bound():
+        nonlocal visited
+        visited += 1
+        if visited > max_entries:
+            raise PermissionError('Private repair exceeded entry bound')
+
+    def repair_entry(path, directory):
+        nonlocal repaired
+        handle = a.open(path, READ_CONTROL | WRITE_DAC, directory=directory)
+        try:
+            try:
+                a.private(handle, directory=directory)
+                return  # already protected: nothing to rewrite
+            except PermissionError:
+                pass
+            owner = PTR()
+            error = a.GetSecurityInfo(handle, SE_FILE_OBJECT, 1, C.byref(owner),
+                                      None, None, None, None)
+            if error:
+                raise OSError(error, 'Cannot verify private ACL')
+            if not owner or not a.EqualSid(owner, a.user_sid):
+                raise PermissionError('Private repair requires owner access')
+            with a.security(directory=directory) as sa:
+                dacl, present, defaulted = PTR(), BOOL(), BOOL()
+                a.check(a.GetSecurityDescriptorDacl(
+                    sa.descriptor, C.byref(present), C.byref(dacl), C.byref(defaulted)))
+                if not present.value or not dacl.value:
+                    raise PermissionError('Security descriptor lacks a private DACL')
+                error = a.SetSecurityInfo(handle, SE_FILE_OBJECT,
+                                          DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                          None, None, dacl, None)
+                if error:
+                    raise OSError(error, 'Cannot apply private DACL')
+            a.private(handle, directory=directory)  # final proof, raises
+            repaired += 1
+        finally:
+            a.CloseHandle(handle)
+
+    def walk(path, depth):
+        if depth > max_depth:
+            raise PermissionError('Private repair exceeded depth bound')
+        bound()
+        repair_entry(path, True)
+        with os.scandir(path) as entries:
+            for entry in entries:
+                bound()
+                child = ntpath.join(str(path), entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    walk(child, depth + 1)
+                elif entry.is_file(follow_symlinks=False):
+                    repair_entry(child, False)
+                else:
+                    raise PermissionError('Refusing repair of non-regular journal entry')
+
+    walk(root, 0)
+    return repaired
+
+
+def open_file(path, flags, *, private=True):
+    import msvcrt
+    a = api()
+    disposition = 1 if flags & os.O_EXCL else (4 if flags & os.O_CREAT else 3)
+    access = 0x80000000
+    if flags & (os.O_WRONLY | os.O_RDWR):
+        access |= 0x40000000
+    with a.security() as sa:
+        handle = a.open(path, access, disposition, security=sa)
+    try:
+        # Native registry reads also require private ACL proof on Windows.
+        a.private(handle, protected=private, inherited=not private)
+        fd = msvcrt.open_osfhandle(handle, (flags & (os.O_WRONLY | os.O_RDWR)) | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        a.CloseHandle(handle)
+        raise
+    return fd  # CRT fd now owns the handle
+
+
+def restrict_file(path):
+    """fchmod(0o600) analogue for an existing user-owned regular file.
+
+    The caller holds pinned ancestors (parent()). Reparse points, directories
+    and multiply linked files are refused by API.open/info. Missing files raise
+    FileNotFoundError."""
+    a = api()
+    handle = a.open(path, WRITE_DAC)
+    try:
+        a.restrict(handle)
+    finally:
+        a.CloseHandle(handle)
+
+
+def replace(source, target):
+    # Same directory, same volume. Bounded: no retry after sharing/ACL/IO uncertainty.
+    api().check(api().MoveFileExW(str(source), str(target), 1 | 8))
+
+
+def canonical_workspace(path):
+    # Native Rust uses canonicalize + strip_verbatim_prefix. Preserve actual case,
+    # never lower() or normcase() a journal identity or native workspace hash.
+    a = api()
+    with parent(ntpath.join(str(path), '__hub_path_probe__'), private=False) as handle:
+        buf = C.create_unicode_buffer(32768)
+        count = a.GetFinalPathNameByHandleW(handle, buf, len(buf), 0)
+        if not 0 < count < len(buf):
+            raise PermissionError('Cannot canonicalize native workspace')
+        text = buf.value
+        if text.startswith('\\\\?\\'):
+            text = text[4:]
+        local_path(ntpath.join(text, '__hub_path_probe__'))
+        return text

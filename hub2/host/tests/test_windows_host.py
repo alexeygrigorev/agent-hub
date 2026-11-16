@@ -218,5 +218,18 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn('still running and holds journal', text)
 
 
+class WindowsCompanionInstallerContracts(unittest.TestCase):
+    def test_installer_uses_exact_manifest_and_selected_bounded_interpreter(self):
+        source = (Path(__file__).resolve().parents[3] / 'deploy/host-install.ps1').read_text()
+        self.assertIn("Get-Verified 'hub.pyz'", source)
+        self.assertIn('$companionManifestSha = (Get-FileHash', source)
+        self.assertIn('$info.FileName = $VenvPython', source)
+        self.assertIn('$info.UseShellExecute = $false', source)
+        self.assertIn('from agent_hub_host.windows_release import main; main()', source)
+        self.assertIn('$process.WaitForExit(30000)', source)
+        self.assertIn('$process.WaitForExit(2000)', source)
+        self.assertIn('no consumer activated', source)
+
+
 if __name__ == '__main__':
     unittest.main()

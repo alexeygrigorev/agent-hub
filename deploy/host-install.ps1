@@ -190,7 +190,13 @@ function Retire-LegacyHost {
 }
 
 Write-Step "Hub2 host install from $Base (mode=$(if ($env:HUB2_INSTALL_MODE) { $env:HUB2_INSTALL_MODE } else { 'install' }))"
-$manifest = Invoke-RestMethod -UseBasicParsing -Uri ($Base + '/cli/host-release.json')
+# Retain the exact HTTPS manifest bytes used for this installation, not a
+# reserialized object or a later mutable human-CLI manifest.
+$companionManifest = Join-Path $Root ('tmp\host-release-' + [guid]::NewGuid().ToString('N') + '.json')
+Invoke-WebRequest -UseBasicParsing -Uri ($Base + '/cli/host-release.json') -OutFile $companionManifest
+if ((Get-Item -LiteralPath $companionManifest).Length -gt 131072) { throw 'release manifest exceeds bound' }
+$companionManifestSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $companionManifest).Hash.ToLowerInvariant()
+$manifest = (Get-Content -LiteralPath $companionManifest -Raw) | ConvertFrom-Json
 $version = [string]$manifest.host_version
 if ($version -notmatch '^[0-9a-f]{40}$') { throw 'invalid published host_version' }
 if ($env:HUB2_EXPECTED_HOST_VERSION -and $env:HUB2_EXPECTED_HOST_VERSION -ne $version) { throw 'published release changed during update; retry' }
@@ -202,6 +208,9 @@ New-Item -ItemType Directory -Force -Path $download | Out-Null
 $wheel = Get-Verified $wheelName[0] $artifacts.($wheelName[0]) $download
 Get-Verified 'websockets-16.0-py3-none-any.whl' $artifacts.'websockets-16.0-py3-none-any.whl' $download | Out-Null
 $installer = Get-Verified 'host-install.ps1' $artifacts.'host-install.ps1' $download
+if ($artifacts.'hub.pyz'.sha256 -notmatch '^[0-9a-f]{64}$' -or
+    $artifacts.'hub.pyz'.size -le 0 -or $artifacts.'hub.pyz'.size -gt 16777216) { throw 'invalid companion artifact record' }
+$companionArchive = Get-Verified 'hub.pyz' $artifacts.'hub.pyz' $download
 Write-Step "verified release $version"
 
 $script:Aplexer = Resolve-Aplexer
@@ -238,6 +247,64 @@ function Install-Wheel([string]$Path) {
   if ($code -ne 0) { throw "pip install failed; see $InstallLog" }
 }
 
+function Quote-CompanionArgument([string]$Value) {
+  if ($Value.IndexOf([char]0) -ge 0) { throw 'invalid companion argument' }
+  $escaped = [regex]::Replace($Value, '(\\*)"', { param($m) ($m.Groups[1].Value + $m.Groups[1].Value + '\"') })
+  $escaped = [regex]::Replace($escaped, '(\\+)$', { param($m) $m.Value + $m.Value })
+  return '"' + $escaped + '"'
+}
+
+function Publish-CredentialArtifacts {
+  # The only child is this verified-wheel stdlib publisher. No shell, task,
+  # provider, profile, enrollment or credential operation exists in its code.
+  $info = New-Object System.Diagnostics.ProcessStartInfo
+  $info.FileName = $VenvPython
+  $info.UseShellExecute = $false
+  $info.CreateNoWindow = $true
+  $info.RedirectStandardOutput = $true
+  $info.RedirectStandardError = $true
+  # The just-installed, checksum-verified host wheel supplies the verifier.
+  # -S skips all .pth/site startup; this fixed package root is not PATH, a user
+  # profile, or the still-unverified companion archive.
+  $packageRoot = Join-Path $Venv 'Lib\site-packages'
+  $bootstrap = 'import sys; sys.path.insert(0, sys.argv.pop(1)); from agent_hub_host.windows_release import main; main()'
+  $argv = @('-I', '-B', '-S', '-c', $bootstrap, $packageRoot,
+            $companionManifest, $companionArchive, $companionManifestSha)
+  $info.Arguments = (($argv | ForEach-Object { Quote-CompanionArgument $_ }) -join ' ')
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $info
+  $started = $false
+  try {
+    $started = $process.Start()
+    if (-not $started) { throw 'companion start failed' }
+    if (-not $process.WaitForExit(30000)) {
+      $process.Kill()
+      if (-not $process.WaitForExit(2000)) { throw 'companion cleanup pending' }
+      throw 'companion deadline'
+    }
+    # Do not retain/echo arbitrary child text. Pipes are bounded by the OS and
+    # not drained until this no-subprocess publisher has exited; overflow stalls
+    # the publisher and the same physical deadline kills/reaps this owned child.
+    $buffer = New-Object char[] 4097
+    $count = $process.StandardOutput.Read($buffer, 0, 4097)
+    $errors = New-Object char[] 4097
+    $errorCount = $process.StandardError.Read($errors, 0, 4097)
+    if ($process.ExitCode -ne 0 -or $count -le 0 -or $count -gt 4096 -or $errorCount -ne 0) { throw 'companion unavailable' }
+    $text = -join $buffer[0..($count - 1)]
+    # Fixed publisher alphabet/schema: duplicates, extra keys and arbitrary
+    # values are refused without emitting the supplied text.
+    $matched = $text -cmatch '^\s*\{"status"\s*:\s*"(current|published)"\}\s*$'
+    if (-not $matched) { throw 'companion unavailable' }
+    Write-Step ('credential_artifacts=' + $Matches[1])
+  } finally {
+    if ($started -and -not $process.HasExited) {
+      $process.Kill()
+      if (-not $process.WaitForExit(2000)) { throw 'companion cleanup pending' }
+    }
+    $process.Dispose()
+  }
+}
+
 # Rehearse the whole install in a throwaway venv BEFORE touching the running
 # daemon: a broken Python/pip/wheel must never leave the desktop disconnected.
 $Preflight = Join-Path $Root ('tmp\preflight-' + $version)
@@ -259,6 +326,9 @@ try {
   Install-Wheel $Venv
   $installed = (& $Hub2 version | ConvertFrom-Json)
   if ($installed.host_version -ne $version) { throw "installed host_version $($installed.host_version) != $version" }
+  try { Publish-CredentialArtifacts } catch {
+    Write-Step 'credential_artifacts=unavailable; owned artifacts retained; no consumer activated'
+  }
 } catch {
   Write-Step "install failed after serve was stopped: $($_.Exception.Message)"
   if ($serveWasRunning -and (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
