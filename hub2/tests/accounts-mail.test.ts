@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { AccountDO as ActualAccountDO } from '../src/account-do';
 function semanticEnv(env:any={}){return env;}
 class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticEnv(env));} }
+import { MachineDO } from '../src/machine-do';
 import { ControlDO } from '../src/control-do';
 import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
 class MailboxDO extends ActualMailboxDO { constructor(ctx:any,env:any){super(ctx,semanticEnv(env));} }
@@ -776,4 +777,51 @@ test('human:me refuses a session worker whose intake route is missing and lists 
  const rest=await data(await m.fetch(human.id,'/api/messages?order=desc&limit=2&cursor='+encodeURIComponent(first.next),'GET',undefined,human));
  assert.deepEqual(rest.items.map((v:any)=>v.body),['one']);assert.equal(rest.next,null);
  assert.equal((await m.fetch(human.id,'/api/messages?order=sideways','GET',undefined,human)).status,400);
+});
+
+// Legacy static caller cutover: reset observations are not redemption authority.
+test('reset expiry observations require explicit approval and expose no redemption or execution transport',async()=>{
+ const s=state();const calls:unknown[]=[];
+ const account=new AccountDO(s.ctx,{HUB2_PROVIDER_FETCH:(async(...args:unknown[])=>{
+  calls.push(args);throw new Error('synthetic provider must not execute');
+ }) as any});
+ try{
+  assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}))).status,200);
+  const grant={id:'synthetic-grant',expires_at:Date.now()+23*3600000,available:true,source:'synthetic-test'};
+  const recorded=await data(await account.fetch(request('/api/account/resets','PUT',grant)));
+  assert.deepEqual(recorded,{recorded:true,redemption:'explicit_approval_required'});
+  const denied=await account.fetch(request('/api/account/resets','PUT',grant,{id:'agent:test',kind:'agent',scopes:[]}));
+  assert.equal(denied.status,403);
+  // Even an operator's explicit flag is not a provider-redemption API.
+  for(const path of ['/api/account/resets','/api/account/resets/redeem','/api/account/resets/consume']){
+   assert.equal((await account.fetch(request(path,'POST',{id:grant.id,approved:true}))).status,404);
+  }
+  await account.alarm();await account.alarm();
+  const grants=await data(await account.fetch(request('/api/account/resets')));
+  assert.equal(grants.items.length,1);assert.equal(grants.items[0].id,grant.id);
+  assert.equal(grants.items[0].available,1);
+  const alerts=await data(await account.fetch(request('/api/account/alerts')));
+  assert.equal(alerts.items.filter((a:any)=>a.kind==='reset_expiry_24h'&&a.grant_id===grant.id).length,1);
+  assert.deepEqual(calls,[],'observation/alerts/refused redemption never call the fake provider');
+ }finally{s.database.close();}
+});
+test('maintained public host diagnostic projection is fixed, private and attempt-epoch fenced',()=>{
+ // Invoke the actual projection on its real prototype; no constructor/alarm or HTTP fixture.
+ const machine=Object.create(MachineDO.prototype);
+ {
+  const base={operation_id:'synthetic-operation',attempt:2,epoch:7,evidence_digest:null};
+  const diagnostic={...base,reason:'workspace_unavailable',stage:'host_launch',
+   detail:'token=synthetic-secret\u001b]0;private-path\u0007',gate_reason:'synthetic-secret',message:'synthetic-secret'};
+  const row={...base,evidence_json:JSON.stringify({_hub_host_start_diagnostic:diagnostic})};
+  const project=(value:any,reason='workspace_unavailable')=>(machine as any).hostStartDiagnostic(value,reason);
+  assert.deepEqual(project(row),{stage:'host_launch',detail:'path does not exist; Hub will not create it'});
+  assert.equal(JSON.stringify(project(row)).includes('synthetic-secret'),false);
+  for(const field of ['operation_id','attempt','epoch']){
+   const altered={...diagnostic,[field]:field==='operation_id'?'foreign':99};
+   assert.equal(project({...row,evidence_json:JSON.stringify({_hub_host_start_diagnostic:altered})}),null);
+  }
+  assert.equal(project({...row,evidence_digest:'committed-proof'}),null);
+  assert.equal(project({...row,evidence_json:'{}'}),null);
+  assert.equal(project(row,'token=synthetic-secret'),null);
+ }
 });
