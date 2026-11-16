@@ -31,6 +31,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -57,6 +58,8 @@ _LOCK = threading.Lock()
 # Runs only the verified bundled CLI module; never this daemon's package.
 HELPER_BOOT = ('import sys; sys.path.insert(0, sys.argv[1]); '
                'from agent_hub_host.managed_claude_deliver import main; raise SystemExit(main(sys.argv[1:]))')
+WINDOWS_HELPER_BOOT = ('import sys; sys.path.insert(0, sys.argv[1]); '
+    'from agent_hub_host.windows_managed_claude_deliver import main; raise SystemExit(main(sys.argv[1:]))')
 HELPER_ENV_DROP = ('HUB_CONFIG_FILE', 'HUB2_CONFIG', 'HUB_TOKEN', 'HUB2_TOKEN', 'HUB_JOB_TOKEN', 'HUB_URL',
                    'HUB_BASE_URL', 'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID')
 
@@ -249,13 +252,14 @@ _DEFAULT = {'default', 'default_enabled', 'consumer_set'}
 _SET = re.compile(r'(?:[0-9a-f]{32}|enrollment_unreadable)\Z')
 
 
-def _consume_windows_check(bridge, state, epoch, lease, generation, revision, files):
-    """Unwired artifact-tranche seam: check only; never enroll/materialize/ACK.
+def _consume_windows(bridge, state, epoch, lease, generation, revision, files, action):
+    """Only the held release's managed consumer; never enroll or use PATH.
 
-    The verified lease supplies the actual interpreter. No dictionary or PATH
-    fallback is accepted. Held source survives through physical child settlement;
-    an unconfirmed child retains its lease in state and prevents another pass.
+    Ownership/physical settlement is shared with the artifact-tranche runner.
+    An uncertain child retains its borrowed code and blocks subsequent passes.
     """
+    if action not in ('check', 'materialize'):
+        raise Refused('consumer_input_invalid')
     from .windows_release import WindowsRelease
     if type(lease) is not WindowsRelease:
         raise Refused('windows_artifact_proof_invalid')
@@ -278,7 +282,7 @@ def _consume_windows_check(bridge, state, epoch, lease, generation, revision, fi
                 raise Refused('delivery_stopped')
             attempted = True
             child = state['child'] = (getattr(bridge, 'delivery_popen', None) or subprocess.Popen)(
-                [lease.python, '-I', '-S', '-c', HELPER_BOOT, lease.archive, 'check'],
+                [lease.python, '-I', '-S', '-c', WINDOWS_HELPER_BOOT, lease.archive, action],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=_environment(), close_fds=True,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -306,15 +310,15 @@ def _consume_windows_check(bridge, state, epoch, lease, generation, revision, fi
         if not isinstance(result, dict):
             raise Refused('consumer_output_invalid')
         keys = set(result)
-        if keys == _BASE and result.get('status') == 'absent':
+        if (not isinstance(result.get('consumer_set'), str)
+                or not re.fullmatch(r'[0-9a-f]{32}', result['consumer_set'])):
+            raise Refused('consumer_output_invalid')
+        if keys == _BASE | {'consumer_set'} and result.get('status') == 'absent':
             return result
-        if keys not in (_FULL, _FULL | _DEFAULT) or result.get('status') not in HELD + ('pending',):
-            raise Refused('consumer_output_invalid')
-        if type(result.get('generation')) is not int or result.get('generation') != generation or result.get('revision') != revision:
-            raise Refused('consumer_output_invalid')
-        if keys == _FULL | _DEFAULT and (type(result.get('default_enabled')) is not bool
-                or result.get('default') not in HELD + ('pending', 'absent', 'observe_only')
-                or not isinstance(result.get('consumer_set'), str) or not _SET.fullmatch(result['consumer_set'])):
+        if (keys != _FULL | {'consumer_set'}
+                or result.get('status') not in HELD + (('pending',) if action == 'check' else ())
+                or type(result.get('generation')) is not int or result['generation'] != generation
+                or result.get('revision') != revision):
             raise Refused('consumer_output_invalid')
         return result
     except BaseException as error:
@@ -340,6 +344,11 @@ def _consume_windows_check(bridge, state, epoch, lease, generation, revision, fi
             if failure is not None:
                 raise failure
             raise Refused('consumer_cleanup_pending')
+
+
+def _consume_windows_check(bridge, state, epoch, lease, generation, revision, files):
+    """Compatibility entrypoint for the original artifact check-only seam."""
+    return _consume_windows(bridge, state, epoch, lease, generation, revision, files, 'check')
 
 
 def _consume(bridge, state, epoch, archive, generation, revision, files, action='materialize'):
@@ -409,6 +418,8 @@ def _verdict(result):
 
 def _deliver(bridge, state, epoch):
     _fence(state, epoch)
+    if sys.platform == 'win32':
+        return _deliver_windows(bridge, state, epoch)
     launcher = bridge.launcher
     readiness = launcher.managed_claude_readiness() if callable(getattr(launcher, 'managed_claude_readiness', None)) else None
     if not isinstance(readiness, dict) or not isinstance(readiness.get('archive'), str):
@@ -419,6 +430,38 @@ def _deliver(bridge, state, epoch):
         if not isinstance(readiness, dict) or not isinstance(readiness.get('archive'), str):
             raise Refused('managed_claude_unavailable')
     archive = readiness['archive']
+    return _deliver_selected(bridge, state, epoch,
+        lambda generation, revision, files, action: _consume(
+            bridge, state, epoch, archive, generation, revision, files, action))
+
+
+def _deliver_windows(bridge, state, epoch):
+    from .windows_release import WindowsRelease
+    select = getattr(bridge.launcher, 'windows_credential_artifacts', None)
+    lease = select() if callable(select) else None
+    if type(lease) is not WindowsRelease:
+        raise Refused('windows_artifact_proof_invalid')
+    failure = None
+    try:
+        lease.check()
+        return _deliver_selected(bridge, state, epoch,
+            lambda generation, revision, files, action: _consume_windows(
+                bridge, state, epoch, lease, generation, revision, files, action))
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        # No close on an unknown child's borrowed lifetime. State owns it until
+        # separately proven settled; request() refuses any subsequent pass.
+        if state.get('windows_pending_artifact_lease') is not lease:
+            try:
+                lease.close()
+            except BaseException:
+                if failure is None:
+                    raise
+
+
+def _deliver_selected(bridge, state, epoch, consume):
     client = bridge.client
     generation, revision, files = _observe(client)
     key = (generation, revision)
@@ -429,12 +472,12 @@ def _deliver(bridge, state, epoch):
         # Never skip on the generation alone: a newly enrolled consumer, a
         # changed consumer set or local drift must be revalidated first.
         _fence(state, epoch)
-        probe = _consume(bridge, state, epoch, archive, generation, revision, files, 'check')
+        probe = consume(generation, revision, files, 'check')
         enabled, hold, identity, _ = _verdict(probe)
         if enabled and hold and identity == previous_set and (probe['status'] == 'absent') == previous_absent:
             return None
     _fence(state, epoch)
-    result = _consume(bridge, state, epoch, archive, generation, revision, files)
+    result = consume(generation, revision, files, 'materialize')
     enabled, hold, identity, blocker = _verdict(result)
     if blocker is not None:
         raise Refused(blocker)
@@ -450,7 +493,7 @@ def _deliver(bridge, state, epoch):
     # only while this connection epoch still owns delivery.
     _still_current(client, generation, revision)
     _fence(state, epoch)
-    recheck = _consume(bridge, state, epoch, archive, generation, revision, files, 'check')
+    recheck = consume(generation, revision, files, 'check')
     enabled2, hold2, identity2, _ = _verdict(recheck)
     if not (enabled2 and hold2 and identity2 == identity
             and (recheck['status'] == 'absent') == (result['status'] == 'absent')):

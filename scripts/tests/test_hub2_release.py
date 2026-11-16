@@ -1666,6 +1666,8 @@ class AlertClientPackagingTests(unittest.TestCase):
                     files[f'{package}/{name}'] = (REPO / package / name).read_bytes()
             files['host/agent_hub_host/managed_claude_deliver.py'] = (
                 REPO / 'host/agent_hub_host/managed_claude_deliver.py').read_bytes()
+            files['host/agent_hub_host/windows_managed_claude_deliver.py'] = (
+                REPO / 'host/agent_hub_host/windows_managed_claude_deliver.py').read_bytes()
             cli_source = """import hashlib,json,zipfile
 from pathlib import Path
 def git_sha(): raise AssertionError('builder must bind exported commit')
@@ -2327,9 +2329,13 @@ class WindowsReaderClosureTests(unittest.TestCase):
                 (package / name).write_bytes(raw)
             helper = b'synthetic reviewed helper source'
             (host / 'managed_claude_deliver.py').write_bytes(helper)
+            consumer = b'synthetic Windows managed consumer source'
+            (host / 'windows_managed_claude_deliver.py').write_bytes(consumer)
             builder.prepare_windows_reader(package, host)
             stamp = (package / '_credential_artifact_binding.py').read_text()
             self.assertIn(repr(hashlib.sha256(helper).hexdigest()), stamp)
+            self.assertIn(repr(hashlib.sha256(consumer).hexdigest()), stamp)
+            self.assertIn(repr('hub2-windows-managed-claude-consumer-v1'), stamp)
             self.assertIn(repr('hub2-windows-credential-artifacts-v1'), stamp)
             (package / 'win32_fs.py').write_bytes(b'foreign reader')
             before = (package / '_credential_artifact_binding.py').read_bytes()

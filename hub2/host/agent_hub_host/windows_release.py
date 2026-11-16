@@ -26,6 +26,8 @@ from . import private_fs, win32_fs as fs
 
 ABI = 'hub2-windows-credential-artifacts-v1'
 HELPER = 'agent_hub_host/managed_claude_deliver.py'
+WINDOWS_CONSUMER = 'agent_hub_host/windows_managed_claude_deliver.py'
+WINDOWS_CONSUMER_ABI = 'hub2-windows-managed-claude-consumer-v1'
 MAX_ARCHIVE = 16 * 1024 * 1024
 MAX_MANIFEST = 128 * 1024
 ROLES = {'launcher', 'venv_config', 'base_executable', 'python_dll'}
@@ -248,6 +250,13 @@ def _runtime_abi():
             'cache_tag': sys.implementation.cache_tag}
 
 
+def _consumer_pin():
+    from ._credential_artifact_binding import WINDOWS_CONSUMER_SOURCE_SHA256, WINDOWS_CONSUMER_ABI as abi
+    if not HEX.fullmatch(WINDOWS_CONSUMER_SOURCE_SHA256) or abi != WINDOWS_CONSUMER_ABI:
+        raise Refused('consumer_binding')
+    return WINDOWS_CONSUMER_SOURCE_SHA256
+
+
 def validate_artifacts(manifest_raw, archive_raw, version, protocol):
     manifest = decode(manifest_raw)
     if (not isinstance(version, str) or not COMMIT.fullmatch(version)
@@ -284,6 +293,8 @@ def validate_artifacts(manifest_raw, archive_raw, version, protocol):
             values[node.targets[0].id] = ast.literal_eval(node.value)
         if values.get('BUILD_COMMIT') != version or digest(read(HELPER, 131072)) != _helper_pin():
             raise Refused('helper_source')
+        if digest(read(WINDOWS_CONSUMER, 131072)) != _consumer_pin():
+            raise Refused('consumer_source')
     return manifest
 
 
