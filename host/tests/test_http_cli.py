@@ -1089,44 +1089,7 @@ export default {{
         self.assertNotEqual(res_so.returncode, 0)
         self.assertIn("403", res_so.stderr)
 
-    def test_real_worker_malformed_and_utf8_bounds(self):
-        # Body > 16 KiB rejected
-        res_over = self.run_cli([
-            "send",
-            "--from", "worker-1",
-            "--to", "worker-2",
-            "--kind", "note",
-            "--body", "-"
-        ], token="token_host_a", input_data="X" * 16385, check=False)
-        self.assertEqual(res_over.returncode, 1)
-        self.assertIn("exceeds 16 KiB limit", res_over.stderr)
 
-        # UTF-8 multibyte body succeeds
-        utf8_text = "Unicode test: 🚀 🤖 äöü €"
-        res_utf8 = self.run_cli([
-            "send",
-            "--from", "worker-1",
-            "--to", "worker-2",
-            "--kind", "note",
-            "--body", utf8_text,
-            "--idempotency-key", "utf8-key-1"
-        ], token="token_host_a")
-        out_utf8 = json.loads(res_utf8.stdout)
-        res_show = self.run_cli(["show", out_utf8["id"]], token="token_host_b")
-        msg = json.loads(res_show.stdout)
-        self.assertEqual(msg["body"], utf8_text)
-
-    def test_real_worker_unknown_addresses(self):
-        # Unknown recipient rejected with 404 (unknown_recipient)
-        res_unknown = self.run_cli([
-            "send",
-            "--from", "worker-1",
-            "--to", "nonexistent-agent-xyz",
-            "--kind", "note",
-            "--body", "Hello nowhere"
-        ], token="token_host_a", check=False)
-        self.assertNotEqual(res_unknown.returncode, 0)
-        self.assertIn("404", res_unknown.stderr)
 
     def test_real_worker_root_role_held_denial_and_zero_effects(self):
         # 1. Attempt send with --from role:root is explicitly denied with 403 (missing_m4_root_authority)
@@ -1885,6 +1848,9 @@ class TestHttpCliRealCleanupInjection(unittest.TestCase):
         self.assertFalse(os.path.exists(server_dir))
 
 
+# Relocated real-HTTP cases use the production Node server, not the Worker fixture.
+from node_http_cli_ports import TestCurrentNodeHttpCli
+
+
 if __name__ == "__main__":
     unittest.main()
-
