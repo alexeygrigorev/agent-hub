@@ -758,3 +758,266 @@ def test_real_cli_asks_record_then_list_shows_exact_ask_and_replay_is_idempotent
     finally:
         server.stop()
         shutil.rmtree(root, ignore_errors=True)
+
+
+# Lifetime drill: real Node/Host/CLI and the unchanged protected process fixture.
+# This adapter lives outside hub2/tests/e2e/**; it is not real aplexer/cgroup proof.
+import subprocess
+import sys
+def _lifetime_process(receipt):
+    try:
+        tail = (Path('/proc') / str(receipt['pid']) / 'stat').read_text().rsplit(')', 1)[1].split()
+    except FileNotFoundError:
+        return False
+    # A different birth is not this owned incarnation; a zombie executes no code.
+    return tail[19] == receipt['birth'] and tail[0] != 'Z'
+
+
+class _LifetimeHub:
+    def __init__(self, fault):
+        self.h = _load_harness()
+        self.root = self.server = self.host = None
+        try:
+            self.root = self.h.scratch_root()
+            self.root.chmod(0o700)
+            self.server = self.h.Server(self.root)
+            self.zipapp = self.h.build_cli(self.root / 'cli')
+            self.server.start()
+            token = self.h.configure_hub(self.server)
+            self.host = self.h.Host(self.root, self.server, token)
+            self.host.state.chmod(0o700)
+            # All selection writes are to this fresh synthetic fixture, before serve.
+            config = json.loads(self.host.config.read_text())
+            fixture = Path(__file__).resolve().parent / 'fixtures/phase24_native_barrier.py'
+            self.native_exe = fixture
+            config['launcher']['aplexer'] = str(fixture)
+            self.host.config.write_text(json.dumps(config))
+            self.host.config.chmod(0o600)
+            (self.host.state / 'phase24-owned.json').write_text(json.dumps(
+                {'state': str(self.host.state.resolve()), 'uid': os.getuid()}))
+            (self.host.state / 'phase24-control.json').write_text(json.dumps(
+                {'fault': fault, 'hold_start': True}))
+            self.cli = self.h.Cli(self.zipapp, self.root, self.server)
+            self.start_host()
+            self.h.wait_for(self.connected, 30, label='owned lifetime host connected')
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass  # Preserve original failure; close retains unknown scratch.
+            raise
+
+    def start_host(self):
+        # Bridge controls and NativeLauncher must use the same owned adapter.
+        # Keep the protected Host helper unchanged; retain its normal serve path.
+        assert not self.host.alive()
+        with self.host.log_path.open('ab') as log:
+            self.host.process = subprocess.Popen(
+                [sys.executable, '-m', 'agent_hub_host.cli', '--config', str(self.host.config),
+                 'serve', '--label', 'e2e', '--aplexer', str(self.native_exe)],
+                cwd=self.host.root, env=self.host.env(), stdout=log,
+                stderr=subprocess.STDOUT, start_new_session=True)
+
+    def connected(self):
+        assert self.host.alive(), 'own host exited'
+        rows = self.server.ok('GET', '/api/fleet/routing/machines')['machines']
+        return any(r.get('machine_id') == self.h.MACHINE and r.get('connected') is True for r in rows)
+
+    def journal(self, sid):
+        import sqlite3
+        path = self.host.config.parent / 'v2-journal.sqlite'
+        db = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)
+        try:
+            db.row_factory = sqlite3.Row
+            rows = db.execute('SELECT operation_id,session_id,epoch,native_id,state,native_dispatch_started '
+                              'FROM launches WHERE session_id=?', (sid,)).fetchall()
+            assert len(rows) == 1, 'one original launch row required'
+            return dict(rows[0])
+        finally:
+            db.close()
+
+    def intake(self, iid):
+        return self.cli.json('intake', 'show', iid)['intake']
+
+    def finish_events(self, iid):
+        result, after = [], None
+        for _ in range(10):
+            args = ['intake', 'history', iid, '--limit', '100']
+            if after is not None:
+                args += ['--after', str(after)]
+            page = self.cli.json(*args)
+            result.extend(e for e in page['events'] if e['kind'] == 'finish_evidence_received')
+            if page['next'] is None:
+                return result
+            assert page['next'] != after
+            after = page['next']
+        raise AssertionError('own fixture history did not finish')
+
+    def create_at_barrier(self):
+        import shlex
+        key = self.h.new_key()
+        effect = self.root / 'business-effect.txt'
+        code = ('from pathlib import Path; import time; '
+                'p=Path(%r); f=p.open("x"); f.write("once"); f.close(); '
+                'print("OWN-LIFETIME-READY",flush=True); time.sleep(300)' % str(effect))
+        command = shlex.join([sys.executable, '-I', '-B', '-c', code])
+        args = ['sessions', 'start', '--no-wait', '--engine', 'shell', '--workspace', str(self.host.workspace),
+                '--prompt', command, '--key', key]
+        created = self.cli.json(*args)
+        marker = self.host.state / 'phase24-barrier.json'
+        self.h.wait_for(marker.exists, 20, label='real workload before withheld start stdout')
+        barrier = json.loads(marker.read_text())
+        sid = created['id']
+        assert barrier['binding']['tag'] == 'task-hub2-' + sid
+        assert all(_lifetime_process(r) for r in barrier['processes'].values())
+        self.h.wait_for(effect.exists, 5, label='one real fixture business effect')
+        assert effect.read_text() == 'once'
+        row = self.journal(sid)
+        assert row['native_dispatch_started'] == 1 and row['native_id'] is None
+        assert row['state'] == 'launching'
+        # Same public CLI key reconciles to the original session, not a new launch.
+        replay = self.cli.json(*args)
+        assert replay['id'] == sid
+        assert len(list(self.host.state.glob('phase24-native-*.json'))) == 1
+        assert len(list((self.host.state / 'stub-sessions').glob('*.json'))) == 1
+        assert all(_lifetime_process(r) for r in barrier['processes'].values())
+        assert self.journal(sid)['native_id'] is None and self.journal(sid)['state'] == 'launching'
+        return created, barrier, row, args
+
+    @staticmethod
+    def stop_process(process):
+        import signal
+        if process is not None:
+            if process.poll() is None:
+                # Popen leader is still unreaped, so this fresh own group cannot be reused.
+                assert os.getpgid(process.pid) == process.pid
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+    def restart_after_fault(self):
+        started = time.monotonic()
+        self.stop_process(self.host.process)
+        seen = self.host.state / 'phase24-observed.json'
+        if seen.exists():
+            seen.unlink()  # Only a newly written fixture observation counts after restart.
+        self.start_host()  # Same config, same journal and original persisted dispatch.
+        return started
+
+    def close(self):
+        errors = []
+        for process in (getattr(self.host, 'process', None), getattr(self.server, 'process', None)):
+            try:
+                self.stop_process(process)
+            except BaseException as error:
+                errors.append(error)
+        if self.host is not None:
+            # Only this fresh fixture's records, never a machine-wide native inventory.
+            sidecars = list(self.host.state.glob('phase24-native-*.json'))
+            known_ids = {json.loads(path.read_text())['binding']['id'] for path in sidecars}
+            for path in (self.host.state / 'stub-sessions').glob('*.json'):
+                if path.stem not in known_ids:
+                    errors.append(AssertionError('unbound fixture process; retain scratch'))
+            for path in sidecars:
+                try:
+                    saved = json.loads(path.read_text())
+                    native = self.host.state / 'stub-sessions' / (saved['binding']['id'] + '.json')
+                    if native.exists():
+                        row = json.loads(native.read_text())
+                        assert saved['binding'] == {k: row[k] for k in saved['binding']}
+                        if row['phase'] != 'exited':
+                            assert all(_lifetime_process(r) for r in saved['processes'].values())
+                            original = self.h.STUB_BIN / 'a'
+                            subprocess.run([sys.executable, str(original), 'kill', row['id'], '--keep-record'],
+                                           env=self.host.env(), check=True, capture_output=True, timeout=10)
+                    self.h.wait_for(lambda: not any(_lifetime_process(r) for r in saved['processes'].values()),
+                                    5, label='only owned fixture processes settled')
+                except BaseException as error:
+                    errors.append(error)
+        if errors:
+            raise AssertionError('owned lifetime cleanup UNKNOWN; retain scratch at %s' % self.root) from errors[0]
+        if self.root is not None:
+            shutil.rmtree(self.root)  # Never delete scratch before every owned process settles.
+
+
+def test_owned_postspawn_prebind_ghost_retires_within_five_minutes(plain_operator_env):
+    import hashlib
+    hub = _LifetimeHub('none')
+    try:
+        created, barrier, before, args = hub.create_at_barrier()
+        sid = created['id']
+        kill = hub.host.state / 'phase24-kill.json'
+        assert not kill.exists(), 'no kill before the original host fault'
+        started = hub.restart_after_fault()
+        deadline = started + 300
+        def remaining():
+            value = deadline - time.monotonic()
+            assert value > 0, 'original five-minute retirement budget expired'
+            return value
+        # Required BEFORE accepting retirement, so natural sleep completion or
+        # later test cleanup cannot stand in for actual normal reconciliation.
+        hub.h.wait_for(kill.exists, remaining(), label='normal host kill of the original ghost')
+        called = json.loads(kill.read_text())
+        attempt = hashlib.sha256(json.dumps(
+            [hub.h.MACHINE, sid, before['operation_id'], before['epoch']],
+            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        assert called['native_id'] == barrier['binding']['id']
+        assert called['binding'] == barrier['binding']
+        assert called['labels'] == {'hub.managed': 'true', 'hub.session': sid, 'hub.attempt': attempt}
+        def qualified():
+            row = hub.journal(sid)
+            evidence = hub.intake(created['intake_id']).get('final_evidence') or {}
+            return (row, evidence) if row['state'] == 'exited' and evidence.get('native_exit_confirmed') is True else None
+        row, evidence = hub.h.wait_for(qualified, remaining(), label='actual recovery and qualified native retirement')
+        assert time.monotonic() - started <= 300
+        assert (row['operation_id'], row['epoch']) == (before['operation_id'], before['epoch'])
+        assert row['native_id'] == barrier['binding']['id'] == evidence['native_id']
+        assert evidence['containment_empty'] is True and evidence['launch_failed'] is True
+        assert type(evidence['exit_code']) is int
+        assert evidence['native_exit']['code'] is None
+        assert evidence['native_exit']['signal'] in (signal.SIGHUP, signal.SIGKILL)
+        assert not _lifetime_process(barrier['processes']['workload_pid'])
+        events = hub.finish_events(created['intake_id'])
+        assert len(events) == 1 and events[0]['body']['native_id'] == row['native_id']
+        assert hub.cli.json(*args)['id'] == sid
+        assert len(list(hub.host.state.glob('phase24-native-*.json'))) == 1
+        assert (hub.root / 'business-effect.txt').read_text() == 'once'
+        # Reconnect legitimately redelivers the original offer. The one journal
+        # row, business effect and finish above prove it is not a second launch.
+        assert len(re.findall(r'Host event type=session\.offer session=%s$' % re.escape(sid),
+                              hub.host.log_path.read_text(), re.M)) == 2
+        assert len(re.findall(r'Host event complete session=%s$' % re.escape(sid),
+                              hub.host.log_path.read_text(), re.M)) == 1
+    finally:
+        hub.close()
+
+
+@pytest.mark.parametrize('fault', ['foreign_attempt', 'no_exit'])
+def test_owned_ghost_unknown_never_creates_a_positive_finish(fault, plain_operator_env):
+    hub = _LifetimeHub(fault)
+    try:
+        created, barrier, before, args = hub.create_at_barrier()
+        sid = created['id']
+        hub.restart_after_fault()
+        observed = hub.host.state / 'phase24-observed.json'
+        hub.h.wait_for(observed.exists, 20, label='real restarted host native observation')
+        if fault == 'no_exit':
+            kill = hub.host.state / 'phase24-kill.json'
+            hub.h.wait_for(kill.exists, 20, label='actual normal native kill with exit proof withheld')
+            assert json.loads(kill.read_text())['native_id'] == barrier['binding']['id']
+        else:
+            hub.h.wait_for(lambda: hub.journal(sid)['state'] == 'aborting', 20,
+                           label='foreign attempt rejected by actual reconciliation')
+        time.sleep(1)  # Observe a complete reconciliation turn; no synthetic ACK/reply.
+        row = hub.journal(sid)
+        assert row['state'] == 'aborting'
+        assert (row['operation_id'], row['epoch']) == (before['operation_id'], before['epoch'])
+        evidence = hub.intake(created['intake_id']).get('final_evidence') or {}
+        assert evidence.get('native_exit_confirmed') is not True
+        assert hub.finish_events(created['intake_id']) == []
+        if fault == 'foreign_attempt':
+            assert row['native_id'] is None
+            assert not (hub.host.state / 'phase24-kill.json').exists()
+            assert _lifetime_process(barrier['processes']['workload_pid'])
+        assert len(list(hub.host.state.glob('phase24-native-*.json'))) == 1
+    finally:
+        hub.close()
