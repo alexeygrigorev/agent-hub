@@ -158,6 +158,8 @@ def request(bridge, now=None):
     now = time.monotonic() if now is None else now
     with _LOCK:
         epoch, running = state['epoch'], state['thread']
+        if state.get('windows_pending_artifact_lease') is not None:
+            return False  # Unknown child still owns held code; never reuse/retry it.
         # Single in-flight across epochs: an old worker must finish (it is
         # fenced and its helper killed) before a new epoch starts another.
         if epoch is None or epoch.stopped.is_set() or (running is not None and running.is_alive()) or now < state['next_at']:
@@ -245,6 +247,99 @@ _BASE = {'status'}
 _FULL = {'status', 'generation', 'revision'}
 _DEFAULT = {'default', 'default_enabled', 'consumer_set'}
 _SET = re.compile(r'(?:[0-9a-f]{32}|enrollment_unreadable)\Z')
+
+
+def _consume_windows_check(bridge, state, epoch, lease, generation, revision, files):
+    """Unwired artifact-tranche seam: check only; never enroll/materialize/ACK.
+
+    The verified lease supplies the actual interpreter. No dictionary or PATH
+    fallback is accepted. Held source survives through physical child settlement;
+    an unconfirmed child retains its lease in state and prevents another pass.
+    """
+    from .windows_release import WindowsRelease
+    if type(lease) is not WindowsRelease:
+        raise Refused('windows_artifact_proof_invalid')
+    if (type(generation) is not int or not 1 <= generation <= 2**53 - 1
+            or not isinstance(revision, str) or not REVISION.fullmatch(revision)
+            or not isinstance(files, dict) or set(files) != {CREDENTIAL_PATH}
+            or not isinstance(files[CREDENTIAL_PATH], str) or not files[CREDENTIAL_PATH]
+            or len(files[CREDENTIAL_PATH].encode('utf8')) > MAX_CREDENTIAL_BYTES):
+        raise Refused('consumer_input_invalid')
+    payload = json.dumps({'label': LABEL, 'generation': generation,
+                          'revision': revision, 'files': files}).encode()
+    if len(payload) > 32768:
+        raise Refused('consumer_input_invalid')
+    lease.check()
+    child, failure, out, attempted = None, None, None, False
+    lease.borrowers += 1
+    try:
+        with _LOCK:
+            if not _owns(state, epoch) or state.get('windows_pending_artifact_lease') is not None:
+                raise Refused('delivery_stopped')
+            attempted = True
+            child = state['child'] = (getattr(bridge, 'delivery_popen', None) or subprocess.Popen)(
+                [lease.python, '-I', '-S', '-c', HELPER_BOOT, lease.archive, 'check'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=_environment(), close_fds=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        try:
+            out, _ = child.communicate(payload, timeout=HELPER_TIMEOUT_SECONDS)
+            if child.poll() is None:
+                raise Refused('consumer_cleanup_pending')
+        except BaseException as error:
+            failure = error
+            _terminate(child)
+            try:
+                child.communicate(timeout=2)
+            except BaseException:
+                pass  # Retained below unless the owned process is actually reaped.
+        if failure is not None:
+            raise failure
+        _fence(state, epoch)
+        lease.check()
+        if child.returncode or not isinstance(out, bytes) or len(out) > HELPER_OUTPUT_BYTES:
+            raise Refused('consumer_output_invalid')
+        try:
+            result = json.loads(out)
+        except (ValueError, UnicodeError):
+            raise Refused('consumer_output_invalid') from None
+        if not isinstance(result, dict):
+            raise Refused('consumer_output_invalid')
+        keys = set(result)
+        if keys == _BASE and result.get('status') == 'absent':
+            return result
+        if keys not in (_FULL, _FULL | _DEFAULT) or result.get('status') not in HELD + ('pending',):
+            raise Refused('consumer_output_invalid')
+        if type(result.get('generation')) is not int or result.get('generation') != generation or result.get('revision') != revision:
+            raise Refused('consumer_output_invalid')
+        if keys == _FULL | _DEFAULT and (type(result.get('default_enabled')) is not bool
+                or result.get('default') not in HELD + ('pending', 'absent', 'observe_only')
+                or not isinstance(result.get('consumer_set'), str) or not _SET.fullmatch(result['consumer_set'])):
+            raise Refused('consumer_output_invalid')
+        return result
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            settled = child is not None and child.poll() is not None
+        except BaseException as error:
+            settled = False
+            if failure is None:
+                failure = error
+        with _LOCK:
+            if attempted and not settled:
+                state['windows_pending_artifact_lease'] = lease
+                # Keep borrowers charged and state['child'] reachable. No close,
+                # success, ACK or new pass can follow this uncertain ownership.
+            else:
+                lease.borrowers -= 1
+                if state['child'] is child:
+                    state['child'] = None
+        if attempted and not settled:
+            if failure is not None:
+                raise failure
+            raise Refused('consumer_cleanup_pending')
 
 
 def _consume(bridge, state, epoch, archive, generation, revision, files, action='materialize'):

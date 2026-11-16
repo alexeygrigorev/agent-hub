@@ -976,6 +976,18 @@ class NativeLauncher:
                 print('RECOVERED hub2-host: codex advertised again', file=sys.stderr, flush=True)
         return reason is None
 
+    def windows_credential_artifacts(self):
+        """A held Windows artifact owner, not consumer enrollment/readiness.
+
+        Deliberately separate from the Linux managed/readiness contract. No
+        normal delivery/ACK path opts Windows in during the artifact tranche.
+        """
+        if sys.platform != 'win32':
+            return None
+        from ._release import HOST_VERSION, PROTOCOL_VERSION
+        from .windows_release import WindowsRelease
+        return WindowsRelease.open(HOST_VERSION, PROTOCOL_VERSION)
+
     def _verified_release(self, release=None):
         """The exact installed release archive; no profile, credential or network probe.
 

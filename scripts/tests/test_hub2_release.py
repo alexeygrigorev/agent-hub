@@ -1660,6 +1660,12 @@ class AlertClientPackagingTests(unittest.TestCase):
                 'uv.lock': b'[[package]]\nname = "websockets"\nversion = "16.0"\nwheels = [{url = "https://fixture.invalid/websockets-16.0-py3-none-any.whl", hash = "sha256:' + b'a'*64 + b'"}]\n',
                 'scripts/hub_alert_client.py': self.client,
             }
+            # Match the real exported release closure; these source bytes are not executed.
+            for name in ('private_fs.py', 'win32_fs.py'):
+                for package in ('host/agent_hub_host', 'hub2/host/agent_hub_host'):
+                    files[f'{package}/{name}'] = (REPO / package / name).read_bytes()
+            files['host/agent_hub_host/managed_claude_deliver.py'] = (
+                REPO / 'host/agent_hub_host/managed_claude_deliver.py').read_bytes()
             cli_source = """import hashlib,json,zipfile
 from pathlib import Path
 def git_sha(): raise AssertionError('builder must bind exported commit')
@@ -2307,6 +2313,30 @@ class RetainedSchemaDiagnosticStagingTests(unittest.TestCase):
         self.assertEqual(result.skipped, [], 'retained DiagnosticStaging contracts must not be skipped')
         self.assertTrue(result.wasSuccessful(), '\n'.join(
             str(case) + '\n' + detail for case, detail in result.failures + result.errors))
+
+class WindowsReaderClosureTests(unittest.TestCase):
+    def test_real_builder_pins_exact_reader_and_helper_source(self):
+        builder = module('build-hub2-release')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package, host = root / 'package', root / 'host'
+            package.mkdir(); host.mkdir()
+            for name in builder.WINDOWS_READER_CLOSURE:
+                raw = (REPO / 'host/agent_hub_host' / name).read_bytes()
+                (host / name).write_bytes(raw)
+                (package / name).write_bytes(raw)
+            helper = b'synthetic reviewed helper source'
+            (host / 'managed_claude_deliver.py').write_bytes(helper)
+            builder.prepare_windows_reader(package, host)
+            stamp = (package / '_credential_artifact_binding.py').read_text()
+            self.assertIn(repr(hashlib.sha256(helper).hexdigest()), stamp)
+            self.assertIn(repr('hub2-windows-credential-artifacts-v1'), stamp)
+            (package / 'win32_fs.py').write_bytes(b'foreign reader')
+            before = (package / '_credential_artifact_binding.py').read_bytes()
+            with self.assertRaises(ValueError):
+                builder.prepare_windows_reader(package, host)
+            self.assertEqual((package / '_credential_artifact_binding.py').read_bytes(), before)
+
 
 if __name__ == '__main__':
     unittest.main()
