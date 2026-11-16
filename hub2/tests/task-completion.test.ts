@@ -1196,6 +1196,11 @@ test('operator re-evaluation of a failed intake accepts merged work and sends un
     assert.equal(intakeRow(f,merged).status,'accepted');
     assert(events(f,merged).some(e=>e.kind==='task_reevaluation_requested'));
     assert(events(f,merged).some(e=>e.kind==='task_acceptance_verified'));
+    const verified=events(f,merged).find(e=>e.kind==='task_acceptance_verified');
+    assert.equal(verified?.body.verdict,'pass');assert.equal(verified?.body.reason,'acceptance_verification_append','a recorded verdict names its true source, not the exit fallback');
+    const view=await json(await f.call('/api/intakes/'+merged));
+    assert.doesNotMatch(String(view.intake?.current_state??view.current_state??''),/could not finish/);
+    assert.doesNotMatch(String(view.intake?.next_step??view.next_step??''),/hub intake start/);
 
     // Work that never reached main: a model pass cannot bypass the gate.
     const unmerged=await createIntake(f,'reeval-unmerged',true);
