@@ -72,7 +72,8 @@ def directory(path, fds, create=False):
     if not path.is_absolute() or any(x in ('.', '..') for x in path.parts):
         raise Refused('regular_cli_directory')
     fd = fds.add(os.open('/', os.O_RDONLY | os.O_DIRECTORY))
-    for part in path.parts[1:]:
+    parts=path.parts[1:]
+    for index,part in enumerate(parts):
         if create:
             try:
                 os.mkdir(part, 0o700, dir_fd=fd)
@@ -80,7 +81,11 @@ def directory(path, fds, create=False):
             except FileExistsError: pass
         fd = fds.add(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd))
         st = os.fstat(fd)
-        if st.st_uid not in (0, os.getuid()) or st.st_mode & 0o002:
+        # Sticky protects a trusted-owner child entry against other UIDs,
+        # not hostile same-UID writers. Admit traversal only; final parents
+        # and private state retain the existing no-world-write boundary.
+        sticky_ancestor = index < len(parts)-1 and bool(st.st_mode & stat.S_ISVTX)
+        if st.st_uid not in (0, os.getuid()) or (st.st_mode & 0o002 and not sticky_ancestor):
             raise Refused('regular_cli_directory')
     return fd
 

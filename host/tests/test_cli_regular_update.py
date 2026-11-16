@@ -362,5 +362,71 @@ class RegularCliTests(unittest.TestCase):
                         if pipe is not None:pipe.close()
             finally:blocked.chmod(mode)
 
+    def _manual_update_below(self, home, target):
+        from agent_hub_host import cli
+        public={'built_from_commit':'b'*40,'version':'synthetic','sha256':r.digest(self.b)}
+        values=[json.dumps(public).encode(),self.b]
+        class Response(io.BytesIO):status=200
+        def urlopen(*args,**kwargs):return Response(values.pop(0))
+        args=argparse.Namespace(url='https://fixture.invalid',check=False,force=False,install_dir=str(target.parent))
+        with mock.patch.dict(os.environ,{'HOME':str(home)}),mock.patch.object(sys,'argv',[str(target)]),mock.patch.object(cli,'get_build_info',return_value={'commit':'a'*40,'version':'synthetic'}),mock.patch('urllib.request.urlopen',urlopen),mock.patch.object(sys,'stdout',io.StringIO()):
+            cli.cmd_update(args)
+        return values
+    def test_owned_sticky_ancestor_allows_ci_manual_update_and_owned_publication(self):
+        sticky=self.base/'sticky';sticky.mkdir(mode=0o700);sticky.chmod(0o1777)
+        home=sticky/'ci-home';home.mkdir(mode=0o700)
+        target=home/'manual-bin/hub'
+        self.assertEqual(self._manual_update_below(home,target),[])
+        self.assertEqual(target.read_bytes(),self.b)
+        root=home/'.local/share/agent-hub2'
+        self.assertFalse(r.selected(root,target),'manual installation was not adopted')
+        owned=home/'owned-bin/hub'
+        self.assertEqual(r.publish(self.a,self.ma,owned,root,create=True)['status'],'published')
+        old=owned.stat().st_ino
+        result=r.publish(self.b,self.mb,owned,root)
+        self.assertEqual(result['status'],'published')
+        self.assertEqual(owned.read_bytes(),self.b)
+        self.assertEqual((owned.parent/result['retained']).stat().st_ino,old)
+    def test_nonsticky_world_writable_ancestor_never_enters_legacy_writer(self):
+        unsafe=self.base/'nonsticky';unsafe.mkdir(mode=0o700);unsafe.chmod(0o777)
+        home=unsafe/'ci-home';home.mkdir(mode=0o700)
+        target=home/'manual-bin/hub';target.parent.mkdir(mode=0o700)
+        target.write_bytes(self.a);target.chmod(0o755);inode=target.stat().st_ino
+        with self.assertRaises(r.Refused):self._manual_update_below(home,target)
+        with self.assertRaises(r.Refused):r.publish(self.b,self.mb,home/'owned-bin/hub',home/'state',create=True)
+        self.assertEqual(target.stat().st_ino,inode);self.assertEqual(target.read_bytes(),self.a)
+    def test_sticky_ancestor_does_not_allow_foreign_owner_or_symlink(self):
+        from types import SimpleNamespace
+        sticky=self.base/'sticky';sticky.mkdir(mode=0o700);sticky.chmod(0o1777)
+        home=sticky/'ci-home';home.mkdir(mode=0o700)
+        root=home/'state';target=home/'bin/hub'
+        actual=r.os.fstat;identity=sticky.stat()
+        def foreign(fd):
+            info=actual(fd)
+            if (info.st_dev,info.st_ino)==(identity.st_dev,identity.st_ino):
+                # Only metadata fault injection on our owned synthetic FD;
+                # no actual foreign chown, privilege or global pathname probe.
+                return SimpleNamespace(st_uid=os.getuid()+1,st_mode=info.st_mode)
+            return info
+        with mock.patch.object(r.os,'fstat',foreign):
+            with self.assertRaises(r.Refused):r.selected(root,target)
+        alias=sticky/'alias';alias.symlink_to(home,target_is_directory=True)
+        with self.assertRaises(OSError):r.selected(alias/'state',alias/'bin/hub')
+        self.assertFalse(target.exists())
+    def test_sticky_final_publication_parent_and_private_state_remain_refused(self):
+        sticky=self.base/'sticky-final';sticky.mkdir(mode=0o700);sticky.chmod(0o1777)
+        fds=r.FDs()
+        try:
+            with self.assertRaises(r.Refused):r.directory(sticky,fds)
+        finally:fds.close()
+        with self.assertRaises(r.Refused):r.publish(self.a,self.ma,sticky/'hub',self.root,create=True)
+        self.assertFalse((sticky/'hub').exists())
+        self.create();inode=self.target.stat().st_ino;self.state.chmod(0o1777)
+        try:
+            with self.assertRaises(r.Refused):r.publish(self.b,self.mb,self.target,self.root)
+            self.assertEqual(self.target.stat().st_ino,inode)
+            self.assertEqual(self.target.read_bytes(),self.a)
+        finally:self.state.chmod(0o700)
+
 
 if __name__=='__main__':unittest.main()
