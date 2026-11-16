@@ -142,8 +142,11 @@ def prepare_windows_reader(package, host_source):
         if (package / name).read_bytes() != (host_source / name).read_bytes():
             raise ValueError('Windows safe-reader closure differs from maintained source')
     helper_sha = hashlib.sha256((host_source / 'managed_claude_deliver.py').read_bytes()).hexdigest()
+    consumer_sha = hashlib.sha256((host_source / 'windows_managed_claude_deliver.py').read_bytes()).hexdigest()
     (package / '_credential_artifact_binding.py').write_text(
-        f'HELPER_SOURCE_SHA256 = {helper_sha!r}\nHELPER_ABI = {WINDOWS_ARTIFACT_ABI!r}\n')
+        f'HELPER_SOURCE_SHA256 = {helper_sha!r}\nHELPER_ABI = {WINDOWS_ARTIFACT_ABI!r}\n'
+        f'WINDOWS_CONSUMER_SOURCE_SHA256 = {consumer_sha!r}\n'
+        "WINDOWS_CONSUMER_ABI = 'hub2-windows-managed-claude-consumer-v1'\n")
 
 
 def build(repo, revision, output):

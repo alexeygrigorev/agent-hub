@@ -22,11 +22,12 @@ CHAIN = {'launcher': ROOT + r'\venv\Scripts\python.exe',
          'python_dll': r'C:\fixture\Python\python313.dll'}
 
 
-def archive_bytes(version=VERSION, helper=HELPER):
+def archive_bytes(version=VERSION, helper=HELPER, consumer=None):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w') as archive:
         archive.writestr('agent_hub_host/_build_info.py', f'BUILD_COMMIT = "{version}"\n')
         archive.writestr(release.HELPER, helper)
+        archive.writestr(release.WINDOWS_CONSUMER, helper if consumer is None else consumer)
     return buffer.getvalue()
 
 
@@ -96,6 +97,7 @@ class Artifacts(unittest.TestCase):
         self.stack.enter_context(patch.dict(sys.modules, {'agent_hub_host._release': module}))
         self.stack.enter_context(patch.object(release, '_chain_paths', return_value=(ROOT, CHAIN)))
         self.stack.enter_context(patch.object(release, '_helper_pin', return_value=release.digest(HELPER)))
+        self.stack.enter_context(patch.object(release, '_consumer_pin', return_value=release.digest(HELPER)))
         self.stack.enter_context(patch.object(release, 'PinnedFile', self.store.pin))
         self.stack.enter_context(patch.object(release, '_new_capsule', side_effect=lambda path: nullcontext()))
         self.stack.enter_context(patch.object(release.private_fs, 'exclusive_lock', side_effect=lambda path: nullcontext()))
@@ -117,6 +119,17 @@ class Artifacts(unittest.TestCase):
                 lease.close()
         lease.close()
         self.assertTrue(lease.closed)
+
+    def test_windows_consumer_source_is_independently_pinned(self):
+        changed = archive_bytes(consumer=b'foreign managed helper, never executed')
+        manifest = json.loads(self.manifest)
+        manifest['artifacts']['hub.pyz'] = {'sha256': release.digest(changed), 'size': len(changed)}
+        self.manifest = json.dumps(manifest).encode()
+        self.store.put(self.manifest_path, self.manifest, False)
+        self.store.put(self.archive_path, changed, False)
+        with self.assertRaisesRegex(release.Refused, 'consumer_source'):
+            self.publish()
+        self.assertNotIn(self.pointer, self.store.entries)
 
     def test_missing_receipt_refuses(self):
         with self.assertRaises(FileNotFoundError):
@@ -256,7 +269,7 @@ class WindowsCheckOnly(unittest.TestCase):
         lease.owner_thread = release.threading.get_ident()
         lease.python, lease.archive = 'VERIFIED-PYTHON', 'VERIFIED-ARCHIVE'
         child = child or SimpleNamespace(returncode=0, poll=lambda: 0,
-            communicate=lambda *a, **k: (b'{"status":"absent"}', b''))
+            communicate=lambda *a, **k: (b'{"status":"absent","consumer_set":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}', b''))
         calls = []
         def popen(argv, **kwargs):
             calls.append((argv, kwargs))
@@ -274,7 +287,7 @@ class WindowsCheckOnly(unittest.TestCase):
 
     def test_actual_command_uses_lease_interpreter_and_check_only(self):
         bundle = self.make()
-        self.assertEqual(self.run_check(bundle), {'status': 'absent'})
+        self.assertEqual(self.run_check(bundle), {'status': 'absent', 'consumer_set': 'a' * 32})
         lease, _, state, _, calls = bundle
         self.assertEqual(calls[0][0][0], 'VERIFIED-PYTHON')
         self.assertEqual(calls[0][0][-2:], ['VERIFIED-ARCHIVE', 'check'])
@@ -306,7 +319,7 @@ class WindowsCheckOnly(unittest.TestCase):
 
     def test_unreaped_child_retains_source_owner_and_no_success(self):
         child = SimpleNamespace(returncode=None, poll=lambda: None, kill=lambda: None,
-            pid=999, communicate=lambda *a, **k: (b'{"status":"absent"}', b''))
+            pid=999, communicate=lambda *a, **k: (b'{"status":"absent","consumer_set":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}', b''))
         bundle = self.make(child)
         with patch.object(delivery, '_terminate'):
             with self.assertRaises(delivery.Refused): self.run_check(bundle)
