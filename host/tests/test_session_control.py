@@ -1245,3 +1245,145 @@ class TestTargetedCaptureReceipt(unittest.TestCase):
         with patch.object(session_control,'request') as transport:
             with self.assertRaisesRegex(ValueError,'invalid_command_id'):session_control.execute(args)
         transport.assert_not_called()
+
+
+class TestEarlyCaptureBinding(unittest.TestCase):
+    def _parse(self, *argv):
+        return parser().parse_args(['sessions', *argv])
+
+    def _bare_409(self):
+        return session_control.SessionHTTPError(409, code='session_not_running',
+                                                message='Session HTTP request failed with status 409 (session_not_running)')
+
+    def test_bare_409_waits_for_wrapped_claimed_to_running_and_reuses_key(self):
+        views = iter([
+            {'session': {'id': 'sid', 'state': 'claimed'}},
+            {'session': {'id': 'sid', 'state': 'starting'}},
+            {'session': {'id': 'sid', 'state': 'running'}},
+        ])
+        posts = []
+
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                posts.append((path, dict(payload)))
+                if len(posts) == 1:
+                    raise self._bare_409()
+                return {'command_id': 'c1'}
+            self.assertEqual((method, path), ('GET', '/api/sessions/sid'))
+            return next(views)
+
+        ack = {'state': 'acked', 'ack': {'capture': 'ok'}}
+        with patch.object(session_control, 'request', side_effect=fake), \
+                patch.object(session_control.time, 'sleep'), \
+                patch.object(session_control, 'wait_for_command', return_value=ack), \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            result = session_control.execute(self._parse('capture', 'sid', '--key', 'stable-k'))
+        self.assertEqual(len(posts), 2)
+        self.assertEqual([p[0] for p in posts], ['/api/sessions/sid/capture', '/api/sessions/sid/capture'])
+        self.assertEqual([p[1]['key'] for p in posts], ['stable-k', 'stable-k'])
+        self.assertEqual(result['command_wait'], ack)
+        self.assertIn('Session sid is claimed: waiting up to', err.getvalue())
+
+    def test_bare_409_preserves_hub1_flat_envelope_and_pending_true(self):
+        for exc_factory, views in (
+            (self._bare_409, iter([{'state': 'offered'}, {'state': 'claimed'}, {'state': 'running'}])),
+            (lambda: session_control.SessionHTTPError(409, code='session_not_bound', pending=True, state='offered'),
+             iter([{'session': {'state': 'claimed'}}, {'session': {'state': 'running'}}])),
+        ):
+            posts = []
+
+            def fake(method, path, payload=None):
+                if method == 'POST':
+                    posts.append(payload['key'])
+                    if len(posts) == 1:
+                        raise exc_factory()
+                    return {'command_id': 'c2'}
+                return next(views)
+
+            ack = {'state': 'acked', 'ack': {'capture': 'tail'}}
+            with self.subTest(exc=exc_factory), \
+                    patch.object(session_control, 'request', side_effect=fake), \
+                    patch.object(session_control.time, 'sleep'), \
+                    patch.object(session_control, 'wait_for_command', return_value=ack), \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                result = session_control.execute(self._parse('capture', 'sid', '--key', 'k-once'))
+            self.assertEqual(posts, ['k-once', 'k-once'])
+            self.assertEqual(result['command_wait'], ack)
+
+    def test_bare_409_already_running_on_peek_retries_once_without_sleep(self):
+        posts = []
+
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                posts.append(payload['key'])
+                if len(posts) == 1:
+                    raise self._bare_409()
+                return {'command_id': 'c3'}
+            return {'session': {'id': 'sid', 'state': 'running'}}
+
+        ack = {'state': 'acked', 'ack': {'capture': 'live'}}
+        with patch.object(session_control, 'request', side_effect=fake), \
+                patch.object(session_control.time, 'sleep') as sleep, \
+                patch.object(session_control, 'wait_for_command', return_value=ack), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            result = session_control.execute(self._parse('capture', 'sid', '--key', 'k-fast'))
+        self.assertEqual(posts, ['k-fast', 'k-fast'])
+        self.assertEqual(result['command_wait'], ack)
+        sleep.assert_not_called()
+
+    def test_bare_409_preserves_terminal_and_foreign_errors_without_sleep(self):
+        for terminal in ('stopped', 'failed', 'lost', 'refused', 'cancelled'):
+            def fake(method, path, payload=None, st=terminal):
+                if method == 'POST':
+                    raise self._bare_409()
+                return {'session': {'id': 'sid', 'state': st}}
+
+            with self.subTest(terminal=terminal), \
+                    patch.object(session_control, 'request', side_effect=fake) as call, \
+                    patch.object(session_control.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, r'status 409 \(session_not_running\).*reconcile with --key k-term'):
+                    session_control.execute(self._parse('capture', 'sid', '--key', 'k-term'))
+            self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+            sleep.assert_not_called()
+
+        def fake_foreign(method, path, payload=None):
+            if method == 'POST':
+                raise self._bare_409()
+            raise session_control.SessionHTTPError(404, code='session_not_found')
+
+        with patch.object(session_control, 'request', side_effect=fake_foreign) as call, \
+                patch.object(session_control.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError, r'404.*session_not_found.*reconcile with --key k-404'):
+                session_control.execute(self._parse('capture', 'sid', '--key', 'k-404'))
+        self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+        sleep.assert_not_called()
+
+    def test_bare_409_deadline_exhaustion_fails_without_enqueue_or_new_session(self):
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                raise self._bare_409()
+            return {'session': {'id': 'sid', 'state': 'claimed'}}
+
+        clock = [0.0]
+        with patch.object(session_control, 'request', side_effect=fake) as call, \
+                patch.object(session_control.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(session_control.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                patch.object(session_control, 'BIND_WAIT_TIMEOUT', 4.0), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(ValueError, 'session_not_bound; session sid did not reach running'):
+                session_control.execute(self._parse('capture', 'sid', '--key', 'k-timeout'))
+        self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+        self.assertTrue(all('/api/sessions/sid' in c.args[1] for c in call.call_args_list))
+
+    def test_no_wait_and_send_do_not_poll_on_bare_409(self):
+        for argv in (
+            ('capture', 'sid', '--no-wait', '--key', 'k-nowait'),
+            ('send', 'sid', '--prompt', 'hello', '--wait', '--key', 'k-send'),
+        ):
+            with self.subTest(argv=argv), \
+                    patch.object(session_control, 'request', side_effect=self._bare_409()) as call, \
+                    patch.object(session_control.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, 'session_not_running'):
+                    session_control.execute(self._parse(*argv))
+            self.assertEqual(call.call_count, 1)
+            sleep.assert_not_called()
