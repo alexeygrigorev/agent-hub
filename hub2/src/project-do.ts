@@ -1,3 +1,4 @@
+import {validNativeAbsenceEvidence} from './machine-native-inventory';
 import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
 import { IntakeRelations } from './intake-relations';
@@ -1052,7 +1053,7 @@ export class ProjectDO {
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_claim', 409);
     const binding=this.workspaceBinding(saga,body.workspace_binding);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale') return json({claimed:false,lost:true,duplicate:true});
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason))) return json({claimed:false,lost:true,duplicate:true});
     if (saga.state === 'claimed' || saga.state === 'admitted' || saga.state === 'running') {
       this.transaction(()=>this.pinWorkspaceBinding(saga,binding));
       return json({ claimed: true, duplicate: true });
@@ -1151,17 +1152,20 @@ export class ProjectDO {
     const body=await bodyObject(request,12_288);
     if(body.reason==='legacy_launch_unobserved')return this.legacyLaunchUnobserved(body,reaped);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
-      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale'].includes(String(body.reason)))
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale','native_inventory_absent'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
     const launchTimedOut=['launch_timeout_no_native','host_no_response'].includes(String(body.reason));
     const launchRefused=body.reason==='host_launch_refused';
     const launchFailed=launchTimedOut||launchRefused;
-    const lost=body.reason==='host_inventory_stale';
+    const lost=['host_inventory_stale','native_inventory_absent'].includes(String(body.reason));
+    const nativeAbsent=body.reason==='native_inventory_absent';
     if (lost && (!reaped || body.lost!==true || body.stopped!==undefined
       || typeof body.native_id!=='string' || body.native_id.length<8 || body.native_id.length>128
       || !Number.isSafeInteger(body.observed_at)
-      || (body.inventory_observed_at!==null && (!Number.isSafeInteger(body.inventory_observed_at)
-        || Number(body.observed_at)-Number(body.inventory_observed_at)<HOST_INVENTORY_LOST_MS)))) return error('invalid_lost_receipt',400);
+      || (nativeAbsent?(!validNativeAbsenceEvidence(body.native_inventory_absence,Number(body.observed_at))
+        ||['stopped','reaped','native_exit_confirmed','exit_code','containment_empty'].some(key=>Object.hasOwn(body,key)))
+        :(body.inventory_observed_at!==null && (!Number.isSafeInteger(body.inventory_observed_at)
+        || Number(body.observed_at)-Number(body.inventory_observed_at)<HOST_INVENTORY_LOST_MS))))) return error('invalid_lost_receipt',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
     const exactAttempt=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch;
@@ -1172,7 +1176,7 @@ export class ProjectDO {
       &&saga.state==='complete'&&saga.last_reason==='stop_confirmed'&&previousAttempt;
     if(!exactAttempt&&!pendingRetryStop&&!duplicateRetryStop)return error('stale_stopped_receipt',409);
     if (lost && (!exactAttempt || (saga.native_id!==null && saga.native_id!==body.native_id))) return error('stale_lost_receipt',409);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale') {
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason))) {
       if (!await this.releaseLostCapacity(saga)) return error('session_cap_release_pending',503);
       return json({lost:true,duplicate:true,session_id:saga.session_id});
     }
@@ -1203,7 +1207,7 @@ export class ProjectDO {
           !launchFailed&&!lost&&['dead','idle'].includes(String(body.reason)),true,now);
       }
       this.db.run("UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?",status,
-        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
+        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at,...(nativeAbsent?{native_outcome:'unconfirmed',native_inventory_absence:body.native_inventory_absence}:{})}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped:nativeAbsent?false:reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
           native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{})}),now,intake.id);
@@ -1379,7 +1383,7 @@ export class ProjectDO {
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_started_receipt', 409);
     const binding=this.workspaceBinding(saga,body.workspace_binding);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale' && saga.native_id===body.native_id) {
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason)) && saga.native_id===body.native_id) {
       return json({started:false,lost:true,duplicate:true});
     }
     if (!/^[0-9a-f-]{36}$/i.test(body.native_id)) return error('invalid_started_receipt',400);

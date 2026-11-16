@@ -9,14 +9,14 @@ const header={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(ma
 
 function fixture(revokeFailures=0,projectFailures=0){
  const database=new DatabaseSync(':memory:'),events:Array<{path:string;body:any}>=[],sockets:any[]=[];
- const revocations:any[]=[];
+ const revocations:any[]=[],kv=new Map<string,unknown>();let kvHook:((key:string)=>void)|undefined,kvDeleteHook:(()=>void)|undefined;
  let alarm:number|null=null;
  const ctx:any={id:{toString:()=> 'machine-h1'},storage:{sql:{exec(query:string,...args:unknown[]){
   const statement=database.prepare(query);let rows:unknown[]=[],rowsRead=0,rowsWritten=0;
   if(statement.columns().length){rows=statement.all(...args as any);rowsRead=rows.length;}
   else{const result=statement.run(...args as any);rowsWritten=Number(result.changes);}
   return{toArray:()=>rows,rowsRead,rowsWritten};
- }},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(error){database.exec('ROLLBACK');throw error;}}},
+ }},async get(key:string){return structuredClone(kv.get(key));},async put(key:string,value:unknown){kv.set(key,structuredClone(value));kvHook?.(key);},async delete(key:string){kvDeleteHook?.();return kv.delete(key);},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(error){database.exec('ROLLBACK');throw error;}}},
   blockConcurrencyWhile(fn:()=>unknown){return Promise.resolve(fn());},getWebSockets(){return sockets;}};
  const env:any={
   CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
@@ -37,7 +37,7 @@ function fixture(revokeFailures=0,projectFailures=0){
  };
  let machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- return{database,get machine(){return machine;},restart:()=>machine=new MachineDO(ctx,env),call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
+ return{database,kv,onKvDelete:(fn:(()=>void)|undefined)=>{kvDeleteHook=fn;},onKvPut:(fn:((key:string)=>void)|undefined)=>{kvHook=fn;},get machine(){return machine;},restart:()=>machine=new MachineDO(ctx,env),call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
 }
 
 async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,nativeId:string|null){
@@ -1681,4 +1681,231 @@ test('complete census omission retains custody in all six modes until qualified 
   assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
   f.database.close();
  }
+});
+
+
+async function commitNativeSnapshot(f:ReturnType<typeof fixture>,at:number,sequence:number,rows:unknown[]=[],finish=true){
+ const {sha256Hex}=await import('../src/crypto.ts');
+ const data=JSON.stringify(rows),body={snapshot_id:'aaaaaaaa-aaaa-4aaa-8aaa-'+String(sequence).padStart(12,'0'),
+  started_at_ms:at,observed_at_ms:at,row_count:rows.length,chunk_count:finish?1:2,
+  sha256:await sha256Hex(data),chunk_index:0,data};
+ const response=await f.call('/api/native-inventory','POST',body);
+ assert.equal(response.status,200,JSON.stringify(await response.clone().json()));
+ return response.json() as Promise<any>;
+}
+
+test('complete native absence durably loses the exact managed attempt without inventing native exit',async()=>{
+ const f=fixture(),session='full-inventory-orphan',native='77777777-7777-4777-8777-777777777777';
+ const epoch=await startClaimed(f,session,native),clock=Date.now;let now=clock()+1_000;
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<=5;i++){
+   if(i){now+=60_000;f.restart();}
+   assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+   await commitNativeSnapshot(f,now,i+1);
+   if(i<5)assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  }
+  const view=(await (await f.call('/api/sessions/'+session,'GET',undefined,actor)).json() as any).session;
+  assert.equal(view.state,'lost');assert.equal(view.native_id,native);assert.equal(view.epoch,epoch);
+  assert.equal(view.evidence,null);assert.notEqual(view.stop_confirmed,true);
+  assert.equal(f.database.prepare('SELECT exit_code FROM sessions WHERE id=?').get(session)?.exit_code,null);
+  assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM session_commands').get()?.n,0);
+  const loss=f.events.filter(e=>e.path==='/_internal/reaped');assert.equal(loss.length,1);
+  assert.equal(loss[0].body.reason,'native_inventory_absent');assert.equal(loss[0].body.lost,true);
+  for(const key of ['stopped','reaped','native_exit_confirmed','exit_code','containment_empty'])assert.equal(loss[0].body[key],undefined);
+  assert.equal(loss[0].body.epoch,epoch);assert.equal(loss[0].body.native_id,native);
+  const snapshot=(await (await f.call('/_internal/live-sessions')).json() as any).sessions;
+  assert.equal(snapshot.length,0,'logical loss must not manufacture a native observation');
+  await commitNativeSnapshot(f,now,6);
+  f.restart();await f.machine.alarm();
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,1);
+  assert.equal(f.revocations.length,1);
+  const liveList=await (await f.call('/api/sessions?live=1','GET',undefined,actor)).json() as any;
+  assert.equal(liveList.items.some((item:any)=>item.id===session),false);
+  // Reappearance cannot rewrite the recorded loss or manufacture exit. Existing
+  // exact future controls and native evidence remain available on the lost row.
+  now+=1000;await commitNativeSnapshot(f,now,7,[observedNative(native)]);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost');
+  const base='/api/sessions/'+session+'/commands';
+  const command=(await (await f.call(base,'POST',{kind:'stop',key:'later-qualified'},actor)).json() as any).command;
+  assert(command);
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',{epoch:epoch+1,result:{stopped:true,evidence:'native_exit',native_id:native}})).status,409);
+  const stop={epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',stop)).status,200);
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',stop)).status,200);
+  assert.equal((await (await f.call('/api/sessions/'+session,'GET',undefined,actor)).json() as any).session.stop_confirmed,true);
+  const start=now-600000;
+  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,start);
+  f.database.prepare("UPDATE sessions SET launch_json=json_set(launch_json,'$.timeout_seconds',1800) WHERE id=?").run(session);f.clearCache();
+  const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,evidence:{source:'aplexer_retirement',
+   containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_deadline:{deadline_ms:start+1800000,exceeded:false},native_exit:{code:0,exited_at_ms:now}}};
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...finish,native_id:'foreign'})).status,409);
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+  assert.equal((await (await f.call('/api/sessions/'+session+'/finish','POST',finish)).json() as any).duplicate,true);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,1);
+ }finally{Date.now=clock;f.database.close();}
+});
+
+
+function observedNative(native:string,state='running',worker=true){
+ return {id:native,tag:'unit-native',workspace:'/tmp',engine:'codex',agent:null,profile:null,agent_profile:null,
+  phase:state==='running'?'running':'exited',cwd:'/tmp',created_at_ms:null,last_activity_ms:null,state,worker_alive:worker};
+}
+
+test('complete native absence resets on every live reappearance and never uses alarm or replay age',async()=>{
+ const f=fixture(),session='transient-absence',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000,sequence=0;
+ const state=()=>f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<4;i++){await commitNativeSnapshot(f,now,++sequence);now+=60000;}
+  // Reappearance and disappearance are both committed before any alarm runs.
+  await commitNativeSnapshot(f,now,++sequence,[observedNative(native)]);
+  now+=1;await commitNativeSnapshot(f,now,++sequence);
+  for(let i=0;i<4;i++){now+=60000;await commitNativeSnapshot(f,now,++sequence);}
+  assert.equal(state(),'running');
+  const marker=structuredClone(f.kv.get('native-absence:'+session));
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+  for(let i=0;i<3;i++){await commitNativeSnapshot(f,now,sequence);await f.machine.alarm();}
+  assert.deepEqual(f.kv.get('native-absence:'+session),marker);
+  assert.equal(state(),'running');
+  now+=60000;await commitNativeSnapshot(f,now,++sequence);assert.equal(state(),'lost');
+ }finally{Date.now=clock;f.database.close();}
+});
+
+test('complete native absence cannot bridge stale partial equal-time or changed-attempt observations',async()=>{
+ for(const mode of ['gap','partial','equal-time','epoch','native','operation','late-kv']){
+  const f=fixture(),session='absence-negative-'+mode,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<5;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+   if(mode==='gap')now+=LIVE_SNAPSHOT_TTL_MS;
+   if(mode==='epoch'||mode==='native'||mode==='operation')f.onKvPut(key=>{
+    if(!key.startsWith('native-absence:'))return;
+    const assignment=mode==='epoch'?'epoch=epoch+1':mode==='native'?"native_id='88888888-8888-4888-8888-888888888888'":"operation_id='changed-operation'";
+    f.database.prepare('UPDATE sessions SET '+assignment+' WHERE id=?').run(session);f.clearCache();f.onKvPut(undefined);
+   });
+   if(mode==='late-kv')f.onKvPut(key=>{if(key.startsWith('native-absence:')){now+=LIVE_SNAPSHOT_TTL_MS+1;f.onKvPut(undefined);}});
+   if(mode==='equal-time'){now-=60000;await commitNativeSnapshot(f,now,6);}
+   else await commitNativeSnapshot(f,now,6,[],mode!=='partial');
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running',mode);
+   assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0,mode);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+test('complete native absence uses live inventory predicate without manufacturing terminal exit',async()=>{
+ for(const mode of ['live','terminal','unknown-worker','live-heartbeat']){
+  const f=fixture(),session='inventory-predicate-'+mode,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<=5;i++){
+    const rows=mode==='live'?[observedNative(native)]:mode==='terminal'?[observedNative(native,'exited',false)]
+     :mode==='unknown-worker'?[{...observedNative(native),state:'unknown',worker_alive:null}]:[];
+    if(mode==='live-heartbeat')assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+     session_id:session,native_id:native,phase:'running',last_activity_at:now,exit_code:null,containment_empty:false,
+    }]})).status,200);
+    await commitNativeSnapshot(f,now,i+1,rows);if(i<5)now+=60000;
+   }
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,['live','live-heartbeat','unknown-worker'].includes(mode)?'running':'lost',mode);
+   assert.equal(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)?.evidence_json,null);
+   assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM session_commands').get()?.n,0);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+
+async function lossProjectFixture(receipt:any){
+ const {ProjectDO}=await import('../src/project-do.ts');
+ const db=new DatabaseSync(':memory:'),releases:any[]=[];let alarm:number|null=null;
+ const ctx:any={id:{toString:()=> 'project-test'},storage:{sql:{exec(q:string,...args:any[]){
+  const p=db.prepare(q);let rows:any[]=[],written=0;if(p.columns().length)rows=p.all(...args);else written=Number(p.run(...args).changes);
+  return {toArray:()=>rows,rowsRead:rows.length,rowsWritten:written};
+ }},transactionSync(fn:()=>unknown){db.exec('BEGIN');try{const r=fn();db.exec('COMMIT');return r;}catch(e){db.exec('ROLLBACK');throw e;}},
+ async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ const unused={idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
+  const request=input instanceof Request?input:new Request(input,init);
+  if(new URL(request.url).pathname==='/_internal/session-cap/release')releases.push(await request.json());
+  return Response.json({ok:true});
+ }})};
+ const project=new ProjectDO(ctx,{CONTROL:unused,MACHINES:unused,ACCOUNTS:unused,MAILBOXES:unused} as any);
+ const call=(path:string,body:any)=>project.fetch(new Request('https://project.test'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
+ await project.fetch(new Request('https://project.test/_metrics'));
+ db.prepare(`INSERT INTO intakes(id,project,title,text,acceptance_criteria_json,status,assigned_machine_id,session_id,created_at,updated_at)
+  VALUES(?,'project-test','test','test','[]','in-progress',?,?,?,?)`).run(receipt.intake_id,receipt.machine_id,receipt.session_id,Date.now(),Date.now());
+ db.prepare(`INSERT INTO dispatch_sagas(operation_id,request_digest,request_key,intake_id,session_id,machine_id,attempt_operation_id,
+  launch_spec_json,native_id,epoch,state,attempt,created_at,updated_at) VALUES(?,'digest','key',?,?,?,?,'{}',?,?,'running',0,?,?)`)
+  .run(receipt.operation_id,receipt.intake_id,receipt.session_id,receipt.machine_id,receipt.attempt_operation_id,receipt.native_id,receipt.epoch,Date.now(),Date.now());
+ return {db,call,releases};
+}
+
+test('complete native absence Project boundary rejects false exit and stale binding then records one truthful loss',async()=>{
+ const f=fixture(),session='project-native-loss',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000,p:Awaited<ReturnType<typeof lossProjectFixture>>|undefined;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<=5;i++){await commitNativeSnapshot(f,now,i+1);if(i<5)now+=60000;}
+  const receipt=f.events.find(e=>e.path==='/_internal/reaped')!.body;p=await lossProjectFixture(receipt);
+  for(const patch of [{epoch:receipt.epoch+1},{native_id:'foreign-native'},
+    {native_inventory_absence:{...receipt.native_inventory_absence,observations:1}},
+    {native_inventory_absence:{...receipt.native_inventory_absence,latest:receipt.native_inventory_absence.first}},
+    {stopped:true},{reaped:true},{native_exit_confirmed:true},{exit_code:0},{containment_empty:true}]){
+   const response=await p.call('/_internal/reaped',{...receipt,...patch});assert([400,409].includes(response.status),JSON.stringify(patch));
+   assert.equal(p.db.prepare('SELECT state FROM dispatch_sagas').get()?.state,'running');assert.equal(p.releases.length,0);
+  }
+  assert.equal((await p.call('/_internal/reaped',receipt)).status,200);
+  const final=JSON.parse(p.db.prepare('SELECT final_evidence_json FROM intakes').get()!.final_evidence_json as string);
+  assert.equal(final.lost,true);assert.equal(final.native_outcome,'unconfirmed');assert.equal(final.reaped,false);
+  assert.equal(final.stopped,undefined);assert.equal(final.native_exit_confirmed,undefined);assert.equal(final.exit_code,undefined);
+  assert.equal(final.native_id,native);assert.equal(p.db.prepare('SELECT last_reason FROM dispatch_sagas').get()?.last_reason,'native_inventory_absent');
+  // Delivery retries validate the original observation time, not a renewed window.
+  now+=600000;assert.equal((await (await p.call('/_internal/reaped',receipt)).json() as any).duplicate,true);
+  assert.deepEqual(await (await p.call('/_internal/started',receipt)).json(),{started:false,lost:true,duplicate:true});
+  assert.deepEqual(await (await p.call('/_internal/claim',receipt)).json(),{claimed:false,lost:true,duplicate:true});
+  assert.equal(p.db.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE kind='session_lost'").get()?.n,1);
+  assert.equal(p.releases.length,2,'existing idempotent start-reservation release is preserved');
+ }finally{Date.now=clock;p?.db.close();f.database.close();}
+});
+
+
+test('complete native absence resets unknown and conflicting UUID presence instead of treating it as omission',async()=>{
+ for(const [state,alive] of [['running',null],['unknown',null],['exited',true],['running',false]] as const){
+  const f=fixture(),session='uncertain-native-'+state+'-'+alive,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<5;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+   await commitNativeSnapshot(f,now,6,[{...observedNative(native),state,worker_alive:alive}]);
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running',state+'/'+alive);
+   assert.equal(f.kv.has('native-absence:'+session),false,'uncertain/conflicting presence resets the absence chain');
+   for(let i=0;i<5;i++){now+=60000;await commitNativeSnapshot(f,now,i+7);}
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running','new omission has not passed its own grace');
+   now+=60000;await commitNativeSnapshot(f,now,12);
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost','genuine later omission still converges');
+   assert.equal(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)?.evidence_json,null);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+
+test('complete native absence cannot bridge a committed reappearance whose KV reset fails',async()=>{
+ const f=fixture(),session='failed-presence-reset',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<4;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+  f.onKvDelete(()=>{throw new Error('synthetic KV reset failure');});
+  await assert.rejects(()=>commitNativeSnapshot(f,now,5,[observedNative(native)]));
+  f.onKvDelete(undefined);
+  assert(f.database.prepare('SELECT native_id FROM native_inventory_rows WHERE native_id=?').get(native),'reappearance really committed despite observer failure');
+  now+=1;await commitNativeSnapshot(f,now,6);
+  now+=60000;await commitNativeSnapshot(f,now,7);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+ }finally{Date.now=clock;f.database.close();}
 });
