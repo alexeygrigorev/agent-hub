@@ -9,16 +9,46 @@ from agent_hub_host import quota_server, quota as quota_cli
 
 class ServerQuotaTests(unittest.TestCase):
     def test_collects_account_observations_without_machine_coverage(self):
-        settings = {'accounts': [{'provider': 'codex', 'account': 'agent-main'}]}
-        future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
-        route = {'status': 'ok', 'error': None, 'details': {'limit_reached': False, 'secret': 'must disappear'},
-                 'windows': {'7d': {'percent_remaining': 71, 'reset_at': future}}}
-        payload = quota_server.collect_accounts(settings, runner=lambda *a, **k: {'codex': route})
-        self.assertNotIn('host_id', payload)
-        self.assertEqual(payload['accounts'][0]['quota']['windows']['7d']['percent_remaining'], 71)
-        self.assertNotIn('secret', str(payload))
-        self.assertEqual(payload['accounts'][1]['quota']['status'], 'error')
-        self.assertEqual(payload['accounts'][1]['quota']['windows'], {})
+        # An explicit empty catalog prevents discovery from the operator HOME.
+        # Only configured accounts are published, not removed default accounts
+        # or synthesized unobserved managed-account error rows.
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text('[]')
+            settings = {'accounts': [{'provider': 'codex', 'account': 'agent-main'}],
+                        'managed_state_file': str(state)}
+            now = datetime.datetime.now(datetime.timezone.utc)
+            observed = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+            future = (now + datetime.timedelta(days=1)).isoformat()
+            route = {'status': 'ok', 'error': None, 'observed_at': observed,
+                     'details': {'limit_reached': False, 'secret': 'must disappear'},
+                     'windows': {'7d': {'percent_remaining': 71, 'reset_at': future}}}
+            calls = []
+            def runner(argv, **kwargs):
+                calls.append(argv)
+                if isinstance(argv, list):
+                    self.assertEqual(argv, ['hub', 'engines', 'quota'])
+                    return {'accounts': []}
+                return {'codex': route, 'go': {'status': 'error', 'secret': 'unconfigured-private'}}
+            payload = quota_server.collect_accounts(settings, runner=runner)
+            self.assertEqual(calls, ['quse', ['hub', 'engines', 'quota']])
+            self.assertEqual(set(payload), {'captured_at', 'accounts'})
+            self.assertRegex(payload['captured_at'], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+            self.assertNotIn('host_id', payload)
+            self.assertEqual(len(payload['accounts']), 1)
+            row = payload['accounts'][0]
+            self.assertEqual(set(row), {'account', 'provider', 'quota'})
+            self.assertEqual((row['account'], row['provider']), ('agent-main', 'codex'))
+            quota = row['quota']
+            self.assertEqual(set(quota), {'status', 'error', 'observed_at', 'details', 'windows'})
+            self.assertEqual((quota['status'], quota['error'], quota['observed_at']), ('ok', None, observed))
+            self.assertEqual(quota['details'], {'limit_reached': False})
+            self.assertEqual(set(quota['windows']), {'7d'})
+            self.assertEqual(quota['windows']['7d']['percent_remaining'], 71)
+            self.assertEqual(quota['windows']['7d']['reset_at'],
+                             (now + datetime.timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+            for private in ('secret', 'must disappear', 'unconfigured-private'):
+                self.assertNotIn(private, json.dumps(payload))
 
     def test_duplicate_account_and_unknown_provider_refused_before_execution(self):
         for accounts in [[{'provider': 'codex', 'account': 'main'}] * 2,

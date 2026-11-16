@@ -22,13 +22,12 @@ import time
 import unittest
 import urllib.request
 
+from node_server_fixture import node_command
+
 from real_worker_harness import (
     RealWorkerHarness,
     WorkerProcessHandle,
     WorkerStartupError,
-    build_fixture_worker_ts,
-    build_miniflare_script,
-    build_wrangler_config,
     find_available_port,
     get_available_cpus,
     read_file_tail,
@@ -42,7 +41,8 @@ class TestRealWorkerStartupHarness(unittest.TestCase):
         self.repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
     def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        if not getattr(self, "_preserve_tmp", False):
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_get_available_cpus_and_port(self):
         cpus = get_available_cpus(2)
@@ -54,13 +54,15 @@ class TestRealWorkerStartupHarness(unittest.TestCase):
         self.assertGreater(port, 1024)
 
     def test_miniflare_config_persists_resources_between_processes(self):
-        script = build_miniflare_script(self.repo_root, self.tmp_dir, "/bundle.js", 8787)
-        options_start = script.index("const opts=") + len("const opts=")
-        options_end = script.index("; const mf=", options_start)
-        options = json.loads(script[options_start:options_end])
-
-        self.assertEqual(options["resourcePersistencePath"], os.path.join(self.tmp_dir, "state"))
-        self.assertNotIn("durableObjectsPersist", options)
+        """Historical method identity; current Node uses one durable data-dir."""
+        state = os.path.join(self.tmp_dir, "state")
+        first = node_command(self.repo_root, state, 8787, "/synthetic/node")
+        second = node_command(self.repo_root, state, 8788, "/synthetic/node")
+        self.assertEqual(first[first.index("--data-dir") + 1], state)
+        self.assertEqual(second[second.index("--data-dir") + 1], state)
+        self.assertEqual(first[first.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(first[first.index("--dev-vars") + 1], "none")
+        self.assertNotEqual(first[first.index("--port") + 1], second[second.index("--port") + 1])
 
     def test_resolve_node_binary(self):
         node_bin = resolve_node_binary()
@@ -392,74 +394,95 @@ with socketserver.TCPServer(("127.0.0.1", {port}), Handler) as httpd:
         self.assertEqual(harness.retry_history[1]["attempt"], 2)
 
     def test_cold_actual_worker_positive(self):
-        """Build real worker bundle, launch Miniflare under harness, probe /healthz, and clean up."""
-        if not os.path.exists(os.path.join(self.repo_root, "src", "bus.ts")):
-            raise unittest.SkipTest("Real Worker source pending")
+        """Real current Node /health, persisted intake across restart, own cleanup.
 
-        server_dir = tempfile.mkdtemp(dir=self.tmp_dir, prefix="sess-cold-")
-        fixture_ts = build_fixture_worker_ts(self.repo_root)
-        with open(os.path.join(server_dir, "fixture_worker.ts"), "w") as f:
-            f.write(fixture_ts)
-
-        cfg = build_wrangler_config(port=8787, main_ts="fixture_worker.ts")
-        with open(os.path.join(server_dir, "wrangler.jsonc"), "w") as f:
-            json.dump(cfg, f)
-
+        The historical method name remains a compatibility entry. No missing
+        Worker/Node source skip, Miniflare build, SQL seed or fake HTTP adapter.
+        """
         node_bin = resolve_node_binary()
-        node_dir = str(Path(node_bin).parent)
-        env = os.environ.copy()
-        current_path = env.get("PATH", "")
-        if node_dir not in current_path.split(os.pathsep):
-            env["PATH"] = f"{node_dir}:{current_path}"
-        env["TOKIO_WORKER_THREADS"] = "1"
-        env["RAYON_NUM_THREADS"] = "1"
-        env["UV_THREADPOOL_SIZE"] = "1"
-        env["NODE_OPTIONS"] = "--max-old-space-size=384"
-        env["MINIFLARE_WORKERD_V8_FLAGS"] = "--single-threaded --single-threaded-gc"
-        env["TMPDIR"] = self.tmp_dir
-        cpu_str = get_available_cpus(2)
-
-        harness = RealWorkerHarness(
-            repo_root=self.repo_root,
-            server_dir=server_dir,
-            tmp_root=self.tmp_dir,
-            readiness_timeout=35.0,
-            poll_interval=0.2,
-            max_startup_attempts=2,
-        )
-
-        build_dir = Path(server_dir) / "bundle"
-        bundle_path = harness.build_worker(
-            config_path=os.path.join(server_dir, "wrangler.jsonc"),
-            out_dir=str(build_dir),
-            env=env,
-            cpu_str=cpu_str,
-            node_bin=node_bin,
-        )
-        self.assertTrue(os.path.exists(bundle_path))
-
-        def launch_worker(port: int, log_name: str) -> WorkerProcessHandle:
-            mf_js = os.path.join(server_dir, f"miniflare-{port}.cjs")
-            script = build_miniflare_script(self.repo_root, server_dir, str(bundle_path), port)
-            with open(mf_js, "w") as f:
-                f.write(script)
-            cmd = ["taskset", "-c", cpu_str, node_bin, str(mf_js)]
-            return harness.launch_command(cmd, port=port, env=env, log_name=log_name)
-
-        handle = harness.start_with_retry(launch_worker)
-        try:
-            self.assertTrue(handle.is_alive())
-            # Real HTTP request to verify worker is actively serving
-            req = urllib.request.Request(handle.health_url)
+        version = subprocess.check_output([node_bin, "-v"], text=True).strip()
+        self.assertGreaterEqual(int(version.lstrip("v").split(".", 1)[0]), 24)
+        entry = Path(self.repo_root) / "hub2/node/main.ts"
+        self.assertTrue(entry.is_file())
+        state = os.path.join(self.tmp_dir, "node-state")
+        token = "node-startup-synthetic-operator-" + "0" * 32
+        env = {"HUB2_DEV_OPERATOR_TOKEN": token, "HUB2_CREDENTIAL_KEY": "ab" * 32,
+               "HUB2_RELEASE_MODE": "active", "HUB2_DEFAULT_ACCOUNT_ID": "startup-fixture",
+               "TMPDIR": self.tmp_dir, "NODE_OPTIONS": "--max-old-space-size=384"}
+        harness = RealWorkerHarness(repo_root=self.repo_root, server_dir=self.tmp_dir,
+            tmp_root=self.tmp_dir, readiness_timeout=35, poll_interval=0.2,
+            max_startup_attempts=2)
+        handles = []
+        settled = set()
+        attempted = set()
+        primary = None
+        def launch(port, log_name):
+            handle = harness.launch_command(node_command(self.repo_root, state, port, node_bin),
+                port=port, health_path="/health", env=env, log_name=log_name, cwd=self.tmp_dir)
+            handles.append(handle)
+            return handle
+        def request(handle, method, path, body=None):
+            data = None if body is None else json.dumps(body).encode()
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (handle.port, path),
+                data=data, method=method, headers={"Authorization": "Bearer " + token,
+                                                  "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                raw = response.read(65537)
+                self.assertLessEqual(len(raw), 65536)
+                return response.status, json.loads(raw)
+        def clean(handle):
+            if id(handle) in attempted:
+                if id(handle) not in settled:
+                    raise AssertionError("Prior own cleanup remains UNKNOWN")
+                return
+            attempted.add(id(handle))
             try:
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    status_code = resp.status
-            except urllib.error.HTTPError as err:
-                status_code = err.code
-            self.assertIn(status_code, (200, 401))
+                handle.cleanup()
+                self.assertFalse(handle.is_alive())
+            except BaseException:
+                self._preserve_tmp = True
+                raise
+            settled.add(id(handle))
+        try:
+            first = launch(find_available_port(), "node-cold.log")
+            harness.wait_for_ready(first)
+            self.assertTrue(first.is_alive())
+            status, _ = request(first, "GET", "/health")
+            self.assertEqual(status, 200)
+            status, _ = request(first, "PATCH", "/api/repos/fixture%2Fnode-startup", {
+                "canonical_url": "https://github.com/fixture/node-startup",
+                "purpose": "Owned cold Node persistence test", "status": "active"})
+            self.assertIn(status, (200, 201))
+            status, created = request(first, "POST", "/api/intake/tasks?project=fixture%2Fnode-startup", {
+                "key": "startup-persist-once", "title": "Actual Node persistence",
+                "text": "Synthetic metadata only; no host, provider or native launch.",
+                "acceptance_criteria": ["Persist across the owned server restart"], "code_task": False})
+            self.assertIn(status, (200, 201))
+            iid = created["intake"]["id"]
+            clean(first)
+            second = launch(find_available_port(), "node-restart.log")
+            harness.wait_for_ready(second)
+            self.assertTrue(second.is_alive())
+            status, found = request(second, "GET", "/api/intake/tasks/" + iid)
+            self.assertEqual(status, 200)
+            self.assertEqual(found["intake"]["id"], iid)
+            self.assertEqual(found["intake"]["title"], "Actual Node persistence")
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            handle.cleanup()
-            self.assertFalse(handle.is_alive())
+            errors = []
+            for handle in handles:
+                if id(handle) in settled:
+                    continue
+                try: clean(handle)
+                except BaseException as error: errors.append(error)
+            if errors:
+                self._preserve_tmp = True
+                if primary is None:
+                    raise AssertionError("Owned Node cleanup UNKNOWN; retain " + self.tmp_dir) from errors[0]
+                if hasattr(primary, "add_note"):
+                    primary.add_note("Owned Node cleanup UNKNOWN; scratch retained at " + self.tmp_dir)
 
     def test_caller_cleanup_proc_surfaces_cleanup_failure_and_preserves_setup_exc(self):
         """Caller teardown (_cleanup_proc) surfaces handle.cleanup errors via try/finally

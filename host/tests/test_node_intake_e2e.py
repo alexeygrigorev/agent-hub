@@ -1021,3 +1021,17 @@ def test_owned_ghost_unknown_never_creates_a_positive_finish(fault, plain_operat
         assert len(list(hub.host.state.glob('phase24-native-*.json'))) == 1
     finally:
         hub.close()
+
+
+# Current backend startup/ownership concerns are required in the prepared Node24
+# lane. Import the TestCase locally so combined pytest selection does not export
+# a duplicate unittest class. Each wrapper forwards one actual result/failure.
+@pytest.mark.parametrize("case_name", ('test_get_available_cpus_and_port', 'test_miniflare_config_persists_resources_between_processes', 'test_resolve_node_binary', 'test_resolve_node_binary_refusal_when_under_22', 'test_read_file_tail_bounded', 'test_startup_failure_fail_fast', 'test_readiness_timeout_bounded', 'test_log_pressure_no_deadlock', 'test_process_group_cleanup_including_grandchildren', 'test_process_group_cleanup_parent_exited_grandchild_alive', 'test_retry_aborts_if_cleanup_cannot_be_verified', 'test_infrastructure_retry_bounded_success_on_attempt_2', 'test_infrastructure_retry_exhausted_raises_with_full_evidence', 'test_cold_actual_worker_positive', 'test_caller_cleanup_proc_surfaces_cleanup_failure_and_preserves_setup_exc'))
+def test_current_node_startup_harness_case(case_name):
+    import unittest
+    from tests.test_real_worker_startup import TestRealWorkerStartupHarness
+    result = unittest.TestResult()
+    TestRealWorkerStartupHarness(case_name).run(result)
+    assert result.testsRun == 1
+    assert not result.skipped, "Current startup coverage must not skip"
+    assert result.wasSuccessful(), result.errors + result.failures
