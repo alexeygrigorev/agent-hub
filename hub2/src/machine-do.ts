@@ -1,7 +1,7 @@
 import { linkSession } from './session-intake-link';
 import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-commands';
 import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
-import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA} from './machine-native-inventory';
+import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA, validNativeAbsenceEvidence, nativeAbsenceObservation, type Meta, type NativeAbsenceEvidence} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
 import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
@@ -168,7 +168,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "provider_fable_smoke_failed": "Launch preparation was refused.",
   "provider_sdk_install_refused": "Launch preparation was refused."
 };
-const HOST_EVENT_REASONS=new Set([...Object.keys(HOST_FAILURE_DETAILS),"host_launch_refused","native_process_absent","launch_timeout_no_native","stop_confirmed","native_exit","stop_unconfirmed","host_inventory_lost","host_operation_failed","native_mail_outcome_uncertain","connected","dead","idle","host_no_response","host_inventory_stale","legacy_launch_unobserved","machine_not_enrolled"]);
+const HOST_EVENT_REASONS=new Set([...Object.keys(HOST_FAILURE_DETAILS),"host_launch_refused","native_process_absent","launch_timeout_no_native","stop_confirmed","native_exit","stop_unconfirmed","host_inventory_lost","host_operation_failed","native_mail_outcome_uncertain","connected","dead","idle","host_no_response","host_inventory_stale","native_inventory_absent","legacy_launch_unobserved","machine_not_enrolled"]);
 function closedHostReason(value:unknown):string {
   return typeof value==='string' && HOST_EVENT_REASONS.has(value) ? value : 'host_operation_failed';
 }
@@ -344,7 +344,7 @@ export class MachineDO {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
-    this.nativeInventory=new MachineNativeInventory(this.db,ctx);
+    this.nativeInventory=new MachineNativeInventory(this.db,ctx,(snapshot,previous)=>this.observeNativeAbsences(snapshot,previous));
     this.nativeCommands=new MachineNativeCommands(this.db,ctx,this.nativeInventory);
     this.ready=initializeSchema(ctx, this.db, 10, [...LATEST_SCHEMA, ...ENGINE_UPDATE_JOBS_SCHEMA], [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
@@ -1443,7 +1443,7 @@ export class MachineDO {
       }
       const revocationReason = row.kind==='legacy-launch-failure' ? 'legacy_launch_unobserved'
         : payload.no_dispatch===true ? 'native_dispatch_not_started'
-        : row.kind==='lost' ? 'host_inventory_stale' : row.kind==='finish' ? 'native_exit_confirmed' : null;
+        : row.kind==='lost' ? (payload.reason==='native_inventory_absent'?'native_inventory_absent':'host_inventory_stale') : row.kind==='finish' ? 'native_exit_confirmed' : null;
       if(revocationReason){
         const revoked=await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/revoke',{
           method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:payload.session_id,
@@ -2161,17 +2161,61 @@ export class MachineDO {
     return applied;
   }
 
-  private async recordLost(session:SessionRow,now:number):Promise<boolean>{
-    const reason='host_inventory_stale',key=`lost:${session.operation_id}:${session.epoch}`;
+  private async observeNativeAbsences(snapshot:Meta,previous:Meta|undefined):Promise<void>{
+    const store=this.presenceStore();
+    if(!store)return; // No durable observation authority in incomplete adapters.
+    const rows=this.db.all<SessionRow>("SELECT * FROM sessions WHERE state='running' AND native_id IS NOT NULL ORDER BY updated_at,id LIMIT 200");
+    for(const session of rows){
+      const key=`native-absence:${session.id}`;
+      const matches=()=>{
+        const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
+        return current?.state==='running'&&current.operation_id===session.operation_id&&current.epoch===session.epoch
+          &&current.native_id===session.native_id&&JSON.stringify(this.nativeInventory.metadata())===JSON.stringify(snapshot);
+      };
+      const eligible=()=>{
+        const now=Date.now();
+        const live=this.db.one<{native_id:string;phase:string;observed_at:number}>('SELECT native_id,phase,observed_at FROM native_sessions WHERE session_id=?',session.id);
+        return matches()&&now>=snapshot.observed_at_ms&&now-snapshot.observed_at_ms<=LIVE_SNAPSHOT_TTL_MS
+          &&snapshot.started_at_ms>=session.updated_at&&!this.stopConfirmed(session)
+          &&this.nativeInventory.absentOrNonliving(session.native_id!)
+          &&!(live&&live.native_id===session.native_id&&!['missing','dead','exited'].includes(live.phase)
+            &&live.observed_at<=now+5000&&now-live.observed_at<=LIVE_SNAPSHOT_TTL_MS);
+      };
+      const saved=await store.get(key) as {operation_id?:string;native_id?:string;epoch?:number;evidence?:NativeAbsenceEvidence}|undefined;
+      if(!matches())continue;
+      if(!eligible()){await store.delete(key);continue;}
+      const now=Date.now(),old=saved?.evidence;
+      const continuous=nativeAbsenceObservation(old)&&JSON.stringify(old.latest)===JSON.stringify(previous)&&saved?.operation_id===session.operation_id&&saved.native_id===session.native_id&&saved.epoch===session.epoch
+        &&Number.isSafeInteger(old.last_seen_at)&&now>=old.last_seen_at&&now-old.last_seen_at<=LIVE_SNAPSHOT_TTL_MS
+        &&snapshot.started_at_ms>=old.latest.observed_at_ms&&snapshot.observed_at_ms>old.latest.observed_at_ms
+        &&snapshot.observed_at_ms-old.latest.observed_at_ms<=LIVE_SNAPSHOT_TTL_MS;
+      const evidence:NativeAbsenceEvidence={first:continuous?old!.first:snapshot,latest:snapshot,
+        first_seen_at:continuous?old!.first_seen_at:now,last_seen_at:now,observations:continuous?old!.observations+1:1};
+      const observation={operation_id:session.operation_id,native_id:session.native_id,epoch:session.epoch,evidence};
+      if(!eligible())continue;
+      await store.put(key,observation);
+      if(!eligible())continue;
+      const persisted=await store.get(key);
+      if(!eligible()||JSON.stringify(persisted)!==JSON.stringify(observation))continue;
+      if(validNativeAbsenceEvidence(evidence,Date.now()))await this.recordLost(session,Date.now(),evidence);
+    }
+  }
+
+  private async recordLost(session:SessionRow,now:number,absence?:NativeAbsenceEvidence):Promise<boolean>{
+    const reason=absence?'native_inventory_absent':'host_inventory_stale',key=`lost:${session.operation_id}:${session.epoch}`;
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       const inventory=this.db.one<{observed_at:number}>('SELECT observed_at FROM machine_liveness WHERE singleton=1');
       if(!current||current.state!=='running'||!current.native_id||current.native_id!==session.native_id
         ||current.epoch!==session.epoch||current.operation_id!==session.operation_id
-        ||now-Math.max(current.updated_at,inventory?.observed_at??0)<HOST_INVENTORY_LOST_MS)return false;
+        ||(!absence&&now-Math.max(current.updated_at,inventory?.observed_at??0)<HOST_INVENTORY_LOST_MS))return false;
+      if(absence&&(!validNativeAbsenceEvidence(absence,now)
+        ||JSON.stringify(this.nativeInventory.metadata())!==JSON.stringify(absence.latest)
+        ||!this.nativeInventory.absentOrNonliving(current.native_id)))return false;
       const payload={operation_id:current.dispatch_id,attempt_operation_id:current.operation_id,session_id:current.id,
         intake_id:current.intake_id,machine_id:current.machine_id,epoch:current.epoch,native_id:current.native_id,
-        reason,lost:true,observed_at:now,inventory_observed_at:inventory?.observed_at??null};
+        reason,lost:true,observed_at:now,inventory_observed_at:inventory?.observed_at??null,
+        ...(absence?{native_inventory_absence:absence}:{})};
       this.db.run("UPDATE sessions SET state='lost',updated_at=? WHERE id=?",now,current.id);
       this.db.run("UPDATE machine_session_operations SET state='lost' WHERE operation_id=? AND session_id=? AND epoch=?",
         current.operation_id,current.id,current.epoch);
