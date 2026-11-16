@@ -276,6 +276,37 @@ def install_operator_cli(target, manifest):
         os.replace(pending, entry)
 
 
+REGULAR_CLI_BOOT = "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('agent_hub_host.regular_cli',run_name='__main__')"
+
+
+def update_regular_operator_cli(root, target, manifest):
+    # No record means no existing regular-path ownership: zero target lookup or
+    # background adoption. Component failure never poisons a healthy Host update.
+    try:
+        os.lstat(root / 'regular-cli')
+    except FileNotFoundError:
+        return 'unmanaged'
+    except OSError:
+        print('Regular operator CLI component: unknown')
+        return 'unknown'
+    try:
+        if not matches_installed_artifact(target / 'hub.pyz', manifest['artifacts']['hub.pyz']):
+            raise ValueError('regular CLI archive mismatch')
+        args = [str(target / 'bin/python'), '-I', '-S', '-c', REGULAR_CLI_BOOT,
+                str(target / 'hub.pyz'), '--root', str(root), '--archive', str(target / 'hub.pyz'),
+                '--manifest', str(target / 'release.json')]
+        inherited = UPDATE_LOCK_FD.get()
+        if inherited is not None:
+            args += ['--lock-fd', str(inherited)]
+        result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=22, pass_fds=() if inherited is None else (inherited,))
+        state = 'updated' if result.returncode == 0 else 'deferred'
+    except Exception:
+        state = 'unknown'
+    print('Regular operator CLI component: ' + state)
+    return state
+
+
 def repair_service_files(base, manifest, root, target):
     # The release is already committed. Do not create a new environment or
     # mark it as an interrupted activation, which would make recovery remove it.
@@ -1350,6 +1381,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             commit_repin(root, releases)
             repin_managed_profiles(target)
             commit_updater(root, releases)
+            update_regular_operator_cli(root, target, installed)
             print('Hub2 release already current: ' + version)
             return
         if scheduled and restart and old and defer_activation(root, current, version):
@@ -1365,6 +1397,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
                 enable_service_timer()
             prune(root, releases)
             record_activation(root, version)
+            update_regular_operator_cli(root, target, read_release_receipt(target))
             print('Reactivated retained Hub2 release: ' + version)
             return
         scratch = root / 'tmp'
@@ -1453,6 +1486,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         prune(root, releases)
         if restart:
             record_activation(root, version)
+        update_regular_operator_cli(root, target, read_release_receipt(target))
         print('Activated Hub2 release: ' + version)
 
 
