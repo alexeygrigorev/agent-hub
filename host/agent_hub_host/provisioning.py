@@ -2834,7 +2834,7 @@ def quotas():
     from Gemini CLI's native Google Code Assist API. Hub itself also reads
     these accounts centrally; this is the backend fallback path.
     """
-    from .fleet import quota_metadata
+    from .quota_metadata import quota_metadata
     from . import credentials
     accounts = []
     with lock():
