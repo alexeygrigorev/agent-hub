@@ -1126,6 +1126,10 @@ test('a doubly wrapped verdict is read as written and an absent verdict fails lo
     assert.deepEqual(events(f,id).filter(e=>e.kind==='worker_append').at(-1).body.evidence,record,'stored unwrapped');
     await finish(f,verifier,0);
     assert.equal(intakeRow(f,id).status,'accepted');assert.equal(completion(f,id).verification.state,'passed');
+    const passed=events(f,id).find(e=>e.kind==='task_acceptance_verified').body;
+    assert.equal(passed.reason,'recorded_acceptance_verification');
+    assert.equal(passed.verdict_source,'worker_append');
+    assert.equal(passed.exit_reason,'verifier_exit_zero');
 
     const silent=await createIntake(f,'silent-verifier',false);
     await start(f,silent,'first');const work=await run(f,silent);await claim(f,silent,work.session_id);await finish(f,work,0);
@@ -1138,6 +1142,7 @@ test('a doubly wrapped verdict is read as written and an absent verdict fails lo
     const unfinished=events(f,silent).find(e=>e.kind==='task_verifier_unfinished');
     assert.match(unfinished.body.cause,/^verifier_exit_without_verdict: the verifier appended no verdict; its last note: could not reach the deployment/);
     assert.equal(completion(f,silent).cause,unfinished.body.cause);
+    assert(!events(f,silent).some(e=>e.kind==='task_acceptance_verified'));
   }finally{f.close();}
 });
 
@@ -1177,6 +1182,9 @@ test('operator re-evaluation of a failed intake accepts merged work and sends un
     await f.call('/api/intakes/'+merged+'/events','POST',{key:'blocked',event:blocker},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
     await finish(f,first,0);
     assert.equal(intakeRow(f,merged).status,'failed');
+    const blocked=(await json(await f.call('/api/intakes/'+merged))).intake;
+    assert.match(blocked.current_state,/Hub could not finish/);
+    assert.match(blocked.next_step,/Developer/);
     await f.project.alarm();
     const before=sagas(f,merged).length;
     const workerTry=await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1'},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
@@ -1194,6 +1202,13 @@ test('operator re-evaluation of a failed intake accepts merged work and sends un
     await f.call('/api/intakes/'+merged+'/merge-evidence','POST',{key:'verifier-proof',evidence:mergeProof},{id:'session:'+vrun.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
     await verify(f,merged,vrun.session_id,'pass');await finish(f,vrun,0);
     assert.equal(intakeRow(f,merged).status,'accepted');
+    const accepted=await json(await f.call('/api/intakes/'+merged));
+    for(const view of [accepted.intake,accepted.task]){
+      assert.equal(view.current_state,null);assert.equal(view.next_step,null);
+    }
+    assert.equal(events(f,merged).filter(e=>e.kind==='intake_context_updated').at(-1).body.current_state,null);
+    f.reopen();
+    assert.equal((await json(await f.call('/api/intakes/'+merged+'/context'))).intake.next_step,null);
     assert(events(f,merged).some(e=>e.kind==='task_reevaluation_requested'));
     assert(events(f,merged).some(e=>e.kind==='task_acceptance_verified'));
 
@@ -1209,6 +1224,8 @@ test('operator re-evaluation of a failed intake accepts merged work and sends un
     await f.call('/api/intakes/'+unmerged+'/merge-evidence','POST',{key:'open-pr',evidence:{...mergeProof,merged_at:null,merge_commit_in_main:false}});
     await verify(f,unmerged,check.session_id,'pass');await finish(f,check,0);
     assert.equal(intakeRow(f,unmerged).status,'failed');
+    const rejected=events(f,unmerged).find(e=>e.kind==='task_acceptance_verification_failed').body;
+    assert.equal(rejected.reason,'merge_gate_blocked');assert.equal(rejected.verdict_source,'worker_append');
     const gaps=completion(f,unmerged).verification.gaps as string[];
     assert(gaps.some(g=>g.includes('the pull request is not merged')),JSON.stringify(gaps));
     assert.equal(completion(f,unmerged).continuation.state,'pending','sent back to the worker');
@@ -1295,10 +1312,12 @@ test('hub intake close succeeds on an already-accepted verified intake while unv
     const closed=await f.call('/api/intakes/'+id,'POST',{
       key:'close-accepted-1',
       expected_version:shown.task.control.version,
-      status:'done',
+      status:'done',current_state:'Old blocked state',next_step:'Developer: restart',
     });
     assert.equal(closed.status,200);
-    assert.equal((await json(closed)).intake.status,'accepted');
+    const accepted=(await json(closed)).intake;
+    assert.equal(accepted.status,'accepted');
+    assert.equal(accepted.current_state,null);assert.equal(accepted.next_step,null);
 
     // Unverified controlled intakes still fail closed with 409 acceptance_verification_required.
     const unverified=await createIntake(f,'close-unverified',true);

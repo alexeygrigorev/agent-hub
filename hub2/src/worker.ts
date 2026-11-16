@@ -713,8 +713,10 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     if (caught instanceof HttpError) return error(caught.code, caught.status);
     return error('invalid_json', 400);
   }
-  const key = body.key;
-  if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(key)) return error('idempotency_key_required', 400);
+  const key = request.headers.get('Idempotency-Key') || body.key;
+  if (key === undefined || key === '') return error('idempotency_key_required', 400, 'pass --key or Idempotency-Key');
+  if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(key))
+    return error('invalid_idempotency_key', 400, 'key must be 1-128 characters: A-Z a-z 0-9 _ . : -');
   const purpose = sessionPurpose(body.purpose);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
   const requestedProject = text('repo') ?? text('project');
