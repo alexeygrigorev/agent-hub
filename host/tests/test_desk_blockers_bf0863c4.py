@@ -270,12 +270,28 @@ def test_admission_refusal_carries_fixed_gate_reason():
     assert 'gate_reason' not in d.classify(ValueError('Fresh admission refused'))
 
 
-def test_typescript_gate_reasons_match_host():
+def test_maintained_public_host_diagnostics_use_fixed_catalog_and_hide_input():
+    # Root Fleet's GATE_REASONS set was the obsolete Hub1 projection. Current
+    # MachineDO publishes a fixed catalog, not arbitrary host gate/detail text.
     from agent_hub_host import dispatch_diagnostics as d
     import re
-    ts = (REPO / 'src/fleet.ts').read_text()
-    block = ts.split('const GATE_REASONS = new Set([', 1)[1].split('])', 1)[0]
-    assert set(re.findall(r"'([a-z_]+)'", block)) == d.GATE_REASONS
+    ts = (REPO / 'hub2/src/machine-do.ts').read_text()
+    match = re.search(r'const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = (\{.*?\n\});', ts, re.S)
+    assert match is not None
+    catalog = json.loads(match.group(1))
+    assert catalog['workspace_unavailable'] == 'path does not exist; Hub will not create it'
+    assert catalog['native_dispatch_not_started'] == 'Native launch did not start.'
+    hostile = 'token=synthetic-secret\x1b]0;private-path\x07'
+    classified = d.classify(ValueError(hostile), workspace_available=False)
+    assert classified['reason'] == 'workspace_unavailable'
+    assert classified['reason'] in catalog
+    assert hostile not in json.dumps(classified)
+    projection = ts.split('  private hostStartDiagnostic(', 1)[1].split('\n  /**', 1)[0]
+    assert 'fixedHostDetail(reason)' in projection
+    assert "return {stage:'host_launch',...(detail?{detail}:{})}" in projection
+    assert '...diagnostic' not in projection
+    # Actual MachineDO projection, stale identity and hostile fields are also
+    # executed by the required accounts-mail Node tests, not a copied projector.
 
 
 def test_admission_lock_failure_is_named(tmp_path, monkeypatch):

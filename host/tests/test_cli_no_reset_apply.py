@@ -23,12 +23,19 @@ class NoResetApplyTests(unittest.TestCase):
         self.assertEqual(matches, [], 'Provider reset redemption must never be implemented in Hub')
 
     def test_alert_service_has_no_provider_transport_or_execution_dependency(self):
-        source = (ROOT / 'src/banked-resets.ts').read_text()
-        imports = re.findall(r"from ['\"]([^'\"]+)['\"]", source)
-        self.assertEqual(imports, ['@cloudflare/workers-types', './liveness'])
-        self.assertIsNone(re.search(r'\b(?:fetch|spawn|execFile|subprocess|redeem|consume)\s*\(', source))
-        self.assertIn('Alexey, please approve', source)
-        self.assertIn('Hub and agents must not redeem it', source)
+        # BankedResets was a Hub1-only service. The maintained AccountDO owns
+        # reset observations/expiry alerts, not provider redemption or execution.
+        source = (ROOT / 'hub2/src/account-do.ts').read_text()
+        resets = source.split(' private async resets(', 1)[1].split(' private async credentials(', 1)[0]
+        alerts = source.split(' private resetAlerts():', 1)[1].split(' private alerts(', 1)[0]
+        for leaf in (resets, alerts):
+            self.assertIsNone(re.search(
+                r'\b(?:fetch|spawn|execFile|subprocess|redeem|consume|provider)\s*\(', leaf))
+        self.assertIn("if(r.method!=='GET')return error('not_found',404)", resets)
+        self.assertIn("redemption:'explicit_approval_required'", resets)
+        self.assertIn("'reset_expiry_'+stage", alerts)
+        # Runtime fake-provider/unauthorized-operation checks live in the required
+        # accounts-mail Node module; this leaf check must not ban quota discovery.
 
 
 if __name__ == '__main__':
