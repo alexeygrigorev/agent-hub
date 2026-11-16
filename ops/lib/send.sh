@@ -28,6 +28,21 @@ if [ "${#body}" -le 1500 ]; then
 else
   msg="[INBOX $id] long message saved at $f - read it, act, then mv it to inbox/processed/"
 fi
+# An existing managed request always owns resolution, including unknown/error states.
+# Never fall back to native friendly-tag selection after a managed failure.
+state="$HOME/tmp/agent-reports/$ROLE/state/managed/current.json"
+if [ -e "$state" ] || [ -L "$state" ]; then
+  ctl="$(cd "$(dirname "$0")" && pwd)/session-ctl.sh"
+  # Installed orch-send/oncall-send historically lives in ~/bin; resolve its
+  # maintained sibling only when present, never a guessed native session.
+  if [ ! -f "$ctl" ]; then
+    echo 'DELIVERY=not-delivered (managed controller companion unavailable; inbox retained)'; exit 2
+  fi
+  if printf '%s' "$msg" | "$ctl" "$ROLE" managed-send "inbox-$id" >/dev/null 2>&1; then
+    echo "DELIVERY=delivered to $ROLE via Hub (bound managed identity)"; exit 0
+  fi
+  echo 'DELIVERY=not-delivered (managed binding or ACK unconfirmed; inbox retained)'; exit 2
+fi
 sid=$(a list --json 2>/dev/null | python3 -c '
 import json,sys
 w,t=sys.argv[1:3]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shared control for the two interactive ops sessions.
-#   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>
+#   session-ctl.sh <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync|reconcile-only>
 # Watchdog (check) restarts a dead or tick-stalled session and proves every restart by a fresh
 # tick (intake 500fd60b); Hub scheduled prompts provide the engine-neutral scheduler.
 # Needs: a (aplexer), git, gh, python3. Never prints secrets.
@@ -10,8 +10,9 @@ ROLE="${1:-}"; CMD="${2:-status}"
 case "$ROLE" in
   orchestrator) TAG=orchestrator-main; REPORTS="$HOME/tmp/agent-reports/orchestrator"; RUNDIR="$HOME/git/agent-hub-wt-orchestrator-run"; SUB=ops/orchestrator; INTAKE=67847fde-a00a-4689-8460-fbad45599f99 ;;
   oncall)       TAG=oncall-engineer;   REPORTS="$HOME/tmp/agent-reports/oncall";        RUNDIR="$HOME/git/agent-hub-wt-oncall-run";       SUB=ops/oncall;        INTAKE=67847fde-a00a-4689-8460-fbad45599f99 ;;
-  *) echo "usage: $0 <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync>" >&2; exit 64 ;;
+  *) echo "usage: $0 <orchestrator|oncall> <start|ensure|check|status|restart|handoff-restart|skills-sync|reconcile-only>" >&2; exit 64 ;;
 esac
+INTAKE="${OPS_INTAKE:-$INTAKE}"  # explicit owner-selected intake; default remains the existing role contract
 BASE_REPO="${BASE_REPO:-$HOME/git/agent-hub}"           # donor clone for the run worktree
 [ -f "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh" ] && . "$HOME/.local/share/agent-hub-ops/guard-bin/env.sh"  # agent rm guard (504d662b): sessions inherit it via --setenv=PATH
 SKILLS_REPO="${SKILLS_REPO:-$HOME/git/bots-management-ops}"   # read-only clone of alexeygrigorev/bots-management (bot-skills is archived)
@@ -111,6 +112,10 @@ arm_proof() {  # $1 = recovery path (1 = restart, 2 = new session on the fallbac
 
 # List failures are errors, never evidence that no session exists.
 matching_sessions() {
+  if [ -e "$STATE/managed/current.json" ] || [ -L "$STATE/managed/current.json" ]; then
+    managed inspect; return $?
+  fi
+  # Explicit legacy READ only; this does not adopt a Hub task by friendly tag.
   t a list --json | python3 -c '
 import json,sys
 w,t,live=sys.argv[1:4]
@@ -195,7 +200,12 @@ prep_worktree() {
   skills_sync
 }
 
-screen() { a capture "$1" --screen --plain 2>/dev/null; }
+screen() {
+  if [ -e "$STATE/managed/current.json" ] || [ -L "$STATE/managed/current.json" ]; then
+    managed capture "$1"; return $?
+  fi
+  a capture "$1" --screen --plain 2>/dev/null
+}
 
 # Prefer a configured route whose Hub quota is fresh and above its provider
 # reserve; when Hub quota is unavailable, use the locally configured engine
@@ -428,69 +438,31 @@ oncall_inbox_stalled() {
 }
 
 start() {
-  local current model_args=()
-  current=$(find_session) || { log "session census failed"; return 1; }
-  [ -n "$current" ] && { log "already running: $current"; return 0; }
-  select_engine || return 1
-  # Clear stale names before launch; never leave orphan workloads behind.
-  stop_old || return 1
-  prep_worktree || return 1
-  date +%s > "$STATE/last_start"
-  model_args=()
-  if [ "$ROLE" = oncall ]; then
-    case "$ENGINE" in
-      opencode)
-        model_args=(--model opencode-go/muse-spark-1.3-contributor)
-        log "oncall model pinned to opencode-go/muse-spark-1.3-contributor"
-        ;;
-      antigravity)
-        model_args=(--model "${ONCALL_ANTIGRAVITY_MODEL:-gemini-4-hydrogen-medium}")
-        log "oncall model pinned to ${ONCALL_ANTIGRAVITY_MODEL:-gemini-4-hydrogen-medium}"
-        ;;
-      grok|zcodex)
-        log "oncall using engine $ENGINE default model"
-        ;;
-      *)
-        log "refusing unsafe oncall engine $ENGINE"; return 1
-        ;;
-    esac
-  elif [ "$ENGINE" = antigravity ]; then
-    # Preserve the orchestrator's explicit Flash default; never leak it into oncall.
-    model_args=(--model "${ORCH_MODEL:-gemini-3.8-flash-high}")
+  local current prompt
+  prompt="Run the $ROLE check now: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox). Hub scheduled prompts continue the recurring work for this role."
+  [ "$ROLE" = orchestrator ] && prompt="Run the orchestrator tick now: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS. Hub scheduled prompts continue the recurring work for this role."
+  if [ -e "$STATE/managed/current.json" ] || [ -L "$STATE/managed/current.json" ]; then
+    # A prior possible submission is reconciled only by its original exact ID;
+    # start never repeats that POST or renews the generation's progress clock.
+    printf '%s' "$prompt" | managed start
+    return $?
   fi
-  # own transient scope so the session outlives the (oneshot) watchdog unit cgroup
-  systemd-run --user --scope --collect -q -- a start --workspace "$RUNDIR/$SUB" --tag "$TAG" --engine "$ENGINE" \
-    "${model_args[@]}" \
-    --label "ops.role=$ROLE" --label "hub.intake=$INTAKE" >/dev/null 9>&- || { log "a start failed"; return 1; }
-  local id; id=$(find_session); [ -n "$id" ] || { log "session not found after start"; return 1; }
-  log "started session $id; waiting for prompt"
-  local i s ready=0
-  for i in $(seq 1 60); do
-    sleep 3; s=$(screen "$id")
-    if grep -qi -E 'Yes, I accept|Bypass Permissions mode' <<<"$s" && grep -q 'No, exit' <<<"$s"; then a send "$id" --hex 32 >/dev/null; sleep 1; a send "$id" --hex 0d >/dev/null; continue; fi
-    if grep -qi -E 'trust this folder|Do you trust|Yes, proceed' <<<"$s"; then a send "$id" --hex 0d >/dev/null; continue; fi
-    if grep -q -E '❯|> $|for shortcuts|Ask anything|ctrl\+p commands' <<<"$s"; then ready=1; break; fi
-  done
-  [ "$ready" = 1 ] || { log "prompt readiness failed: $id"; return 1; }
-  local prompt="Run the $ROLE check now: follow $RUNDIR/$SUB/hourly-check.md, starting with step 0 (skills sync, handoff, inbox). Hub scheduled prompts continue the recurring work for session tag $TAG."
-  [ "$ROLE" = orchestrator ] && prompt="Run the orchestrator tick now: follow $BRIEF (durable brief) and $RUNDIR/$SUB/CLAUDE.md; append one line to $TICKS. Hub scheduled prompts continue the recurring work for session tag $TAG."
-  a send "$id" "$prompt" --enter >/dev/null; local rc=$?
+  current=$(find_session) || { log "legacy session census unconfirmed; no start"; return 1; }
+  [ -z "$current" ] || { log "already running legacy session: $current; owner handoff required for adoption"; return 0; }
+  prep_worktree || return 1
+  printf '%s' "$prompt" | managed start || { log "Hub startup/delivery unconfirmed; request retained"; return 1; }
   echo "$prompt" > "$STATE/loop_command"
-  log "engine-neutral startup prompt sent (rc=$rc); Hub schedules provide recurring work"
-  return "$rc"
+  log "Hub-managed startup brief delivered; Hub schedules provide recurring work"
 }
 
 stop_old() {
-  local ids id
-  ids=$(matching_sessions all) || { log "session census failed"; return 1; }
-  for id in $ids; do
-    if t a kill "$id" >/dev/null 2>&1; then
-      log "stopped old session $id"
-    else
-      log "a kill refused $id; checking for verified dead record"
-      forget_dead "$id" || return 1
-    fi
-  done
+  if [ -e "$STATE/managed/current.json" ] || [ -L "$STATE/managed/current.json" ]; then
+    managed stop || { log "owned STOP unconfirmed; no replacement"; return 1; }
+    return 0
+  fi
+  local ids
+  ids=$(matching_sessions all) || { log "legacy session census failed"; return 1; }
+  [ -z "$ids" ] || { log "unmanaged legacy role requires acknowledged owner retirement; no automatic kill/adoption"; return 1; }
 }
 
 make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer than the last start
@@ -507,7 +479,6 @@ make_handoff() {  # $1 = reason; keeps a hand-written handoff.md if it is newer 
 restart() {  # $1 = reason
   local now last; now=$(date +%s); last=$(cat "$STATE/last_start" 2>/dev/null || echo 0)
   if [ $((now-last)) -lt "$MIN_RESTART_GAP" ] && [ "${FORCE:-0}" != 1 ]; then log "restart suppressed: last start $((now-last))s ago"; return 1; fi
-  select_engine || return 1
   make_handoff "${1:-manual}"; stop_old || return 1; start
 }
 
@@ -538,7 +509,7 @@ recover() {  # $1 = path, $2 = reason, $3 = engine whose proof failed (optional)
     ENGINE_EXCLUDE="$failed_engine"
   fi
   ENGINE_SELECTED=0
-  if FORCE=1 restart "$reason (recovery path $path, engine $ENGINE)"; then arm_proof "$path" "$ENGINE"; hub_report recovering
+  if FORCE=1 restart "$reason (Hub-managed recovery path $path)"; then arm_proof "$path" hub; hub_report recovering
   else rc=1; fi
   ENGINE="$saved"; ENGINE_EXCLUDE="$saved_exclude"; ENGINE_SELECTED="$saved_selected"
   [ "$rc" = 0 ] || restart_failed restart_failed
@@ -569,6 +540,17 @@ check_proof() {
 check() {
   mkdir -p "$HOME/tmp/agent-reports/orchestrator" "$HOME/tmp/agent-reports/oncall/inbox"
   local id
+  if [ -e "$STATE/managed/current.json" ] || [ -L "$STATE/managed/current.json" ]; then
+    # Finish only the original keyed brief after transient binding/ACK loss;
+    # this action cannot allocate a request or submit any start.
+    managed resume >/dev/null
+    local managed_status=$?
+    if [ "$managed_status" = 10 ]; then
+      log "owned terminal Hub session; qualified STOP required before replacement"
+      recover 1 "owned terminal Hub session"; return
+    fi
+    [ "$managed_status" = 0 ] || { log "managed reconciliation unconfirmed"; restart_failed census_failed; return 1; }
+  fi
   id=$(find_session) || { log "session census failed"; restart_failed census_failed; return 1; }
   if [ -n "$id" ] && usage_limit_screen "$id"; then
     log "STALLED session=$id: provider usage limit screen"
@@ -610,13 +592,190 @@ check() {
   restart_failed
 }
 
+# One lifecycle implementation shared by startup, watchdog and inbox delivery.
+# Absence of this ledger permits legacy READ/status only, never implicit adoption.
+managed() {
+  python3 - "$ROLE" "$STATE" "$RUNDIR/$SUB" "$INTAKE" "$TAG" "$@" 3<&0 9>&- <<'PY_MANAGED'
+import hashlib,json,os,pathlib,re,stat,subprocess,sys,time,uuid,select
+role,state,requested,intake,name,action,*arguments=sys.argv[1:]
+root=pathlib.Path(state)/'managed'; current=root/'current.json'; project='alexeygrigorev/agent-hub'
+deadline=time.monotonic()+(60 if action=='stop' else 150)
+class Unknown(Exception):pass
+def require(value):
+    if not value:raise Unknown()
+def uid(value):
+    require(type(value) is str and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',value));return value
+def stable_id(prefix,key):
+    h=hashlib.sha256(json.dumps([prefix,project,intake,key],separators=(',',':')).encode()).hexdigest()
+    return h[:8]+'-'+h[8:12]+'-5'+h[13:16]+'-a'+h[17:20]+'-'+h[20:32]
+def trusted_parents():
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        for part in pathlib.Path(state).parts[1:]:
+            child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);os.close(fd);fd=child
+            st=os.fstat(fd);require(st.st_uid in (0,os.getuid()) and not st.st_mode&0o022)
+    finally:os.close(fd)
+def private(path,directory=False):
+    s=path.lstat();require(not stat.S_ISLNK(s.st_mode) and s.st_uid==os.getuid())
+    require(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode) and s.st_nlink==1)
+    require(stat.S_IMODE(s.st_mode)==(0o700 if directory else 0o600))
+def syncdir():
+    fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def exclusive(path,raw):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    try:
+        with os.fdopen(fd,'wb') as stream:stream.write(raw);stream.flush();os.fsync(stream.fileno())
+    except BaseException:raise
+    syncdir()
+def save(record):
+    temporary=root/('.write-'+uuid.uuid4().hex)
+    exclusive(temporary,(json.dumps(record,sort_keys=True)+'\n').encode())
+    if os.path.lexists(current):private(current)
+    os.replace(temporary,current);syncdir()
+def load():
+    private(root,True);private(current);require(current.stat().st_size<=32768)
+    r=json.loads(current.read_bytes());require(type(r) is dict and r.get('v')==1)
+    require((r.get('role'),r.get('intake'),r.get('requested'),r.get('project'))==(role,intake,requested,project))
+    require(type(r.get('key')) is str and re.fullmatch(r'ops-[a-z]+-[0-9a-f]{32}',r['key']))
+    require(r.get('id')==stable_id('hub2-start-session-v1',r['key']))
+    require(r.get('operation')==stable_id('hub2-start-operation-v1',r['key']))
+    return r
+def call(argv,timeout=20):
+    remaining=deadline-time.monotonic();require(remaining>0)
+    try:p=subprocess.run(['hub',*argv],capture_output=True,timeout=min(timeout,remaining),check=False)
+    except (OSError,subprocess.TimeoutExpired):raise Unknown() from None
+    require(p.returncode==0 and len(p.stdout)<=65536)
+    try:
+        result=json.loads(p.stdout);require(type(result) is dict);return result
+    except (ValueError,UnicodeError):raise Unknown() from None
+def view(r):
+    result=call(['sessions','show',r['id']]);s=result.get('session',result)
+    require(type(s) is dict and s.get('id')==r['id'] and s.get('intake_id')==intake and s.get('project_id')==r['project'])
+    require(s.get('operation_id')==r['operation'] and s.get('requested_workspace')==requested)
+    require(s.get('managed') is True and type(s.get('epoch')) is int and s['epoch']>=1)
+    machine=s.get('machine_id');require(machine==r.get('target_machine'));require(type(machine) is str and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',machine))
+    resolved=s.get('workspace');require(type(resolved) is str and len(resolved)<=1024 and resolved.startswith('/') and not any(ord(c)<32 for c in resolved))
+    digest=hashlib.sha256(json.dumps({'intake_id':intake,'project_id':r['project']},sort_keys=True).encode()).hexdigest()
+    require(resolved==requested or re.fullmatch(r'/[^\0]*?/\.local/hub-worktrees/'+digest,resolved))
+    require(not any(x in ('.','..') for x in resolved.split('/')))
+    native=s.get('native_id');require(native is None or uid(native))
+    candidate={'machine':machine,'epoch':s['epoch'],'native':native,'resolved':resolved}
+    assignment={'machine':machine,'epoch':s['epoch']}
+    if r.get('assignment') is not None:require(r['assignment']==assignment)
+    else:r['assignment']=assignment;save(r)
+    bound=r.get('binding')
+    if bound is not None:require(bound==candidate)
+    elif s.get('state')=='running':
+        uid(native);r['binding']=candidate;save(r)
+    return s
+def read_body():
+    mode=os.fstat(3).st_mode;require(stat.S_ISFIFO(mode) or stat.S_ISREG(mode))
+    body=bytearray()
+    while True:
+        remaining=deadline-time.monotonic();require(remaining>0)
+        ready,_,_=select.select([3],[],[],remaining);require(ready)
+        part=os.read(3,min(4096,16385-len(body)))
+        if not part:break
+        body.extend(part);require(len(body)<=16384)
+    require(body);bytes(body).decode('utf8');return bytes(body)
+def brief(r):
+    f=root/(r['key']+'.brief');private(f);raw=f.read_bytes();require(len(raw)<=16384 and hashlib.sha256(raw).hexdigest()==r['brief_sha256']);return raw
+def deliver(r,body,key):
+    s=view(r);require(s.get('state')=='running' and r.get('binding') is not None)
+    require(type(key) is str and re.fullmatch(r'[A-Za-z0-9_.:-]{1,120}',key))
+    # Body is private stdin, not a command argument or a log field.
+    remaining=deadline-time.monotonic();require(remaining>0)
+    try:p=subprocess.run(['hub','sessions','send',r['id'],'--body-file','-','--key',key,'--wait','--timeout',str(min(30,remaining))],input=body,capture_output=True,timeout=min(35,remaining))
+    except (OSError,subprocess.TimeoutExpired):raise Unknown() from None
+    require(p.returncode==0 and len(p.stdout)<=65536)
+    result=json.loads(p.stdout);receipt=result.get('command_wait') or {}
+    require(receipt.get('state')=='acked' and (receipt.get('ack') or {}).get('outcome')=='delivered')
+    view(r)
+try:
+    trusted_parents()
+    if action=='start':
+        prompt=read_body()
+        if not root.exists():root.mkdir(mode=0o700)
+        private(root,True)
+        if os.path.lexists(current):
+            r=load()
+            if r.get('retired') is True:
+                exclusive(root/(r['key']+'.retired.json'),(json.dumps(r,sort_keys=True)+'\n').encode())
+                current.unlink();syncdir()
+            else:require(r.get('retired') is False)
+        if not os.path.lexists(current):
+            target=os.environ.get('OPS_HUB_MACHINE','hetzner-aplexer');require(type(target) is str and re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',target))
+            key='ops-'+role+'-'+uuid.uuid4().hex
+            exclusive(root/(key+'.brief'),prompt)
+            r={'target_machine':target,'started_at':int(time.time()),'v':1,'role':role,'intake':intake,'requested':requested,'project':project,'key':key,'id':stable_id('hub2-start-session-v1',key),'operation':stable_id('hub2-start-operation-v1',key),'submitted':False,'retired':False,'binding':None,'assignment':None,'brief_sha256':hashlib.sha256(prompt).hexdigest(),'brief_sent':False,'stop_requested':False}
+            save(r)
+            marker=pathlib.Path(state)/('.last_start-'+key)
+            fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w') as stream:stream.write(str(r['started_at'])+'\n');stream.flush();os.fsync(stream.fileno())
+            os.replace(marker,pathlib.Path(state)/'last_start')
+            parent=os.open(state,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            try:os.fsync(parent)
+            finally:os.close(parent)
+        r=load()
+        if r['submitted'] is False:
+            r['submitted']=True;save(r) # durable attempt BEFORE any possible start
+            try:call(['sessions','start','--repo',project,'--workspace',requested,'--name',name,'--machine',r['target_machine'],'--interactive','--purpose','implement','--intake-task-id',intake,'--key',r['key'],'--no-wait'])
+            except Unknown:pass # read-only keyed reconciliation, never submit again
+        while True:
+            s=view(r)
+            if s.get('state')=='running':break
+            require(s.get('state') in ('queued','offered','starting') and deadline-time.monotonic()>1)
+            time.sleep(min(1,deadline-time.monotonic()))
+        if not r['brief_sent']:
+            deliver(r,brief(r),r['key']+'-brief');r['brief_sent']=True;save(r)
+        print(r['binding']['native'])
+    elif action in ('inspect','reconcile','resume'):
+        r=load()
+        if r['retired']:sys.exit(0)
+        s=view(r)
+        if action=='resume' and s.get('state') in ('failed','stopped','completed','expired'):
+            # Typed control result only: a terminal row is NOT retirement proof.
+            # The watchdog must still obtain a fresh owned qualified Hub STOP.
+            sys.exit(10)
+        require(s.get('state')=='running' and r.get('binding') is not None)
+        if action=='resume' and not r['brief_sent']:
+            deliver(r,brief(r),r['key']+'-brief');r['brief_sent']=True;save(r)
+        if action=='inspect':require(r.get('brief_sent') is True)
+        print(r['binding']['native'])
+    elif action=='send':
+        r=load();require(not r['retired']);body=read_body()
+        deliver(r,body,arguments[0]);print('delivered')
+    elif action=='capture':
+        r=load();s=view(r);require(s.get('state')=='running' and r.get('binding') is not None and r['binding']['native']==arguments[0])
+        result=call(['sessions','capture',r['id'],'--screen','--max-bytes','16384','--timeout','20'],25)
+        receipt=result.get('command_wait') or {};ack=receipt.get('ack') or {};require(receipt.get('state')=='acked' and ack.get('outcome')=='delivered')
+        text=ack.get('capture');require(type(text) is str and len(text.encode())<=16384);print(text)
+    elif action=='stop':
+        r=load()
+        if r['retired']:sys.exit(0)
+        s=view(r);require(r.get('binding') is not None or s.get('native_id') is None)
+        r['stop_requested']=True;save(r)
+        result=call(['sessions','stop',r['id'],'--key',r['key']+'-stop','--wait','--timeout',str(max(0.01,deadline-time.monotonic()))],60)
+        stopped=result.get('stop_wait') or {};require(stopped.get('id')==r['id'] and (stopped.get('state')=='stopped' or stopped.get('stop_confirmed') is True))
+        after=view(r);require((after.get('state')=='stopped' or after.get('stop_confirmed') is True) and after.get('state') in ('stopped','failed'))
+        r['retired']=True;r['stopped_native']=after.get('native_id');save(r)
+    else:raise Unknown()
+except (Unknown,OSError,ValueError,TypeError,KeyError):
+    print('managed_outcome_unconfirmed; retain owned request and reconcile, no native fallback',file=sys.stderr);sys.exit(1)
+PY_MANAGED
+}
+
 case "$CMD" in
-  start) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; start ;;
-  ensure|check) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; check ;;
-  status) id=$(find_session); [ -n "$id" ] && { log "running $id"; echo "attach: a attach $id   (or: a open $TAG --workspace $RUNDIR)"; } || { log "not running"; exit 1; } ;;
-  restart) if [ "$ROLE" = orchestrator ]; then role_lock || exit 75; fi; FORCE=1 restart "manual" ;;
+  start) role_lock || exit 75; start ;;
+  ensure|check) role_lock || exit 75; check ;;
+  status) role_lock || exit 75; id=$(find_session); [ -n "$id" ] && { log "running $id"; echo "attach: a attach $id   (or: a open $TAG --workspace $RUNDIR)"; } || { log "not running"; exit 1; } ;;
+  restart) role_lock || exit 75; FORCE=1 restart "manual" ;;
   handoff-restart)  # called BY the session itself after writing handoff.md; detaches so it survives the kill
     FORCE=1 setsid nohup bash -c "sleep 5; '$0' $ROLE restart" >>"$STATE/restart.log" 2>&1 < /dev/null 9>&- & log "restart scheduled in 5s" ;;
+  reconcile-only) role_lock || exit 75; managed reconcile ;;
+  managed-send) role_lock || exit 75; managed send "${3:-}" ;;
   skills-sync) refresh_rundir; skills_sync ;;
   *) echo "unknown command $CMD" >&2; exit 64 ;;
 esac
