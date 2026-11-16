@@ -927,17 +927,29 @@ def match_session_state(entry: dict, wanted: str) -> bool:
     return entry_state == wanted
 
 
-def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
+TRANSIENT_BIND_STATES = ('queued', 'offered', 'claimed', 'starting', 'uncertain')
+
+
+def _session_row(view):
+    """Unwrap Hub2 {session: {...}} envelopes while preserving Hub1 flat rows."""
+    if not isinstance(view, dict):
+        return None
+    session = view.get('session')
+    return session if isinstance(session, dict) else view
+
+
+def wait_until_bound(session_id, interval, timeout=None):
     """Poll a pending session until it is running (bound); False when the budget runs out."""
     from urllib.parse import quote
-    end = time.monotonic() + timeout
+    budget = BIND_WAIT_TIMEOUT if timeout is None else timeout
+    end = time.monotonic() + budget
     while True:
-        row = request('GET', '/api/sessions/' + quote(session_id, safe=''))
+        row = _session_row(request('GET', '/api/sessions/' + quote(session_id, safe='')))
         if isinstance(row, dict):
             state = row.get('state')
             if state == 'running':
                 return True
-            if state not in ('queued', 'offered', 'starting', 'uncertain'):
+            if state not in TRANSIENT_BIND_STATES:
                 return False  # terminal or unknown: no bind is coming
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -1512,16 +1524,30 @@ def _execute(args):
                 try:
                     return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
                 except SessionHTTPError as exc:
-                    if cmd != 'capture' or not exc.pending or timeout is None:
+                    bare_not_running = (not exc.pending and exc.status == 409 and exc.code == 'session_not_running')
+                    if cmd != 'capture' or timeout is None or (not exc.pending and not bare_not_running):
                         raise
-                    # Early capture: wait for the native binding instead of failing with
-                    # a bare 409, then give the acknowledgement its full budget.
-                    print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
-                          file=sys.stderr, flush=True)
+                    from urllib.parse import quote
                     outer = _request_deadline.get()
                     bind_token = _request_deadline.set(time.monotonic() + BIND_WAIT_TIMEOUT + 10)
                     try:
-                        bound = wait_until_bound(args.id, min(interval, 2.0))
+                        if bare_not_running:
+                            row = _session_row(request('GET', '/api/sessions/' + quote(args.id, safe='')))
+                            state = row.get('state') if isinstance(row, dict) else None
+                            if state == 'running':
+                                bound = True
+                            elif state in TRANSIENT_BIND_STATES:
+                                print(f'Session {args.id} is {state}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                                      file=sys.stderr, flush=True)
+                                bound = wait_until_bound(args.id, min(interval, 2.0), timeout=BIND_WAIT_TIMEOUT)
+                            else:
+                                raise exc
+                        else:
+                            # Early capture: wait for the native binding instead of failing with
+                            # a bare 409, then give the acknowledgement its full budget.
+                            print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                                  file=sys.stderr, flush=True)
+                            bound = wait_until_bound(args.id, min(interval, 2.0), timeout=BIND_WAIT_TIMEOUT)
                     finally:
                         _request_deadline.reset(bind_token)
                     if not bound:
