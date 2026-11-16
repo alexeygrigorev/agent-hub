@@ -1035,3 +1035,131 @@ def test_current_node_startup_harness_case(case_name):
     assert result.testsRun == 1
     assert not result.skipped, "Current startup coverage must not skip"
     assert result.wasSuccessful(), result.errors + result.failures
+
+
+@pytest.mark.parametrize("method", [
+    "test_real_worker_malformed_and_utf8_bounds",
+    "test_real_worker_unknown_addresses",
+])
+def test_current_node_ports_of_legacy_http_mailbox_cases(method):
+    """Forward real TestCase execution and failure through required Node CI."""
+    import unittest
+    from node_http_cli_ports import TestCurrentNodeHttpCli
+    result = unittest.TestResult()
+    TestCurrentNodeHttpCli(method).run(result)
+    assert result.testsRun == 1 and not result.skipped
+    assert result.wasSuccessful(), str(result.errors + result.failures)
+
+
+class _SessionInputHub(_LifetimeHub):
+    """Real Host/Node transport with one real non-generative input workload."""
+    def start_host(self):
+        if not getattr(self, '_input_configured', False):
+            fixture = Path(__file__).resolve().parent / 'fixtures/session_loop_native.py'
+            own_bin = self.root / 'session-input-bin'
+            own_bin.mkdir(mode=0o700)
+            provider = own_bin / 'codex'
+            provider.write_text('#!/usr/bin/env python3\nimport runpy\nrunpy.run_path(%r)["workload"]()\n' % str(fixture))
+            provider.chmod(0o700)
+            # Same accepted wrapper shape; only its test-owned endpoint changes.
+            gate = self.host.codex_wrapper.parent / 'quota-gate.py'
+            self.host.codex_wrapper.write_text(
+                '#!/usr/bin/env bash\nset -euo pipefail\npython3 %s\nexec %s "$@"\n' % (gate, provider))
+            config = json.loads(self.host.config.read_text())
+            config['launcher']['aplexer'] = str(fixture)
+            self.host.config.write_text(json.dumps(config))
+            self.native_exe = fixture
+            (self.host.state / 'phase24-control.json').write_text(json.dumps(
+                {'fault': 'none', 'hold_start': False}))
+            self._input_configured = True
+        super().start_host()  # serve --aplexer is the same exact input adapter.
+
+
+def test_real_worker_session_loop_via_cli_and_receiver():
+    """Current real Node/Host/CLI loop; no model work or legacy claim proof."""
+    import hashlib
+    hub = _SessionInputHub('none')
+    try:
+        intake = hub.server.ok('POST', '/api/intake/tasks?project=' + quote(hub.h.PROJECT, safe=''), {
+            'key': 'session-input-intake', 'title': 'Owned input transport loop',
+            'text': 'Read one fixed test input; no model/provider invocation',
+            'acceptance_criteria': ['Preserve exact native input identity and qualified STOP']})['intake']
+        args = ['sessions', 'start', '--no-wait', '--engine', 'codex', '--interactive',
+                '--purpose', 'review', '--workspace', str(hub.host.workspace),
+                '--intake-task-id', intake['id'], '--key', 'session-input-start']
+        created = hub.cli.json(*args)
+        sid = created['id']
+        assert created['intake_id'] == intake['id']
+        def running():
+            view = hub.cli.json('sessions', 'show', sid, '--json')['session']
+            return view if view['state'] == 'running' and view.get('native_id') else None
+        view = hub.h.wait_for(running, 30, label='actual host starts and binds input workload')
+        native = view['native_id']
+        saved = json.loads((hub.host.state / ('phase24-native-' + native + '.json')).read_text())
+        row = hub.journal(sid)
+        assert row['native_id'] == native and row['state'] == 'running'
+        assert saved['binding']['id'] == native
+        assert saved['binding']['tag'] == 'task-hub2-' + sid
+        assert saved['binding']['workspace'] == str(hub.host.workspace)
+        assert all(_lifetime_process(r) for r in saved['processes'].values())
+        attempt = hashlib.sha256(json.dumps(
+            [hub.h.MACHINE, sid, row['operation_id'], row['epoch']],
+            sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        assert saved['labels'] == {'hub.managed': 'true', 'hub.session': sid, 'hub.attempt': attempt}
+        ready = hub.host.state / ('session-loop-ready-' + native + '.json')
+        hub.h.wait_for(ready.exists, 5, label='actual input workload ready')
+        assert hub.cli.json(*args)['id'] == sid
+        assert len(list(hub.host.state.glob('phase24-native-*.json'))) == 1
+        import uuid
+        foreign = subprocess.run([sys.executable, str(hub.native_exe), 'send',
+                                  str(uuid.uuid4()), '--stdin', '--enter'],
+                                 input='must not reach original target', text=True,
+                                 capture_output=True, env=hub.host.env(), timeout=10)
+        assert foreign.returncode != 0
+        assert not (hub.host.state / ('session-loop-input-' + native + '.json')).exists()
+        assert all(_lifetime_process(r) for r in saved['processes'].values())
+
+        text = 'hello real input target'
+        send_args = ['sessions', 'send', sid, '--prompt', text, '--key', 'session-input-send', '--wait', '--timeout', '20']
+        sent = hub.cli.json(*send_args)
+        assert sent.get('command_id')
+        commands = hub.cli.json('sessions', 'commands', sid)['commands']
+        sends = [c for c in commands if c['kind'] == 'send']
+        assert len(sends) == 1 and sends[0]['state'] == 'acked'
+        assert sends[0]['id'] == sent['command_id']
+        assert sends[0]['ack']['delivery'] == 'native_acknowledged'
+        receipt = json.loads((hub.host.state / ('session-loop-receipt-' + native + '.json')).read_text())
+        assert receipt['native_id'] == native and receipt['count'] == 1
+        assert receipt['pid'] == saved['processes']['workload_pid']['pid']
+        assert receipt['birth'] == saved['processes']['workload_pid']['birth']
+        assert receipt['body_sha256'] == hashlib.sha256(text.encode()).hexdigest()
+        assert hub.cli.json(*send_args)['command_id'] == sent['command_id']
+        commands = hub.cli.json('sessions', 'commands', sid)['commands']
+        assert len([c for c in commands if c['kind'] == 'send']) == 1
+        assert json.loads((hub.host.state / ('session-loop-receipt-' + native + '.json')).read_text()) == receipt
+
+        captured = hub.cli.json('sessions', 'capture', sid, '--max-bytes', '4096', '--key', 'session-input-capture')
+        wait = captured['command_wait']
+        assert wait['state'] == 'acked'
+        assert 'SESSION-LOOP-READ:' + receipt['body_sha256'] in wait['ack']['capture']
+        stopped = hub.cli.json('sessions', 'stop', sid, '--key', 'session-input-stop')
+        # Current CLI stop_wait is the confirmed session view; the exact
+        # acknowledged stop command remains in the command history.
+        assert stopped['stop_wait']['id'] == sid
+        assert stopped['stop_wait']['state'] == 'stopped'
+        assert stopped['stop_wait']['stop_confirmed'] is True
+        stop_commands = hub.cli.json('sessions', 'commands', sid)['commands']
+        exact_stop = [c for c in stop_commands if c['id'] == stopped['command_id']]
+        assert len(exact_stop) == 1 and exact_stop[0]['kind'] == 'stop'
+        assert exact_stop[0]['state'] == 'acked'
+        assert exact_stop[0]['ack']['outcome'] == 'delivered'
+        assert exact_stop[0]['ack']['confirmed_exit'] is True
+        final = hub.cli.json('sessions', 'show', sid, '--json')['session']
+        assert final['state'] == 'stopped' and final['stop_confirmed'] is True
+        assert final['native_id'] == native
+        assert final['evidence']['native_exit_confirmed'] is True
+        assert final['evidence']['evidence']['containment_empty'] is True
+        hub.h.wait_for(lambda: not any(_lifetime_process(r) for r in saved['processes'].values()),
+                       5, label='original native process identities absent')
+    finally:
+        hub.close()  # Only known original fixture processes; unknowns retain scratch.
