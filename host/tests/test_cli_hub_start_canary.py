@@ -1207,6 +1207,27 @@ class CanaryTest(unittest.TestCase):
         self.assertFalse(prior_file.exists())
         self.assertIn("sessions stop " + SID + " --key canary-prior-sigkilled-reconcile", self.calls())
 
+    def test_timer_cadence_is_shell_5min_and_full_30min_as_rendered_and_announced(self):
+        import configparser
+        installer = (ROOT / "scripts" / "install-hub-start-canary.sh").read_text()
+        rendered = {}
+        for name in ("hub-start-canary.timer", "hub-start-canary-full.timer"):
+            r = subprocess.run(
+                ["sed", "-e", "s/@CANARY_USER@/u/", "-e", "s/@CANARY_GROUP@/g/", str(ROOT / "deploy" / name)],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            cp = configparser.ConfigParser(strict=False, interpolation=None)
+            cp.optionxform = str
+            cp.read_string(r.stdout)
+            rendered[name] = cp
+        shell, full = rendered["hub-start-canary.timer"], rendered["hub-start-canary-full.timer"]
+        self.assertEqual(shell["Timer"]["OnUnitActiveSec"], "5min")
+        self.assertIn("every 5 minutes", shell["Unit"]["Description"])
+        self.assertEqual(full["Timer"]["OnUnitActiveSec"], "30min")
+        self.assertIn("every 30 minutes", full["Unit"]["Description"])
+        self.assertIn("shell every 5 min, full every 30 min", installer)
+        self.assertNotIn("15 min", installer)
+
     def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
