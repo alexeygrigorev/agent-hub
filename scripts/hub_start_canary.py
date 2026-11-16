@@ -1885,7 +1885,7 @@ class Canary:
         if eff_candidate:
             archive_args = [
                 *self.hub, "intake", "update", intake_id,
-                "--status", "archived", "--reason", "deploy_gate_shell_canary",
+                "--status", "archived", "--reason", f"deploy_gate_{clean(eff_mode, 16)}_canary",
             ]
         else:
             archive_args = [

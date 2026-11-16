@@ -44,11 +44,11 @@ sys.exit(0 if m and m.group(1)=='active' else 1)
 PY
 grep -Fq 'confirm_bootstrap' "$WORKFLOW" && grep -Fq 'DISABLE-HUB-DISPATCH' "$WORKFLOW" \
   || fail 'bootstrap must require a typed confirmation'
-python3 - "$WORKFLOW" <<'PY' || fail 'pre-commit live shell canary must run after public CLI verification and before finalize_deploy commit'
+python3 - "$WORKFLOW" <<'PY' || fail 'pre-commit live full canary must run after public CLI verification and before finalize_deploy commit'
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 verify_idx = text.find("- name: Verify public CLI and host release assets against CI bundle")
-canary_idx = text.find("- name: Run pre-commit live shell start canary on Hetzner")
+canary_idx = text.find("- name: Run pre-commit live full start canary on Hetzner")
 finalize_idx = text.find("- name: Finalize deploy after all public smokes pass")
 rollback_idx = text.find("- name: Automatically restore the previous release and Caddy config after a failed deploy or smoke")
 if min(verify_idx, canary_idx, finalize_idx, rollback_idx) < 0:
@@ -62,6 +62,7 @@ for required in (
     "StrictHostKeyChecking=yes",
     "UserKnownHostsFile=\"$canary_known_hosts\"",
     "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --run-token $run_token --helper-sha256 $helper_sha256",
+    "verdict.get(\"mode\") != \"full\"",
     "verdict.get(\"candidate_sha\") != deploy_sha or verdict.get(\"host_version\") != deploy_sha",
     "verdict.get(\"run_token\") != run_token",
     "verdict.get(\"helper_sha256\") != helper_sha256",
@@ -69,9 +70,9 @@ for required in (
     "verdict.get(\"intake_archived\") is not True",
 ):
     if required not in canary_block:
-        raise SystemExit(f"missing {required!r} in precommit_shell_canary step")
+        raise SystemExit(f"missing {required!r} in precommit_full_canary step")
 PY
-pass 'workflow covers Hub health, pre-commit live shell canary, and rollback'
+pass 'workflow covers Hub health, pre-commit live full canary, and rollback'
 
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/etc/sites"
 git init --bare -q "$TEST_ROOT/remote.git"

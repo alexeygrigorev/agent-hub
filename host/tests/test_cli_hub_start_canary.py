@@ -12,7 +12,7 @@ SCRIPT = ROOT / "scripts" / "hub-start-canary.sh"
 SID, NATIVE = "11111111-2222-4333-8444-555555555555", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 
 FAKE_HUB = r'''
-import json, os, signal, sys, pathlib, time
+import json, os, re, signal, sys, pathlib, time
 d = pathlib.Path(os.environ["FAKE_DIR"]); sc = os.environ.get("FAKE_SCENARIO", "ok")
 args = sys.argv[1:]
 with open(d / "argv.jsonl", "a") as recorded:
@@ -46,6 +46,9 @@ if args[:2] == ["sessions", "start"]:
     if "printf '%%s:%%s:%%s\\n' CANARY-OK " in prompt_text:
         parts = prompt_text.split(";")[0].split()
         (d / "marker").write_text(f"CANARY-OK:{parts[-2]}:{parts[-1]}")
+    elif "--engine" not in args and re.search(r'and "[0-9a-f]{12}:[0-9a-f]{32,64}" as one output line', prompt_text):
+        bound = re.search(r'and "([0-9a-f]{12}:[0-9a-f]{32,64})" as one output line', prompt_text).group(1)
+        (d / "marker").write_text(f"CANARY-OK:{bound}")
     else:
         (d / "marker").write_text("CANARY-OK" + (":" + run_id if "--engine" not in args else ""))
     if sc == "sigterm_on_start" and first:
@@ -898,6 +901,85 @@ class CanaryTest(unittest.TestCase):
         self.assertIn(f"printf '%s:%s:%s\\n' CANARY-OK {sha[:12]} {token}; sleep 30", prompt)
         self.assertEqual(list((self.state / "pending").glob("*.json")), [])
 
+    def full_candidate_args(self, sha, pyz_sha, token, helper_sha):
+        return (
+            "--deploy-gate", "--mode", "full",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--run-token", token, "--helper-sha256", helper_sha,
+        )
+
+    def test_precommit_full_deploy_gate_binds_candidate_modelless_and_archives_intake(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", *self.full_candidate_args(sha, pyz_sha, token, helper_sha),
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((v["ok"], v["mode"], v["deploy_gate"]), (True, "full", True))
+        self.assertEqual((v["candidate_sha"], v["run_token"], v["host_version"]), (sha, token, sha))
+        self.assertEqual((v["helper_sha256"], v["hub_pyz_sha256"]), (helper_sha, pyz_sha))
+        self.assertEqual((v["intake_archived"], v["cleanup"]), (True, "not_needed"))
+        c = self.calls()
+        self.assertNotIn("--engine", c)
+        self.assertNotIn("--model", c)
+        self.assertIn(f"{sha[:12]}:{token}", (self.tmp / "prompt").read_text())
+        self.assertEqual(
+            (self.tmp / "archived_intake").read_text(),
+            "intake update intake-canary-1 --status archived --reason deploy_gate_full_canary",
+        )
+        self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+    def test_precommit_full_deploy_gate_failure_and_timeout_are_typed_and_cleaned_up(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        for scenario, stage in (("capture_prompt_only", "capture"), ("never_running", "running")):
+            with self.subTest(scenario=scenario):
+                rel_root, pyz_sha = self.prepare_candidate_release(sha)
+                r, v = self.run_canary(
+                    scenario, *self.full_candidate_args(sha, pyz_sha, token, helper_sha),
+                    HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
+                    HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
+                    HUB_CANARY_RUNNING_TIMEOUT_S="0.3",
+                    HUB_CANARY_CAPTURE_TIMEOUT_S="0.3",
+                    FAKE_HOST_VERSION=sha,
+                )
+                self.assertEqual((r.returncode, v["ok"], v["mode"], v["stage"]), (1, False, "full", stage))
+                self.assertEqual(json.loads(r.stderr.strip().splitlines()[-1])["stage"], stage)
+                self.assertEqual(self.mails(), [])
+                self.assertEqual((v["cleanup"], v["intake_archived"]), ("stopped", True))
+                self.assertIn("sessions stop " + SID, self.calls())
+                self.assertNotIn("--engine", self.calls())
+                self.assertEqual(
+                    (self.tmp / "archived_intake").read_text(),
+                    "intake update intake-canary-1 --status archived --reason deploy_gate_full_canary",
+                )
+                self.assertEqual(list((self.state / "pending").glob("*.json")), [])
+
+    def test_precommit_full_deploy_gate_rejects_helper_and_archive_digest_mismatch(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        r, v = self.run_canary(
+            "ok", *self.full_candidate_args(sha, pyz_sha, token, "0" * 64),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root), HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "helper_version", "helper_sha256_mismatch"))
+        self.assertEqual(self.calls(), "")
+        r, v = self.run_canary(
+            "ok", *self.full_candidate_args(sha, "f" * 64, token, helper_sha),
+            HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root), HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+        )
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_hub_pyz_cli_sha_mismatch"))
+        self.assertEqual(self.calls(), "")
+
     def test_precommit_deploy_gate_rejects_helper_digest_mismatch(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -1207,6 +1289,11 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(verdict["helper_sha256"], helper_sha)
         self.assertEqual(verdict["hub_pyz_sha256"], pyz_sha)
         self.assertEqual(verdict["intake_archived"], True)
+        self.assertEqual((verdict["mode"], verdict["deploy_gate"]), ("full", True))
+        wrapper_calls = self.calls()
+        self.assertIn("sessions start", wrapper_calls)
+        self.assertNotIn("--engine", wrapper_calls)
+        self.assertNotIn("--model", wrapper_calls)
 
         # Hold the deploy-gate lock and verify concurrent forced-command execution fails closed.
         import fcntl

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Forced-command SSH wrapper for the Hub pre-commit live shell start canary.
+# Forced-command SSH wrapper for the Hub pre-commit live full (model-less, candidate-bound) start canary.
 # Invoked via authorized_keys:
 #   restrict,command="/usr/local/sbin/hub-start-canary/hub-deploy-gate-forced.sh" ssh-ed25519 ...
 # Purges the caller environment, validates SSH_ORIGINAL_COMMAND against a single
@@ -12,7 +12,7 @@ HERE="$(/usr/bin/dirname -- "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")")"
 emit_reject() {
   local stage="$1" reason="$2" code="$3"
   local payload
-  payload="$(/usr/bin/printf '{"cleanup": "not_needed", "deploy_gate": true, "mode": "shell", "ok": false, "reason": "%s", "session_id": null, "stage": "%s"}\n' "$reason" "$stage")"
+  payload="$(/usr/bin/printf '{"cleanup": "not_needed", "deploy_gate": true, "mode": "full", "ok": false, "reason": "%s", "session_id": null, "stage": "%s"}\n' "$reason" "$stage")"
   /usr/bin/printf '%s\n' "$payload"
   /usr/bin/printf '%s\n' "$payload" >&2
   exit "$code"
@@ -68,7 +68,7 @@ exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S}s" \
   HUB_CANARY_LOCK_WAIT_S="$DEPLOY_GATE_LOCK_WAIT_S" \
   "${EXTRA_ENV[@]}" \
   /usr/bin/python3 -I -S "$HERE/hub_start_canary.py" \
-  --mode shell \
+  --mode full \
   --deploy-gate \
   --candidate-sha "$CANDIDATE_SHA" \
   --candidate-cli-sha256 "$CANDIDATE_CLI_SHA256" \
