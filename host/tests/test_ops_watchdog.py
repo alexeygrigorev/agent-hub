@@ -647,5 +647,20 @@ class OpsWatchdogTest(unittest.TestCase):
         self.assertEqual(len(self.starts()), 1)
 
 
+def load_tests(loader, standard_tests, pattern):
+    # Required deploy CI selects this module explicitly. Keep the new installed
+    # layout cases in their authoritative module; lazy import avoids exporting
+    # an imported TestCase that pytest would collect a second time.
+    if __package__:
+        from .test_ops_install import OpsInstallTests
+    else:
+        from test_ops_install import OpsInstallTests
+    installed = loader.loadTestsFromTestCase(OpsInstallTests)
+    if installed.countTestCases() != 6:
+        raise RuntimeError('ops_installed_layout_suite_changed_or_empty')
+    standard_tests.addTests(installed)
+    return standard_tests
+
+
 if __name__ == '__main__':
     unittest.main()
