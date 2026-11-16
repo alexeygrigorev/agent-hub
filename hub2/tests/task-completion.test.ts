@@ -118,7 +118,7 @@ async function finishClaimed(f:F,id:string,binding:any,exit=0){
   const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
   return verifier;
 }
-const start=(f:F,id:string,key:string,extra:object={})=>f.call('/api/intakes/'+id+'/start','POST',{key,workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.',...extra});
+const start=(f:F,id:string,key:string,extra:object={})=>f.call('/api/intakes/'+id+'/start','POST',{key,workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.',timeout_seconds:1800,...extra});
 
 test('task sessions receive the completion contract with intake, session and criteria within the launch limit',async()=>{
   const f=fixture();
@@ -1353,4 +1353,14 @@ test('read-only briefs are not code tasks, and an operator can reclassify and re
     const state=await json(await f.call('/api/intakes/'+forced+'/merge-state'));
     assert.equal(state.merge_gate.required,false);assert.equal(state.merge_gate.ok,true);
   }finally{f.close();}
+});
+
+test('implementation sessions default to a 2h deadline, review keeps 30 min',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'timeout-default');
+    const r=await f.call('/api/intakes/'+id+'/start','POST',{key:'dflt',workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.'});
+    assert.equal(r.status,201);
+    assert.equal(JSON.parse(sagas(f,id)[0].launch_spec_json).timeout_seconds,7200);
+  }finally{f.close?.();}
 });

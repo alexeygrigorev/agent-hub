@@ -971,7 +971,7 @@ test('ordinary Claude start preserves exact pre-selector request digest',async()
  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
  const {createHash}=await import('node:crypto');
  const prior=createHash('sha256').update(JSON.stringify({intake_id:own.id,criteria:['Actual result'],workspace:start.workspace,
-  prompt:'Original requested behavior',interactive:false,with_goal:false,timeout_seconds:1800,
+  prompt:'Original requested behavior',interactive:false,with_goal:false,timeout_seconds:7200,
   route:{machine_id:'h1',engine:'claude',model:'opus',effort:'medium',override_reason:null,required_capabilities:[],with_goal:false}})).digest('hex');
  assert.equal(saga.request_digest,prior);assert(!Object.hasOwn(JSON.parse(saga.launch_spec_json),'managed_credential_label'));
  f.sql.close();f.collectorSql.close();
