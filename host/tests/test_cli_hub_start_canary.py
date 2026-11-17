@@ -1228,6 +1228,60 @@ class CanaryTest(unittest.TestCase):
         self.assertIn("shell every 5 min, full every 30 min", installer)
         self.assertNotIn("15 min", installer)
 
+    def test_trusted_wrapper_waits_for_existing_lock_longer_than_five_seconds_once(self):
+        import fcntl
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        lib = self.tmp / "waiting-canary-lib"; lib.mkdir()
+        for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
+            shutil.copy2(ROOT / "scripts" / name, lib / name)
+            (lib / name).chmod(0o755)
+        # Do NOT override DEPLOY_GATE_LOCK_WAIT_S: exercise the actual fixed wrapper policy.
+        (lib / ".test-harness.env").write_text(
+            f'USER_HOME="{self.tmp}"\n'
+            f'A_BIN="{sys.executable} -I -S {self.tmp / "fake_a.py"}"\n'
+            f'HOST_RELEASE_ROOT="{rel_root}"\nWORKSPACE_DIR="{self.tmp / "ws"}"\nSTATE_DIR="{self.state}"\n'
+            f'EXTRA_ENV=(FAKE_DIR="{self.tmp}" FAKE_SCENARIO="ok" FAKE_HOST_VERSION="{sha}" '
+            f'HUB_CANARY_MACHINE="HOST-1" HUB_CANARY_REPO="owner/repo" '
+            f'HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_RUNNING_TIMEOUT_S="1.5" HUB_CANARY_CAPTURE_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_STOP_TIMEOUT_S="1.5" HUB_CANARY_CLEANUP_BUDGET_S="1.5")\n'
+        )
+        self.state.mkdir(mode=0o700)
+        lock = self.state / "deploy-gate.lock"
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = lock.stat()
+        child = subprocess.Popen([str(lib / "hub-deploy-gate-forced.sh")],
+            env={"SSH_ORIGINAL_COMMAND": f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
+                 "HUB_CANARY_LOCK_WAIT_S": "0", "DEPLOY_GATE_LOCK_WAIT_S": "0"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        started = time.monotonic()
+        try:
+            time.sleep(5.2)
+            self.assertIsNone(child.poll(), "old five-second refusal must not win")
+            self.assertFalse((self.tmp / "started").exists())
+            time.sleep(max(0, 6 - (time.monotonic() - started)))
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            out, err = child.communicate(timeout=15)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            if child.poll() is None:
+                child.kill(); child.communicate(timeout=5)
+        self.assertEqual(child.returncode, 0, err)
+        verdict = json.loads(out)
+        self.assertEqual((verdict["ok"], verdict["mode"], verdict["intake_archived"]), (True, "full", True))
+        self.assertEqual((verdict["candidate_sha"], verdict["run_token"], verdict["helper_sha256"], verdict["hub_pyz_sha256"]),
+                         (sha, token, helper_sha, pyz_sha))
+        starts = [a for a in map(json.loads, (self.tmp / "argv.jsonl").read_text().splitlines()) if a[:2] == ["sessions", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertNotIn("--engine", starts[0]); self.assertNotIn("--model", starts[0])
+        self.assertIn("sessions stop", self.calls()); self.assertIn("intake update", self.calls())
+        self.assertEqual((lock.stat().st_dev, lock.stat().st_ino), (before.st_dev, before.st_ino))
+
     def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -3521,6 +3575,78 @@ class TrustedCaptureBudgetTests(unittest.TestCase):
         self.assertEqual(cleanup, [255])  # Original <=60s independent cleanup, not renewed active240.
         archive.assert_called_once_with(deadline=255)
         clear.assert_called_once()
+
+
+class TrustedLockBudgetTests(unittest.TestCase):
+    def canary(self, **env):
+        return TrustedCaptureBudgetTests().canary(**env)
+
+    def temporary(self):
+        base = pathlib.Path(os.environ.get("TMPDIR") or ROOT / ".local" / "tmp")
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(prefix="trusted-lock-", dir=base)
+
+    def test_trusted_wait_caps_sixty_and_periodic_default_remains_one_twenty(self):
+        from scripts import hub_start_canary as mod
+        self.assertEqual(self.canary().lock_wait, 60)
+        self.assertEqual(self.canary(HUB_CANARY_LOCK_WAIT_S="999").lock_wait, 60)
+        self.assertEqual(self.canary(HUB_CANARY_LOCK_WAIT_S="0.1").lock_wait, 0.1)
+        self.assertEqual(TrustedCaptureBudgetTests().canary(candidate=False).lock_wait, 120)
+        c = self.canary(HUB_CANARY_CLEANUP_BUDGET_S="999")
+        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget, c.capture_timeout), (240, 45, 60, 120))
+        self.assertEqual(mod.TRUSTED_RUNNING_TIMEOUT_S, 90)
+
+    def test_existing_lock_acquisition_can_wait_sixteen_seconds_without_new_lock(self):
+        from scripts import hub_start_canary as mod
+        import fcntl
+        clock = [0.0]; calls = []
+        def flock(fd, flags):
+            calls.append((fd, flags))
+            if clock[0] < 16: raise BlockingIOError()
+        def sleep(seconds): clock[0] += seconds
+        with self.temporary() as root:
+            path = pathlib.Path(root) / "deploy-gate.lock"
+            with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(mod.time, "sleep", side_effect=sleep), mock.patch.object(mod.fcntl, "flock", side_effect=flock):
+                fd = mod.acquire_lock_fd(path, self.canary().lock_wait)
+            try:
+                self.assertGreaterEqual(clock[0], 16); self.assertLess(clock[0], 16.1)
+                self.assertEqual(set(x[0] for x in calls), {fd})
+                self.assertEqual(set(x[1] for x in calls), {fcntl.LOCK_EX | fcntl.LOCK_NB})
+                self.assertEqual(os.fstat(fd).st_ino, path.stat().st_ino)
+            finally: os.close(fd)
+
+    def test_persistent_busy_expires_at_sixty_with_zero_start_effects(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(); clock = [0.0]
+        def sleep(seconds): clock[0] += seconds
+        with self.temporary() as root, \
+             mock.patch.object(mod, "raw_state_dir_path", return_value=pathlib.Path(root)), \
+             mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(mod.time, "sleep", side_effect=sleep), \
+             mock.patch.object(mod.fcntl, "flock", side_effect=BlockingIOError), \
+             mock.patch.object(c, "verify_helper_digest"), mock.patch.object(c, "verify_candidate_host_release") as converge, \
+             mock.patch.object(c, "start") as start, mock.patch.object(c, "cleanup") as cleanup:
+            result = c.execute()
+            self.assertTrue((pathlib.Path(root) / "deploy-gate.lock").is_file())
+            self.assertEqual((result["ok"], result["stage"], result["reason"], result["session_id"], result["cleanup"]),
+                             (False, "lock", "deploy_gate_lock_busy", None, "not_needed"))
+            self.assertEqual((clock[0], c.active_deadline, c.start_attempted), (60, 240, False))
+            converge.assert_not_called(); start.assert_not_called(); cleanup.assert_not_called()
+
+    def test_wait_is_clipped_to_original_active_remaining_and_never_renews_it(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(); c.active_deadline = 240; clock = [225.0]
+        def sleep(seconds): clock[0] += seconds
+        with self.temporary() as root, \
+             mock.patch.object(mod, "raw_state_dir_path", return_value=pathlib.Path(root)), \
+             mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(mod.time, "sleep", side_effect=sleep), \
+             mock.patch.object(mod.fcntl, "flock", side_effect=BlockingIOError):
+            with self.assertRaisesRegex(mod.StageFailure, "deploy_gate_lock_busy"):
+                c.acquire_deploy_gate_lock()
+            self.assertEqual((clock[0], c.active_deadline, c.stage_deadline(90)), (240, 240, 240))
+            self.assertIsNone(c.lock_fd); self.assertFalse(c.start_attempted)
 
 
 if __name__ == "__main__":

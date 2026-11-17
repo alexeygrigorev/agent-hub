@@ -25,7 +25,7 @@ TRUSTED_STOP_TIMEOUT_S = 45.0
 TRUSTED_CMD_TIMEOUT_S = 45.0
 TRUSTED_ACTIVE_BUDGET_S = 240.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
-TRUSTED_LOCK_WAIT_S = 5.0
+TRUSTED_LOCK_WAIT_S = 60.0
 PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
 # Public, unauthenticated Hub health body checked before each periodic start.
 # HUB_CANARY_HEALTH_URL exists for offline tests: https anywhere, plain http
