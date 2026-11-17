@@ -274,3 +274,64 @@ class BridgeResponsivenessTests(unittest.TestCase):
                     thread.join(5)
                 journal.close_thread()
                 journal.db.close()
+
+
+class ResourceReleaseReaperTests(unittest.TestCase):
+    setUp = LaunchReaperTests.setUp
+    row = LaunchReaperTests.row
+    settle = LaunchReaperTests.settle
+    state = LaunchReaperTests.state
+    receipt = LaunchReaperTests.receipt
+    def test_qualified_absence_releases_with_original_outbox(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        evidence={'source':'aplexer_all_registry_census','complete':True,'match_count':0,'started_at_ms':150,'observed_at_ms':160}
+        self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:True,absence_evidence=lambda *_:evidence))
+        self.settle()
+        metadata=json.loads(self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0])
+        self.assertTrue(metadata['released'])
+        self.assertEqual(metadata['release_reason'],'qualified_absence')
+        self.assertTrue(self.receipt()['launch_expired'])
+        self.assertNotIn('native_exit_confirmed',self.receipt())
+
+    def test_unqualified_stale_absence_retains_original_reserve(self):
+        from agent_hub_host import resource_admission as admission
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+        with self.journal.db:self.journal.db.execute('UPDATE launches SET admission_json=?',(admission.starting(row),))
+        before=self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0]
+        self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:False,absence_evidence=lambda *_:{'started_at_ms':150}))
+        self.settle()
+        self.assertEqual(self.state(),'aborting')
+        self.assertEqual(self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0],before)
+
+    def test_outbox_failure_rolls_back_release_and_state(self):
+        self.row('pending_admission')
+        def failed(*args):raise RuntimeError('synthetic durability failure')
+        self.journal.enqueue=failed
+        with self.assertRaises(RuntimeError):reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'pending_admission')
+        self.assertIsNone(self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0])
+
+    def test_legacy_report_reuses_persisted_absence_without_any_new_census(self):
+        evidence={'source':'aplexer_all_registry_census','started_at_ms':100,'observed_at_ms':110,
+            'row_count':0,'sha256':'a'*64,'complete':True,'match_count':0,'workspace':'/owned',
+            'tag':'task-hub2-session','dispatch_provenance':'legacy_unknown'}
+        payload={'operation_id':'operation','epoch':1,'native_id':None,'launch_failed':True,
+            'failure_kind':'legacy_census_absent','native_outcome':'unconfirmed','evidence':evidence}
+        self.row('launch_failed_unconfirmed',payload=payload)
+        def forbidden():raise AssertionError('no new native census permitted')
+        self.bridge.launcher=SimpleNamespace(inventory=forbidden)
+        reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'launch_failed_reported')
+        self.assertEqual(self.receipt(),payload)
+        value=json.loads(self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0])
+        self.assertTrue(value['released'])
+        self.assertEqual(value['release_reason'],'qualified_legacy_absence')
+
+    def test_legacy_report_with_no_qualified_source_stays_accounting_unknown(self):
+        payload={'operation_id':'operation','epoch':1,'native_id':None,'launch_failed':True}
+        self.row('launch_failed_unconfirmed',payload=payload)
+        reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'launch_failed_reported')
+        self.assertEqual(self.receipt(),payload)
+        self.assertIsNone(self.journal.db.execute('SELECT admission_json FROM launches').fetchone()[0])
