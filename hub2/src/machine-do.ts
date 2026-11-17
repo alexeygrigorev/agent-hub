@@ -1,3 +1,4 @@
+import {SessionWakes,wakeProof,type WakeRecord,type WakeSession} from './session-wakes';
 import { linkSession } from './session-intake-link';
 import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-commands';
 import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
@@ -18,6 +19,7 @@ const CAPTURE_ACK_BODY_BYTES = 401 * 1024;
 const COMMAND_HISTORY_BYTES = 8 * 1024 * 1024;
 const HOST_START_DIAGNOSTIC_KEY = '_hub_host_start_diagnostic';
 const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
+  "missed_wake": "Scheduled wake was not verified within its deadline.",
   "native_dispatch_not_started": "Native launch did not start.",
   "host_operation_failed": "Host operation failed.",
   "workspace_unavailable": "path does not exist; Hub will not create it",
@@ -337,6 +339,7 @@ export class MachineDO {
   private readonly ready:Promise<void>;
   private readonly nativeInventory:MachineNativeInventory;
   private readonly nativeCommands:MachineNativeCommands;
+  private readonly wakes:SessionWakes;
   private readonly preflightWaiters = new Map<string, (result: JsonRecord) => void>();
 
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
@@ -346,11 +349,16 @@ export class MachineDO {
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.nativeInventory=new MachineNativeInventory(this.db,ctx,(snapshot,previous)=>this.observeNativeAbsences(snapshot,previous));
     this.nativeCommands=new MachineNativeCommands(this.db,ctx,this.nativeInventory);
+    this.wakes=new SessionWakes(ctx.storage,{
+      session:id=>this.wakeSession(id),enqueue:w=>this.enqueueWake(w),
+      command:w=>{const c=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND epoch=?',w.command_id,w.session_id,w.epoch);return c?{state:c.state==='wake_pending'?'pending':c.state==='wake_failed'?'failed':c.state,result:this.parse(c.result_json) as JsonRecord,updated_at:c.updated_at}:undefined;},
+      missed:async w=>{this.wakeNotification(w);},
+    });
     this.ready=initializeSchema(ctx, this.db, 10, [...LATEST_SCHEMA, ...ENGINE_UPDATE_JOBS_SCHEMA], [[SCHEMA[0]],COMPACT_KEYS,['ALTER TABLE machine_capabilities ADD COLUMN resources_json TEXT'],MACHINE_ACTIVE_MIGRATION,[
       'CREATE TABLE IF NOT EXISTS machine_liveness(singleton INTEGER PRIMARY KEY CHECK(singleton=1),observed_at INTEGER NOT NULL)',
       'CREATE TABLE IF NOT EXISTS native_sessions(session_id TEXT PRIMARY KEY,native_id TEXT,phase TEXT NOT NULL,last_activity_at INTEGER,exit_code INTEGER,containment_empty INTEGER NOT NULL,observed_at INTEGER NOT NULL) WITHOUT ROWID',
       'DROP TABLE IF EXISTS machine_active','ALTER TABLE machine_capabilities DROP COLUMN resources_json','ALTER TABLE machines DROP COLUMN active_session_id',
-    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA,NATIVE_COMMAND_SCHEMA,ENGINE_UPDATE_JOBS_SCHEMA],()=>this.scheduleNext(),6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,8,10));
+    ],['ALTER TABLE session_commands ADD COLUMN capture_mode TEXT'],NATIVE_INVENTORY_SCHEMA,NATIVE_COMMAND_SCHEMA,ENGINE_UPDATE_JOBS_SCHEMA],async()=>{await this.wakes.load();await this.scheduleNext();},6,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,8,10));
     this.constructorMs = performance.now() - started;
   }
 
@@ -409,6 +417,8 @@ export class MachineDO {
       if (url.pathname === '/api/sessions' && request.method === 'GET') return this.sessionList(request);
       const sessionView = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
       if (sessionView && request.method === 'GET') return this.sessionDetail(request, decodeURIComponent(sessionView[1]));
+      const wake=url.pathname.match(/^\/api\/sessions\/([^/]+)\/(wake|wakes)$/);
+      if(wake)return await this.sessionWake(request,decodeURIComponent(wake[1]),wake[2]);
       const sessionEvents = url.pathname.match(/^\/api\/sessions\/([^/]+)\/events$/);
       if (sessionEvents && request.method === 'GET') return this.sessionEvents(request, decodeURIComponent(sessionEvents[1]));
       const commandAck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands\/([^/]+)\/ack$/);
@@ -513,6 +523,8 @@ export class MachineDO {
     await this.ready;
     const now = Date.now();
     this.nativeCommands.expire(now);
+    await this.wakes.sweep();
+    const wakeMachine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');if(wakeMachine)await this.notifyPendingCommands(wakeMachine.machine_id);
     const expired = this.db.all<SessionRow>(
       "SELECT * FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL AND created_at<=? ORDER BY created_at,id LIMIT 100",
       now-CLAIMED_WITHOUT_NATIVE_GRACE_MS);
@@ -1406,7 +1418,7 @@ export class MachineDO {
 
   private async flushOutbox(now: number): Promise<void> {
     const rows = this.db.all<OutboxRow>(
-      `SELECT * FROM machine_outbox WHERE state='pending' AND next_action_at <= ? ORDER BY next_action_at, id LIMIT 20`, now,
+      `SELECT * FROM machine_outbox WHERE (state='pending' OR (kind='wake' AND state='wake_pending')) AND next_action_at <= ? ORDER BY next_action_at, id LIMIT 20`, now,
     );
     for (const row of rows) await this.flushOne(row.id);
   }
@@ -1416,7 +1428,7 @@ export class MachineDO {
   }
 
   private async flushOneRaw(id: string, env:Hub2Env): Promise<boolean> {
-    const row = this.db.one<OutboxRow>('SELECT * FROM machine_outbox WHERE id=? AND state=\'pending\'', id);
+    const row = this.db.one<OutboxRow>("SELECT * FROM machine_outbox WHERE id=? AND (state='pending' OR (kind='wake' AND state='wake_pending'))", id);
     if (!row) return false;
     const payload = this.parse(row.payload_json) as JsonRecord;
     if(row.kind==='finish'&&!payload.intake_id)payload.intake_id=this.db.one<{intake_id:string}>('SELECT intake_id FROM sessions WHERE id=? AND operation_id=?',payload.session_id,payload.attempt_operation_id)?.intake_id;
@@ -1467,7 +1479,7 @@ export class MachineDO {
         return true;
       }
       const stub = env.PROJECTS.get(env.PROJECTS.idFromName(row.project_id));
-      const path = row.kind === 'stopped-finish' ? '/_internal/stopped-finish' : row.kind === 'finish-dead-letter' ? '/_internal/finish-dead-letter' : row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
+      const path = row.kind === 'wake' ? '/_internal/session-wake' : row.kind === 'stopped-finish' ? '/_internal/stopped-finish' : row.kind === 'finish-dead-letter' ? '/_internal/finish-dead-letter' : row.kind === 'finish' ? '/_internal/finish' : row.kind === 'started' ? '/_internal/started'
         : row.kind === 'auth-fallback' ? '/_internal/auth-fallback'
         : row.kind === 'stopped' ? '/_internal/stopped' : (row.kind === 'reaped' || row.kind === 'lost' || row.kind === 'legacy-launch-failure') ? '/_internal/reaped'
         : row.kind === 'claim' ? '/_internal/claim' : '/_internal/requeue';
@@ -1475,19 +1487,19 @@ export class MachineDO {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       });
       if (!response.ok) throw new Error('project_forward_failed');
-      this.db.run("UPDATE machine_outbox SET state='delivered', updated_at=? WHERE id=? AND state='pending'", Date.now(), row.id);
+      this.db.run("UPDATE machine_outbox SET state='delivered', updated_at=? WHERE id=? AND (state='pending' OR (kind='wake' AND state='wake_pending'))", Date.now(), row.id);
       return true;
     } catch {
       const now = Date.now();
       const attempt = row.attempt + 1;
       if(attempt>=10){
-        this.db.run("UPDATE machine_outbox SET state='dead_letter',attempt=?,updated_at=? WHERE id=? AND state='pending'",attempt,now,row.id);
+        this.db.run("UPDATE machine_outbox SET state='dead_letter',attempt=?,updated_at=? WHERE id=? AND (state='pending' OR (kind='wake' AND state='wake_pending'))",attempt,now,row.id);
         if(typeof payload.session_id==='string')this.db.run('INSERT OR IGNORE INTO attention VALUES(?,?,?,?,?)',payload.session_id,'outbox_retries_exhausted',row.operation_id,null,now);
         console.error('[hub2] MACHINE_OUTBOX_DEAD_LETTER',JSON.stringify({id:row.id,kind:row.kind,operation_id:row.operation_id,attempt}));
         return false;
       }
       const delay = Math.min(15 * 60_000, 1_000 * 2 ** Math.min(attempt, 9));
-      this.db.run('UPDATE machine_outbox SET attempt=?, next_action_at=?, updated_at=? WHERE id=? AND state=\'pending\'', attempt, now + delay, now, row.id);
+      this.db.run("UPDATE machine_outbox SET attempt=?, next_action_at=?, updated_at=? WHERE id=? AND (state='pending' OR (kind='wake' AND state='wake_pending'))", attempt, now + delay, now, row.id);
       return false;
     }
   }
@@ -1503,6 +1515,7 @@ export class MachineDO {
     const current = await this.ctx.storage.getAlarm();
     const nativeDue=this.db.schemaVersion>=9?this.db.one<{due:number|null}>("SELECT MIN(deadline_ms) AS due FROM native_commands WHERE state='pending'")?.due:null;
     const presenceDue=this.presenceDue(await this.hostPresence(),Date.now());
+    const wakeDue=this.wakes.due();
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
       UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
@@ -1511,9 +1524,10 @@ export class MachineDO {
       UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
       UNION ALL SELECT ? AS due
       UNION ALL SELECT ? AS due
-      UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE state='pending'
+      UNION ALL SELECT ? AS due
+      UNION ALL SELECT MIN(next_action_at) AS due FROM machine_outbox WHERE (state='pending' OR (kind='wake' AND state='wake_pending'))
       UNION ALL SELECT ? AS due WHERE EXISTS(SELECT 1 FROM sessions WHERE state IN ('claimed','running'))
-    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,presenceDue,Date.now()+SESSION_REAP_INTERVAL_MS);
+    )`,CLAIMED_WITHOUT_NATIVE_GRACE_MS,HOST_INVENTORY_LOST_MS,nativeDue??null,presenceDue,wakeDue,Date.now()+SESSION_REAP_INTERVAL_MS);
     if (next?.due !== null && next?.due !== undefined) {
       // Ordinary requests preserve pending wakes, even overdue ones. Only the
       // handler may replace the runtime's retry lease and own the next wake.
@@ -1577,6 +1591,7 @@ export class MachineDO {
     if (kind === 'send' && (typeof commandText !== 'string' || !commandText.trim() || new TextEncoder().encode(commandText).byteLength > 8192)) return error('invalid_command_text', 400);
     if (kind !== 'send' && commandText !== undefined) return error('unexpected_command_text', 400);
     const key = request.headers.get('Idempotency-Key') || body.key;
+    if(typeof key==='string'&&key.startsWith('hub-wake:'))return error('reserved_command_key',400);
     if (typeof key !== 'string' || !/^[A-Za-z0-9_.:-]{1,120}$/.test(key)) return error('idempotency_key_required', 400);
     const digest = await sha256Hex(JSON.stringify({ kind, text: commandText ?? null, epoch: session.epoch, ...(captureMode ? {mode:captureMode} : {}) }));
     // Schema6 is the first rollout bridge: keep its legacy command wire and
@@ -1653,12 +1668,13 @@ export class MachineDO {
     if (!machineId) return error('forbidden', 403);
     const safety=request.headers.get('x-hub2-safety-mode')==='operator_stop';
     if(new URL(request.url).searchParams.has('safety')&&!safety)return error('untrusted_safety_mode',403);
-    const row = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?', commandId, sessionId, machineId);
+    let row = this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?', commandId, sessionId, machineId);
     if (!row) return error('stale_command', 409);
     const capture = row.kind === 'capture';
     const body = await bodyObject(request, capture ? CAPTURE_ACK_BODY_BYTES : 12_288);
     if (!Number.isSafeInteger(body.epoch) || !body.result || typeof body.result !== 'object' || Array.isArray(body.result)) return error('invalid_command_ack', 400);
     const resultLimit = capture && typeof (body.result as JsonRecord).output === 'string' ? CAPTURE_RESULT_JSON_BYTES : 8192;
+    if(row.kind==='wake_send'){const current=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=?',commandId,sessionId,machineId);if(!current)return error('stale_command',409);row=current;}
     if (new TextEncoder().encode(JSON.stringify(body.result)).byteLength > resultLimit) return error('command_ack_too_large', 413);
     if (row.epoch !== body.epoch) return error('stale_command', 409);
     if(safety&&row.kind!=='stop')return error('safety_command_refused',403);
@@ -1666,6 +1682,32 @@ export class MachineDO {
       ? this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch)
       : null;
     let result={...body.result as JsonRecord};
+    const wakeBinding=(this.parse(row.result_json) as JsonRecord|null)?.wake_binding as JsonRecord|undefined;
+    if(wakeBinding){
+      const current=this.wakeSession(sessionId);
+      if(row.kind!=='wake_send'||!current||current.operation_id!==wakeBinding.operation_id||current.epoch!==row.epoch||current.native_id!==wakeBinding.native_id)return error('stale_wake',409);
+      if(result.wake_pending===true){
+        if(Object.keys(result).sort().join(',')!=='native_message_id,wake_pending'||typeof result.native_message_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.native_message_id))return error('invalid_wake_result',400);
+        if(row.state!=='wake_pending')return error('stale_command',409);
+        if(wakeBinding.native_message_id!==undefined&&wakeBinding.native_message_id!==result.native_message_id)return error('wake_receipt_conflict',409);
+        if(wakeBinding.ack_deadline_ms===undefined){
+          const now=Date.now();
+          if(now>=Number(wakeBinding.deadline_ms)){await this.wakes.sweep();await this.scheduleNext();return json({acknowledged:false,expired:true});}
+          const upgraded={...wakeBinding,native_message_id:result.native_message_id,ack_deadline_ms:now+600000};
+          this.db.run("UPDATE session_commands SET result_json=?,updated_at=? WHERE id=? AND epoch=? AND state='wake_pending' AND json_extract(result_json,'$.wake_binding.ack_deadline_ms') IS NULL",JSON.stringify({wake_binding:upgraded,wake_delivered_at_ms:now}),now,row.id,row.epoch);
+        }
+        await this.wakes.sweep();await this.scheduleNext();await this.notifyPendingCommands(machineId);
+        return json({acknowledged:false,pending:true});
+      }
+      if(Object.keys(result).some(k=>!['delivery','delivered_at_ms','wake_proof'].includes(k))||result.delivery!=='native_acknowledged'||!Number.isSafeInteger(result.delivered_at_ms)||Number(result.delivered_at_ms)<=0||Number(result.delivered_at_ms)>Date.now()+5000)return error('invalid_wake_result',400);
+      if(!wakeProof(result.wake_proof,wakeBinding))return error('invalid_wake_proof',409);
+      const reused=this.db.one<{id:string}>("SELECT id FROM session_commands WHERE id<>? AND kind='wake_send' AND json_valid(result_json) AND json_extract(result_json,'$.wake_proof.native_message_id')=? LIMIT 1",row.id,(result.wake_proof as JsonRecord).native_message_id);
+      if(reused)return error('wake_proof_replayed',409);
+      const firstReceipt=this.parse(row.result_json) as JsonRecord;
+      if(!Number.isSafeInteger(firstReceipt.wake_delivered_at_ms)||!Number.isSafeInteger(wakeBinding.ack_deadline_ms))return error('wake_receipt_required',409);
+      result={...result,delivered_at_ms:firstReceipt.wake_delivered_at_ms,wake_delivered_at_ms:firstReceipt.wake_delivered_at_ms,wake_binding:wakeBinding};
+    }
+
     const diagnostic=this.nativeControlDiagnostic(result,row.kind);
     delete result.native_control_stage; delete result.native_control_error;
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
@@ -1709,9 +1751,11 @@ export class MachineDO {
     if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
     if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed) && row.result_json === resultJson)) {
-      return row.result_json === resultJson ? json({ acknowledged: true, duplicate: true }) : error('command_ack_conflict', 409);
+      if(row.result_json!==resultJson)return error('command_ack_conflict',409);
+      if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.scheduleNext();}
+      return json({acknowledged:true,duplicate:true});
     }
-    if (row.state !== 'pending') return error('command_not_pending', 409);
+    if (row.state !== 'pending'&&!(wakeBinding&&['wake_pending','wake_failed'].includes(row.state))) return error('command_not_pending', 409);
     if(captureBinding){
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=? AND epoch=?',sessionId,machineId,row.epoch);
       const echo=(body.result as JsonRecord).capture_binding as JsonRecord|undefined;
@@ -1725,19 +1769,23 @@ export class MachineDO {
         return error('stale_command',409);
       }
     } else {
-      this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND state='pending' AND epoch=?",
-        unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId, row.epoch);
+      this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND (state='pending' OR (?=1 AND state IN ('wake_pending','wake_failed'))) AND epoch=?",
+        unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId,wakeBinding?1:0, row.epoch);
     }
+    if(row.kind==='stop'&&result.stopped===true)await this.scheduleNext();
+    if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.wakes.sweep();await this.scheduleNext();}
     await this.notifyPendingCommands(machineId);
     return json({ acknowledged: true });
   }
 
   private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
     const stop=this.stopOnly(socket);
+    const wakeCap=this.db.one<{capabilities_json:string}>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?',machineId);
+    const supportsWakes=!!wakeCap&&(JSON.parse(wakeCap.capabilities_json) as string[]).includes('session-wakes:v1');
     const command=this.db.one<CommandRow>(`
       SELECT c.* FROM session_commands c
       JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch
-      WHERE c.machine_id=? AND c.state='pending' AND (
+      WHERE c.machine_id=? AND (c.state='pending' OR (c.kind='wake_send' AND c.state='wake_pending')) AND (CASE WHEN json_valid(c.result_json) THEN json_type(c.result_json,'$.wake_binding') END IS NULL OR (?=1 AND COALESCE(json_extract(c.result_json,'$.wake_binding.ack_deadline_ms'),json_extract(c.result_json,'$.wake_binding.deadline_ms'))>?)) AND (
         s.state IN ('claimed','running') OR (c.kind='capture' AND s.state='completed-awaiting-review' AND s.exit_code=0
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.native_id') END=s.native_id
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.operation_id') END=s.operation_id
@@ -1748,7 +1796,7 @@ export class MachineDO {
             WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
         ))
       ) ${stop?"AND c.kind='stop'":''}
-      ORDER BY CASE WHEN c.kind='stop' THEN 0 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId);
+      ORDER BY CASE WHEN c.kind='stop' THEN 0 WHEN c.kind='wake_send' THEN 2 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId,supportsWakes?1:0,Date.now());
     if(!stop){
       const native=this.nativeCommands.next();
       if(native&&await this.authorizedAttachment(socket,'machine:offer',true,env)){
@@ -1975,7 +2023,7 @@ export class MachineDO {
       labels:this.parse(machine.labels_json),last_seen:machine.last_seen,connected:this.machineSockets(`${machine.machine_id}`).length>0}:null,
       sessions,live_active_count:this.liveSessions().filter(row=>isLiveActiveSession(row)).length,
       attention:this.db.all<JsonRecord>('SELECT * FROM attention ORDER BY observed_at DESC,session_id LIMIT 20').map(row=>({...row,reason:closedHostReason(row.reason)})),
-      pending_notifications:this.db.all("SELECT id,kind,attempt,next_action_at FROM machine_outbox WHERE state='pending' ORDER BY next_action_at,id LIMIT 21")});
+      pending_notifications:this.db.all("SELECT id,kind,attempt,next_action_at FROM machine_outbox WHERE (state='pending' OR (kind='wake' AND state='wake_pending')) ORDER BY next_action_at,id LIMIT 21")});
   }
 
   private liveSessions():LiveSession[]{
@@ -2039,7 +2087,7 @@ export class MachineDO {
       if(session.native_id&&!live)continue;  // The host snapshot is bounded.
       if(live){
         const reason=inactiveReason({...live,last_activity_at:live.last_activity_at??session.created_at},now);
-        if(reason)candidates.push({session,reason,live});
+        if(reason&&!(reason==='idle'&&this.wakes.holdsIdle(session.id,now)))candidates.push({session,reason,live});
       }
     }
     if(dryRun)return {machine_id:machine.machine_id,dry_run:true,active_count:active,reaped:0,stop_requested:0,
@@ -2376,7 +2424,7 @@ export class MachineDO {
         ...(row.kind === 'stop' ? { outcome: row.state === 'failed' ? 'failed' : 'delivered',
           confirmed_exit: row.state==='acked'&&this.qualifiedStopResult(session,result) } : {}),
       };
-      const entry={ id: row.id, session_id: row.session_id, kind: row.kind, state: row.state, created_at: row.created_at, ack };
+      const entry={ id: row.id, session_id: row.session_id, kind: row.kind==='wake_send'?'send':row.kind, state: row.state, created_at: row.created_at, ack };
       bytes += new TextEncoder().encode(JSON.stringify(entry)).length + (commands.length ? 1 : 0);
       if(bytes>COMMAND_HISTORY_BYTES)return error('command_history_too_large',413);
       commands.push(entry);
@@ -2421,6 +2469,51 @@ export class MachineDO {
       ...(typeof result.reason === 'string' ? { reason: closedLaunchReason(result.reason) } : {}),
       ...(typeof result.detail === 'string' ? { detail: fixedHostDetail(result.reason) } : {}),
     });
+  }
+
+  private wakeSession(id:string):WakeSession|undefined{
+    const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);if(!row)return;
+    const launch=this.parse(row.launch_json) as JsonRecord;
+    return{id:row.id,operation_id:row.operation_id,epoch:row.epoch,native_id:row.native_id,state:row.state,project_id:row.project_id,intake_id:row.intake_id,machine_id:row.machine_id,interactive:launch.interactive===true,workspace:String(boundWorkspace(launch))};
+  }
+  private enqueueWake(w:WakeRecord):boolean{
+    const current=this.wakeSession(w.session_id);
+    if(!current||current.operation_id!==w.operation_id||current.epoch!==w.epoch||current.native_id!==w.native_id||current.state!=='running'||!current.interactive)return false;
+    const prior=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=?',w.command_id);
+    if(prior)return prior.session_id===w.session_id&&prior.epoch===w.epoch;
+    const native=this.db.one<{row_json:string}>('SELECT row_json FROM native_inventory_rows WHERE native_id=?',w.native_id);
+    const observed=native?JSON.parse(native.row_json) as JsonRecord:null;
+    if(this.nativeInventory.status().fresh!==true||!observed||!Number.isSafeInteger(observed.created_at_ms)||Number(observed.created_at_ms)<=0||observed.tag!==`task-hub2-${w.session_id}`||observed.workspace!==w.workspace)return false;
+    w.native_birth=Number(observed.created_at_ms);
+    const binding={id:w.id,session_id:w.session_id,operation_id:w.operation_id,epoch:w.epoch,native_id:w.native_id,tag:observed.tag,workspace:w.workspace,created_at_ms:w.native_birth,deadline_ms:w.wake_at_ms+600000};
+    this.db.transaction(this.ctx,()=>{
+      const row=this.wakeSession(w.session_id);if(!row||row.operation_id!==w.operation_id||row.epoch!==w.epoch||row.native_id!==w.native_id||row.state!=='running')throw new HttpError('stale_wake',409);
+      this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,'wake_send',?,'wake_pending',?,?,?)`,w.command_id,w.session_id,w.machine_id,w.epoch,'hub-wake:'+w.id,w.id,w.prompt,JSON.stringify({wake_binding:binding}),Date.now(),Date.now());
+    });return true;
+  }
+  private wakeNotification(w:WakeRecord){
+    const payload={wake_id:w.id,session_id:w.session_id,attempt_operation_id:w.operation_id,epoch:w.epoch,intake_id:w.intake_id,state:w.state,reason:w.reason,missed_at:w.missed_at,wake_at_ms:w.wake_at_ms};
+    this.db.transaction(this.ctx,()=>{
+      if(w.state==='missed')this.db.run("UPDATE session_commands SET state='wake_failed',updated_at=? WHERE id=? AND kind='wake_send' AND state='wake_pending'",Date.now(),w.command_id);
+      if(w.state==='acked')this.db.run("DELETE FROM attention WHERE session_id=? AND reason='missed_wake' AND message_id=?",w.session_id,w.id);
+      if(w.missed_at!==null){this.insertOutbox('wake:'+w.id+':missed','wake',w.operation_id,w.project_id,{...payload,state:'missed'},Date.now());}
+      if(w.missed_at!==null&&w.state!=='acked')this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=excluded.message_id,observed_at=excluded.observed_at',w.session_id,'missed_wake',w.operation_id,w.id,Date.now());
+      this.insertOutbox('wake:'+w.id+':'+(w.state==='acked'?'resolved':w.missed_at!==null?'missed':w.state),'wake',w.operation_id,w.project_id,payload,Date.now());
+      for(const phase of new Set(['missed',w.state==='acked'?'resolved':w.missed_at!==null?'missed':w.state]))this.db.run("UPDATE machine_outbox SET state='wake_pending' WHERE id=? AND kind='wake' AND state='pending'",'wake:'+w.id+':'+phase);
+    });
+  }
+  private async sessionWake(request:Request,id:string,action:string):Promise<Response>{
+    const session=this.wakeSession(id),actor=actorFrom(request);
+    const read=request.method==='GET';
+    if(!session||!actor||!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||'')))return error('session_not_found',404);
+    if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
+    if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
+    const b=await bodyObject(request,12288);if(Object.keys(b).some(k=>!['key','at','prompt','body'].includes(k)))return error('invalid_wake',400);
+    const {wake,replay}=await this.wakes.create(session,actor.id,b.key as string,b.at,b.prompt??b.body);
+    this.wakeNotification(wake);await this.flushOne('wake:'+wake.id+':'+(wake.missed_at!==null?'missed':wake.state));await this.wakes.sweep();await this.scheduleNext();
+    await this.notifyPendingCommands(session.machine_id);
+    const current=await this.wakes.lookup(id,wake.id)??wake;
+    return json({...this.wakes.view(current),...this.wakes.waiting(id),replay},replay?200:201);
   }
 
   private sessionDetail(request: Request, id: string): Response {
@@ -2474,6 +2567,7 @@ export class MachineDO {
       ...(launch.managed_credential_label?{managed_credential_label:launch.managed_credential_label}:{}),
       ...(picker ? { picker, policy_id: picker.policy_id, policy_version: picker.policy_version } : {}),
       mode:launch.interactive===true?'interactive':'headless',
+      ...(['running','claimed','offered'].includes(row.state)?this.wakes.waiting(row.id):{}),
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
       last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
       interactive:launch.interactive,evidence:this.sessionEvidence(row),
@@ -2536,12 +2630,13 @@ export class MachineDO {
   }
 
   private commandView(row: CommandRow): JsonRecord {
-    return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind,
+    return { id: row.id, session_id: row.session_id, epoch: row.epoch, kind: row.kind==='wake_send'?'send':row.kind,
       ...(row.kind === 'stop' ? {deadline_ms: row.created_at + 60000} : {}),
       ...(row.capture_mode ? {mode:row.capture_mode} : {}),
       ...(row.kind==='capture'&&(this.parse(row.result_json) as JsonRecord|null)?.capture_binding
         ?{capture_binding:(this.parse(row.result_json) as JsonRecord).capture_binding}:{}),
-      ...(row.kind==='send'&&row.text!==null ? {text:row.text} : {}) };
+      ...((row.kind==='send'||row.kind==='wake_send')&&row.text!==null ? {text:row.text} : {}),
+      ...((this.parse(row.result_json) as JsonRecord|null)?.wake_binding?{wake:(this.parse(row.result_json) as JsonRecord).wake_binding}:{}) };
   }
 
   private machineActor(actor: Actor | undefined, scope: string): string | undefined {
