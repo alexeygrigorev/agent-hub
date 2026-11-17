@@ -1,3 +1,7 @@
+import { spawnSync } from 'node:child_process';
+import { fstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
@@ -1908,4 +1912,118 @@ test('complete native absence cannot bridge a committed reappearance whose KV re
   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running');
   assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
  }finally{Date.now=clock;f.database.close();}
+});
+
+// Real Bridge.command/Journal in an isolated child, with only the native adapter fake.
+function ordinarySendHost(root:string,command:any,native:string,mode='fail'){
+ const python=String.raw`
+import json,os,sqlite3,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from agent_hub_host.agent import Bridge,Journal
+from agent_hub_host.native_launch import canonical
+import hashlib
+root=Path(sys.argv[2]);command=json.loads(sys.argv[3]);native_id=sys.argv[4];mode=sys.argv[5]
+journal=Journal(root/'journal.sqlite')
+try:
+ with journal.db:
+  journal.db.execute('INSERT OR IGNORE INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,?,?)',('op-'+command['session_id'],command['session_id'],command['epoch'],'fixture',str(root),'task-hub2-'+command['session_id'],native_id,'running',1))
+ bridge=Bridge.__new__(Bridge);bridge.journal=journal
+ bridge.resolve_launch_native=lambda row:(row['native_id'],None)
+ effects=root/'effects.json'
+ counts=json.loads(effects.read_text()) if effects.exists() else {'send':0,'capture':0}
+ def fake_native(kind,*args,**kwargs):
+  counts[kind]+=1;effects.write_text(json.dumps(counts))
+  if kind=='send':raise subprocess.TimeoutExpired('synthetic owned input',60)
+  assert kind=='capture'
+  return subprocess.CompletedProcess([],0,'actual owned fixture capture\\n','')
+ bridge.native=fake_native
+ if mode=='executing':
+  with journal.db:bridge.begin_command(command['id'],hashlib.sha256(canonical(command).encode()).hexdigest())
+ frames=[]
+ class Socket:
+  def send(self,raw):frames.append(json.loads(raw))
+ try:bridge.dispatch({'type':'session.command','command':command},Socket(),None);error=None
+ except Exception as exc:error=type(exc).__name__
+ row=journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+ queued=journal.db.execute('SELECT * FROM outbox WHERE key=?',('command:'+command['id'],)).fetchone()
+ launch=journal.db.execute('SELECT state,native_id FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+ print(json.dumps({'result':json.loads(row['result']) if row and row['result'] else None,'frame':frames[0] if frames else None,'error_class':error,'command_state':row['state'] if row else None,'payload':json.loads(queued['payload']) if queued else None,'path':queued['path'] if queued else None,'launch':dict(launch),'effects':counts}))
+finally:journal.close_thread()
+`;
+ const home=join(root,'home'),tmp=join(root,'tmp');mkdirSync(home,{recursive:true,mode:0o700});mkdirSync(tmp,{recursive:true,mode:0o700});
+ const env:Record<string,string>={HOME:home,TMPDIR:tmp,PATH:process.env.PATH??'/usr/bin:/bin',LANG:'C.UTF-8'};
+ for(const [key,value]of Object.entries(process.env))if(key.startsWith('AGENT_HUB_HEAVY_TEST_')&&value!==undefined)env[key]=value;
+ const stdio:any[]=['ignore','pipe','pipe'];
+ if(env.AGENT_HUB_HEAVY_TEST_HELD){fstatSync(9);while(stdio.length<9)stdio.push('ignore');stdio.push(9);}
+ const child=spawnSync('python3',['-I','-S','-B','-c',python,fileURLToPath(new URL('../host',import.meta.url)),root,JSON.stringify(command),native,mode],{env,stdio,encoding:'utf8',timeout:10000,maxBuffer:65536});
+ assert.equal(child.error,undefined);assert.equal(child.status,0,'isolated actual Host fixture setup must settle');
+ return JSON.parse(child.stdout);
+}
+
+async function sendQueueFixture(){
+ const f=fixture(),sender='uncertain-sender',other='other-capture';
+ const native='11111111-2222-4333-8444-555555555555',otherNative='22222222-2222-4222-8222-222222222222';
+ const epoch=await startClaimed(f,sender,native);await startClaimed(f,other,otherNative);
+ const row=f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(sender) as any;
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify({...JSON.parse(row.launch_json),interactive:true}),sender);f.clearCache();
+ const {socket,frames}=captureSocket(f);
+ const made=await f.call('/api/sessions/'+sender+'/commands','POST',{kind:'send',text:'synthetic input',key:'ordinary-send-once'},captureOperator);assert.equal(made.status,201);
+ const send=(await made.json() as any).command;
+ f.database.prepare('UPDATE session_commands SET created_at=1 WHERE id=?').run(send.id);
+ const madeCapture=await f.call('/api/sessions/'+other+'/commands','POST',{kind:'capture',mode:'screen',key:'other-capture-once'},captureOperator);assert.equal(madeCapture.status,201);
+ const capture=(await madeCapture.json() as any).command;
+ frames.length=0;await(f.machine as any).sendPendingCommands(socket,'h1');assert.equal(frames.at(-1).command.id,send.id);
+ return{f,sender,other,native,otherNative,epoch,send,capture,socket,frames};
+}
+
+test('ordinary send uncertainty joined real Host error event releases other-session capture without delivery or custody change',async()=>{
+ const q=await sendQueueFixture();let root:string|undefined;
+ try{
+  const base=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(base,{recursive:true,mode:0o700});root=mkdtempSync(join(base,'ordinary-send-joined-'));
+  const report=ordinarySendHost(root,q.send,q.native);
+  q.frames.length=0;await(q.f.machine as any).sendPendingCommands(q.socket,'h1');assert.equal(q.frames.at(-1).command.id,q.send.id,'no ACK still blocks before settlement');
+  assert.deepEqual(report.result,{error:'command_outcome_uncertain',reason:'command_outcome_uncertain'});
+  assert.equal(report.command_state,'done');assert.equal(report.effects.send,1);assert.equal(report.launch.state,'running');
+  assert.equal(report.path,null);assert.equal(report.payload,null,'negative uncertainty must never use normal ACK on old servers');
+  assert.equal(report.frame.type,'host.error');assert.equal(report.frame.epoch,q.epoch);assert.equal(report.frame.operation_id,'op-'+q.sender);assert.equal(report.frame.native_id,q.native);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(report.frame));
+  assert.equal(q.frames.at(-1).command.id,q.capture.id);
+  const listing=await(await q.f.call('/api/sessions/'+q.sender+'/commands?command_id='+q.send.id,'GET',undefined,captureOperator)).json() as any;
+  assert.equal(listing.commands[0].state,'failed');assert.deepEqual(listing.commands[0].ack,report.result);
+  const replay=await q.f.call('/api/sessions/'+q.sender+'/send','POST',{key:'ordinary-send-once',body:'synthetic input'},captureOperator);
+  const legacy=await replay.json() as any;assert.equal(legacy.delivery,'unconfirmed');assert.equal(legacy.state,'failed');
+  const again=ordinarySendHost(root,q.send,q.native);assert.equal(again.effects.send,1);assert.deepEqual(again.frame,report.frame);assert.equal(again.payload,null);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(again.frame));
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed','lost event replay is idempotent');
+  const captured=ordinarySendHost(root,q.capture,q.otherNative);
+  assert.equal(captured.effects.capture,1);assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
+  assert.equal((await q.f.call(captured.path,'POST',captured.payload)).status,200);
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.capture.id) as any).state,'acked');
+  for(const session of[q.sender,q.other])assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.ok(!q.f.events.some(x=>/finish|stopped/.test(x.path)));
+ }finally{q.f.database.close();if(root)rmSync(root,{recursive:true,force:true});}
+});
+
+test('ordinary send terminal error event rejects legacy loose fields stale epoch and settled STOP races',async()=>{
+ const q=await sendQueueFixture();
+ try{
+  const event={type:'host.error',stage:'host_command',reason:'command_outcome_uncertain',session_id:q.sender,
+   message_id:q.send.id,epoch:q.epoch,operation_id:'op-'+q.sender,native_id:q.native,command_kind:'send',command_state:'done'};
+  const before=q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id);
+  const loose={type:'host.error',stage:'host_command',reason:'command_outcome_uncertain',session_id:q.sender,message_id:q.send.id};
+  for(const bad of[loose,{...event,epoch:q.epoch+1},{...event,epoch:true},{...event,operation_id:'foreign'},
+    {...event,native_id:q.otherNative},{...event,command_kind:'wake_send'},{...event,command_state:'executing'},
+    {...event,message_id:q.capture.id}]){
+   await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(bad));
+   assert.deepEqual(q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id),before);
+  }
+  const stop=await q.f.call('/api/sessions/'+q.sender+'/commands','POST',{kind:'stop',key:'qualified-stop-race'},captureOperator);assert.equal(stop.status,201);
+  const command=(await stop.json() as any).command;
+  assert.equal((await q.f.call('/api/sessions/'+q.sender+'/commands/'+command.id+'/ack','POST',{epoch:q.epoch,result:{stopped:true,evidence:'native_exit',native_id:q.native}})).status,200);
+  const stopped=q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(event));
+  assert.deepEqual(q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id),stopped);
+  assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(q.sender) as any).state,'stopped');
+ }finally{q.f.database.close();}
 });

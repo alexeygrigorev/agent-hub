@@ -1099,12 +1099,38 @@ class HostTests(unittest.TestCase):
         offer = self.offer()
         offer["launch"]["interactive"] = True
         self.bridge.offer(offer)
+        self.journal.flush(self.client)  # Only the fixture's actual launch receipts.
         command = {"id": "uncertain-command", "session_id": "session-1", "epoch": 1, "kind": "send", "text": "hello"}
-        self.bridge.command(command)
-        with self.journal.db:
-            self.journal.db.execute("UPDATE commands SET state='executing',result=NULL WHERE id=?", (command["id"],))
-        with self.assertRaisesRegex(RuntimeError, "uncertain"):
-            self.bridge.command(command)
+        # Interrupt after the real fake-native input, before receipt persistence.
+        # The original executing transaction must survive; no synthetic ACK row.
+        with patch.object(self.bridge,'finish_command',side_effect=RuntimeError('synthetic crash before receipt')):
+            with self.assertRaisesRegex(RuntimeError,'synthetic crash before receipt'):
+                self.bridge.command(command)
+        row=self.journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+        self.assertEqual(row['state'],'executing');self.assertIsNone(row['result'])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
+        negative={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+        self.assertEqual(self.bridge.command(command),negative)
+        frames=[]
+        class Socket:
+            def send(inner,value):
+                with sqlite3.connect(self.journal.path) as db:
+                    self.assertEqual(db.execute('SELECT state FROM commands WHERE id=?',(command['id'],)).fetchone()[0],'done')
+                frames.append(json.loads(value))
+        for _ in range(2):
+            self.bridge.dispatch({'type':'session.command','command':command},Socket(),None)
+        self.assertEqual(len(frames),2);self.assertEqual(frames[0],frames[1])
+        launch=self.journal.db.execute('SELECT * FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+        self.assertEqual(frames[0],{'type':'host.error','stage':'host_command','reason':'command_outcome_uncertain',
+            'session_id':command['session_id'],'message_id':command['id'],'epoch':command['epoch'],
+            'operation_id':launch['operation_id'],'native_id':launch['native_id'],'command_kind':'send','command_state':'done'})
+        row=self.journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+        self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),negative)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(launch['state'],'running');self.assertEqual(launch['native_id'],self.native.process['id'])
+        with self.assertRaisesRegex(ValueError,'command_id_conflict'):
+            self.bridge.command({**command,'text':'foreign input'})
         self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
 
     def test_socket_reconnect_replayed_command_executes_once_before_and_after_ack_loss(self):
@@ -1924,10 +1950,14 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         self.assertEqual(json.loads(self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',('command:'+command['id'],)).fetchone()[0])['result'],result)
         with self.assertRaisesRegex(ValueError,'command_id_conflict'):
             self.bridge.command({**command,'mode':None})
-        for kind in ['send','stop']:
+        for kind in ['stop']:
             other={**command,'id':'uncertain-'+kind,'kind':kind}
             with self.journal.db:self.bridge.begin_command(other['id'],hashlib.sha256(canonical(other).encode()).hexdigest())
             with self.assertRaisesRegex(RuntimeError,'command_outcome_uncertain'):self.bridge.command(other)
+        self.assertEqual(self.native.calls,[])
+        send={**command,'id':'uncertain-send','kind':'send'}
+        with self.journal.db:self.bridge.begin_command(send['id'],hashlib.sha256(canonical(send).encode()).hexdigest())
+        self.assertEqual(self.bridge.command(send),{'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'})
         self.assertEqual(self.native.calls,[])
 
     def test_initial_screen_capture_exception_is_durable_failure_and_replay_never_calls_native(self):
@@ -2443,3 +2473,87 @@ class NativeControlDiagnosticsTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt) as raised:
             native_control_step({},'capture_rpc',cancelled)
         self.assertIs(raised.exception,control)
+
+
+class OrdinarySendUncertaintyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='send-uncertainty-')
+        self.addCleanup(self.temp.cleanup)
+        self.journal=Journal(Path(self.temp.name)/'journal.sqlite')
+        self.addCleanup(self.journal.close_thread)
+        self.bridge=Bridge.__new__(Bridge);self.bridge.journal=self.journal
+        self.bridge.resolve_launch_native=lambda row:(row['native_id'],None)
+        self.calls=[]
+        def native(*args,**kwargs):
+            self.calls.append((args,kwargs))
+            raise subprocess.TimeoutExpired('synthetic owned send',60)
+        self.bridge.native=native
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,?,?)',
+                ('op','sender',7,'digest',self.temp.name,'task-hub2-sender','11111111-2222-4333-8444-555555555555','running',1))
+        self.command={'id':'send-once','session_id':'sender','epoch':7,'kind':'send','text':'synthetic owned input'}
+        self.negative={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+
+    def dispatch(self):
+        frames=[]
+        class Socket:
+            def send(inner,value):
+                with sqlite3.connect(self.journal.path) as db:
+                    self.assertEqual(db.execute('SELECT state FROM commands WHERE id=?',(self.command['id'],)).fetchone()[0],'done')
+                frames.append(json.loads(value))
+        self.bridge.dispatch({'type':'session.command','command':self.command},Socket(),None)
+        return frames
+
+    def test_post_begin_native_exception_settles_negative_once_and_retains_custody(self):
+        frames=self.dispatch();self.assertEqual(len(frames),1)
+        frame=frames[0]
+        self.assertEqual(frame,{'type':'host.error','stage':'host_command','reason':'command_outcome_uncertain',
+            'session_id':'sender','message_id':'send-once','epoch':7,'operation_id':'op',
+            'native_id':'11111111-2222-4333-8444-555555555555','command_kind':'send','command_state':'done'})
+        self.assertEqual(self.dispatch(),frames)
+        self.assertEqual(len(self.calls),1)
+        row=self.journal.db.execute('SELECT * FROM commands').fetchone()
+        self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),self.negative)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        launch=self.journal.db.execute('SELECT state,native_id FROM launches').fetchone()
+        self.assertEqual(launch['state'],'running');self.assertEqual(launch['native_id'],frame['native_id'])
+        self.assertNotIn('delivery',frame);self.assertNotIn('stopped',frame)
+
+    def test_executing_replay_settles_without_effect_and_keeps_digest_stop_fences(self):
+        from agent_hub_host.native_launch import canonical
+        digest=hashlib.sha256(canonical(self.command).encode()).hexdigest()
+        with self.journal.db:self.bridge.begin_command(self.command['id'],digest)
+        self.assertEqual(self.dispatch()[0]['command_state'],'done')
+        for changed in ({'text':'foreign'},{'epoch':8},{'kind':'stop'}):
+            with self.assertRaisesRegex(ValueError,'command_id_conflict'):
+                self.bridge.command({**self.command,**changed})
+        stop={**self.command,'id':'uncertain-stop','kind':'stop'}
+        with self.journal.db:self.bridge.begin_command(stop['id'],hashlib.sha256(canonical(stop).encode()).hexdigest())
+        with self.assertRaisesRegex(RuntimeError,'command_outcome_uncertain'):self.bridge.command(stop)
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+
+    def test_lost_error_event_replays_without_normal_ack_or_finish_poison(self):
+        class LostSocket:
+            def send(inner,value):raise OSError('synthetic lost socket')
+        with self.assertRaises(OSError):
+            self.bridge.dispatch({'type':'session.command','command':self.command},LostSocket(),None)
+        self.assertEqual(self.journal.db.execute('SELECT state FROM commands').fetchone()[0],'done')
+        self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
+        self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
+        self.assertEqual(len(self.calls),1)
+        client=FakeClient();self.journal.flush(client)
+        self.assertEqual(client.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox_dead_letters').fetchone()[0],0)
+
+    def test_pre_begin_epoch_headless_and_missing_launch_refusals_emit_no_receipt(self):
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
+            self.bridge.command({**self.command,'epoch':8})
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
+            self.bridge.command({**self.command,'session_id':'foreign'})
+        self.journal.db.execute('UPDATE launches SET interactive=0')
+        with self.assertRaisesRegex(ValueError,'headless_send_refused'):self.bridge.command(self.command)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(self.calls,[])

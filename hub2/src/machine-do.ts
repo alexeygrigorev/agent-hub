@@ -1950,6 +1950,27 @@ export class MachineDO {
     const row = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',body.session_id,attachment.machine_id);
     if (!row) return;
     const operation=boundedString(body.operation_id,180)?body.operation_id:null,message=boundedString(body.message_id,180)?body.message_id:null;
+    // Only the fully bound new ordinary-send diagnostic is terminal authority.
+    // Older hosts' loose host.error remains diagnostic-only; old servers also
+    // safely ignore these extra fields instead of treating a NACK as delivery.
+    if(body.stage==='host_command'&&body.reason==='command_outcome_uncertain'
+      &&body.command_kind==='send'&&body.command_state==='done'&&message!==null
+      &&Number.isSafeInteger(body.epoch)&&body.epoch===row.epoch
+      &&operation===row.operation_id&&typeof body.native_id==='string'&&body.native_id===row.native_id){
+      const changed=this.db.transaction(this.ctx,()=>{
+        const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',row.id,attachment.machine_id);
+        if(!current||current.state!=='running'||current.epoch!==body.epoch
+          ||current.operation_id!==operation||current.native_id!==body.native_id)return false;
+        const command=this.db.one<CommandRow>("SELECT * FROM session_commands WHERE id=? AND session_id=? AND machine_id=? AND epoch=? AND kind='send' AND state='pending'",message,row.id,attachment.machine_id,body.epoch);
+        if(!command)return false;
+        this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE id=? AND state='pending'",
+          JSON.stringify({error:'command_outcome_uncertain',reason:'command_outcome_uncertain'}),Date.now(),command.id);
+        return true;
+      });
+      if(changed)await this.notifyPendingCommands(attachment.machine_id);
+      return; // Duplicate/stopped commands keep their authoritative settlement.
+    }
+
     body = {...body, reason:closedHostReason(body.reason)};
     const hostLaunchEvent=(body.stage==='host_launch'||body.stage==null)&&message===null;
     const hostLaunchDiagnostic=body.stage==='host_launch'&&message===null;

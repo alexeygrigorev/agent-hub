@@ -1193,8 +1193,18 @@ class Bridge:
                         self.finish_command(identity,command,result)
                     logging.getLogger(__name__).warning('Capture interrupted command_id=%s',identity)
                     return result
+                if old['state']=='executing' and command.get('kind')=='send':
+                    # Delivery may have happened. Settle transport negatively,
+                    # never retry input or claim delivery/exit from uncertainty.
+                    result={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+                    with db:
+                        self.finish_command(identity,command,result)
+                    return result
                 raise RuntimeError("command_outcome_uncertain")
             result = json.loads(old["result"])
+            if (command.get('kind')=='send' and 'wake' not in command
+                    and result=={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}):
+                return result  # Existing host.error transport, never a normal ACK.
             self.journal.emit(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"+("?safety=operator_stop" if command.get("kind")=="stop" else ""),
                               {"epoch": command["epoch"], "result": result})
             return result
@@ -1339,8 +1349,14 @@ class Bridge:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
                 raise ValueError("invalid_command_text")
-            self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
-            result = {"delivery": "native_acknowledged"}
+            try:
+                self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
+            except Exception:
+                # The durable executing row precedes this one native attempt.
+                # Errors after it cannot prove that no input was delivered.
+                result={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+            else:
+                result = {"delivery": "native_acknowledged"}
         with db:
             self.finish_command(identity, command, result)
         return result
@@ -1437,6 +1453,9 @@ class Bridge:
 
     def finish_command(self, identity, command, result):
         self.journal.db.execute("UPDATE commands SET state='done',result=? WHERE id=?", (canonical(result), identity))
+        if (command.get('kind')=='send' and 'wake' not in command
+                and result=={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}):
+            return  # Old servers must never project this as delivered/acked.
         self.journal.enqueue(f"command:{identity}", f"/api/sessions/{command['session_id']}/commands/{identity}/ack"
                              + ("?safety=operator_stop" if command.get("kind") == "stop" else ""),
                              {"epoch": command["epoch"], "result": result})
@@ -1455,7 +1474,20 @@ class Bridge:
     def dispatch(self, event, socket, acknowledge):
         try:
             if event.get("type") == "session.command":
-                self.command(event["command"])
+                command=event['command']
+                result=self.command(command)
+                if (command.get('kind')=='send' and 'wake' not in command
+                        and command.get('target_kind')!='native'
+                        and result=={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}):
+                    row=self.journal.db.execute('SELECT * FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+                    if row and row['epoch']==command['epoch'] and row['native_id']:
+                        # Journal done-negative precedes this replayable existing
+                        # diagnostic transport. Old servers leave it pending.
+                        socket.send(canonical({'type':'host.error','stage':'host_command',
+                            'reason':'command_outcome_uncertain','session_id':command['session_id'],
+                            'message_id':command['id'],'epoch':command['epoch'],
+                            'operation_id':row['operation_id'],'native_id':row['native_id'],
+                            'command_kind':'send','command_state':'done'}))
             elif event.get("type") == "mailbox.deliver":
                 from .messages import deliver
                 deliver(self, event["message"])
