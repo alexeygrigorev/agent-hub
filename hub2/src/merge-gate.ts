@@ -119,20 +119,32 @@ export function mergeGate(required: boolean, value: unknown, expectedRepository?
  * Work may land in several repositories (a content repo plus a site repo, say),
  * none of which need be the intake's project: the newest observation of each
  * repository must pass, and every repository's problems are reported. An
- * observation that identified no pull request at all is superseded by any
+ * observation that identified no pull request is superseded only by a newer
  * observation that did, so a first `merge-check` against the wrong default
- * repository never blocks the intake forever. */
-export function mergeGateAll(required: boolean, newestFirst: unknown[], expectedRepository?: string): MergeGateResult {
+ * repository never blocks the intake forever, while a newer "no PR" still
+ * blocks an older pass. A PR outside the intake's project must also be cited
+ * in the intake (its text, a note or a DONE record), tying it to this work. */
+export function mergeGateAll(required: boolean, newestFirst: unknown[], expectedRepository?: string,
+  cited: (prUrl: string) => boolean = () => true): MergeGateResult {
   if (!required) return {required:false,ok:true,problems:[]};
   const records = newestFirst.filter(v => !mergeEvidenceShapeError(v)) as Record<string, unknown>[];
   if (!records.length) return mergeGate(true, newestFirst[0], expectedRepository);
-  const identified = records.filter(e => typeof e.pr_url === 'string' && GITHUB_PR.test(e.pr_url));
   const latest = new Map<string, Record<string, unknown>>();
-  for (const e of identified.length ? identified : records.slice(0, 1)) {
+  let newerIdentified = false;
+  for (const e of records) {
+    const identified = typeof e.pr_url === 'string' && GITHUB_PR.test(e.pr_url);
+    if (!identified && newerIdentified) continue;
+    newerIdentified ||= identified;
     const repo = String(e.repository).toLowerCase();
     if (!latest.has(repo)) latest.set(repo, e);
   }
-  const results = [...latest.values()].map(e => mergeGate(true, e));
+  const results = [...latest.values()].map(e => {
+    const r = mergeGate(true, e);
+    const foreign = expectedRepository && String(e.repository).toLowerCase() !== expectedRepository.toLowerCase();
+    if (foreign && typeof e.pr_url === 'string' && GITHUB_PR.test(e.pr_url) && !cited(e.pr_url.split('?')[0]))
+      return {...r, ok:false, problems:[...r.problems, `the pull request ${e.pr_url.split('?')[0]} is outside ${expectedRepository} and not cited in the intake; cite it in a note or the DONE record`]};
+    return r;
+  });
   const several = results.length > 1, problems: string[] = [];
   for (const r of results) for (const p of r.problems) problems.push(several ? `${r.evidence?.repository}: ${p}` : p);
   const evidence = results.find(r => !r.ok)?.evidence ?? results[0].evidence;

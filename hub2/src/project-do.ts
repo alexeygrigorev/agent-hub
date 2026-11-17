@@ -552,16 +552,40 @@ export class ProjectDO {
   }
 
   private intakeMergeGate(intake:IntakeRow){
-    return mergeGateAll(codeTask(this.parse(intake.source_json)),this.mergeEvidenceRecords(intake.id),intake.project);
+    const required=codeTask(this.parse(intake.source_json));
+    if(!required)return mergeGateAll(false,[]);
+    // Citations: the intake text and every journal record except merge observations themselves.
+    let corpus:string|undefined;
+    const cited=(url:string)=>{
+      if(corpus===undefined){
+        const parts=[intake.title,intake.text];
+        for(const row of this.db.all<{kind:string,body_json:string}>('SELECT kind,body_json FROM intake_events WHERE task_id=? ORDER BY seq DESC LIMIT 2000',intake.id)){
+          const body=this.parse(row.body_json) as JsonRecord|null;
+          if(row.kind==='worker_append'&&(body?.evidence as JsonRecord|undefined)?.kind==='merge_gate')continue;
+          parts.push(row.body_json);
+        }
+        corpus=parts.join('\n').toLowerCase();
+      }
+      const at=corpus.indexOf(url.toLowerCase());
+      // Not a prefix of a longer PR number (pull/1 vs pull/12).
+      return at>=0&&!/[0-9]/.test(corpus.charAt(at+url.length));
+    };
+    return mergeGateAll(true,this.mergeEvidenceRecords(intake.id),intake.project,cited);
   }
 
   /** The independent verifier passed every criterion and only the merge gate
    * held acceptance back: once the gate is satisfied, an operator's `done`
    * (the Developer's live check) accepts without another verifier round. */
-  private onlyMergeBlocked(completion:CompletionRecord|undefined):boolean{
+  private onlyMergeBlocked(intake:IntakeRow,completion:CompletionRecord|undefined):boolean{
     const v=completion?.verification;
-    return !!v&&['failed','escalated'].includes(v.state)&&Array.isArray(v.gaps)&&v.gaps.length>0
-      &&v.gaps.every(gap=>typeof gap==='string'&&gap.startsWith('Merge gate: '));
+    if(!v||v.state!=='failed')return false;
+    if(v.merge_gate_only===true)return true;
+    // Records written before merge_gate_only existed: Hub's own verification
+    // event says the merge gate blocked, and every gap is a Hub merge-gate gap.
+    const event=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='task_acceptance_verification_failed' ORDER BY seq DESC LIMIT 1",intake.id);
+    const body=event?this.parse(event.body_json) as JsonRecord|null:null;
+    return body?.merge_gate_blocked===true&&Array.isArray(v.gaps)&&v.gaps.length>0
+      &&v.gaps.every(gap=>typeof gap==='string'&&gap.startsWith('Merge gate: ')&&gap.endsWith('Run hub intake merge-check after updating the PR and CI.'));
   }
 
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
@@ -608,7 +632,7 @@ export class ProjectDO {
         }
         const final=this.parse(row.final_evidence_json??'{}') as JsonRecord;
         const completion=final.completion as CompletionRecord|undefined;
-        mergeReleased=hasScope(actor,'operator:admin')&&row.status==='failed'&&this.onlyMergeBlocked(completion);
+        mergeReleased=hasScope(actor,'operator:admin')&&row.status==='failed'&&this.onlyMergeBlocked(row,completion);
         if(completion?.controlled===true&&completion.verification?.state!=='passed'&&!mergeReleased)
           return error('acceptance_verification_required',409,'Independent acceptance verification must pass before this intake can be accepted. When the merge gate is now satisfied, run hub intake reevaluate.');
       }
@@ -1612,6 +1636,7 @@ export class ProjectDO {
       tries:0,next_action_at:retry?now:null,original_session_id:origin,
       ...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),
       ...(gaps.length?{gaps}:{}),...(priorVerifier?{previous_verifier_session_id:priorVerifier}:{}),
+      ...(mergeBlocked&&!(verdict?.gaps??[]).length?{merge_gate_only:true}:{}),
       excluded_policy_ids:excluded,...(!explicit?{last_reason:reason}:{})};
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:passed?'claimed':'unfinished',
       reason:passed?'acceptance_verified':explicit?'acceptance_verification_failed':escalated?'verification_exhausted':'verification_incomplete',
