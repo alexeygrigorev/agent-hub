@@ -506,7 +506,7 @@ def add_commands(sub):
     merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
     merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
-    merge_check.add_argument('--pr', default=None, help='Hub2: the PR (URL or number) that merged this work; default: the newest PR of the intake project cited in the intake, else a PR of a branch the host pushed for it')
+    merge_check.add_argument('--pr', default=None, help='Hub2: the PR (URL or number) that merged this work; a URL may be in any repository (run once per repository the work merged in); default: the newest PR of the intake project cited in the intake, else a PR of a branch the host pushed for it')
     merge_state = commands.add_parser('merge-state', help="One intake's programmatic merge gate (Hub2), or the list of unmerged intakes (legacy Hub)")
     merge_state.add_argument('id', nargs='?')
     reevaluate = commands.add_parser('reevaluate', help='Operator: re-run Hub acceptance verification and the merge gate on a failed intake; a pass accepts it, a fail sends it back with named gaps')
@@ -591,6 +591,13 @@ def _hub2_merge_check(args, intake):
     pr = args.pr
     if pr and not str(pr).startswith('https://') and not str(pr).isdigit():
         raise IntakeInputError('--pr must be a PR URL or number')
+    # Work merged in another repository (content repo, site repo): the PR URL
+    # names that repository, and Hub gates on the newest observation of each.
+    cited = hub2_merge_evidence.PR_URL.match(str(pr)) if pr else None
+    if pr and str(pr).startswith('https://') and not cited:
+        raise IntakeInputError('--pr URL must be https://github.com/<owner>/<repo>/pull/<number>')
+    if cited:
+        repository = cited.group(1)
     if not pr:
         pr = hub2_merge_evidence.find_pr(repository, _hub2_events(intake_id))
     evidence = hub2_merge_evidence.collect(repository, pr)

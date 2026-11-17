@@ -12,7 +12,7 @@ import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
-import { codeTask, mergeEvidenceShapeError, mergeGate, mergeGaps, readOnlyBrief } from './merge-gate';
+import { codeTask, mergeEvidenceShapeError, mergeGateAll, mergeGaps, readOnlyBrief } from './merge-gate';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
@@ -540,16 +540,28 @@ export class ProjectDO {
     return result;
   }
 
-  private latestMergeEvidence(intakeId:string):unknown{
+  /** Every merge observation of the intake, newest first: work may be merged
+   * in several repositories, so the gate reads the newest one of each. */
+  private mergeEvidenceRecords(intakeId:string):unknown[]{
+    const found:unknown[]=[];
     for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' ORDER BY seq DESC LIMIT 200",intakeId)){
       const append=this.parse(row.body_json) as JsonRecord|null,evidence=append?.evidence as JsonRecord|undefined;
-      if(evidence?.kind==='merge_gate')return evidence;
+      if(evidence?.kind==='merge_gate')found.push(evidence);
     }
-    return undefined;
+    return found;
   }
 
   private intakeMergeGate(intake:IntakeRow){
-    return mergeGate(codeTask(this.parse(intake.source_json)),this.latestMergeEvidence(intake.id),intake.project);
+    return mergeGateAll(codeTask(this.parse(intake.source_json)),this.mergeEvidenceRecords(intake.id),intake.project);
+  }
+
+  /** The independent verifier passed every criterion and only the merge gate
+   * held acceptance back: once the gate is satisfied, an operator's `done`
+   * (the Developer's live check) accepts without another verifier round. */
+  private onlyMergeBlocked(completion:CompletionRecord|undefined):boolean{
+    const v=completion?.verification;
+    return !!v&&['failed','escalated'].includes(v.state)&&Array.isArray(v.gaps)&&v.gaps.length>0
+      &&v.gaps.every(gap=>typeof gap==='string'&&gap.startsWith('Merge gate: '));
   }
 
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
@@ -580,6 +592,7 @@ export class ProjectDO {
         if(resolved instanceof Response)return resolved;
         nextParentId=resolved;
       }
+      let mergeReleased=false;
       if(body.status==='accepted'){
         const gate=this.intakeMergeGate(row);
         if(!gate.ok){
@@ -595,12 +608,13 @@ export class ProjectDO {
         }
         const final=this.parse(row.final_evidence_json??'{}') as JsonRecord;
         const completion=final.completion as CompletionRecord|undefined;
-        if(completion?.controlled===true&&completion.verification?.state!=='passed')
-          return error('acceptance_verification_required',409,'Independent acceptance verification must pass before this intake can be accepted.');
+        mergeReleased=hasScope(actor,'operator:admin')&&row.status==='failed'&&this.onlyMergeBlocked(completion);
+        if(completion?.controlled===true&&completion.verification?.state!=='passed'&&!mergeReleased)
+          return error('acceptance_verification_required',409,'Independent acceptance verification must pass before this intake can be accepted. When the merge gate is now satisfied, run hub intake reevaluate.');
       }
       const changesCore=body.title!==undefined||body.text!==undefined||body.acceptance_criteria!==undefined||body.status!==undefined;
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
-      if(body.status==='accepted'&&(!['completed-awaiting-review','accepted'].includes(row.status)||!hasScope(actor,'operator:admin')))return error('review_required',409);
+      if(body.status==='accepted'&&(!['completed-awaiting-review','accepted'].includes(row.status)&&!mergeReleased||!hasScope(actor,'operator:admin')))return error('review_required',409);
       if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
       const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2,parent_intake_id:nextParentId};
       this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,parent_intake_id=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,next.parent_intake_id,at,row.id);
