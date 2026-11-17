@@ -714,7 +714,13 @@ class Bridge:
                 if changed.rowcount != 1:
                     return None
             try:
-                receipt = self.launcher.launch(task_id, launch)
+                # Temporary original-1.3 drill: fail only the candidate-bound
+                # production full canary through the real undispatched route.
+                # Keep the original launch/digest/context and all other offers.
+                dispatch_launch = launch
+                if self._controlled_broken_start_drill(offer, launch):
+                    dispatch_launch = dict(launch, engine=None)
+                receipt = self.launcher.launch(task_id, dispatch_launch)
                 native = self.lookup(receipt["session_id"], {"tag": tag, "workspace": launch["workspace"]})
                 if not native or native["id"] != receipt["session_id"]:
                     raise RuntimeError("launch_outcome_uncertain")
@@ -744,6 +750,28 @@ class Bridge:
         self.journal.emit(f"started:{operation}:{epoch}", f"/api/sessions/{session}/started",
                           {"operation_id": operation, "epoch": epoch, "native_id": native["id"]})
         return native["id"]
+
+    def _controlled_broken_start_drill(self, offer, launch):
+        """Temporary canary-only fault; title/context are scope, not authority."""
+        if (self.machine_id != 'hetzner-aplexer'
+                or offer.get('project_id') != 'alexeygrigorev/agent-hub'
+                or offer.get('launch', {}).get('purpose') != 'review'
+                or launch.get('interactive') or launch.get('with_goal')
+                or launch.get('engine') == 'shell'):
+            return False
+        try:
+            from ._release import HOST_VERSION
+        except (ImportError, SyntaxError):
+            return False
+        if (type(HOST_VERSION) is not str or not re.fullmatch(r'[0-9a-f]{40}', HOST_VERSION)
+                or type(offer.get('title')) is not str
+                or not re.fullmatch(r'hub-canary-full-' + HOST_VERSION[:12] + r'-[0-9a-f]{12}', offer['title'])):
+            return False
+        try:
+            expected = (Path.home() / 'work' / 'hub-canary').resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        return launch.get('workspace') == str(expected)
 
     def repair_label_finish(self, row, binding, acknowledge, timeout_seconds):
         """One exact frozen terminal receipt, after a durable binding ACK echo.
