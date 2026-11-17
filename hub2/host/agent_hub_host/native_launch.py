@@ -1227,14 +1227,25 @@ class NativeLauncher:
         if objective is not None and provider == 'claude' and 'CLAUDE_CONFIG_DIR' not in child_env:
             env.pop('CLAUDE_CONFIG_DIR', None)  # Empty inherited values stay absent too.
         env["PWD"] = str(Path(specification["workspace"]).resolve())
+        # Private exact-attempt diagnostics are opt-in; no public launch field.
+        from .zai_diagnostic_selector import prepare as prepare_zai_diagnostic
+        diagnostic = prepare_zai_diagnostic(self, specification, route, child, child_env, env, local=local)
+        if diagnostic is not None:
+            argv, child = diagnostic.transport(argv, child)
         # `a start` is only the daemon handshake client: the spawned session lives
         # under the aplexer supervisor, so the runner timeout bounds the handshake
         # alone. A killed handshake with a created session stays launch-uncertain
         # and is reconciled by identity, never re-spawned.
         before_dispatch = specification.get('before_native_dispatch')
+        if diagnostic is not None:
+            diagnostic.before_dispatch()
         if before_dispatch:
             before_dispatch()
         try:
+            # The durable dispatch marker may have consumed the remaining budget.
+            # Time-only: the callback legitimately changed dispatch_started to 1.
+            if diagnostic is not None:
+                diagnostic.check()
             result = self.runner(argv, text=True, encoding='utf-8', errors='replace', capture_output=True,
                                  timeout=35, check=False,
                                  env=env, cwd=specification["workspace"])
