@@ -17,13 +17,25 @@ from agent_hub_host.client import ApiError, Client, save_config
 from agent_hub_host.cli import main as cli_main
 
 
+STRICT_SEND_HELP = '--strict --enter --expect-tag --expect-workspace --expect-created-at-ms --idempotency-key --deadline-ms'
+
+
 class FakeNative:
     def __init__(self):
         self.calls, self.process, self.fail_send = [], None, False
+        self.help_snapshots = []
 
     def __call__(self, args, **options):
         self.calls.append((args, options))
         command = args[1:]
+        if command == ['send', '--help']:
+            # Feature discovery has no target/text/input and never mutates a worker.
+            if options.get('input') is not None:
+                raise AssertionError('read-only help must not carry input')
+            before = json.loads(json.dumps(self.process))
+            result = subprocess.CompletedProcess(args, 0, STRICT_SEND_HELP, '')
+            self.help_snapshots.append((before, json.loads(json.dumps(self.process))))
+            return result
         if "start" in command[:1]:
             child = args[args.index("--") + 1:]
             tag = args[args.index("--tag") + 1]
@@ -111,6 +123,12 @@ class HostTests(unittest.TestCase):
         self.addCleanup(auth.stop)
 
     def tearDown(self):
+        # This fixture owns the asynchronous census and its thread-local journal.
+        from agent_hub_host.launch_reaper import observation_thread
+        thread = observation_thread(self.bridge)
+        if thread is not None:
+            thread.join(10)
+            self.assertFalse(thread.is_alive(), 'fixture census did not settle before cleanup')
         self.journal.db.close()
         self.temp.cleanup()
 
@@ -1131,7 +1149,17 @@ class HostTests(unittest.TestCase):
         with patch("agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
             self.bridge.serve("machine-1", [])
         self.assertEqual(len(connections), 3)
-        self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
+        probes = [(call, options) for call, options in self.native.calls if call[1:] == ['send', '--help']]
+        business_sends = [(call, options) for call, options in self.native.calls
+                          if call[1] == 'send' and call[1:] != ['send', '--help']]
+        self.assertEqual(len(business_sends), 1)
+        self.assertEqual(len(probes), 1 if os.sys.platform == 'linux' else 0)
+        for call, options in probes:
+            self.assertEqual(call[1:], ['send', '--help'])
+            self.assertIsNone(options.get('input'))
+        self.assertEqual(len(self.native.help_snapshots), len(probes))
+        for before, after in self.native.help_snapshots:
+            self.assertEqual(before, after)
         self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
     def test_bad_application_event_reports_hold_without_dropping_other_work(self):
@@ -2184,8 +2212,15 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.observations[self.rows['a-poison']['native_id']]['tag']='foreign-private-tag'
         healthy=self.observations[self.rows['z-healthy']['native_id']]
         healthy.update(phase=healthy_phase,containment_empty=True,exit={'code':0,'exited_at_ms':123})
-        self.effects=[];self.frames=[]
+        self.effects=[];self.frames=[];self.help_probes=[]
         def runner(argv,**kwargs):
+            if argv[1:] == ['send', '--help']:
+                self.assertIsNone(kwargs.get('input'))
+                before = json.loads(json.dumps(self.observations))
+                result = subprocess.CompletedProcess(argv, 0, STRICT_SEND_HELP, '')
+                self.help_probes.append(tuple(argv[1:]))
+                self.assertEqual(self.observations, before)
+                return result
             self.effects.append(argv[1:])
             if argv[1]=='kill':
                 self.assertEqual(argv[2],self.rows['z-healthy']['native_id'])
@@ -2219,6 +2254,7 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertNotIn('foreign-private-tag',json.dumps(errors))
         self.assertNotIn(str(self.root),json.dumps(errors))
         self.assertFalse(any(args[0]=='kill' for args in self.effects))
+        self.assertEqual(self.help_probes, [('send', '--help')] if os.sys.platform == 'linux' else [])
 
     def test_valid_interrupted_bound_launch_still_stops_only_qualified_native(self):
         rows=self.seed(healthy_state='launching')
@@ -2299,6 +2335,7 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertEqual(len(attempts),1)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
         self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+        self.assertEqual(self.help_probes, [('send', '--help')] if os.sys.platform == 'linux' else [])
 
 
 class NativeControlDiagnosticsTests(unittest.TestCase):
