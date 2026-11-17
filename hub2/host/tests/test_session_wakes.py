@@ -1,5 +1,6 @@
 """Actual Bridge command+journal, fake native guard only; no provider or host process."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -239,10 +240,126 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         with self.assertRaisesRegex(ValueError,'headless_send_refused'):self.invoke()
         self.assertEqual(self.calls,[])
 
+class StrictInboxWakeTests(unittest.TestCase):
+    invoke = SessionWakeTests.invoke
+    def setUp(self):
+        SessionWakeTests.setUp(self)
+        import types,sys
+        self.command['wake']['transport']='strict-inbox:v1'
+        self.environment=mock.patch.dict(os.environ,{'APLEXER_WORKSPACE':''});self.environment.start();self.addCleanup(self.environment.stop)
+        self.mode=Path(self.temp.name)/'mode';self.mode.write_text('ok')
+        self.fake=Path(self.temp.name)/'inbox_cli.py'
+        self.fake.write_text(INBOX_CLI)
+        self.calls=[];self.bridge.executable=sys.executable
+        self.bridge.native=types.MethodType(Bridge.native,self.bridge)
+        def runner(argv,**kwargs):
+            self.calls.append((tuple(argv[1:]),kwargs.get('cwd')))
+            return subprocess.run([sys.executable,'-I','-S',str(self.fake),*argv[1:]],**kwargs)
+        self.bridge.runner=runner
+    def creations(self):return [c for c in self.calls if c[0][:2]==('message','send')]
+    def test_full_envelope_short_notice_same_command_replay_and_per_call_cwd(self):
+        result=self.invoke();proof=result['wake_proof']
+        self.assertEqual(proof['kind'],'strict_inbox_notice_v1');self.assertEqual(proof['envelope_id'],ENVELOPE)
+        self.assertEqual(proof['body_sha256'],hashlib.sha256(self.command['text'].encode()).hexdigest())
+        self.assertEqual(len(self.creations()),1);args,cwd=self.creations()[0]
+        self.assertEqual(cwd,self.temp.name);self.assertNotIn('--workspace',args);self.assertNotIn('--from',args);self.assertNotIn('--pane',args)
+        notice=[c for c in self.calls if c[0][0]=='send'][0][0]
+        self.assertEqual(notice[-1],'Read inbox message '+ENVELOPE);self.assertEqual(len(notice[-1]),55)
+        self.assertEqual(notice[notice.index('--idempotency-key')+1],self.command['id'])
+        self.assertEqual(notice[notice.index('--deadline-ms')+1],'2000000')
+        count=len(self.calls);self.assertEqual(self.invoke(),result);self.assertEqual(len(self.calls),count)
+    def test_context_identity_stderr_and_workspace_override_refuse_before_creation(self):
+        for mode in ['identity','who-error','who-output','who-stderr']:
+            with self.subTest(mode=mode):
+                self.mode.write_text(mode)
+                with self.assertRaisesRegex(RuntimeError,'wake_local_context_unverified'):self.invoke()
+        with mock.patch.dict(os.environ,{'APLEXER_WORKSPACE':'/foreign'}):
+            with self.assertRaisesRegex(RuntimeError,'wake_local_context_unverified'):self.invoke()
+        self.assertEqual(self.creations(),[])
+        self.assertEqual(self.bridge.journal.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+    def test_unknown_create_never_creates_again_even_if_native_durable(self):
+        self.mode.write_text('create-unknown')
+        with self.assertRaisesRegex(RuntimeError,'native_command_failed'):self.invoke()
+        self.assertTrue((Path(self.temp.name)/'envelope.json').exists())
+        self.mode.write_text('ok')
+        with self.assertRaisesRegex(RuntimeError,'wake_outcome_uncertain'):self.invoke()
+        self.assertEqual(len(self.creations()),1)
+    def test_busy_notice_reuses_real_envelope_and_original_native_once(self):
+        self.mode.write_text('busy');self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-inbox:v1'})
+        self.mode.write_text('ok');self.assertEqual(self.invoke()['wake_proof']['envelope_id'],ENVELOPE)
+        self.assertEqual(len(self.creations()),1)
+        notices=[c[0] for c in self.calls if c[0][0]=='send'];self.assertEqual(notices[0],notices[1])
+    def test_early_ack_is_not_notice_proof_and_no_duplicate_business_envelope(self):
+        self.mode.write_text('early-ack-busy');self.assertTrue(self.invoke()['wake_pending'])
+        self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
+        self.mode.write_text('ok');self.assertEqual(self.invoke()['delivery'],'native_acknowledged');self.assertEqual(len(self.creations()),1)
+    def test_committed_progress_rechecks_missing_or_changed_envelope_without_recreation(self):
+        self.mode.write_text('busy');self.invoke()
+        for mode in ['show-missing','show-changed']:
+            self.mode.write_text(mode)
+            with self.assertRaises(RuntimeError):self.invoke()
+        self.assertEqual(len(self.creations()),1)
+    def test_actual_envelope_schema_target_data_body_and_sender_are_not_borrowable(self):
+        for field in ['id','to','body','data','workspace','from','delivery','extra','duplicate']:
+            with self.subTest(field=field):
+                # Each scenario owns a fresh journal; no clearing a consumed fence.
+                self.bridge.journal.close_thread()
+                self.bridge.journal=Journal(Path(self.temp.name)/('case-'+field+'.sqlite'))
+                self.bridge.journal.db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES('op','s',1,'d',?,'task-hub2-s',?,'running',1)",(self.temp.name,NATIVE));self.bridge.journal.db.commit()
+                self.mode.write_text('bad-envelope:'+field)
+                with self.assertRaises((RuntimeError,ValueError)):self.invoke()
+        self.assertFalse(any(c[0][0]=='send' for c in self.calls))
+    def test_late_after_durable_creation_retains_unknown_without_notice(self):
+        runner=self.bridge.runner
+        def late(argv,**kw):
+            result=runner(argv,**kw)
+            if argv[1:3]==['message','send']:self.wall_clock.return_value=2001
+            return result
+        self.bridge.runner=late
+        with self.assertRaisesRegex(RuntimeError,'wake_deadline_exceeded'):self.invoke()
+        self.wall_clock.return_value=1000;self.bridge.runner=runner
+        with self.assertRaisesRegex(RuntimeError,'wake_outcome_uncertain'):self.invoke()
+        self.assertFalse(any(c[0][0]=='send' for c in self.calls))
+
+INBOX_CLI = r'''import sys,json,hashlib,os
+from pathlib import Path
+root=Path(__file__).parent;args=sys.argv[1:];mode=(root/'mode').read_text()
+if args==['whoami','--json']:
+ if mode=='identity':print('{}');raise SystemExit(0)
+ if mode=='who-output':print('{}')
+ if mode in ['who-error','who-stderr']:print('synthetic',file=sys.stderr)
+ raise SystemExit(1)
+if args[:2]==['message','send']:
+ assert '--workspace' not in args and '--from' not in args and '--pane' not in args
+ text=args[args.index('--')+1];data=json.loads(args[args.index('--data')+1]);b=data['wake_binding']
+ assert os.getcwd()==b['workspace']
+ envelope={'schema_version':1,'id':'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee','workspace':os.getcwd(),'created_at':1,'from':{'external':True},'to':{'tag':b['tag'],'session_id':b['native_id']},'kind':'hub-wake','body':text,'data':data,'delivery':'inbox'}
+ (root/'envelope.json').write_text(json.dumps(envelope))
+ if mode=='create-unknown':raise SystemExit(2)
+ if mode.startswith('bad-envelope:'):
+  field=mode.split(':')[1]
+  if field=='extra':envelope['extra']=True
+  elif field=='duplicate':print(json.dumps(envelope)[:-1]+',"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}');raise SystemExit(0)
+  else:envelope[field]='foreign'
+ print(json.dumps(envelope));raise SystemExit(0)
+if args[:2]==['message','show']:
+ assert args[-1]=='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+ if mode=='show-missing':raise SystemExit(2)
+ e=json.loads((root/'envelope.json').read_text())
+ if mode=='show-changed':e['body']='foreign'
+ print(json.dumps(e));raise SystemExit(0)
+assert args[0]=='send' and '--strict' in args
+field=lambda key:args[args.index(key)+1];text=args[args.index('--')+1]
+assert text=='Read inbox message aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+r={'version':1,'session_id':args[1],'operation_id':field('--idempotency-key'),'deadline_ms':int(field('--deadline-ms')),'request_sha256':hashlib.sha256(json.dumps([args[1],field('--idempotency-key'),field('--expect-tag'),field('--expect-workspace'),int(field('--expect-created-at-ms')),int(field('--deadline-ms')),text],ensure_ascii=False,separators=(',',':')).encode()).hexdigest(),'status':'submitted_verified','mutation':True,'landed':True,'submitted':True,'consumed':None,'reason':'submission_observed'}
+if mode in ['busy','early-ack-busy']:r.update(status='refused',mutation=False,landed=False,submitted=False,reason='not_idle')
+print(json.dumps(r));raise SystemExit(0 if r['submitted'] else 4)
+'''
+
 if __name__=='__main__':
     import sys
-    if sys.argv[1:] in (['--wire'],['--strict-wire']):
-        case=(StrictSessionWakeTests() if '--strict-wire' in sys.argv else SessionWakeTests());case.setUp();case.wall.stop()
+    if sys.argv[1:] in (['--wire'],['--strict-wire'],['--inbox-wire']):
+        case=(StrictInboxWakeTests() if '--inbox-wire' in sys.argv else StrictSessionWakeTests() if '--strict-wire' in sys.argv else SessionWakeTests());case.setUp();case.wall.stop()
         try:
             first=True
             for line in sys.stdin:
@@ -251,7 +368,7 @@ if __name__=='__main__':
                     db=case.bridge.journal.db;db.execute('DELETE FROM launches')
                     db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,'d',?,?,?,'running',1)",(binding['operation_id'],binding['session_id'],binding['epoch'],binding['workspace'],binding['tag'],binding['native_id']));db.commit();first=False
                     case.status.update(id=binding['native_id'],tag=binding['tag'],workspace=binding['workspace'],created_at_ms=binding['created_at_ms'])
-                    if '--strict-wire' not in sys.argv:
+                    if '--strict-wire' not in sys.argv and '--inbox-wire' not in sys.argv:
                         case.bridge.native=lambda *a,**k:subprocess.CompletedProcess(a,0,json.dumps({'id':ENVELOPE,'to':{'tag':binding['tag'],'session_id':binding['native_id']}} if a[1]=='send' else {'status':'submitted'}),'')
                 print(json.dumps(case.invoke()),flush=True)
         finally:case.doCleanups()

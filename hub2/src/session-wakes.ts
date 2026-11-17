@@ -122,9 +122,12 @@ export function wakeProof(proof:unknown,binding:JsonRecord):proof is JsonRecord{
  * No mailbox ID is invented; native operation_id is this command UUID.
  */
 export async function strictWakeProof(proof:unknown,binding:JsonRecord,commandId:string,text:string):Promise<boolean>{
- if(binding.transport!=='strict-submit:v1'||!proof||typeof proof!=='object'||Array.isArray(proof))return false;
+ if(!['strict-submit:v1','strict-inbox:v1'].includes(String(binding.transport))||!proof||typeof proof!=='object'||Array.isArray(proof))return false;
  const p=proof as JsonRecord;
- if(Object.keys(p).sort().join(',')!=='epoch,kind,operation_id,receipt'||p.kind!=='strict_submit_v1'||p.epoch!==binding.epoch||p.operation_id!==binding.operation_id)return false;
+ const inbox=binding.transport==='strict-inbox:v1';
+ if(Object.keys(p).sort().join(',')!==(inbox?'body_sha256,envelope_id,epoch,kind,operation_id,receipt':'epoch,kind,operation_id,receipt')||p.kind!==(inbox?'strict_inbox_notice_v1':'strict_submit_v1')||p.epoch!==binding.epoch||p.operation_id!==binding.operation_id)return false;
+ if(inbox&&(typeof p.envelope_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(p.envelope_id)||p.body_sha256!==await sha256Hex(text)))return false;
+ const notice=inbox?'Read inbox message '+p.envelope_id:text;
  const r=p.receipt;if(!r||typeof r!=='object'||Array.isArray(r))return false;const v=r as JsonRecord;
  const keys=Object.keys(v).sort().join(',');
  if(keys!=='consumed,deadline_ms,landed,mutation,operation_id,reason,request_sha256,session_id,status,submitted,version'
@@ -132,6 +135,6 @@ export async function strictWakeProof(proof:unknown,binding:JsonRecord,commandId
  if(v.replayed!==undefined&&typeof v.replayed!=='boolean')return false;
  if(v.version!==1||v.session_id!==binding.native_id||v.operation_id!==commandId||v.deadline_ms!==binding.deadline_ms
   ||v.status!=='submitted_verified'||v.mutation!==true||v.landed!==true||v.submitted!==true||v.consumed!==null||v.reason!=='submission_observed')return false;
- const expected=await sha256Hex(JSON.stringify([binding.native_id,commandId,binding.tag,binding.workspace,binding.created_at_ms,binding.deadline_ms,text]));
+ const expected=await sha256Hex(JSON.stringify([binding.native_id,commandId,binding.tag,binding.workspace,binding.created_at_ms,binding.deadline_ms,notice]));
  return v.request_sha256===expected;
 }

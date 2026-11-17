@@ -1686,9 +1686,9 @@ export class MachineDO {
     if(wakeBinding){
       const current=this.wakeSession(sessionId);
       if(row.kind!=='wake_send'||!current||current.operation_id!==wakeBinding.operation_id||current.epoch!==row.epoch||current.native_id!==wakeBinding.native_id)return error('stale_wake',409);
-      const strict=wakeBinding.transport==='strict-submit:v1';
+      const strict=['strict-submit:v1','strict-inbox:v1'].includes(String(wakeBinding.transport));
       if(strict&&result.wake_pending===true){
-        if(Object.keys(result).sort().join(',')!=='transport,wake_pending'||result.transport!=='strict-submit:v1')return error('invalid_wake_result',400);
+        if(Object.keys(result).sort().join(',')!=='transport,wake_pending'||result.transport!==wakeBinding.transport)return error('invalid_wake_result',400);
         if(row.state!=='wake_pending')return error('stale_command',409);
         await this.wakes.sweep();await this.scheduleNext();return json({acknowledged:false,pending:true});
       }
@@ -1708,6 +1708,11 @@ export class MachineDO {
       if(Object.keys(result).some(k=>!['delivery','delivered_at_ms','wake_proof'].includes(k))||result.delivery!=='native_acknowledged'||!Number.isSafeInteger(result.delivered_at_ms)||Number(result.delivered_at_ms)<=0||Number(result.delivered_at_ms)>Date.now()+5000)return error('invalid_wake_result',400);
       if(strict){
         if(!await strictWakeProof(result.wake_proof,wakeBinding,row.id,row.text??''))return error('invalid_wake_proof',409);
+        if(wakeBinding.transport==='strict-inbox:v1'){
+          const proof=result.wake_proof as JsonRecord|undefined;
+          const reused=proof&&this.db.one<{id:string}>("SELECT id FROM session_commands WHERE id<>? AND kind='wake_send' AND json_valid(result_json) AND json_extract(result_json,'$.wake_proof.envelope_id')=? LIMIT 1",row.id,proof.envelope_id);
+          if(reused)return error('wake_proof_replayed',409);
+        }
         const live=this.wakeSession(sessionId);
         if(!live||live.state!=='running'||live.operation_id!==wakeBinding.operation_id||live.epoch!==row.epoch||live.native_id!==wakeBinding.native_id)return error('stale_wake',409);
         if(Number(result.delivered_at_ms)>Number(wakeBinding.deadline_ms))return error('wake_ack_after_deadline',409);
@@ -1796,12 +1801,13 @@ export class MachineDO {
     const stop=this.stopOnly(socket);
     const wakeCap=this.db.one<{capabilities_json:string}>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?',machineId);
     const wakeCaps=wakeCap?JSON.parse(wakeCap.capabilities_json) as string[]:[];
-    const strictWakes=wakeCaps.includes('session-wakes:strict-submit:v1');
-    const supportsWakes=strictWakes||wakeCaps.includes('session-wakes:v1');
+    const inboxWakes=wakeCaps.includes('session-wakes:strict-inbox:v1');
+    const strictWakes=inboxWakes||wakeCaps.includes('session-wakes:strict-submit:v1');
+    const supportsWakes=inboxWakes||strictWakes||wakeCaps.includes('session-wakes:v1');
     const command=this.db.one<CommandRow>(`
       SELECT c.* FROM session_commands c
       JOIN sessions s ON s.id=c.session_id AND s.machine_id=c.machine_id AND c.epoch=s.epoch
-      WHERE c.machine_id=? AND (c.state='pending' OR (c.kind='wake_send' AND c.state='wake_pending')) AND (CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.wake_binding.transport') END IS NULL OR (?=1 AND json_extract(c.result_json,'$.wake_binding.transport')='strict-submit:v1')) AND (CASE WHEN json_valid(c.result_json) THEN json_type(c.result_json,'$.wake_binding') END IS NULL OR (?=1 AND COALESCE(json_extract(c.result_json,'$.wake_binding.ack_deadline_ms'),json_extract(c.result_json,'$.wake_binding.deadline_ms'))>?)) AND (
+      WHERE c.machine_id=? AND (c.state='pending' OR (c.kind='wake_send' AND c.state='wake_pending')) AND (CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.wake_binding.transport') END IS NULL OR (?=1 AND json_extract(c.result_json,'$.wake_binding.transport')='strict-submit:v1') OR (?=1 AND json_extract(c.result_json,'$.wake_binding.transport')='strict-inbox:v1')) AND (CASE WHEN json_valid(c.result_json) THEN json_type(c.result_json,'$.wake_binding') END IS NULL OR (?=1 AND COALESCE(json_extract(c.result_json,'$.wake_binding.ack_deadline_ms'),json_extract(c.result_json,'$.wake_binding.deadline_ms'))>?)) AND (
         s.state IN ('claimed','running') OR (c.kind='capture' AND s.state='completed-awaiting-review' AND s.exit_code=0
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.native_id') END=s.native_id
           AND CASE WHEN json_valid(c.result_json) THEN json_extract(c.result_json,'$.capture_binding.operation_id') END=s.operation_id
@@ -1812,7 +1818,7 @@ export class MachineDO {
             WHERE a.operation_id=s.operation_id AND a.session_id=s.id AND a.epoch=s.epoch))
         ))
       ) ${stop?"AND c.kind='stop'":''}
-      ORDER BY CASE WHEN c.kind='stop' THEN 0 WHEN c.kind='wake_send' THEN 2 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId,strictWakes?1:0,supportsWakes?1:0,Date.now());
+      ORDER BY CASE WHEN c.kind='stop' THEN 0 WHEN c.kind='wake_send' THEN 2 ELSE 1 END,c.created_at,c.id LIMIT 1`,machineId,strictWakes?1:0,inboxWakes?1:0,supportsWakes?1:0,Date.now());
     if(!stop){
       const native=this.nativeCommands.next();
       if(native&&await this.authorizedAttachment(socket,'machine:offer',true,env)){
@@ -2502,7 +2508,7 @@ export class MachineDO {
     if(this.nativeInventory.status().fresh!==true||!observed||!Number.isSafeInteger(observed.created_at_ms)||Number(observed.created_at_ms)<=0||observed.tag!==`task-hub2-${w.session_id}`||observed.workspace!==w.workspace)return false;
     w.native_birth=Number(observed.created_at_ms);
     // Every NEW wake uses strict transport; old/unknown hosts durably hold it.
-    const binding={id:w.id,session_id:w.session_id,operation_id:w.operation_id,epoch:w.epoch,native_id:w.native_id,tag:observed.tag,workspace:w.workspace,created_at_ms:w.native_birth,deadline_ms:w.wake_at_ms+600000,transport:'strict-submit:v1'};
+    const binding={id:w.id,session_id:w.session_id,operation_id:w.operation_id,epoch:w.epoch,native_id:w.native_id,tag:observed.tag,workspace:w.workspace,created_at_ms:w.native_birth,deadline_ms:w.wake_at_ms+600000,transport:'strict-inbox:v1'};
     this.db.transaction(this.ctx,()=>{
       const row=this.wakeSession(w.session_id);if(!row||row.operation_id!==w.operation_id||row.epoch!==w.epoch||row.native_id!==w.native_id||row.state!=='running')throw new HttpError('stale_wake',409);
       this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,'wake_send',?,'wake_pending',?,?,?)`,w.command_id,w.session_id,w.machine_id,w.epoch,'hub-wake:'+w.id,w.id,w.prompt,JSON.stringify({wake_binding:binding}),Date.now(),Date.now());

@@ -17,22 +17,22 @@ import type {WakeRecord,WakeSession} from '../src/session-wakes';
 const admin={id:'operator:wake-test',kind:'operator',scopes:['operator:admin']};
 const host={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','machine:offer','session:report']};
 const native='11111111-2222-4333-8444-555555555555';
-function fixture(){
+function fixture(workspace='/owned/work'){
  const db=new DatabaseSync(':memory:'),kv=new Map<string,unknown>(),events:any[]=[],sockets:any[]=[];let projectFailure=false;let alarm:number|null=null;
  const ctx:any={storage:{sql:{exec(q:string,...args:any[]){const p=db.prepare(q);let rows:any[]=[],written=0;if(p.columns().length)rows=p.all(...args);else written=Number(p.run(...args).changes);return{toArray:()=>rows,rowsRead:rows.length,rowsWritten:written};}},transactionSync(fn:()=>unknown){db.exec('BEGIN');try{const out=fn();db.exec('COMMIT');return out;}catch(e){db.exec('ROLLBACK');throw e;}},async get(k:string){return structuredClone(kv.get(k));},async put(k:string,v:unknown){kv.set(k,structuredClone(v));},async delete(k:string){return kv.delete(k);},async list(o:any={}){return new Map([...kv].filter(([k])=>k.startsWith(o.prefix??'')&&(!o.startAfter||k>o.startAfter)).sort(([a],[b])=>a.localeCompare(b)).slice(0,o.limit??1000));},async getAlarm(){return alarm;},async setAlarm(v:number){alarm=v;},async deleteAlarm(){alarm=null;}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn()),getWebSockets:()=>sockets};
  const env:any={HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:(x:string)=>x,get:()=>({fetch:async(input:any)=>{const p=new URL(input.url??input).pathname;if(p==='/_verify')return Response.json({actor:admin});if(p.startsWith('/api/routes/session/'))return Response.json({route:{id:'s1',owner:'h1'}});return Response.json({authorized:true});}})},PROJECTS:{idFromName:(x:string)=>x,get:()=>({fetch:async(input:any,init?:any)=>{const req=input instanceof Request?input:new Request(input,init);events.push({path:new URL(req.url).pathname,body:await req.json()});return projectFailure?Response.json({error:'synthetic_unavailable'},{status:503}):Response.json({ok:true});}})}};
  let machine=new MachineDO(ctx,env);env.MACHINES={idFromName:(x:string)=>x,get:()=>({fetch:(r:Request)=>machine.fetch(r)})};
  const call=(p:string,method='GET',body?:any,actor:any=admin)=>machine.fetch(new Request('https://machine.test'+p,{method,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- async function boot(interactive=true,wakeSupport=true){await call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive',...(wakeSupport?['session-wakes:v1']:[])],native_sessions:[]},host);const response=await call('/_internal/reserve','POST',{operation_id:'op1:0',dispatch_id:'op1',attempt:0,session_id:'s1',project_id:'p1',intake_id:'i1',machine_id:'h1',request_digest:'d1',title:'wake',acceptance_criteria:['wake'],account_id:'claude',launch:{workspace:'/owned/work',engine:'claude',model:'sonnet',prompt:'test',interactive}});assert.equal(response.status,201);const r=await response.json() as any;await call('/_internal/activate','POST',{operation_id:'op1:0',session_id:'s1',epoch:r.epoch});db.prepare("UPDATE sessions SET state='running',native_id=? WHERE id='s1'").run(native);return r.epoch;}
+ async function boot(interactive=true,wakeSupport=true){await call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive',...(wakeSupport?['session-wakes:v1']:[])],native_sessions:[]},host);const response=await call('/_internal/reserve','POST',{operation_id:'op1:0',dispatch_id:'op1',attempt:0,session_id:'s1',project_id:'p1',intake_id:'i1',machine_id:'h1',request_digest:'d1',title:'wake',acceptance_criteria:['wake'],account_id:'claude',launch:{workspace,engine:'claude',model:'sonnet',prompt:'test',interactive}});assert.equal(response.status,201);const r=await response.json() as any;await call('/_internal/activate','POST',{operation_id:'op1:0',session_id:'s1',epoch:r.epoch});db.prepare("UPDATE sessions SET state='running',native_id=? WHERE id='s1'").run(native);return r.epoch;}
  const publicCall=(p:string,body?:any)=>worker.fetch(new Request('https://hub.test'+p,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+'x'.repeat(40),'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})}),env);
- return{db,kv,events,sockets,failProject(value=true){projectFailure=value;},edit(q:string){db.exec(q);(machine as any).db.cache.clear();},storage:ctx.storage,boot,call,publicCall,get machine(){return machine;},restart(){machine=new MachineDO(ctx,env);},get alarm(){return alarm;}};
+ return{workspace,db,kv,events,sockets,failProject(value=true){projectFailure=value;},edit(q:string){db.exec(q);(machine as any).db.cache.clear();},storage:ctx.storage,boot,call,publicCall,get machine(){return machine;},restart(){machine=new MachineDO(ctx,env);},get alarm(){return alarm;}};
 }
 test('public session wake records a durable one-shot for the existing interactive session',async()=>{
  const f=fixture();await f.boot();const response=await f.publicCall('/api/sessions/s1/wake',{key:'once',at:new Date(Date.now()+60_000).toISOString(),prompt:'Check the external result'});assert.equal(response.status,201,await response.text());
 });
 
 async function publish(f:ReturnType<typeof fixture>,now=Date.now(),birth=1){
- const rows=[{id:native,tag:'task-hub2-s1',workspace:'/owned/work',engine:'claude',agent:null,profile:null,agent_profile:null,phase:'running',state:'running',worker_alive:true,cwd:'/owned/work',created_at_ms:birth,last_activity_ms:null}];
+ const rows=[{id:native,tag:'task-hub2-s1',workspace:f.workspace,engine:'claude',agent:null,profile:null,agent_profile:null,phase:'running',state:'running',worker_alive:true,cwd:'/owned/work',created_at_ms:birth,last_activity_ms:null}];
  const data=JSON.stringify(rows),meta={snapshot_id:crypto.randomUUID(),started_at_ms:now,observed_at_ms:now,row_count:1,chunk_count:1,sha256:await sha256Hex(data)};
  assert.equal((await f.call('/api/native-inventory','POST',{...meta,chunk_index:0,data},host)).status,200);
 }
@@ -265,8 +265,29 @@ function legacyFixture(){
  const restart=f.restart;f.restart=()=>{restart();install();};install();return f;
 }
 
+/** Immutable 035a direct-strict producer: existing inflight records stay direct. */
+function directFixture(){
+ const f=fixture();
+ function install(){(f.machine as any).enqueueWake=function(this:LegacyWakeProducer,w:WakeRecord):boolean{
+    const current=this.wakeSession(w.session_id);
+    if(!current||current.operation_id!==w.operation_id||current.epoch!==w.epoch||current.native_id!==w.native_id||current.state!=='running'||!current.interactive)return false;
+    const prior=this.db.one<CommandRow>('SELECT * FROM session_commands WHERE id=?',w.command_id);
+    if(prior)return prior.session_id===w.session_id&&prior.epoch===w.epoch;
+    const native=this.db.one<{row_json:string}>('SELECT row_json FROM native_inventory_rows WHERE native_id=?',w.native_id);
+    const observed=native?JSON.parse(native.row_json) as JsonRecord:null;
+    if(this.nativeInventory.status().fresh!==true||!observed||!Number.isSafeInteger(observed.created_at_ms)||Number(observed.created_at_ms)<=0||observed.tag!==`task-hub2-${w.session_id}`||observed.workspace!==w.workspace)return false;
+    w.native_birth=Number(observed.created_at_ms);
+    const binding={id:w.id,session_id:w.session_id,operation_id:w.operation_id,epoch:w.epoch,native_id:w.native_id,tag:observed.tag,workspace:w.workspace,created_at_ms:w.native_birth,deadline_ms:w.wake_at_ms+600000,transport:'strict-submit:v1'};
+    this.db.transaction(this.ctx,()=>{
+      const row=this.wakeSession(w.session_id);if(!row||row.operation_id!==w.operation_id||row.epoch!==w.epoch||row.native_id!==w.native_id||row.state!=='running')throw new HttpError('stale_wake',409);
+      this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,'wake_send',?,'wake_pending',?,?,?)`,w.command_id,w.session_id,w.machine_id,w.epoch,'hub-wake:'+w.id,w.id,w.prompt,JSON.stringify({wake_binding:binding}),Date.now(),Date.now());
+    });return true;
+  };}
+ const restart=f.restart;f.restart=()=>{restart();install();};install();return f;
+}
+
 async function strictFixture(){
- const f=fixture();await f.boot();await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-submit:v1'],native_sessions:[]},host);await publish(f);return f;
+ const f=directFixture();await f.boot();await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-submit:v1'],native_sessions:[]},host);await publish(f);return f;
 }
 async function strictProof(c:any){const b=JSON.parse(c.result_json).wake_binding;return{delivery:'native_acknowledged',delivered_at_ms:Date.now(),wake_proof:{kind:'strict_submit_v1',epoch:b.epoch,operation_id:b.operation_id,receipt:{version:1,session_id:b.native_id,operation_id:c.id,request_sha256:await sha256Hex(JSON.stringify([b.native_id,c.id,b.tag,b.workspace,b.created_at_ms,b.deadline_ms,c.text])),deadline_ms:b.deadline_ms,status:'submitted_verified',mutation:true,landed:true,submitted:true,consumed:null,reason:'submission_observed'}}};}
 test('strict wake capability selects durable explicit transport without a mailbox ID',async()=>{
@@ -327,17 +348,17 @@ test('new wake on old-marker host is strictly held and resumes same command key 
  const f=fixture();await f.boot();await publish(f);const frames:any[]=[];
  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:host.id,generation:'1',connected_at:Date.now(),connection_id:'qualified-host'}),send:(s:string)=>frames.push(JSON.parse(s))};f.sockets.push(socket);
  const response=await create(f,'held-strict');assert.equal(response.status,201);const created=await response.json() as any,c=command(f),binding=JSON.parse(c.result_json).wake_binding;
- assert.equal(binding.transport,'strict-submit:v1');assert.equal(binding.native_message_id,undefined);assert.equal(c.state,'wake_pending');
+ assert.equal(binding.transport,'strict-inbox:v1');assert.equal(binding.native_message_id,undefined);assert.equal(c.state,'wake_pending');
  assert.equal(frames.filter(x=>x.type==='session.command').length,0);
  assert.equal((await f.call('/api/sessions/s1/commands','POST',{kind:'capture',key:'ordinary-while-held'})).status,201);
  const ordinary=frames.find(x=>x.type==='session.command');assert.equal(ordinary.command.kind,'capture');assert.equal(ordinary.command.wake,undefined);
  await f.call('/api/sessions/s1/commands/'+ordinary.command.id+'/ack','POST',{epoch:ordinary.command.epoch,result:{output:'synthetic-readonly'}},host);
  f.restart();assert.equal((await create(f,'held-strict')).status,200);assert.equal(command(f).id,c.id);assert.deepEqual(JSON.parse(command(f).result_json).wake_binding,binding);
- await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-submit:v1'],native_sessions:[]},host);
+ await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-inbox:v1'],native_sessions:[]},host);
  await (f.machine as any).sendPendingCommands(socket,'h1');const resumed=frames.filter(x=>x.type==='session.command'&&x.command.wake).at(-1)!.command;
  assert.equal(resumed.id,c.id);assert.equal(resumed.wake.deadline_ms,binding.deadline_ms);assert.deepEqual(resumed.wake,binding);
  const again=await(await create(f,'held-strict')).json() as any;assert.equal(again.wake_id,created.wake_id);assert.equal(command(f).id,c.id);
- assert.equal((await ack(f,c,await strictProof(c))).status,200);assert.equal((await history(f)).wakes[0].wake_state,'acked');
+ assert.equal((await ack(f,c,await inboxProof(c))).status,200);assert.equal((await history(f)).wakes[0].wake_state,'acked');
  assert.equal(f.db.prepare("SELECT COUNT(*) AS n FROM session_commands WHERE kind='wake_send'").get()!.n,1);
 });
 
@@ -350,4 +371,52 @@ test('explicit historical producer stale transaction guard raises typed409 witho
  try{assert.throws(()=>machine.enqueueWake(structuredClone(wake)),(error:any)=>error instanceof ExpectedHttpError&&error.code==='stale_wake'&&error.status===409);}
  finally{machine.wakeSession=original;}
  assert.equal(reads,2);assert.equal(command(f),undefined);assert.equal((await history(f)).wakes[0].wake_state,'pending');
+});
+
+async function inboxFixture(workspace='/owned/work'){const f=fixture(workspace);await f.boot();await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-inbox:v1'],native_sessions:[]},host);await publish(f);return f;}
+async function inboxProof(c:any){const result=await strictProof(c),b=JSON.parse(c.result_json).wake_binding,id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';Object.assign(result.wake_proof,{kind:'strict_inbox_notice_v1',envelope_id:id,body_sha256:await sha256Hex(c.text)});result.wake_proof.receipt.request_sha256=await sha256Hex(JSON.stringify([b.native_id,c.id,b.tag,b.workspace,b.created_at_ms,b.deadline_ms,'Read inbox message '+id]));return result;}
+test('inbox notice proof binds full body and real envelope separately from short strict submission',async()=>{
+ const f=await inboxFixture();await create(f);const c=command(f),good=await inboxProof(c);assert.equal(JSON.parse(c.result_json).wake_binding.transport,'strict-inbox:v1');
+ for(const change of [{body_sha256:'0'.repeat(64)},{envelope_id:crypto.randomUUID()},{kind:'strict_submit_v1'},{extra:true}]){const r=structuredClone(good);Object.assign(r.wake_proof,change);assert.equal((await ack(f,c,r)).status,409);}
+ assert.equal((await ack(f,c,await strictProof(c))).status,409);
+ assert.equal((await ack(f,c,good)).status,200);assert.equal((await ack(f,c,good)).status,200);
+ assert.equal((await history(f)).wakes[0].wake_state,'acked');assert.equal(good.wake_proof.receipt.consumed,null);
+});
+test('new inbox transport does not leak into historical direct host while normal commands flow',async()=>{
+ const f=await inboxFixture();await create(f);const c=command(f);await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-submit:v1'],native_sessions:[]},host);
+ const frames:any[]=[];const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:host.id,generation:'1',connected_at:Date.now(),connection_id:'qualified-host'}),send:(s:string)=>frames.push(JSON.parse(s))};f.sockets.push(socket);
+ await(f.machine as any).sendPendingCommands(socket,'h1');assert.equal(frames.length,0);
+ await f.call('/api/sessions/s1/commands','POST',{kind:'capture',key:'ordinary-inbox-held'});assert.equal(frames.at(-1).command.kind,'capture');assert.equal(command(f).id,c.id);
+});
+
+test('actual service-context Bridge inbox notice receipt crosses MachineDO ACK with no sender impersonation',async()=>{
+ const parent=process.env.TMPDIR||fileURLToPath(new URL('../../.local/tmp',import.meta.url));
+ mkdirSync(parent,{recursive:true,mode:0o700});const owned=mkdtempSync(join(parent,'wake-inbox-bridge-'));
+ try{
+ const f=await inboxFixture(owned);const frames:any[]=[];
+ f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:host.id,generation:'1',connected_at:Date.now(),connection_id:'qualified-host'}),send:(s:string)=>frames.push(JSON.parse(s))});
+ await create(f);const c=command(f),packet=frames.find(x=>x.type==='session.command').command;assert.equal(packet.kind,'send');assert.ok(packet.wake);
+ const hostRoot=fileURLToPath(new URL('../host',import.meta.url)),script=fileURLToPath(new URL('../host/tests/test_session_wakes.py',import.meta.url));
+
+ const child=spawn('/usr/bin/python3',['-I','-S','-c','import runpy,sys;sys.path.insert(0,sys.argv[1]);sys.argv=sys.argv[2:];runpy.run_path(sys.argv[0],run_name="__main__")',hostRoot,script,'--inbox-wire'],{stdio:['pipe','pipe','pipe'],env:{...process.env,HOME:owned,TMPDIR:owned}});
+ const lines=createInterface({input:child.stdout}),iterator=lines[Symbol.asyncIterator](),closed=once(child,'close');let error='';child.stderr.on('data',b=>error=(error+String(b)).slice(-8192));
+ const timer=setTimeout(()=>child.kill('SIGKILL'),15000);
+ try{
+  child.stdin.write(JSON.stringify(packet)+'\n');const first=await iterator.next();assert.equal(first.done,false,error);const result=JSON.parse(first.value!);assert.equal(result.wake_proof.kind,'strict_inbox_notice_v1');assert.equal((await ack(f,c,result)).status,200);assert.equal((await history(f)).wakes[0].wake_state,'acked');
+ }finally{child.stdin.end();await closed;clearTimeout(timer);lines.close();}
+ assert.equal(child.exitCode,0,error);
+ }finally{rmSync(owned,{recursive:true,force:true});}
+});
+
+test('new host retains existing direct strict command eligibility without changing its transport',async()=>{
+ const f=await strictFixture();await create(f);const c=command(f),b=JSON.parse(c.result_json).wake_binding;
+ const frames:any[]=[];const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:host.id,generation:'1',connected_at:Date.now(),connection_id:'qualified-host'}),send:(s:string)=>frames.push(JSON.parse(s))};f.sockets.push(socket);
+ await f.call('/api/heartbeat','POST',{labels:[],engines:['claude'],capabilities:['interactive','session-wakes:strict-inbox:v1'],native_sessions:[]},host);
+ await(f.machine as any).sendPendingCommands(socket,'h1');assert.equal(frames.at(-1).command.id,c.id);assert.deepEqual(frames.at(-1).command.wake,b);
+ assert.equal(b.transport,'strict-submit:v1');assert.equal((await ack(f,c,await strictProof(c))).status,200);
+});
+test('different inbox command cannot reuse another completed envelope UUID',async()=>{
+ const f=await inboxFixture();await create(f,'first');const first=command(f);assert.equal((await ack(f,first,await inboxProof(first))).status,200);
+ await create(f,'second');const second=f.db.prepare("SELECT * FROM session_commands WHERE kind='wake_send' AND id<>?").get(first.id) as any;
+ assert.ok(second);assert.equal((await ack(f,second,await inboxProof(second))).status,409);assert.equal(second.state,'wake_pending');
 });

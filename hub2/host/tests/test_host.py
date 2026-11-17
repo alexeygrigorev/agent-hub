@@ -219,7 +219,7 @@ class HostTests(unittest.TestCase):
                 self.assertEqual(len(probes)-before, 1 if count == 27 else 0)
                 flags = captured[-1][2]
                 legacy = tags + ['headless', 'modes:v1:shell:h', 'repo-identity:v1', 'workspace-preflight:v1']
-                self.assertEqual(flags, legacy + (['session-wakes:strict-submit:v1'] if count == 27 else []) + [workspace])
+                self.assertEqual(flags, legacy + (['session-wakes:strict-inbox:v1'] if count == 27 else []) + [workspace])
                 self.assertEqual(len([flag for flag in flags if not flag.startswith('workspace:')]), 32)
                 self.assertEqual(captured[-1][1], ['shell'])
                 self.auth_observer.assert_not_called()
