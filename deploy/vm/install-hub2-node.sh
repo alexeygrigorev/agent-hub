@@ -691,6 +691,36 @@ if [[ "$HUB_ONLY" != true ]]; then
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 fi
 
+# Best-effort diagnostic only: bounded exact-unit/current-invocation projection.
+# Journal field matching works without the newer journalctl --invocation option.
+report_hub2_startup_failure() {
+  (
+    set +e
+    local invocation after status markers
+    invocation="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --property=InvocationID --value 2>/dev/null)"
+    if [[ ! "$invocation" =~ ^[0-9a-f]{32}$ ]]; then
+      printf '%s\n' '[hub2-startup-diagnostic-v1] unavailable'
+      exit 0
+    fi
+    status="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --no-pager \
+      --property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus 2>/dev/null |
+      grep -E '^(ActiveState=(active|reloading|inactive|failed|activating|deactivating|maintenance)|SubState=(running|dead|failed|start|start-pre|start-post|stop|stop-sigterm|stop-sigkill|stop-post|auto-restart|exited)|Result=(success|resources|timeout|exit-code|signal|core-dump|watchdog|start-limit-hit|oom-kill|protocol)|MainPID=[0-9]{1,10}|ExecMainCode=[0-9]{1,10}|ExecMainStatus=[0-9]{1,10})$' | head -n 6)"
+    markers="$(timeout --kill-after=0.5s 0.5s journalctl --no-pager --quiet --output=cat --lines=100 \
+      '_SYSTEMD_UNIT=agent-hub-hub2.service' "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null |
+      grep -E '^\[hub2-startup-v1\] stage=(preimport|imports_env|schema_probe_begin|schema_probe_end|runtime|listening) elapsed_ms=[0-9]{1,10}( objects=[0-9]{1,4})?( code=startup_failed)?$' | head -n 24)"
+    after="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --property=InvocationID --value 2>/dev/null)"
+    if [[ "$after" != "$invocation" ]]; then
+      printf '%s\n' '[hub2-startup-diagnostic-v1] invocation_changed'
+      exit 0
+    fi
+    printf '%s\n' '[hub2-startup-diagnostic-v1] current_invocation'
+    [[ -z "$status" ]] || printf '%s\n' "$status"
+    [[ -z "$markers" ]] || printf '%s\n' "$markers"
+    exit 0
+  ) || true
+  return 0
+}
+
 wait_for_hub2_readiness() {
   local attempt=0 curl_rc=0 health_body="" max_wait=15 start_seconds deadline remaining max_time
   if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && "${AGENT_HUB_TEST_READINESS_DEADLINE_S:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -705,6 +735,7 @@ wait_for_hub2_readiness() {
     fi
     if ! systemctl is-active --quiet agent-hub-hub2.service; then
       printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state on readiness attempt %s/15.\n' "$attempt" >&2
+      report_hub2_startup_failure
       return 1
     fi
     remaining=$((deadline - SECONDS))
@@ -729,9 +760,11 @@ wait_for_hub2_readiness() {
   done
   if ! systemctl is-active --quiet agent-hub-hub2.service; then
     printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state after %s readiness attempts.\n' "$((attempt > 15 ? 15 : attempt))" >&2
+    report_hub2_startup_failure
     return 1
   fi
   printf 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after %s attempts / %ss (last curl exit=%s): %s\n' "$((attempt > 15 ? 15 : attempt))" "$((SECONDS - start_seconds))" "$curl_rc" "$health_body" >&2
+  report_hub2_startup_failure
   return 1
 }
 
