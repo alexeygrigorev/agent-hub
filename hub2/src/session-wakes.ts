@@ -109,11 +109,29 @@ export class SessionWakes{
 }
 /** Same accepted native-delivery shape as legacy validateSendProof; no processing claim. */
 export function wakeProof(proof:unknown,binding:JsonRecord):proof is JsonRecord{
- if(!proof||typeof proof!=='object'||Array.isArray(proof))return false;const p=proof as JsonRecord;
+ if(binding.transport!==undefined||!proof||typeof proof!=='object'||Array.isArray(proof))return false;const p=proof as JsonRecord;
  return Object.keys(p).sort().join(',')==='kind,native_message_id,sender_created_at_ms,sender_generation,sender_native_id,sender_tag,sender_workspace,status'
   &&p.kind==='native_delivery'&&['submitted','already-submitted','recipient-acked'].includes(String(p.status))
   &&typeof p.native_message_id==='string'&&/^[0-9a-f-]{36}$/i.test(p.native_message_id)
   &&p.sender_native_id===binding.native_id&&p.sender_tag===binding.tag&&p.sender_workspace===binding.workspace
   &&p.sender_generation===binding.epoch&&p.sender_created_at_ms===binding.created_at_ms
   &&p.native_message_id===binding.native_message_id;
+}
+
+/** Service control uses the existing identity-bound strict native receipt.
+ * No mailbox ID is invented; native operation_id is this command UUID.
+ */
+export async function strictWakeProof(proof:unknown,binding:JsonRecord,commandId:string,text:string):Promise<boolean>{
+ if(binding.transport!=='strict-submit:v1'||!proof||typeof proof!=='object'||Array.isArray(proof))return false;
+ const p=proof as JsonRecord;
+ if(Object.keys(p).sort().join(',')!=='epoch,kind,operation_id,receipt'||p.kind!=='strict_submit_v1'||p.epoch!==binding.epoch||p.operation_id!==binding.operation_id)return false;
+ const r=p.receipt;if(!r||typeof r!=='object'||Array.isArray(r))return false;const v=r as JsonRecord;
+ const keys=Object.keys(v).sort().join(',');
+ if(keys!=='consumed,deadline_ms,landed,mutation,operation_id,reason,request_sha256,session_id,status,submitted,version'
+  &&keys!=='consumed,deadline_ms,landed,mutation,operation_id,reason,replayed,request_sha256,session_id,status,submitted,version')return false;
+ if(v.replayed!==undefined&&typeof v.replayed!=='boolean')return false;
+ if(v.version!==1||v.session_id!==binding.native_id||v.operation_id!==commandId||v.deadline_ms!==binding.deadline_ms
+  ||v.status!=='submitted_verified'||v.mutation!==true||v.landed!==true||v.submitted!==true||v.consumed!==null||v.reason!=='submission_observed')return false;
+ const expected=await sha256Hex(JSON.stringify([binding.native_id,commandId,binding.tag,binding.workspace,binding.created_at_ms,binding.deadline_ms,text]));
+ return v.request_sha256===expected;
 }

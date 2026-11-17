@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
@@ -1628,6 +1629,31 @@ class Bridge:
         except Exception:
             pass  # A reconnect/observation failure never blocks normal host work.
 
+    def strict_wake_supported(self):
+        # Optional transport negotiation only. No provider, config or start gate.
+        if sys.platform != 'linux' or not isinstance(getattr(self,'executable',None),str):
+            return False  # Native strict receipt support is explicitly Linux-only.
+        try:
+            path = Path(self.executable).resolve(strict=True)
+            def identity():
+                item = path.stat()
+                return (str(path),item.st_dev,item.st_ino,item.st_size,item.st_mtime_ns,item.st_ctime_ns)
+            before = identity()
+            cached = getattr(self,'_strict_wake_capability',None)
+            if cached is not None and cached[0] == before:
+                return cached[1]
+            response = self.native('send','--help',allow_failure=True,timeout=2)
+            required = {'--strict','--enter','--expect-tag','--expect-workspace',
+                        '--expect-created-at-ms','--idempotency-key','--deadline-ms'}
+            supported = (response.returncode == 0 and len(response.stdout) <= 16384
+                         and required <= set(re.findall(r'--[a-z][a-z-]*',response.stdout)))
+            if identity() != before:
+                return False
+            self._strict_wake_capability = (before,supported)
+            return supported
+        except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
+            return False
+
     def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
@@ -1704,7 +1730,7 @@ class Bridge:
         # credential, auth or repository observation from the legacy budget.
         # A full host truthfully defers wakes while ordinary work stays usable.
         if len(capabilities) < 32:
-            capabilities.append('session-wakes:v1')
+            capabilities.append('session-wakes:strict-submit:v1' if self.strict_wake_supported() else 'session-wakes:v1')
         # Workspace inventory has its own protocol allowance; repository count
         # must never evict engine/credential hints or silently lose clone labels.
         capabilities.extend(workspace_tags)

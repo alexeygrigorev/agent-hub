@@ -217,6 +217,7 @@ class CliTests(unittest.TestCase):
         })
         saved_config = self.config.read_bytes()
         with patch("agent_hub_host.cli.Journal") as journal, \
+             patch("agent_hub_host.agent.Bridge.strict_wake_supported", return_value=True), \
              patch("agent_hub_host.auth.refresh") as refresh, \
              patch("agent_hub_host.native_launch.shutil.which", return_value=None):
             code, result = self.invoke("heartbeat", "--label", "fleet-cycle", "--aplexer", os.sys.executable)
@@ -229,7 +230,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(auth, "Bearer synthetic-token")
         self.assertEqual(body["labels"], ["fleet-cycle"])
         self.assertEqual(body["engines"], ["shell"])
-        self.assertEqual(body["capabilities"], ["headless", "modes:v1:shell:h", "repo-identity:v1", "workspace-preflight:v1", "session-wakes:v1"])
+        self.assertEqual(body["capabilities"], ["headless", "modes:v1:shell:h", "repo-identity:v1", "workspace-preflight:v1", "session-wakes:strict-submit:v1"])
         self.assertNotIn("native_sessions", body)
         journal.assert_not_called()
         refresh.assert_not_called()
