@@ -101,6 +101,10 @@ class HostTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.journal = Journal(self.root / "private/journal.sqlite")
         self.native, self.client = FakeNative(), FakeClient()
+        # Lifecycle fake processes run against a synthetic healthy host, not CI RAM.
+        physical = patch('agent_hub_host.resource_admission.available_bytes', return_value=1024**4)
+        physical.start()
+        self.addCleanup(physical.stop)
         self.bridge = Bridge(self.client, self.journal, [self.root], ["codex"],
                              executable=os.sys.executable, runner=self.native,
                              launcher_config={"private_provider_homes": True, "argv": [os.sys.executable], "config_dir": str(self.root / "launcher"),
@@ -1670,6 +1674,54 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[-1]['detail'],'Host operation failed.')
         self.assertNotIn('PRIVATE',json.dumps(sent))
 
+
+
+
+
+class ResourceAdmissionHostTests(unittest.TestCase):
+    setUp = HostTests.setUp
+    tearDown = HostTests.tearDown
+    offer = HostTests.offer
+
+    def test_low_memory_settles_actual_no_dispatch_without_native_effect(self):
+        from agent_hub_host import resource_admission as admission
+        with patch.object(admission, 'available_bytes', return_value=3*1024**3):
+            self.assertIsNone(self.bridge.offer(self.offer()))
+        self.assertFalse(any(args[1:2] == ['start'] for args, _ in self.native.calls))
+        row = self.journal.db.execute('SELECT * FROM launches').fetchone()
+        self.assertEqual((row['state'], row['native_dispatch_started'], row['native_id']), ('stopped_before_dispatch',0,None))
+        self.assertTrue(json.loads(row['admission_json'])['released'])
+        payload = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertTrue(payload['no_dispatch'])
+        self.assertEqual(payload['failure_reason'], 'native_dispatch_not_started')
+        self.assertNotIn('native_exit_confirmed', payload)
+
+    def test_healthy_dispatch_replay_keeps_one_business_start(self):
+        self.bridge.offer(self.offer())
+        self.bridge.offer(self.offer())
+        self.assertEqual(sum(args[1:2] == ['start'] for args,_ in self.native.calls),1)
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+        meta=json.loads(row['admission_json'])
+        self.assertEqual(row['native_dispatch_started'],1)
+        self.assertEqual(meta['identity']['id'], row['native_id'])
+        self.assertFalse(meta['released'])
+
+    def test_callback_lateness_after_marker_never_runs_or_fakes_no_dispatch(self):
+        from agent_hub_host import resource_admission as admission
+        now=[100.]
+        original=self.bridge.mark_native_dispatch
+        def late(*args):
+            permit=original(*args)
+            now[0]+=2
+            return permit
+        self.bridge.mark_native_dispatch=late
+        with patch.object(admission,'clock',side_effect=lambda:now[0]):
+            with self.assertRaises(admission.Refused):self.bridge.offer(self.offer())
+        row=self.journal.db.execute('SELECT * FROM launches').fetchone()
+        self.assertEqual((row['state'],row['native_dispatch_started']),('aborting',1))
+        self.assertFalse(json.loads(row['admission_json'])['released'])
+        self.assertFalse(any(args[1:2]==['start'] for args,_ in self.native.calls))
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
 
 
 if __name__ == "__main__":
