@@ -1306,6 +1306,13 @@ test('an operator done accepts a verified intake that only the merge gate held b
       return f.call('/api/intakes/'+id,'POST',{key,expected_version:shown.task.control.version,status:'done',note:'Developer live check passed'});};
     const refused=await close('done-1');
     assert.equal(refused.status,409);assert.equal((await json(refused)).error,'merge_gate');
+    // An uncited foreign PR: Hub's refusal quotes the URL, which must never count as a citation.
+    const foreign={...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'};
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site-uncited',evidence:foreign});
+    for(const key of ['done-u1','done-u2']){
+      const again=await close(key);
+      assert.equal(again.status,409);assert.equal((await json(again)).error,'merge_gate');
+    }
     await f.call('/api/intakes/'+id+'/events','POST',{key:'cite',note:'Work merged in https://github.com/org/site/pull/1'});
     await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site',evidence:{...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'}});
     assert.equal(completion(f,id).verification.merge_gate_only,true);
