@@ -784,7 +784,11 @@ class Canary:
                 f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
                 if mode == "shell"
                 else (
-                    "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
+                    "Use two sequential shell tool calls. First run a separate foreground shell command. "
+                    "If the session wrapper requires a private first-action evidence file, begin that same command with the required `aplexer whoami --json` "
+                    "and its complete stdout redirected only to that exact private evidence path; use `&&` before the marker operation so the file-writing step must succeed first. "
+                    "This foreground command must output only the marker: never tee or print the whoami JSON or extra prose. "
+                    "In that same foreground command, print the "
                     f'concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" as one output line and let it finish. '
                     "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
                     "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "
@@ -801,7 +805,11 @@ class Canary:
             # The complete expected output never occurs in the model prompt. A
             # wrapped echo of the prompt therefore cannot count as execution.
             self.prompt = PROMPTS["shell"] if mode == "shell" else (
-                "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
+                "Use two sequential shell tool calls. First run a separate foreground shell command. "
+                    "If the session wrapper requires a private first-action evidence file, begin that same command with the required `aplexer whoami --json` "
+                    "and its complete stdout redirected only to that exact private evidence path; use `&&` before the marker operation so the file-writing step must succeed first. "
+                    "This foreground command must output only the marker: never tee or print the whoami JSON or extra prose. "
+                    "In that same foreground command, print the "
                 f'concatenation of "CANARY-", "OK:", and "{run_id}" as one output line and let it finish. '
                 "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
                 "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "

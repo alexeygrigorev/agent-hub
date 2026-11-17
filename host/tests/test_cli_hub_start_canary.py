@@ -814,7 +814,7 @@ class CanaryTest(unittest.TestCase):
         self.assertIn('`run_in_background: true`', claude_prompt)
         self.assertIn('wait on that exact background task id', claude_prompt)
         self.assertIn('two sequential shell tool calls', prompt)
-        self.assertIn('First run a separate foreground shell command that prints the concatenation of "CANARY-", "OK:", and', prompt)
+        self.assertIn('In that same foreground command, print the concatenation of "CANARY-", "OK:", and', prompt)
         self.assertLess(
             prompt.index('First run a separate foreground shell command'),
             prompt.index('Immediately after the marker print finishes, run a separate foreground `sleep 60` command'),
@@ -3334,7 +3334,7 @@ class CanaryTest(unittest.TestCase):
             self.assertIn("substitute another sleep mechanism", claude_prompt)
             self.assertIn("do not create or edit other files", claude_prompt)
             self.assertNotIn("foreground `sleep", claude_prompt)
-            expected_hash = "162c127213a58a56922031e4f7bcb6ed635cf931d6ba5bf2ee6d41b64f14c4bf" if inst is c_full else "ea03a441552fab36088e0dba4ca0d238811c6210e1f0825985d02fa356cc7d44"
+            expected_hash = "05cdac60e695dc731cfafdfe5832d78bcaa3d5c13e0a7f55430bae008513f830" if inst is c_full else "c5da7e6e3bfb74c35a3228742327f7d3912acbf68d1db101a680cf59c700396a"
             self.assertEqual(__import__("hashlib").sha256(other_prompt.encode()).hexdigest(), expected_hash)
             self.assertTrue(other_prompt.startswith("Use two sequential shell tool calls. First run a separate foreground shell command"))
             self.assertIn(f'concatenation of "CANARY-", "OK:", and {expected_piece} as one output line and let it finish.', inst.prompt)
@@ -3647,6 +3647,86 @@ class TrustedLockBudgetTests(unittest.TestCase):
                 c.acquire_deploy_gate_lock()
             self.assertEqual((clock[0], c.active_deadline, c.stage_deadline(90)), (240, 240, 240))
             self.assertIsNone(c.lock_fd); self.assertFalse(c.start_attempted)
+
+
+class FirstCallCanaryProofTests(unittest.TestCase):
+    def canary(self, candidate=True):
+        return TrustedCaptureBudgetTests().canary(candidate=candidate)
+
+    def test_nonclaude_prompt_combines_private_first_action_before_marker_not_hold(self):
+        for candidate in (False, True):
+            with self.subTest(candidate=candidate):
+                c=self.canary(candidate);nonclaude=c.prompt.split('For every other runtime, follow this unchanged sequence: ',1)[1]
+                self.assertIn('begin that same command with the required `aplexer whoami --json`',nonclaude)
+                self.assertIn('complete stdout redirected only to that exact private evidence path',nonclaude)
+                self.assertIn('use `&&` before the marker operation',nonclaude)
+                self.assertIn('This foreground command must output only the marker',nonclaude)
+                self.assertIn('run a separate foreground `sleep 60` command',nonclaude)
+                self.assertIn('Do not chain the marker print with the hold',nonclaude)
+                self.assertNotIn(c.marker,c.prompt)
+                self.assertIn('run_in_background: true',c.prompt)
+                self.assertIn('provider-native blocking Monitor or TaskOutput',c.prompt)
+
+    def packet(self, command, content, *, success=True, code=0):
+        observation={'kind':'result','native_event':'tool_call_result','native_session_id':'native-source-session',
+                     'native_turn_id':'native-source-turn','call_id':'call-1','tool':'Bash','command':command,'content':content,
+                     'native_success':success,'exit_code':code,'status':'completed','timed_out':False,
+                     'native_truncated':False,'native_original_bytes':len(content.encode()),'native_returned_bytes':len(content.encode()),
+                     'local_truncated':False,'observation_complete':True}
+        return [{'type':'thread.started','thread_id':'source-thread'},
+                {'type':'item.completed','item':{'id':'result-1','type':'native_tool_result','thread_id':'source-thread',
+                                               'turn_id':'source-turn','observation':observation}}]
+
+    def combined_command(self, directory, c, *, fail=False):
+        import shlex
+        directory=pathlib.Path(directory);binary=directory/'bin';binary.mkdir(mode=0o700)
+        fake=binary/'aplexer';identity='{"id":"owned-synthetic-native","phase":"running"}\n'
+        fake.write_text('#!/bin/sh\n'+('exit 7\n' if fail else "printf '%s\\n' "+shlex.quote(identity.rstrip('\n'))+'\n'));fake.chmod(0o700)
+        evidence=directory/'private first-action.json'
+        suffix=c.marker.removeprefix('CANARY-OK:')
+        command='aplexer whoami --json > '+shlex.quote(str(evidence))+" && printf '%s%s%s' CANARY- OK: "+shlex.quote(suffix)
+        env={'PATH':str(binary)+':/usr/bin:/bin','HOME':str(directory),'TMPDIR':str(directory),'LANG':'C.UTF-8'}
+        result=subprocess.run(['/bin/sh','-c',command],cwd=directory,env=env,capture_output=True,text=True,timeout=3,check=False,umask=0o077)
+        return command,result,evidence,identity
+
+    def temporary(self):
+        parent=pathlib.Path(os.environ.get('TMPDIR') or ROOT/'.local/tmp');parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        return tempfile.TemporaryDirectory(dir=parent,prefix='first-call-proof-')
+
+    def test_one_actual_fake_cli_command_writes_private_identity_then_marker_only_and_parser_accepts(self):
+        from scripts import hub_start_canary as mod
+        with self.temporary()as directory:
+            c=self.canary();command,result,evidence,identity=self.combined_command(directory,c)
+            self.assertEqual((result.returncode,result.stderr,result.stdout),(0,'',c.marker))
+            self.assertEqual(evidence.read_text(),identity)
+            self.assertEqual(evidence.stat().st_mode & 0o077,0)
+            packet=self.packet(command,result.stdout)
+            proof=mod.zai_native_return_proof('\n'.join(json.dumps(e)for e in packet),c.marker)
+            self.assertTrue(proof['proven']);self.assertFalse(proof['invalidated'])
+            self.assertTrue(c.output_has_marker('\n'.join(json.dumps(e)for e in packet),engine='zai'))
+
+    def test_first_action_failure_cannot_print_marker_or_qualify(self):
+        from scripts import hub_start_canary as mod
+        with self.temporary()as directory:
+            c=self.canary();command,result,evidence,_=self.combined_command(directory,c,fail=True)
+            self.assertEqual(result.returncode,7);self.assertEqual(result.stdout,'');self.assertTrue(evidence.exists())
+            packet=self.packet(command,result.stdout,success=False,code=7)
+            self.assertFalse(mod.zai_native_return_proof('\n'.join(json.dumps(e)for e in packet),c.marker)['proven'])
+
+    def test_identity_stdout_extra_prose_echo_and_invalid_native_result_remain_nonproof(self):
+        from scripts import hub_start_canary as mod
+        import copy
+        c=self.canary();command='aplexer whoami --json > OWNED_FIRST_ACTION && printf SPLIT_MARKER'
+        for content in ('{"id":"synthetic"}\n'+c.marker,c.marker+'\nextra',c.marker+'\n'):
+            with self.subTest(extra_stdout=content!=c.marker):
+                packet=self.packet(command,content)
+                self.assertFalse(mod.zai_native_return_proof('\n'.join(json.dumps(e)for e in packet),c.marker)['proven'])
+        for change in ({'exit_code':1},{'timed_out':True},{'native_truncated':True},{'observation_complete':False},{'native_session_id':'foreign'}):
+            with self.subTest(change=change):
+                packet=self.packet(command,c.marker);packet[-1]['item']['observation'].update(change)
+                self.assertFalse(mod.zai_native_return_proof('\n'.join(json.dumps(e)for e in packet),c.marker,('source-thread','source-turn','native-source-session'))['proven'])
+        echo=json.dumps({'type':'item.completed','item':{'id':'message','type':'agent_message','text':c.marker}})
+        self.assertFalse(self.canary().output_has_marker(echo,engine='zai'))
 
 
 if __name__ == "__main__":
