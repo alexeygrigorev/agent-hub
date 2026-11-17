@@ -148,6 +148,7 @@ export class ProjectDO {
       await this.ready;
       if (['/_internal/finish-dead-letter','/_internal/stopped-finish'].includes(url.pathname) && request.method==='POST')
         return await terminalReceipt(request,this.db,fn=>this.transaction(fn),(...args)=>this.appendEvent(...args),id=>this.intakeContext(id));
+      if(url.pathname==='/_internal/session-wake'&&request.method==='POST')return await this.sessionWakeInternal(request);
       if (url.pathname === '/_internal/finish' && request.method === 'POST') return await this.finishInternal(request);
       if (url.pathname === '/_internal/started' && request.method === 'POST') return await this.startedInternal(request);
       if ((url.pathname === '/_internal/stopped' || url.pathname === '/_internal/reaped') && request.method === 'POST') return await this.stoppedInternal(request);
@@ -304,7 +305,12 @@ export class ProjectDO {
     if (!row) return error('intake_not_found', 404);
     if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
     const rows = this.db.all<IntakeEventRow>('SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? ORDER BY seq DESC LIMIT 50', intakeId).reverse();
-    return json({ intake: this.viewIntake(row), task: this.taskCompat(row),
+    const waiting=this.db.one<{wake_at_ms:number}>(`SELECT CAST(json_extract(e.body_json,'$.wake_at_ms') AS INTEGER) AS wake_at_ms FROM intake_events e
+      WHERE e.task_id=? AND e.kind='session_wake_updated' AND json_extract(e.body_json,'$.wake_state')='pending'
+      AND json_extract(e.body_json,'$.wake_at_ms')>? AND NOT EXISTS(SELECT 1 FROM intake_events n WHERE n.task_id=e.task_id
+        AND n.kind IN ('session_wake_updated','session_wake_missed') AND n.seq>e.seq AND json_extract(n.body_json,'$.wake_id')=json_extract(e.body_json,'$.wake_id'))
+      AND json_extract(e.body_json,'$.session_id')=? ORDER BY wake_at_ms LIMIT 1`,intakeId,Date.now(),row.session_id);
+    return json({ intake: this.viewIntake(row), task: this.taskCompat(row),...(waiting?{waiting_until:new Date(waiting.wake_at_ms).toISOString()}:{}),
       events: rows.map(r => ({ seq: r.seq, actor_id: r.actor_id, kind: r.kind, at: r.at, body: this.parse(r.body_json) })) });
   }
 
@@ -1821,11 +1827,28 @@ export class ProjectDO {
    * when Hub cannot recover an unfinished intake itself. Runs inside the
    * caller's transaction: records the alert in the intake journal and makes the
    * developer the intake's active owner, so it never sits ownerless. */
-  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker}):void{
+  private async sessionWakeInternal(request:Request):Promise<Response>{
+    const b=await bodyObject(request,4096);
+    if(typeof b.wake_id!=='string'||!/^[0-9a-f]{64}$/.test(b.wake_id)||typeof b.session_id!=='string'||typeof b.attempt_operation_id!=='string'||!Number.isSafeInteger(b.epoch)||!['pending','queued','delivered','acked','missed'].includes(String(b.state)))return error('invalid_wake',400);
+    const saga=this.sagaByAttempt(b.attempt_operation_id),intake=typeof b.intake_id==='string'?this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',b.intake_id):undefined;
+    if(!saga||!intake||saga.session_id!==b.session_id||saga.intake_id!==intake.id||saga.epoch!==b.epoch)return error('stale_wake',409);
+    this.transaction(()=>{
+      const now=Date.now(),missed=b.state!=='acked'&&Number.isSafeInteger(b.missed_at),key='session-wake:'+b.wake_id+':'+(missed?'missed':String(b.state));
+      const prior=this.db.one('SELECT 1 FROM intake_events WHERE task_id=? AND event_key=?',intake.id,key);if(prior)return;
+      if(b.state==='pending'&&this.db.one("SELECT 1 FROM intake_events WHERE task_id=? AND kind IN ('session_wake_updated','session_wake_missed') AND json_extract(body_json,'$.wake_id')=? AND json_extract(body_json,'$.wake_state') IN ('missed','acked') LIMIT 1",intake.id,b.wake_id))return;
+      this.appendEvent(intake.id,key,'hub:service:wake',missed?'session_wake_missed':'session_wake_updated',{
+        session_id:b.session_id,wake_id:b.wake_id,wake_state:b.state,wake_at_ms:b.wake_at_ms,
+        reason:missed?'missed_wake':null,authority:'untrusted_task_data',
+        ...(missed?{note:'Scheduled wake was not verified within its deadline. Handed to idle-with-open-AC recovery.'}:{})},now);
+      if(missed)this.raiseDeveloperAlert(intake.id,b.session_id as string,'missed_wake','missed_wake',0,now,undefined,b.wake_id as string);
+    });return json({recorded:true});
+  }
+
+  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker},receiptKey?:string):void{
     const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS,
       ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{})};
-    this.appendEvent(intakeId,'developer-alert:'+kind+':'+sessionId,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
-    this.appendEvent(intakeId,'developer-owner:'+kind+':'+sessionId,COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
+    this.appendEvent(intakeId,'developer-alert:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+    this.appendEvent(intakeId,'developer-owner:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
       current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).${why?` Cause: ${why.cause}`:''}`,
       next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);

@@ -1165,6 +1165,13 @@ class Bridge:
             raise ValueError("invalid_command_id")
         digest = hashlib.sha256(canonical(command).encode()).hexdigest()
         db = self.journal.db
+        if 'wake' in command:
+            from . import wake_send
+            result = wake_send.execute(self, command, digest)
+            if result.get('wake_pending') is True:
+                self.journal.emit('command:'+identity, f"/api/sessions/{command['session_id']}/commands/{identity}/ack",
+                                  {'epoch':command['epoch'], 'result':result})
+            return result
         old = db.execute("SELECT * FROM commands WHERE id=?", (identity,)).fetchone()
         if old:
             if old["digest"] != digest:
@@ -1630,7 +1637,7 @@ class Bridge:
                  (('headless','h'),('interactive','i')) if mode in available[engine])
                  for engine in engines if re.fullmatch(r'[A-Za-z0-9_.-]{1,48}',engine)
                  and available[engine].intersection({'headless','interactive'})]
-        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        capabilities=['headless']+modes+['session-wakes:v1']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
         workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]

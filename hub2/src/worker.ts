@@ -347,7 +347,7 @@ const router = {
         );
       }
       const session = path.match(
-        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|link|events|commands(?:\/[^/]+\/ack)?))?$/,
+        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|wake|wakes|link|events|commands(?:\/[^/]+\/ack)?))?$/,
       );
       if (session) {
         let machineId =
