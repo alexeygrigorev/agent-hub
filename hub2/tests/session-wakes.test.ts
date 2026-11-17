@@ -8,6 +8,8 @@ import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {createInterface} from 'node:readline';
 import {once} from 'node:events';
+import {mkdirSync,mkdtempSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
 import {sha256Hex} from '../src/crypto';
 const admin={id:'operator:wake-test',kind:'operator',scopes:['operator:admin']};
 const host={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','machine:offer','session:report']};
@@ -99,7 +101,10 @@ test('actual host Bridge guard receipt crosses the unchanged command ACK boundar
  f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:host.id,generation:'1',connected_at:Date.now(),connection_id:'qualified-host'}),send:(s:string)=>frames.push(JSON.parse(s))});
  await create(f);const c=command(f),packet=frames.find(x=>x.type==='session.command').command;assert.equal(packet.kind,'send');assert.ok(packet.wake);
  const hostRoot=fileURLToPath(new URL('../host',import.meta.url)),script=fileURLToPath(new URL('../host/tests/test_session_wakes.py',import.meta.url));
- const child=spawn('/usr/bin/python3',['-I','-S','-c','import runpy,sys;sys.path.insert(0,sys.argv[1]);sys.argv=sys.argv[2:];runpy.run_path(sys.argv[0],run_name="__main__")',hostRoot,script,'--wire'],{stdio:['pipe','pipe','pipe'],env:{...process.env,HOME:process.env.TMPDIR}});
+ const parent=process.env.TMPDIR||fileURLToPath(new URL('../../.local/tmp',import.meta.url));
+ mkdirSync(parent,{recursive:true,mode:0o700});const owned=mkdtempSync(join(parent,'wake-bridge-'));
+ try{
+ const child=spawn('/usr/bin/python3',['-I','-S','-c','import runpy,sys;sys.path.insert(0,sys.argv[1]);sys.argv=sys.argv[2:];runpy.run_path(sys.argv[0],run_name="__main__")',hostRoot,script,'--wire'],{stdio:['pipe','pipe','pipe'],env:{...process.env,HOME:owned,TMPDIR:owned}});
  const lines=createInterface({input:child.stdout}),iterator=lines[Symbol.asyncIterator](),closed=once(child,'close');let error='';child.stderr.on('data',b=>error=(error+String(b)).slice(-8192));
  const timer=setTimeout(()=>child.kill('SIGKILL'),15000);
  try{
@@ -108,6 +113,7 @@ test('actual host Bridge guard receipt crosses the unchanged command ACK boundar
   const second=await iterator.next();assert.equal(second.done,false,error);const result=JSON.parse(second.value!);assert.ok(result.wake_proof);assert.equal((await ack(f,c,result)).status,200);assert.equal((await history(f)).wakes[0].wake_state,'acked');
  }finally{child.stdin.end();await closed;clearTimeout(timer);lines.close();}
  assert.equal(child.exitCode,0,error);
+ }finally{rmSync(owned,{recursive:true,force:true});}
 });
 test('linked intake waiting and missed handoff are durable, scoped and idempotent without completion',async()=>{
  const db=new DatabaseSync(':memory:');let alarm:any=null;
