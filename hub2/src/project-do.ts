@@ -554,21 +554,24 @@ export class ProjectDO {
   private intakeMergeGate(intake:IntakeRow){
     const required=codeTask(this.parse(intake.source_json));
     if(!required)return mergeGateAll(false,[]);
-    // Citations: the intake text and every journal record except merge observations themselves.
+    // Citations: the intake text and worker-written records (notes, DONE records),
+    // never merge observations or Hub's own refusal/alert records, which quote the URL.
     let corpus:string|undefined;
     const cited=(url:string)=>{
       if(corpus===undefined){
         const parts=[intake.title,intake.text];
-        for(const row of this.db.all<{kind:string,body_json:string}>('SELECT kind,body_json FROM intake_events WHERE task_id=? ORDER BY seq DESC LIMIT 2000',intake.id)){
+        for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' ORDER BY seq DESC LIMIT 2000",intake.id)){
           const body=this.parse(row.body_json) as JsonRecord|null;
-          if(row.kind==='worker_append'&&(body?.evidence as JsonRecord|undefined)?.kind==='merge_gate')continue;
+          if((body?.evidence as JsonRecord|undefined)?.kind==='merge_gate')continue;
           parts.push(row.body_json);
         }
         corpus=parts.join('\n').toLowerCase();
       }
-      const at=corpus.indexOf(url.toLowerCase());
       // Not a prefix of a longer PR number (pull/1 vs pull/12).
-      return at>=0&&!/[0-9]/.test(corpus.charAt(at+url.length));
+      const needle=url.toLowerCase();
+      for(let at=corpus.indexOf(needle);at>=0;at=corpus.indexOf(needle,at+1))
+        if(!/[0-9]/.test(corpus.charAt(at+needle.length)))return true;
+      return false;
     };
     return mergeGateAll(true,this.mergeEvidenceRecords(intake.id),intake.project,cited);
   }
