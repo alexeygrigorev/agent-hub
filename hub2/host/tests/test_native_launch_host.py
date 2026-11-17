@@ -879,6 +879,63 @@ class LaunchReceiptTest(unittest.TestCase):
                                           poll=lambda selector: {'phase': 'dead'}, sleep=lambda s: None)
 
 
+class OrdinaryInteractiveNativeEngineTests(unittest.TestCase):
+    def launch(self, provider, model, *, interactive=True, with_goal=False):
+        parent=Path(__file__).resolve().parents[3]/'.local/tmp'
+        parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent,prefix='ordinary-engine-') as workspace:
+            captured={};native_id='d6cf9872-8597-48a5-be64-990cdef4db31'
+            def runner(argv,**options):
+                prefix=argv[:argv.index('--')];child=argv[argv.index('--')+1:]
+                engine=prefix[prefix.index('--engine')+1] if '--engine' in prefix else 'shell'
+                captured.update(argv=argv,child=child,native_engine=engine,options=options)
+                return subprocess.CompletedProcess(argv,0,json.dumps({'id':native_id,'tag':'task-ordinary-engine',
+                    'workspace':workspace,'command':child,'engine':engine,'created_at_ms':1,'phase':'running'}),'')
+            adapter=nl.NativeLauncher({'private_provider_homes':True,'routes':{provider:{'provider':provider}}},runner=runner,aplexer='synthetic-aplexer')
+            spec={'workspace':workspace,'engine':provider,'model':model,'prompt':'literal scoped task --with-goal is just text',
+                  'interactive':interactive,'with_goal':with_goal,'timeout_seconds':90,'operation_id':'ordinary:0','epoch':1}
+            from agent_hub_host import zai_diagnostic_selector
+            with mock.patch.object(nl,'codex_launch_wrapper',return_value=Path('/synthetic/verified-launch-codex.sh')), \
+                 mock.patch.object(adapter,'record_evidence'), \
+                 mock.patch.object(zai_diagnostic_selector,'prepare',return_value=None), \
+                 mock.patch.object(adapter,'register_goal',return_value={'status':'active'}) as register:
+                receipt=adapter.launch('ordinary-engine',spec)
+            captured.update(receipt=receipt,goal_calls=register.call_count,workspace=workspace)
+            return captured
+
+    def test_ordinary_tui_native_engine_matches_actual_family_for_every_supported_provider(self):
+        cases=[('codex','gpt-6.1-sol','codex'),('zai','glm-5.3-flash','codex'),
+               ('claude','sonnet','claude'),('go',nl.OPENCODE_MODEL,'opencode'),
+               ('antigravity','gemini-4-argon-medium','antigravity')]
+        for provider,model,engine in cases:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model);prefix=got['argv'][:got['argv'].index('--')]
+                self.assertIn('--engine',prefix);self.assertEqual(got['native_engine'],engine)
+                self.assertEqual(prefix[prefix.index('--engine')+1],engine)
+                self.assertEqual(got['goal_calls'],0);self.assertEqual(got['receipt']['mode'],'interactive')
+                self.assertNotIn('goal_registration',got['receipt'])
+                self.assertIn(model,got['child']);self.assertNotIn('exec',got['child']);self.assertNotIn('-p',got['child'])
+                self.assertEqual(prefix[prefix.index('--memory')+1],'1500M');self.assertEqual(prefix[prefix.index('--pids')+1],'256')
+                self.assertEqual(prefix[prefix.index('--workspace')+1],got['workspace'])
+                self.assertEqual(prefix[prefix.index('--cwd')+1],got['workspace'])
+                if provider=='codex':self.assertEqual(got['child'][0],'/synthetic/verified-launch-codex.sh')
+
+    def test_headless_still_has_no_outer_interactive_engine_marker(self):
+        for provider,model in [('codex','gpt-6.1-sol'),('claude','sonnet')]:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model,interactive=False)
+                self.assertNotIn('--engine',got['argv'][:got['argv'].index('--')])
+                self.assertEqual(got['goal_calls'],0);self.assertEqual(got['receipt']['mode'],'headless')
+                self.assertIn('exec' if provider=='codex' else '-p',got['child'])
+
+    def test_goal_family_and_registration_remain_exactly_the_existing_mapping(self):
+        for provider,model,engine in [('codex','gpt-6.1-sol','codex'),('zai','glm-5.3-flash','codex'),('claude','sonnet','claude')]:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model,with_goal=True)
+                self.assertEqual(got['native_engine'],engine);self.assertEqual(got['goal_calls'],1)
+                self.assertEqual(got['receipt']['goal_registration'],{'status':'active'})
+                self.assertNotIn('literal scoped task --with-goal is just text',got['child'])
+
 if __name__ == '__main__':
     unittest.main()
 

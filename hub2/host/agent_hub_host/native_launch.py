@@ -1210,11 +1210,13 @@ class NativeLauncher:
                 "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
                 "--tag", "task-" + task_id]
-        if objective is not None:
-            # A literal -- command keeps its argv but does not infer an engine.
-            # Codex and its zcodex fork share a transcript family; Claude has
-            # its own native delivery/readiness and conversation format.
-            argv += ["--engine", "claude" if provider == 'claude' else "codex"]
+        if specification.get("interactive") and not local:
+            # Literal argv does not infer native engine metadata. Every real
+            # interactive TUI needs its family for input framing/readiness;
+            # /goal registration remains conditional on objective below.
+            native_engine = {"codex": "codex", "zai": "codex", "claude": "claude",
+                             "go": "opencode", "antigravity": "antigravity"}[provider]
+            argv += ["--engine", native_engine]
         if specification.get("session_id"):
             argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
         if specification.get('attempt_label'):
