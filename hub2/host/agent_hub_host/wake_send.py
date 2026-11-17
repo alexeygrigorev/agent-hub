@@ -12,6 +12,8 @@ import uuid
 
 
 def execute(bridge, command, digest):
+    if isinstance(command.get('wake'),dict) and 'transport' in command['wake']:
+        return execute_strict(bridge,command,digest)
     db = bridge.journal.db
     identity = command['id']
     binding = command.get('wake')
@@ -117,4 +119,96 @@ def execute(bridge, command, digest):
                             'sender_created_at_ms':binding['created_at_ms']}}
     with db:
         bridge.finish_command(identity, command, result)
+    return result
+
+def execute_strict(bridge, command, digest):
+    """A native once-ID guards retries; no mailbox or sender impersonation."""
+    db = bridge.journal.db
+    identity = command.get('id')
+    binding = command.get('wake')
+    fields = {'id','session_id','operation_id','epoch','native_id','tag','workspace',
+              'created_at_ms','deadline_ms','transport'}
+    if (not isinstance(binding, dict) or set(binding) != fields
+            or binding['transport'] != 'strict-submit:v1' or command.get('kind') != 'send'
+            or binding['session_id'] != command.get('session_id')
+            or binding['epoch'] != command.get('epoch') or type(binding['epoch']) is not int
+            or binding['epoch'] <= 0 or type(binding['created_at_ms']) is not int
+            or binding['created_at_ms'] <= 0 or type(binding['deadline_ms']) is not int
+            or not isinstance(identity,str) or str(uuid.UUID(identity)) != identity
+            or not isinstance(binding['native_id'],str)
+            or str(uuid.UUID(binding['native_id'])) != binding['native_id']):
+        raise ValueError('invalid_wake_command')
+    text = command.get('text')
+    if not isinstance(text,str) or not text.strip() or len(text.encode()) > 8192:
+        raise ValueError('invalid_wake_command')
+    start = time.monotonic()
+    def remaining():
+        left = min(30-(time.monotonic()-start), (binding['deadline_ms']-time.time()*1000)/1000)
+        if left <= 0:
+            raise RuntimeError('wake_deadline_exceeded')
+        return left
+    def qualified():
+        row = db.execute('SELECT * FROM launches WHERE session_id=?',(binding['session_id'],)).fetchone()
+        if (not row or row['operation_id'] != binding['operation_id'] or row['epoch'] != binding['epoch']
+                or row['native_id'] != binding['native_id'] or row['tag'] != binding['tag']
+                or row['workspace'] != binding['workspace'] or row['state'] != 'running'):
+            raise ValueError('wake_fence_conflict')
+        if row['interactive'] != 1:
+            raise ValueError('headless_send_refused')
+        status = bridge.lookup(binding['native_id'],row,timeout=remaining())
+        if (not status or status.get('phase',status.get('state')) != 'running'
+                or status.get('created_at_ms') != binding['created_at_ms']):
+            raise ValueError('wake_identity_unverified')
+    old = db.execute('SELECT * FROM commands WHERE id=?',(identity,)).fetchone()
+    if old and old['digest'] != digest:
+        raise ValueError('command_id_conflict')
+    if old and old['state'] == 'done':
+        result = json.loads(old['result'])
+        bridge.journal.emit('command:'+identity,'/api/sessions/'+binding['session_id']+'/commands/'+identity+'/ack',
+                            {'epoch':binding['epoch'],'result':result})
+        return result
+    qualified()
+    if not old:
+        with db: bridge.begin_command(identity,digest)
+    # A repeated CLI RPC uses EXACTLY the same worker-persisted once-ID/digest/
+    # original deadline. Uncertain worker fences never write a second input.
+    remaining()
+    sent = bridge.native('send',binding['native_id'],'--enter','--strict',
+                         '--expect-tag',binding['tag'],'--expect-workspace',binding['workspace'],
+                         '--expect-created-at-ms',str(binding['created_at_ms']),
+                         '--idempotency-key',identity,'--deadline-ms',str(binding['deadline_ms']),
+                         '--json','--',text,allow_failure=True,timeout=remaining())
+    def unique(pairs):
+        value = {}
+        for key,item in pairs:
+            if key in value:
+                raise ValueError('duplicate_receipt_field')
+            value[key] = item
+        return value
+    try:
+        receipt = json.loads(sent.stdout,object_pairs_hook=unique)
+    except (ValueError,RecursionError):
+        raise RuntimeError('wake_receipt_unverified') from None
+    qualified()
+    remaining()
+    expected = hashlib.sha256(json.dumps([binding['native_id'],identity,binding['tag'],binding['workspace'],
+        binding['created_at_ms'],binding['deadline_ms'],text],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+    fields = {'version','session_id','operation_id','request_sha256','deadline_ms','status',
+              'mutation','reason','landed','submitted','consumed'}
+    if (not isinstance(receipt,dict) or set(receipt) not in (fields,fields|{'replayed'})
+            or ('replayed' in receipt and type(receipt['replayed']) is not bool)
+            or type(receipt.get('version')) is not int or receipt['version'] != 1
+            or receipt.get('session_id') != binding['native_id'] or receipt.get('operation_id') != identity
+            or receipt.get('request_sha256') != expected or type(receipt.get('deadline_ms')) is not int
+            or receipt['deadline_ms'] != binding['deadline_ms']):
+        raise RuntimeError('wake_receipt_unverified')
+    if (sent.returncode != 0 or receipt.get('status') != 'submitted_verified'
+            or receipt.get('mutation') is not True or receipt.get('landed') is not True
+            or receipt.get('submitted') is not True or receipt.get('consumed') is not None
+            or receipt.get('reason') != 'submission_observed'):
+        return {'wake_pending':True,'transport':'strict-submit:v1'}
+    result = {'delivery':'native_acknowledged','delivered_at_ms':int(time.time()*1000),
+              'wake_proof':{'kind':'strict_submit_v1','epoch':binding['epoch'],
+                            'operation_id':binding['operation_id'],'receipt':receipt}}
+    with db: bridge.finish_command(identity,command,result)
     return result

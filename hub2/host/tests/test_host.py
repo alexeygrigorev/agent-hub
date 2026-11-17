@@ -182,6 +182,8 @@ class HostTests(unittest.TestCase):
         self.assertFalse(any(flag.startswith('credentials:') for flag in captured[-1][2]))
 
     def test_optional_wake_negotiation_uses_only_spare_legacy_slots_and_preserves_workspaces(self):
+        probes = []
+        self.bridge.strict_wake_supported = lambda: probes.append(True) or True
         captured = []
         self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
         self.bridge.engines = {'shell'}
@@ -194,10 +196,12 @@ class HostTests(unittest.TestCase):
                     def tags(self):
                         return tags + [workspace]
                 self.bridge.advertisement = Advertisement()
+                before = len(probes)
                 self.bridge.heartbeat([], include_native_sessions=False)
+                self.assertEqual(len(probes)-before, 1 if count == 27 else 0)
                 flags = captured[-1][2]
                 legacy = tags + ['headless', 'modes:v1:shell:h', 'repo-identity:v1', 'workspace-preflight:v1']
-                self.assertEqual(flags, legacy + (['session-wakes:v1'] if count == 27 else []) + [workspace])
+                self.assertEqual(flags, legacy + (['session-wakes:strict-submit:v1'] if count == 27 else []) + [workspace])
                 self.assertEqual(len([flag for flag in flags if not flag.startswith('workspace:')]), 32)
                 self.assertEqual(captured[-1][1], ['shell'])
                 self.auth_observer.assert_not_called()
