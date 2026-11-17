@@ -254,7 +254,7 @@ test('missing or cross-repository merge proof blocks acceptance, fails verificat
     const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
     assert.equal(intakeRow(f,id).status,'failed','a model pass cannot bypass the programmatic merge check');
     assert.equal(completion(f,id).verification.state,'failed');
-    assert(completion(f,id).verification.gaps.some((gap:string)=>gap.includes('expected org/completion')));
+    assert(completion(f,id).verification.gaps.some((gap:string)=>gap.includes('is not in org/another-project')));
     assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='merge_gate_blocked'));
     await f.project.alarm();
     const continuation=activeSaga(f,id),prompt=JSON.parse(continuation.launch_spec_json).prompt;
@@ -1252,6 +1252,50 @@ test('merge evidence for a PR of another repository never satisfies the gate',as
     await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'foreign',evidence:{...mergeProof,pr_url:'https://github.com/org/other/pull/9'}});
     const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
     assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('is not in org/completion')));
+  }finally{f.close();}
+});
+
+test('work merged in other repositories satisfies the gate when the newest proof of each repository passes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'multi-repo',true);
+    const proofOf=(repo:string,n:number,extra:object={})=>({...mergeProof,repository:repo,pr_url:`https://github.com/${repo}/pull/${n}`,...extra});
+    const post=async(key:string,evidence:object)=>assert.equal((await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key,evidence})).status,201);
+    const state=async()=>(await json(await f.call('/api/intakes/'+id+'/merge-state'))).merge_gate;
+    // A first merge-check against the intake project found no PR there: superseded once any PR is identified.
+    await post('none',{kind:'merge_gate',repository:'org/completion',checked_at:mergeProof.checked_at,observation_error:'no pull request of org/completion is cited in the intake'});
+    assert.equal((await state()).ok,false);
+    await post('content',proofOf('org/content',6));
+    await post('site-red',proofOf('org/site',1,{checks_state:'failure',checks_successful:1,checks_failed:1}));
+    const red=await state();
+    assert.equal(red.ok,false);assert(red.problems.every((p:string)=>p.startsWith('org/site: ')),JSON.stringify(red.problems));
+    await post('site',proofOf('org/site',1));
+    const green=await state();assert.equal(green.ok,true,JSON.stringify(green.problems));
+    await start(f,id,'first');
+    const first=await run(f,id);await claim(f,id,first.session_id);
+    await finishClaimed(f,id,first);
+    assert.equal(intakeRow(f,id).status,'accepted','closes done without an operator');
+  }finally{f.close();}
+});
+
+test('an operator done accepts a verified intake that only the merge gate held back, once the gate passes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'merge-released',true);
+    await start(f,id,'first');
+    const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'failed');
+    assert(completion(f,id).verification.gaps.every((g:string)=>g.startsWith('Merge gate: ')));
+    const close=async(key:string)=>{const shown=await json(await f.call('/api/intakes/'+id));
+      return f.call('/api/intakes/'+id,'POST',{key,expected_version:shown.task.control.version,status:'done',note:'Developer live check passed'});};
+    const refused=await close('done-1');
+    assert.equal(refused.status,409);assert.equal((await json(refused)).error,'merge_gate');
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site',evidence:{...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'}});
+    const done=await close('done-2');
+    assert.equal(done.status,200,JSON.stringify(await done.clone().json()));
+    assert.equal(intakeRow(f,id).status,'accepted');
   }finally{f.close();}
 });
 

@@ -115,6 +115,30 @@ export function mergeGate(required: boolean, value: unknown, expectedRepository?
   return {required:true,ok:false,evidence:value as MergeEvidence,problems};
 }
 
+/** The gate over every merge observation recorded on an intake, newest first.
+ * Work may land in several repositories (a content repo plus a site repo, say),
+ * none of which need be the intake's project: the newest observation of each
+ * repository must pass, and every repository's problems are reported. An
+ * observation that identified no pull request at all is superseded by any
+ * observation that did, so a first `merge-check` against the wrong default
+ * repository never blocks the intake forever. */
+export function mergeGateAll(required: boolean, newestFirst: unknown[], expectedRepository?: string): MergeGateResult {
+  if (!required) return {required:false,ok:true,problems:[]};
+  const records = newestFirst.filter(v => !mergeEvidenceShapeError(v)) as Record<string, unknown>[];
+  if (!records.length) return mergeGate(true, newestFirst[0], expectedRepository);
+  const identified = records.filter(e => typeof e.pr_url === 'string' && GITHUB_PR.test(e.pr_url));
+  const latest = new Map<string, Record<string, unknown>>();
+  for (const e of identified.length ? identified : records.slice(0, 1)) {
+    const repo = String(e.repository).toLowerCase();
+    if (!latest.has(repo)) latest.set(repo, e);
+  }
+  const results = [...latest.values()].map(e => mergeGate(true, e));
+  const several = results.length > 1, problems: string[] = [];
+  for (const r of results) for (const p of r.problems) problems.push(several ? `${r.evidence?.repository}: ${p}` : p);
+  const evidence = results.find(r => !r.ok)?.evidence ?? results[0].evidence;
+  return {required:true,ok:!problems.length,...(evidence?{evidence}:{}),problems};
+}
+
 export function mergeGaps(result: MergeGateResult): string[] {
   return result.problems.map(problem => `Merge gate: ${problem}. Run hub intake merge-check after updating the PR and CI.`);
 }

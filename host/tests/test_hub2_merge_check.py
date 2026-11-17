@@ -132,6 +132,16 @@ class CliTests(unittest.TestCase):
         self.assertTrue(result['dry_run'])
         self.assertEqual([c.args[0] for c in request.call_args_list], ['GET'])
 
+    def test_pr_url_of_another_repository_is_collected_against_that_repository(self):
+        other = 'https://github.com/org/site/pull/1'
+        with patch.object(intake, 'request', return_value={'intake': {'id': 'i-1', 'project': REPO}}), \
+                patch.object(hme, 'collect', return_value={'kind': 'merge_gate'}) as collect:
+            intake.execute(self.parse('merge-check', 'i-1', '--pr', other, '--dry-run'))
+        collect.assert_called_once_with('org/site', other)
+        with patch.object(intake, 'request', return_value={'intake': {'id': 'i-1', 'project': REPO}}):
+            with self.assertRaises(intake.IntakeInputError):
+                intake.execute(self.parse('merge-check', 'i-1', '--pr', 'https://example.com/pull/1', '--dry-run'))
+
     def test_merge_state_and_reevaluate_routes(self):
         with patch.object(intake, 'request', return_value={}) as request:
             intake.execute(self.parse('merge-state', 'i-1'))
