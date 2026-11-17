@@ -376,9 +376,9 @@ class Bridge:
         self._unavailable_workspace_warnings=set()
         self.executable = shutil.which(executable) or str(Path(executable).resolve(strict=True))
 
-    def native(self, *args, input=None, allow_failure=False, timeout=30):
+    def native(self, *args, input=None, allow_failure=False, timeout=30, cwd=None):
         result = self.runner([self.executable, *args], input=input, text=True, encoding='utf-8', errors='replace',
-                             capture_output=True, timeout=timeout, check=False)
+                             capture_output=True, timeout=timeout, check=False, **({'cwd':cwd} if cwd is not None else {}))
         if result.returncode and not allow_failure:
             raise RuntimeError("native_command_failed")
         if len(result.stdout) > 262144:
@@ -1730,7 +1730,7 @@ class Bridge:
         # credential, auth or repository observation from the legacy budget.
         # A full host truthfully defers wakes while ordinary work stays usable.
         if len(capabilities) < 32:
-            capabilities.append('session-wakes:strict-submit:v1' if self.strict_wake_supported() else 'session-wakes:v1')
+            capabilities.append('session-wakes:strict-inbox:v1' if self.strict_wake_supported() else 'session-wakes:v1')
         # Workspace inventory has its own protocol allowance; repository count
         # must never evict engine/credential hints or silently lose clone labels.
         capabilities.extend(workspace_tags)

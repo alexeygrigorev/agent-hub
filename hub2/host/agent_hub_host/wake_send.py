@@ -6,6 +6,7 @@ its native guarded deliver operation (which never creates another envelope).
 No PTY injection, identity override, provider action or headless resume.
 """
 import hashlib
+import os
 import json
 import time
 import uuid
@@ -123,13 +124,14 @@ def execute(bridge, command, digest):
 
 def execute_strict(bridge, command, digest):
     """A native once-ID guards retries; no mailbox or sender impersonation."""
+    inbox = command.get('wake', {}).get('transport') == 'strict-inbox:v1'
     db = bridge.journal.db
     identity = command.get('id')
     binding = command.get('wake')
     fields = {'id','session_id','operation_id','epoch','native_id','tag','workspace',
               'created_at_ms','deadline_ms','transport'}
     if (not isinstance(binding, dict) or set(binding) != fields
-            or binding['transport'] != 'strict-submit:v1' or command.get('kind') != 'send'
+            or binding['transport'] not in {'strict-submit:v1','strict-inbox:v1'} or command.get('kind') != 'send'
             or binding['session_id'] != command.get('session_id')
             or binding['epoch'] != command.get('epoch') or type(binding['epoch']) is not int
             or binding['epoch'] <= 0 or type(binding['created_at_ms']) is not int
@@ -168,7 +170,67 @@ def execute_strict(bridge, command, digest):
                             {'epoch':binding['epoch'],'result':result})
         return result
     qualified()
-    if not old:
+    wire_text = text
+    envelope = None
+    if inbox:
+        # No identity/workspace override. Native also discovers ancestor IDs;
+        # only its explicit silent no-identity result qualifies this route.
+        if os.environ.get('APLEXER_WORKSPACE'):
+            raise RuntimeError('wake_local_context_unverified')
+        who = bridge.native('whoami','--json',allow_failure=True,timeout=remaining(),cwd=binding['workspace'])
+        if who.returncode != 1 or who.stdout != '' or who.stderr != '':
+            raise RuntimeError('wake_local_context_unverified')
+        qualified();remaining()
+        progress = json.loads(old['result']) if old and old['result'] else None
+        if old and not progress:
+            raise RuntimeError('wake_outcome_uncertain')
+        data = {'command_id':identity,'wake_binding':binding,
+                'body_sha256':hashlib.sha256(text.encode()).hexdigest()}
+        def validated(value):
+            keys={'schema_version','id','workspace','created_at','from','to','kind','body','data','delivery'}
+            if (not isinstance(value,dict) or set(value) != keys
+                    or type(value['schema_version']) is not int or value['schema_version'] != 1
+                    or type(value['created_at']) is not int or value['created_at'] <= 0
+                    or value['workspace'] != binding['workspace'] or value['kind'] != 'hub-wake'
+                    or value['body'] != text or value['data'] != data or value['delivery'] != 'inbox'
+                    or value['from'] != {'external':True} or value['from'].get('external') is not True
+                    or value['to'] != {'tag':binding['tag'],'session_id':binding['native_id']}
+                    or not isinstance(value['id'],str) or str(uuid.UUID(value['id'])) != value['id']):
+                raise RuntimeError('wake_receipt_unverified')
+            return value
+        def decode(raw):
+            def unique(pairs):
+                value={}
+                for key,item in pairs:
+                    if key in value: raise ValueError('duplicate_receipt_field')
+                    value[key]=item
+                return value
+            try:return json.loads(raw,object_pairs_hook=unique)
+            except (ValueError,RecursionError):raise RuntimeError('wake_receipt_unverified') from None
+        if not old:
+            # A crash/unknown result beyond this committed boundary NEVER
+            # creates another envelope. Availability is sacrificed to custody.
+            with db: bridge.begin_command(identity,digest)
+            remaining()
+            sent = bridge.native('message','send','--to',binding['tag'],'--kind','hub-wake',
+                                 '--data',json.dumps(data,ensure_ascii=False,separators=(',',':')),
+                                 '--json','--',text,timeout=remaining(),cwd=binding['workspace'])
+            envelope = validated(decode(sent.stdout))
+            qualified();remaining()
+            progress={'inbox_envelope':envelope}
+            with db:
+                db.execute("UPDATE commands SET result=? WHERE id=? AND state='executing'",(json.dumps(progress),identity))
+        if not isinstance(progress,dict) or set(progress) != {'inbox_envelope'}:
+            raise RuntimeError('wake_receipt_unverified')
+        envelope = validated(progress['inbox_envelope'])
+        def reread():
+            result=bridge.native('message','show','--json',envelope['id'],timeout=remaining(),cwd=binding['workspace'])
+            if validated(decode(result.stdout)) != envelope:
+                raise RuntimeError('wake_receipt_unverified')
+            qualified();remaining()
+        reread()
+        wire_text = 'Read inbox message '+envelope['id']
+    elif not old:
         with db: bridge.begin_command(identity,digest)
     # A repeated CLI RPC uses EXACTLY the same worker-persisted once-ID/digest/
     # original deadline. Uncertain worker fences never write a second input.
@@ -177,7 +239,7 @@ def execute_strict(bridge, command, digest):
                          '--expect-tag',binding['tag'],'--expect-workspace',binding['workspace'],
                          '--expect-created-at-ms',str(binding['created_at_ms']),
                          '--idempotency-key',identity,'--deadline-ms',str(binding['deadline_ms']),
-                         '--json','--',text,allow_failure=True,timeout=remaining())
+                         '--json','--',wire_text,allow_failure=True,timeout=remaining())
     def unique(pairs):
         value = {}
         for key,item in pairs:
@@ -192,7 +254,7 @@ def execute_strict(bridge, command, digest):
     qualified()
     remaining()
     expected = hashlib.sha256(json.dumps([binding['native_id'],identity,binding['tag'],binding['workspace'],
-        binding['created_at_ms'],binding['deadline_ms'],text],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
+        binding['created_at_ms'],binding['deadline_ms'],wire_text],ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
     fields = {'version','session_id','operation_id','request_sha256','deadline_ms','status',
               'mutation','reason','landed','submitted','consumed'}
     if (not isinstance(receipt,dict) or set(receipt) not in (fields,fields|{'replayed'})
@@ -206,9 +268,13 @@ def execute_strict(bridge, command, digest):
             or receipt.get('mutation') is not True or receipt.get('landed') is not True
             or receipt.get('submitted') is not True or receipt.get('consumed') is not None
             or receipt.get('reason') != 'submission_observed'):
-        return {'wake_pending':True,'transport':'strict-submit:v1'}
+        return {'wake_pending':True,'transport':binding['transport']}
     result = {'delivery':'native_acknowledged','delivered_at_ms':int(time.time()*1000),
               'wake_proof':{'kind':'strict_submit_v1','epoch':binding['epoch'],
                             'operation_id':binding['operation_id'],'receipt':receipt}}
+    if inbox:
+        reread()
+        result['wake_proof'].update(kind='strict_inbox_notice_v1',
+            envelope_id=envelope['id'],body_sha256=hashlib.sha256(text.encode()).hexdigest())
     with db: bridge.finish_command(identity,command,result)
     return result
