@@ -20,6 +20,7 @@ HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_c
 TRUSTED_CONVERGE_TIMEOUT_S = 90.0
 TRUSTED_RUNNING_TIMEOUT_S = 90.0
 TRUSTED_CAPTURE_TIMEOUT_S = 30.0
+TRUSTED_FULL_CAPTURE_TIMEOUT_S = 120.0
 TRUSTED_STOP_TIMEOUT_S = 45.0
 TRUSTED_CMD_TIMEOUT_S = 45.0
 TRUSTED_ACTIVE_BUDGET_S = 240.0
@@ -750,7 +751,8 @@ class Canary:
         if candidate_sha is not None:
             self.converge_timeout = min(env_num("HUB_CANARY_CONVERGE_TIMEOUT_S", TRUSTED_CONVERGE_TIMEOUT_S), TRUSTED_CONVERGE_TIMEOUT_S)
             self.running_timeout = min(env_num("HUB_CANARY_RUNNING_TIMEOUT_S", TRUSTED_RUNNING_TIMEOUT_S), TRUSTED_RUNNING_TIMEOUT_S)
-            self.capture_timeout = min(env_num("HUB_CANARY_CAPTURE_TIMEOUT_S", TRUSTED_CAPTURE_TIMEOUT_S), TRUSTED_CAPTURE_TIMEOUT_S)
+            capture_ceiling = TRUSTED_FULL_CAPTURE_TIMEOUT_S if mode == "full" else TRUSTED_CAPTURE_TIMEOUT_S
+            self.capture_timeout = min(env_num("HUB_CANARY_CAPTURE_TIMEOUT_S", capture_ceiling), capture_ceiling)
             self.stop_timeout = min(env_num("HUB_CANARY_STOP_TIMEOUT_S", TRUSTED_STOP_TIMEOUT_S), TRUSTED_STOP_TIMEOUT_S)
             self.cmd_timeout = min(env_num("HUB_CANARY_CMD_TIMEOUT_S", TRUSTED_CMD_TIMEOUT_S), TRUSTED_CMD_TIMEOUT_S)
             self.active_budget = min(env_num("HUB_CANARY_ACTIVE_BUDGET_S", TRUSTED_ACTIVE_BUDGET_S), TRUSTED_ACTIVE_BUDGET_S)
@@ -1604,6 +1606,10 @@ class Canary:
     def check_capture(self):
         self.current_stage = "capture"
         deadline = self.stage_deadline(self.capture_timeout)
+        if self.candidate_sha is not None and self.mode == "full" and self.active_deadline is not None:
+            # Keep the original active deadline and reserve the normal STOP
+            # ceiling even when an operator lowers a stage timeout.
+            deadline = min(deadline, self.active_deadline - TRUSTED_STOP_TIMEOUT_S)
         reason = "no_output"
         attempt = 0
         while time.monotonic() < deadline:

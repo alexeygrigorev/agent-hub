@@ -3409,5 +3409,119 @@ class CanaryTest(unittest.TestCase):
         self.assertFalse(c_full.output_has_marker(burst_tail_4096, engine="claude"))
 
 
+class TrustedCaptureBudgetTests(unittest.TestCase):
+    def canary(self, mode="full", candidate=True, **env):
+        from scripts import hub_start_canary as mod
+        with mock.patch.dict(os.environ):
+            for key in list(os.environ):
+                if key.startswith("HUB_CANARY_"):
+                    os.environ.pop(key)
+            os.environ.update(env)
+            return mod.Canary(mode, "capture-budget", deploy_gate=True,
+                              candidate_sha="a" * 40 if candidate else None,
+                              run_token="b" * 32 if candidate else None)
+
+    def test_full_ceiling_shell_and_periodic_defaults_and_lower_override(self):
+        from scripts import hub_start_canary as mod
+        self.assertEqual(self.canary().capture_timeout, 120)
+        self.assertEqual(self.canary("shell").capture_timeout, 30)
+        self.assertEqual(self.canary(candidate=False).capture_timeout, 120)
+        self.assertEqual(self.canary("shell", candidate=False).capture_timeout, 30)
+        self.assertEqual(self.canary(HUB_CANARY_CAPTURE_TIMEOUT_S="999").capture_timeout, 120)
+        self.assertEqual(self.canary("shell", HUB_CANARY_CAPTURE_TIMEOUT_S="999").capture_timeout, 30)
+        self.assertEqual(self.canary(HUB_CANARY_CAPTURE_TIMEOUT_S="17").capture_timeout, 17)
+        c = self.canary(HUB_CANARY_ACTIVE_BUDGET_S="999", HUB_CANARY_CLEANUP_BUDGET_S="999")
+        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget), (240, 45, 60))
+        self.assertEqual((mod.TRUSTED_RUNNING_TIMEOUT_S, mod.TRUSTED_CONVERGE_TIMEOUT_S), (90, 90))
+
+    def test_full_real_marker_after_30_seconds_can_qualify_before_original_clip(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(); c.engine = "codex"; c.active_deadline = 1240
+        clock = [1000.0]; deadlines = []
+        def run(argv, deadline=None):
+            deadlines.append(deadline); clock[0] += 20
+            output = json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+                "status": "completed", "exit_code": 0, "aggregated_output": c.marker + "\n"}}) if clock[0] >= 1060 else json.dumps({"type": "turn.started"})
+            return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": output}}}), ""
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(c, "run", side_effect=run), mock.patch.object(c, "pause"):
+            c.check_capture()
+        self.assertEqual(clock[0], 1060)
+        self.assertEqual(deadlines, [1120, 1120, 1120])
+        self.assertEqual(c.active_deadline, 1240)
+
+    def test_capture_reserves_constant_45_seconds_without_renewing_active_deadline(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(HUB_CANARY_STOP_TIMEOUT_S="1"); c.active_deadline = 240
+        clock = [180.0]; deadlines = []
+        def run(argv, deadline=None):
+            deadlines.append(deadline); clock[0] += 5
+            return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": ""}}}), ""
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(c, "run", side_effect=run), mock.patch.object(c, "pause"):
+            with self.assertRaisesRegex(mod.StageFailure, "empty_capture"):
+                c.check_capture()
+        self.assertEqual(deadlines, [195, 195, 195])
+        self.assertEqual((clock[0], c.active_deadline), (195, 240))
+        # No capture command starts when only the reserved STOP interval remains.
+        with mock.patch.object(mod.time, "monotonic", return_value=195), mock.patch.object(c, "run") as run:
+            with self.assertRaisesRegex(mod.StageFailure, "no_output"):
+                c.check_capture()
+            run.assert_not_called()
+
+    def test_no_output_still_fails_at_full_ceiling_without_a_fresh_window(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(); c.active_deadline = 240
+        clock = [0.0]; deadlines = []
+        def run(argv, deadline=None):
+            deadlines.append(deadline); clock[0] += 30
+            return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": ""}}}), ""
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(c, "run", side_effect=run), mock.patch.object(c, "pause"):
+            with self.assertRaisesRegex(mod.StageFailure, "empty_capture"):
+                c.check_capture()
+        self.assertEqual(deadlines, [120] * 4)
+        self.assertEqual((clock[0], c.active_deadline), (120, 240))
+
+    def test_marker_returned_at_clipped_deadline_is_not_a_success(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(); c.engine = "codex"; c.active_deadline = 240
+        clock = [190.0]
+        output = json.dumps({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": c.marker}})
+        def run(argv, deadline=None):
+            self.assertEqual(deadline, 195); clock[0] = 195
+            return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": output}}}), ""
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(c, "run", side_effect=run), mock.patch.object(c, "pause"):
+            with self.assertRaisesRegex(mod.StageFailure, "no_output_beyond_prompt"):
+                c.check_capture()
+        self.assertEqual(c.active_deadline, 240)
+
+    def test_execute_capture_expiry_retains_cleanup_and_archive_under_original_bounds(self):
+        from scripts import hub_start_canary as mod
+        c = self.canary(HUB_CANARY_CLEANUP_BUDGET_S="60"); clock = [0.0]; cleanup = []
+        def converge(): clock[0] = 180
+        def start(): c.start_attempted = True; c.session = SID
+        def run(argv, deadline=None):
+            self.assertEqual(deadline, 195); clock[0] += 5
+            return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": ""}}}), ""
+        def clean(deadline=None): cleanup.append(deadline); return "stopped"
+        with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(c, "verify_helper_digest"), mock.patch.object(c, "acquire_deploy_gate_lock"), \
+             mock.patch.object(c, "verify_candidate_host_release", side_effect=converge), \
+             mock.patch.object(c, "reconcile_prior_pending"), mock.patch.object(c, "start", side_effect=start), \
+             mock.patch.object(c, "wait_running"), mock.patch.object(c, "run", side_effect=run), \
+             mock.patch.object(c, "pause"), mock.patch.object(c, "cleanup", side_effect=clean), \
+             mock.patch.object(c, "archive_intake", return_value=True) as archive, \
+             mock.patch.object(c, "clear_pending_state") as clear:
+            result = c.execute()
+        self.assertEqual((result["ok"], result["stage"], result["reason"], result["cleanup"]),
+                         (False, "capture", "empty_capture", "stopped"))
+        self.assertEqual((c.active_deadline, clock[0]), (240, 195))
+        self.assertEqual(cleanup, [255])  # Original <=60s independent cleanup, not renewed active240.
+        archive.assert_called_once_with(deadline=255)
+        clear.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
