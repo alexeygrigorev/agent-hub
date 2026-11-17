@@ -1637,7 +1637,7 @@ class Bridge:
                  (('headless','h'),('interactive','i')) if mode in available[engine])
                  for engine in engines if re.fullmatch(r'[A-Za-z0-9_.-]{1,48}',engine)
                  and available[engine].intersection({'headless','interactive'})]
-        capabilities=['headless']+modes+['session-wakes:v1']+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
         workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]
@@ -1700,6 +1700,11 @@ class Bridge:
                 workspace_tags = [tag for tag in workspace_tags if tag not in qualified_set]
                 if INVENTORY_OVERFLOW_TAG not in workspace_tags:
                     workspace_tags.append(INVENTORY_OVERFLOW_TAG)
+        # Optional wake negotiation never evicts an existing resource, mode,
+        # credential, auth or repository observation from the legacy budget.
+        # A full host truthfully defers wakes while ordinary work stays usable.
+        if len(capabilities) < 32:
+            capabilities.append('session-wakes:v1')
         # Workspace inventory has its own protocol allowance; repository count
         # must never evict engine/credential hints or silently lose clone labels.
         capabilities.extend(workspace_tags)
