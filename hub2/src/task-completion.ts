@@ -52,6 +52,8 @@ export type VerificationAction = {
   summary?: string;
   gaps?: string[];
   previous_verifier_session_id?: string;
+  /** The verifier passed every criterion; only Hub's merge gate failed. */
+  merge_gate_only?: boolean;
   excluded_policy_ids: string[];
   last_reason?: string | null;
   /** Operator re-evaluation round: verifier keys (and so session ids) never

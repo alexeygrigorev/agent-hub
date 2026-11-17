@@ -226,6 +226,7 @@ test('an unmet criterion is sent back to the original worker with the verifier g
     const rejected=completion(f,id);
     assert.equal(intakeRow(f,id).status,'failed');assert.equal(rejected.verification.state,'failed');
     assert.deepEqual(rejected.verification.gaps,['The requested export is missing.']);
+    assert.equal(rejected.verification.merge_gate_only,undefined,'a verifier gap is never released by an operator done');
     assert.equal(rejected.continuation.state,'pending');
     await f.project.alarm();
     const continuation=activeSaga(f,id),prompt=JSON.parse(continuation.launch_spec_json).prompt;
@@ -1268,9 +1269,21 @@ test('work merged in other repositories satisfies the gate when the newest proof
     await post('content',proofOf('org/content',6));
     await post('site-red',proofOf('org/site',1,{checks_state:'failure',checks_successful:1,checks_failed:1}));
     const red=await state();
-    assert.equal(red.ok,false);assert(red.problems.every((p:string)=>p.startsWith('org/site: ')),JSON.stringify(red.problems));
+    assert.equal(red.ok,false);assert(red.problems.includes('org/site: checks are not green for the exact head SHA'),JSON.stringify(red.problems));
     await post('site',proofOf('org/site',1));
+    const uncited=await state();
+    assert.equal(uncited.ok,false,'a PR outside the intake project must be tied to the intake');
+    assert(uncited.problems.some((p:string)=>p.includes('https://github.com/org/content/pull/6 is outside org/completion and not cited')));
+    const note=async(key:string,text:string)=>assert.equal((await f.call('/api/intakes/'+id+'/events','POST',{key,note:text})).status,201);
+    await note('cite-12','Also see https://github.com/org/content/pull/61 and https://github.com/org/site/pull/12');
+    assert.equal((await state()).ok,false,'a longer PR number is not a citation');
+    await note('cite','Merged https://github.com/org/content/pull/6 and https://github.com/org/site/pull/1');
     const green=await state();assert.equal(green.ok,true,JSON.stringify(green.problems));
+    // A newer observation that found no PR blocks again (rework without a PR).
+    await post('rework',{kind:'merge_gate',repository:'org/completion',checked_at:mergeProof.checked_at,observation_error:'no pull request of org/completion is cited in the intake'});
+    assert.equal((await state()).ok,false);
+    await post('site-again',proofOf('org/site',1));
+    assert.equal((await state()).ok,true);
     await start(f,id,'first');
     const first=await run(f,id);await claim(f,id,first.session_id);
     await finishClaimed(f,id,first);
@@ -1288,11 +1301,14 @@ test('an operator done accepts a verified intake that only the merge gate held b
     const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
     assert.equal(intakeRow(f,id).status,'failed');
     assert(completion(f,id).verification.gaps.every((g:string)=>g.startsWith('Merge gate: ')));
+    assert.equal(completion(f,id).verification.merge_gate_only,true);
     const close=async(key:string)=>{const shown=await json(await f.call('/api/intakes/'+id));
       return f.call('/api/intakes/'+id,'POST',{key,expected_version:shown.task.control.version,status:'done',note:'Developer live check passed'});};
     const refused=await close('done-1');
     assert.equal(refused.status,409);assert.equal((await json(refused)).error,'merge_gate');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'cite',note:'Work merged in https://github.com/org/site/pull/1'});
     await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site',evidence:{...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'}});
+    assert.equal(completion(f,id).verification.merge_gate_only,true);
     const done=await close('done-2');
     assert.equal(done.status,200,JSON.stringify(await done.clone().json()));
     assert.equal(intakeRow(f,id).status,'accepted');
