@@ -25,11 +25,13 @@ import sys
 import tempfile
 import time
 import uuid
+import io
 from pathlib import Path
 
 _SCRIPTS = str(Path(__file__).resolve().parent)
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
+import phase7_original_work  # noqa: E402
 import hydrogen_acquire  # noqa: E402  (sibling pure modules; no import-time I/O)
 import hydrogen_frame  # noqa: E402
 import hydrogen_helper  # noqa: E402
@@ -1944,7 +1946,7 @@ def _persist_manifest(manifest_path, manifest):
 
 
 def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest, manifest_path,
-              clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports, hydrogen_ctx=None):
+              clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports, hydrogen_ctx=None, original_ac=False):
     err = rec['errors']
     sample = rec['n']
     rec['create_key'] = 'acc10-create-%s-%d' % (run_id, sample)
@@ -1955,7 +1957,13 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
     brief_path = Path(output_dir) / ('brief-%d.txt' % sample)
     ac_path = Path(output_dir) / ('ac-%d.txt' % sample)
     helper_path = helper_path_for(output_dir, sample)
-    brief_text, ac_text = make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path, helper_path)
+    if original_ac:
+        brief_text = ('Original Phase7 source-audit sample. Follow maintained first-action instructions. '
+                      'Wait for Root one normal Hub message before source-audit work. '
+                      'Do not run a helper, finish or close this intake before that message.')
+        ac_text = 'Perform the source audit after Root message; remain running for normal owned STOP.'
+    else:
+        brief_text, ac_text = make_child_brief_and_ac(run_id, sample, parent_intake_id, challenge_path, helper_path)
     exclusive_write_private(brief_path, brief_text.encode('utf-8'))
     exclusive_write_private(ac_path, ac_text.encode('utf-8'))
 
@@ -1985,28 +1993,38 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         return
     sample_manifest['child_intake_id'] = child_id
 
-    # Seed 32-byte random challenge AFTER freezing brief/AC and BEFORE start.
-    challenge32 = os.urandom(32)
-    exclusive_write_private(challenge_path, challenge32, mode=0o400)
-    sample_manifest['challenge_sha256'] = hashlib.sha256(challenge32).hexdigest()
-    # Root-pinned helper: rendered and pinned AFTER child creation and BEFORE dispatch (the brief only names its
-    # path). The worker must copy these exact bytes; the result artifact itself is never pre-created.
-    helper_bytes = hydrogen_helper.render_helper({
-        'aplexer_binary': (hydrogen_ctx or {}).get('aplexer_binary'),
-        'challenge_path': str(challenge_path),
-        'child_intake_id': child_id,
-        'machine_id': HOST,
-        'parent_intake_id': parent_intake_id,
-        'project': PROJECT,
-        'run_id': run_id,
-        'sample': sample,
-    })
-    exclusive_write_private(helper_path, helper_bytes)
-    sample_manifest['helper_sha256'] = hashlib.sha256(helper_bytes).hexdigest()
+    if original_ac:
+        challenge32 = None
+        helper_bytes = phase7_original_work.seed(
+            sys.modules[__name__], helper_path, child_id, parent_intake_id, run_id, sample,
+            (hydrogen_ctx or {})['aplexer_binary'])
+        sample_manifest['helper_sha256'] = hashlib.sha256(helper_bytes).hexdigest()
+    else:
+        # Seed 32-byte random challenge AFTER freezing brief/AC and BEFORE start.
+        challenge32 = os.urandom(32)
+        exclusive_write_private(challenge_path, challenge32, mode=0o400)
+        sample_manifest['challenge_sha256'] = hashlib.sha256(challenge32).hexdigest()
+        # Root-pinned helper: rendered and pinned AFTER child creation and BEFORE dispatch (the brief only names its
+        # path). The worker must copy these exact bytes; the result artifact itself is never pre-created.
+        helper_bytes = hydrogen_helper.render_helper({
+            'aplexer_binary': (hydrogen_ctx or {}).get('aplexer_binary'),
+            'challenge_path': str(challenge_path),
+            'child_intake_id': child_id,
+            'machine_id': HOST,
+            'parent_intake_id': parent_intake_id,
+            'project': PROJECT,
+            'run_id': run_id,
+            'sample': sample,
+        })
+        exclusive_write_private(helper_path, helper_bytes)
+        sample_manifest['helper_sha256'] = hashlib.sha256(helper_bytes).hexdigest()
     _persist_manifest(manifest_path, manifest)
 
     argv = build_start_argv(workspace, child_id, rec['start_key'])
     t0 = clock()
+    if original_ac:
+        rec['_start_wall_ms'] = int(time.time() * 1000)
+        rec['_source_commit'] = manifest['commit']
     deadline = t0 + RUNNING_BUDGET_S
     rec['_start_argv'] = list(argv)
     try:
@@ -2138,6 +2156,10 @@ def one_start(r, rec, run_id, parent_intake_id, workspace, output_dir, manifest,
         err.append('native workspace %r != %s' % (native_ws, actual_workspace))
         return
 
+    if original_ac:
+        phase7_original_work.observe(sys.modules[__name__], r, rec, run_id, sample, parent_intake_id,
+                                     child_id, helper_path, helper_bytes, clock, sleep)
+        return
     engine = rec.get('engine')
     if engine == 'antigravity' and rec.get('model') == HYDROGEN_MODEL:
         transport = (capture_transports or {}).get(engine)
@@ -2521,12 +2543,13 @@ def summarize(recs, evidence_problems):
 
 
 def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=None,
-        intake=None, workspace=None, output_dir=None, plan_only=False):
+        intake=None, workspace=None, output_dir=None, plan_only=False, original_ac=False):
     if out is None:
         out = sys.stdout
     window = {'start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
     run_id = str(uuid.uuid4())
-    evidence_problems, evidence_digest, capture_transports = checked_native_evidence(evidence_path, commit)
+    evidence_check = phase7_original_work.checked_evidence if original_ac else checked_native_evidence
+    evidence_problems, evidence_digest, capture_transports = evidence_check(evidence_path, commit)
     problems = list(evidence_problems)
     if not isinstance(workspace, str) or not workspace.startswith('/') or '\x00' in workspace:
         problems.append('explicit absolute --workspace required')
@@ -2544,7 +2567,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
             before = sample_alerts(r)
         except Exception as exc:
             before = None
-            problems.append('alert baseline unavailable: %s' % exc)
+            problems.append('alert baseline unavailable' if original_ac else 'alert baseline unavailable: %s' % exc)
     else:
         before = None
 
@@ -2559,7 +2582,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         return 1
     manifest_path = out_dir / ('manifest-%s.json' % run_id)
     manifest = {
-        'schema': 'phase7_native_run_manifest_v2',
+        'schema': 'phase7_original_run_manifest_v1' if original_ac else 'phase7_native_run_manifest_v2',
         'run_id': run_id,
         'parent_intake_id': intake,
         'requested_workspace': workspace,
@@ -2582,18 +2605,21 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         print(json.dumps({'run_id': run_id, 'manifest': str(manifest_path), 'plan': plan}, indent=2), file=out)
         return 0
 
-    # Durably provisioned private parent for the Hydrogen once-only key fences (O_EXCL records + dir fsync).
-    fence_dir = out_dir / 'hydrogen-fence'
-    try:
-        os.mkdir(str(fence_dir), 0o700)
-        fsync_dir(out_dir)
-        fence_stat = os.lstat(fence_dir)
-        if not stat.S_ISDIR(fence_stat.st_mode) or stat.S_IMODE(fence_stat.st_mode) != 0o700:
-            raise OSError('fence directory is not private 0700')
-    except OSError as exc:
-        print('ACCEPTANCE FAIL (preconditions): Hydrogen fence directory: %s' % exc, file=out)
-        return 1
-    hydrogen_ctx = {'aplexer_binary': aplexer_binary, 'fence_dir': fence_dir, 'home': os.path.expanduser('~')}
+    if original_ac:
+        hydrogen_ctx = {'aplexer_binary': aplexer_binary}
+    else:
+        # Durably provisioned private parent for the Hydrogen once-only key fences (O_EXCL records + dir fsync).
+        fence_dir = out_dir / 'hydrogen-fence'
+        try:
+            os.mkdir(str(fence_dir), 0o700)
+            fsync_dir(out_dir)
+            fence_stat = os.lstat(fence_dir)
+            if not stat.S_ISDIR(fence_stat.st_mode) or stat.S_IMODE(fence_stat.st_mode) != 0o700:
+                raise OSError('fence directory is not private 0700')
+        except OSError as exc:
+            print('ACCEPTANCE FAIL (preconditions): Hydrogen fence directory: %s' % exc, file=out)
+            return 1
+        hydrogen_ctx = {'aplexer_binary': aplexer_binary, 'fence_dir': fence_dir, 'home': os.path.expanduser('~')}
 
     recs = []
     seen_intakes, seen_sessions, seen_natives = set(), set(), set()
@@ -2605,7 +2631,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
                 one_start(
                     r, rec, run_id, intake, workspace, out_dir, manifest, manifest_path,
                     clock, sleep, seen_intakes, seen_sessions, seen_natives, capture_transports,
-                    hydrogen_ctx=hydrogen_ctx,
+                    hydrogen_ctx=hydrogen_ctx, original_ac=original_ac,
                 )
             except Exception as exc:
                 rec['errors'].append('start crashed: %s' % exc)
@@ -2641,7 +2667,7 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
                 rec['errors'].append('cleanup uncertain: could not determine whether start was accepted; original key ' + rec['start_key'])
 
     window['end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    evidence_problems, post_digest, _ = checked_native_evidence(evidence_path, commit)
+    evidence_problems, post_digest, _ = evidence_check(evidence_path, commit)
     post_problems = list(evidence_problems)
     if post_digest != evidence_digest:
         post_problems.append('operator-validated evidence bundle changed during run')
@@ -2668,6 +2694,9 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
         alert_watermarks={'before': before, 'after': after, 'required_post_observed_at_ms': post_cutoff_ms},
         parent_intake_id=intake,
     )
+    if original_ac:
+        exclusive_write_private(out_dir / 'private-result.json', canonical_json_bytes(summary) + b'\n')
+        summary = phase7_original_work.public_summary(summary)
     print(json.dumps(summary, indent=2, sort_keys=True, default=str), file=out)
     print('ACCEPTANCE %s' % ('PASS' if summary['ok'] else 'FAIL'), file=out)
     return 0 if summary['ok'] else 1
@@ -2675,6 +2704,8 @@ def run(r, evidence_path, commit, clock=time.monotonic, sleep=time.sleep, out=No
 
 def main(argv=None, runner=None):
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--formal', action='store_true', help='Explicit later typed/Hydrogen qualification mode; original AC is default')
+    ap.add_argument('--attach-output', action='store_true', help='Append actual sanitized original-mode stdout as keyed intake notes')
     ap.add_argument('--live', action='store_true', help='really start ten sessions (also needs HUB_ACCEPTANCE_READY=1)')
     ap.add_argument('--plan', action='store_true', help='read-only plan mode: render manifest and argv without invoking Hub')
     ap.add_argument('--evidence', help='Root-validated same-commit native-pane/deployment/canary/CI evidence JSON')
@@ -2689,15 +2720,46 @@ def main(argv=None, runner=None):
     if args.plan:
         return run(
             runner or Runner(alerts_cmd=args.alerts_cmd), args.evidence, args.commit,
-            intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir, plan_only=True,
+            intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir, plan_only=True, original_ac=not args.formal,
         )
     if not args.live or os.environ.get('HUB_ACCEPTANCE_READY') != '1':
         print('refusing: live run needs --live and HUB_ACCEPTANCE_READY=1 (orchestrator readiness)', file=sys.stderr)
         return 2
-    return run(
-        runner or Runner(alerts_cmd=args.alerts_cmd), args.evidence, args.commit,
-        intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir,
-    )
+    active_runner = runner or Runner(alerts_cmd=args.alerts_cmd)
+    if args.formal:
+        return run(active_runner, args.evidence, args.commit,
+                   intake=args.intake_task_id, workspace=ws, output_dir=args.output_dir)
+    if not args.output_dir or Path(args.output_dir).exists():
+        print('UNKNOWN: original mode requires a new private output directory', file=sys.stderr)
+        return 2
+    buffer = io.StringIO()
+    class Tee:
+        def write(self, text):
+            buffer.write(text)
+            return sys.stdout.write(text)
+        def flush(self):
+            sys.stdout.flush()
+    print(json.dumps({'mode': 'original_ac', 'selected_commit': args.commit if valid_hex40(args.commit) else 'UNKNOWN',
+        'runner_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        'work_helper_sha256': hashlib.sha256(Path(phase7_original_work.__file__).read_bytes()).hexdigest(),
+        'window_begin': datetime.datetime.now(datetime.timezone.utc).isoformat()}, sort_keys=True), file=Tee())
+    try:
+        code = run(active_runner, args.evidence, args.commit, intake=args.intake_task_id,
+                   workspace=ws, output_dir=args.output_dir, original_ac=True, out=Tee())
+    except Exception:
+        print('ACCEPTANCE UNKNOWN: interrupted original check; retained custody needs review', file=Tee())
+        code = 1
+    print(json.dumps({'core_exit_code': code, 'window_end': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'output_attachment': 'PENDING_UNTIL_ACK'}, sort_keys=True), file=Tee())
+    attached = phase7_original_work.retain_and_attach(
+        sys.modules[__name__], active_runner, args.output_dir, args.intake_task_id,
+        buffer.getvalue(), code, attach=args.attach_output)
+    final = code if attached else 1
+    phase7_original_work.write_once(Path(args.output_dir) / 'final-process-result.json',
+        canonical_json_bytes({'exit_code': final, 'core_exit_code': code,
+                              'attachment': 'APPENDED' if attached else 'PENDING',
+                              'stdout_sha256': hashlib.sha256(buffer.getvalue().encode()).hexdigest()}))
+    return final
 
 
 if __name__ == '__main__':

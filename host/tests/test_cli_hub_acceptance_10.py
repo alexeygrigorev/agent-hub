@@ -623,7 +623,7 @@ class V2NativeAndLineageTests(Harness):
         buf = io.StringIO()
         with mock.patch('sys.stdout', buf):
             rc = acc.main([
-                '--plan',
+                '--plan', '--formal',
                 '--evidence', native_evidence(),
                 '--commit', COMMIT,
                 '--workspace', str(self.base_ws),
