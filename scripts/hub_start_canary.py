@@ -1302,10 +1302,14 @@ def read_at_limited(dir_fd, name, limit=65536):
     return data.decode("utf-8", "replace")
 
 
-def open_cgroup_dir(group):
-    """Directory fd of a cgroup reached component-by-component without following symlinks."""
+def open_cgroup_dir(group, root_fd=None):
+    """Directory fd of a cgroup reached component-by-component without following symlinks.
+
+    With root_fd the walk starts from (a duplicate of) that already-held cgroup mount root, so the
+    returned directory is provably below the root whose identity the caller recorded.
+    """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(CGROUP_ROOT, flags)
+    fd = os.open(CGROUP_ROOT, flags) if root_fd is None else os.dup(root_fd)
     try:
         for part in group.split("/")[1:]:
             nxt = os.open(part, flags, dir_fd=fd)
@@ -1315,6 +1319,40 @@ def open_cgroup_dir(group):
         os.close(fd)
         raise
     return fd
+
+
+def parse_fdinfo_mount_id(text):
+    """The single positive decimal mnt_id of a /proc/self/fdinfo/<fd> text; ValueError otherwise."""
+    values = [line.partition(":")[2].strip() for line in text.splitlines() if line.startswith("mnt_id:")]
+    if len(values) != 1 or not values[0].isdecimal() or int(values[0]) <= 0:
+        raise ValueError("mnt_id")
+    return int(values[0])
+
+
+def read_fd_mount_id(fd):
+    return parse_fdinfo_mount_id(read_text_limited(f"{PROC_ROOT}/self/fdinfo/{fd}"))
+
+
+PROVIDED_COORDINATES = (
+    "cgroup_namespace_device", "cgroup_namespace_inode", "mount_namespace_device", "mount_namespace_inode",
+    "cgroup_root_device", "cgroup_root_inode", "cgroup_mount_id",
+)
+
+
+def provided_coordinates(identity, boot_id):
+    """PRESENT known coordinates of a provided SDK containment identity, strictly typed; ValueError otherwise.
+
+    The boot id must be the current one; every present coordinate must be a positive int (never bool/float/
+    string/null) and no unknown key is accepted. Missing optional coordinates stay missing (never invented).
+    """
+    if not isinstance(identity, dict) or type(identity.get("boot_id")) is not str or identity["boot_id"] != boot_id:
+        raise ValueError("boot")
+    if set(identity) - {"boot_id", *PROVIDED_COORDINATES}:
+        raise ValueError("unknown coordinate")
+    present = {key: identity[key] for key in PROVIDED_COORDINATES if key in identity}
+    if any(type(value) is not int or value <= 0 for value in present.values()):
+        raise ValueError("coordinate type")
+    return present
 
 
 def census_signature(census):
@@ -1486,38 +1524,6 @@ class PhysicalAdmission:
     def namespace_inode(self, name):
         return os.stat(f"{PROC_ROOT}/self/ns/{name}").st_ino
 
-    def measure_pid(self, row, pid):
-        """One identity+memory sample for a census row's workload; raises OSError/ValueError if unknowable."""
-        cgroup = row["workload_cgroup"]
-        if (not isinstance(cgroup, str) or not cgroup.startswith("/") or "\0" in cgroup
-                or ".." in cgroup.split("/")):
-            raise ValueError("cgroup")
-        group = f"{CGROUP_ROOT}{cgroup}"
-        stat_text = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
-        fields = stat_text[stat_text.rindex(")") + 2:].split()
-        start_ticks = int(fields[19])
-        if f"0::{cgroup}" not in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines():
-            raise ValueError("pid not in cgroup")
-        members = {int(x) for x in read_text_limited(f"{group}/cgroup.procs").split()}
-        if pid not in members:
-            raise ValueError("pid not a member")
-        status = {}
-        for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
-            if ":" in line:
-                key, _, value = line.partition(":")
-                status[key] = value.split()
-        rss_anon = int(status["RssAnon"][0]) * 1024
-        mem_stat = {}
-        for line in read_text_limited(f"{group}/memory.stat").splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1].isdigit():
-                mem_stat[parts[0]] = int(parts[1])
-        current = int(read_text_limited(f"{group}/memory.current").strip())
-        return {
-            "start_ticks": start_ticks, "members": frozenset(members), "rss_anon": rss_anon,
-            "group_anon": mem_stat["anon"], "group_current": current,
-        }
-
     def read_launcher_caps(self, deadline):
         """Actual new-worker caps of the selected Host launcher (seam; production reads the Host config)."""
         return read_launcher_caps(selected_launcher_config_path(), self.machine)
@@ -1627,8 +1633,16 @@ class PhysicalAdmission:
         return {"kind": "workload_current", "pid": pid, "group": derived, "premise": "identity_absent"}
 
     def sample_coordinator(self, target, boot_id, ns_ids):
-        """One fresh kernel sample of a chosen kernel-proven PID (coordinator or current workload): identity plus anonymous/cap accounting."""
+        """One fresh kernel sample of a chosen kernel-proven PID: identity plus anonymous/cap accounting.
+
+        Used for a coordinator, a current-proof workload and (target["provided"] set) a workload whose
+        recorded identity is PROVIDED. The provided sample additionally holds the cgroup MOUNT ROOT fd
+        (dev/ino/mnt_id) and checks every present recorded coordinate against the real kernel object. Only
+        the CHOSEN pid's identity and membership are proven; the other members of its cgroup are never compared.
+        """
         pid, group = target["pid"], target["group"]
+        provided = target.get("provided")
+        fd = root_fd = None
         try:
             if read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip() != boot_id:
                 raise StageFailure("admission", "resident_identity_unknown")
@@ -1638,46 +1652,75 @@ class PhysicalAdmission:
                 raise StageFailure("admission", "resident_identity_unknown")
             start_ticks = int(fields[19])
             groups = [line[3:] for line in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines() if line.startswith("0::")]
-            namespaces = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}").st_ino for name in ("cgroup", "mnt")}
+            ns_stats = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}") for name in ("cgroup", "mnt")}
+            namespaces = {name: st.st_ino for name, st in ns_stats.items()}
+            if groups != [group] and provided is not None:
+                raise StageFailure("admission", "resident_measurement_unknown")  # the provided pid is not in its recorded cgroup
             if groups != [group] or namespaces != ns_ids:
                 raise StageFailure("admission", "resident_identity_unknown")
-            fd = open_cgroup_dir(group)
-            try:
-                opened = os.fstat(fd)
-                members = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
-                mem_stat = {}
-                for line in read_at_limited(fd, "memory.stat").splitlines():
-                    parts = line.split()
-                    if len(parts) == 2 and parts[1].isdigit():
-                        mem_stat[parts[0]] = int(parts[1])
-                current = int(read_at_limited(fd, "memory.current").strip())
-                maximum = read_at_limited(fd, "memory.max").strip()
-                status = {}
-                for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
-                    if ":" in line:
-                        key, _, value = line.partition(":")
-                        status[key] = value.split()
-                if len(status["RssAnon"]) != 2 or status["RssAnon"][1] != "kB" or not status["RssAnon"][0].isdecimal():
-                    raise ValueError("RssAnon")
-                rss_anon = int(status["RssAnon"][0]) * 1024
-                raw_again = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
-                after = os.fstat(fd)
-                on_path = os.stat(f"{CGROUP_ROOT}{group}")
-                members_again = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
-            finally:
-                os.close(fd)
+            root = mount_id = None
+            if provided is not None:
+                root_fd = os.open(CGROUP_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+                root, mount_id = os.fstat(root_fd), read_fd_mount_id(root_fd)
+                root_path = os.stat(CGROUP_ROOT)
+                if (root_path.st_dev, root_path.st_ino) != (root.st_dev, root.st_ino):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                actual = {
+                    "cgroup_namespace_device": ns_stats["cgroup"].st_dev, "cgroup_namespace_inode": ns_stats["cgroup"].st_ino,
+                    "mount_namespace_device": ns_stats["mnt"].st_dev, "mount_namespace_inode": ns_stats["mnt"].st_ino,
+                    "cgroup_root_device": root.st_dev, "cgroup_root_inode": root.st_ino, "cgroup_mount_id": mount_id,
+                }
+                if any(actual[key] != value for key, value in provided.items()):
+                    raise StageFailure("admission", "resident_identity_unknown")
+            fd = open_cgroup_dir(group, root_fd) if root_fd is not None else open_cgroup_dir(group)
+            opened = os.fstat(fd)
+            members = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            mem_stat = {}
+            for line in read_at_limited(fd, "memory.stat").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    mem_stat[parts[0]] = int(parts[1])
+            current = int(read_at_limited(fd, "memory.current").strip())
+            maximum = None if provided is not None else read_at_limited(fd, "memory.max").strip()  # provided rows keep the recorded cap
+            status = {}
+            for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    status[key] = value.split()
+            if len(status["RssAnon"]) != 2 or status["RssAnon"][1] != "kB" or not status["RssAnon"][0].isdecimal():
+                raise ValueError("RssAnon")
+            rss_anon = int(status["RssAnon"][0]) * 1024
+            raw_again = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+            after = os.fstat(fd)
+            on_path = os.stat(f"{CGROUP_ROOT}{group}")
+            members_again = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            if provided is not None:
+                root_after, mount_after, root_path_after = os.fstat(root_fd), read_fd_mount_id(root_fd), os.stat(CGROUP_ROOT)
+                if ((root_after.st_dev, root_after.st_ino, mount_after) != (root.st_dev, root.st_ino, mount_id)
+                        or (root_path_after.st_dev, root_path_after.st_ino) != (root.st_dev, root.st_ino)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+        except (OSError, ValueError, KeyError, IndexError):
+            raise StageFailure("admission", "resident_measurement_unknown")
+        finally:
+            for held in (fd, root_fd):
+                if held is not None:
+                    os.close(held)
+        try:
             if (int(raw_again[raw_again.rindex(")") + 2:].split()[19]) != start_ticks
                     or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
                     or (on_path.st_dev, on_path.st_ino) != (opened.st_dev, opened.st_ino)):
                 raise StageFailure("admission", "resident_identity_unstable")
             if pid not in members or pid not in members_again:
-                raise StageFailure("admission", "resident_identity_unknown")
+                raise StageFailure("admission", "resident_measurement_unknown" if provided is not None else "resident_identity_unknown")
+            identity = (boot_id, start_ticks, group, opened.st_dev, opened.st_ino, tuple(sorted(namespaces.items())))
+            if provided is not None:
+                identity += (pid, ns_stats["cgroup"].st_dev, ns_stats["mnt"].st_dev, root.st_dev, root.st_ino, mount_id)
             return {
-                "identity": (boot_id, start_ticks, group, opened.st_dev, opened.st_ino, tuple(sorted(namespaces.items()))),
+                "identity": identity,
                 "start_ticks": start_ticks, "rss_anon": rss_anon, "group_anon": mem_stat["anon"], "group_current": current,
-                "cap": int(maximum) if maximum.isdecimal() and int(maximum) > 0 else None,
+                "cap": None if maximum is None else (int(maximum) if maximum.isdecimal() and int(maximum) > 0 else None),
             }
-        except (OSError, ValueError, KeyError, IndexError):
+        except (ValueError, KeyError, IndexError):
             raise StageFailure("admission", "resident_measurement_unknown")
 
     def coordinator_reserve(self, row, target, boot_id, ns_ids, boot_now, btime, deadline):
@@ -1723,13 +1766,17 @@ class PhysicalAdmission:
     def revalidate_fallbacks(self, census, targets, boot_id, ns_ids, deadline, *, hub_rows=None, native_ids=None):
         """Final bounded check: every kernel-derived premise, selection and chosen identity is still the sampled one.
 
-        Covers native-coordinator fallbacks and current-proof workloads (absent recorded identity). For the
-        latter the managed in-flight rows are re-read once as well and must not gain or lose an uncovered row.
+        Covers native-coordinator fallbacks, current-proof workloads (absent recorded identity) and measured
+        provided-identity workloads. For the latter two the managed in-flight rows are re-read once as well and
+        must not gain or lose an uncovered row. Returns the extra reserve (bytes, never negative) a young provided
+        row must add because its final anonymous usage is lower than the credited one; the caller adds it ONCE
+        before the final MemAvailable sample.
         """
         derived = [(row, targets[row["id"]]) for row in census
-                   if targets.get(row.get("id"), {}).get("kind") in ("coordinator", "workload_current")]
+                   if targets.get(row.get("id"), {}).get("kind") in ("coordinator", "workload_current")
+                   or targets.get(row.get("id"), {}).get("proof") == "provided"]
         if not derived:
-            return
+            return 0
         self.admission_time_left(deadline)
         final = self.read_census(deadline)
         try:
@@ -1738,14 +1785,19 @@ class PhysicalAdmission:
             raise StageFailure("admission", "resident_fallback_changed")  # duplicate/invalid final id: ambiguous snapshot
         if changed:
             raise StageFailure("admission", "resident_fallback_changed")
-        if hub_rows is not None and any(target["kind"] == "workload_current" for _row, target in derived):
+        if hub_rows is not None and any(target["kind"] == "workload_current" or target.get("proof") == "provided" for _row, target in derived):
             self.admission_time_left(deadline)
             freeze = lambda rows: sorted(json.dumps([r.get(k) for k in ("id", "native_id", "workspace", "cwd", "host", "machine_id", "machine")], default=str)
                                          for r in self.uncovered_inflight_rows(rows, native_ids))
             if freeze(self.read_hub_rows(deadline)) != freeze(hub_rows):
                 raise StageFailure("admission", "resident_fallback_changed")
+        final_rows = {r["id"].lower(): r for r in final}
+        delta = 0
         for row, target in derived:
             self.admission_time_left(deadline)
+            if target.get("proof") == "provided":
+                delta += self.revalidate_provided(final_rows[row["id"].lower()], target, boot_id, ns_ids)
+                continue
             if target["kind"] == "coordinator":
                 if row.get("workload_pid") is not None and not self.workload_pid_absent(row["workload_pid"]):
                     raise StageFailure("admission", "resident_fallback_changed")
@@ -1755,6 +1807,34 @@ class PhysicalAdmission:
             sample = self.sample_coordinator(target, boot_id, ns_ids)
             if sample["identity"] != target["identity"] or (target["cap"] is not None and sample["cap"] != target["cap"]):
                 raise StageFailure("admission", "resident_fallback_changed")
+        return delta
+
+    def revalidate_provided(self, final_row, target, boot_id, ns_ids):
+        """Final sample of a measured provided workload; returns the (non-negative) extra young reserve to add once.
+
+        The re-read PRESENT recorded coordinates are validated strictly and against the final kernel objects before
+        any credit is accepted. Credit is min(first, second, final) accounting anon (shared: the chosen PID's own
+        RssAnon, unshared: the validated group anon); the unchanged cap-minus-credit formula is recomputed and only
+        an increase over the initially reserved extra is returned. A rising anon never lowers a reserve.
+        """
+        try:
+            provided = provided_coordinates(final_row.get("containment_cgroup_identity"), boot_id)
+        except ValueError:
+            raise StageFailure("admission", "resident_identity_unknown")
+        target["provided"] = provided
+        sample = self.sample_coordinator(target, boot_id, ns_ids)
+        if sample["identity"] != target["identity"]:
+            raise StageFailure("admission", "resident_fallback_changed")
+        if not target["credited"]:
+            return 0  # no credit was taken (whole recorded cap reserved): nothing a later sample can lower
+        group_ok = 0 < sample["group_anon"] <= sample["group_current"]
+        if sample["rss_anon"] <= 0 or (not target["shared"] and not group_ok):
+            raise StageFailure("admission", "resident_anonymous_unknown")
+        if target["mature"]:
+            return 0
+        final_anon = sample["rss_anon"] if target["shared"] else sample["group_anon"]
+        credit = min(target["anon"], final_anon)
+        return max(0, max(0, target["recorded_cap"] - credit) - target["extra"])
 
     def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now, *, target=None, btime=None, deadline=None):
         """(extra bytes, kind) this current native row may still claim beyond what MemAvailable already reflects.
@@ -1778,15 +1858,25 @@ class PhysicalAdmission:
         identity = row.get("containment_cgroup_identity")
         if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
             raise StageFailure("admission", "resident_identity_unknown")
-        for key, name in (("cgroup_namespace_inode", "cgroup"), ("mount_namespace_inode", "mnt")):
-            if key in identity and type(identity[key]) is int and identity[key] != ns_ids[name]:
-                raise StageFailure("admission", "resident_identity_unknown")
         try:
-            first = self.measure_pid(row, pid)
-            second = self.measure_pid(row, pid)
-        except (OSError, ValueError, KeyError, IndexError):
+            provided = provided_coordinates(identity, boot_id)
+        except ValueError:
+            raise StageFailure("admission", "resident_identity_unknown")
+        recorded = row.get("workload_cgroup")
+        group = relative_cgroup(recorded)
+        if group is None or group != recorded:
             raise StageFailure("admission", "resident_measurement_unknown")
-        if first["start_ticks"] != second["start_ticks"] or first["members"] != second["members"] or pid not in first["members"]:
+        # Chosen-PID kernel proof (the strong sampler shared with the coordinator path): identity, held scope and
+        # mount-root fds, namespaces and membership of THIS pid, twice under the same deadline. Other members of the
+        # cgroup may join or leave freely; only the chosen identity must be stable.
+        target.update(group=group, provided=provided)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        first = self.sample_coordinator(target, boot_id, ns_ids)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        second = self.sample_coordinator(target, boot_id, ns_ids)
+        if first["identity"] != second["identity"]:
             raise StageFailure("admission", "resident_identity_unstable")
         ticks = os.sysconf("SC_CLK_TCK")
         age = boot_now - first["start_ticks"] / ticks
@@ -1801,11 +1891,13 @@ class PhysicalAdmission:
         else:
             mature_ok = pid_ok and group_ok
             anon = min(first["group_anon"], second["group_anon"])
-        if age >= MATURE_RESIDENT_AGE_S and mature_ok:
-            return 0, "mature"
-        if cap is None:
+        mature = age >= MATURE_RESIDENT_AGE_S and mature_ok
+        if not mature and cap is None:
             raise StageFailure("admission", "resident_bound_unknown")
-        return (max(0, cap - anon) if mature_ok else cap), "young"
+        extra = 0 if mature else (max(0, cap - anon) if mature_ok else cap)
+        target.update(proof="provided", identity=first["identity"], credited=mature_ok, mature=mature, shared=shared,
+                      anon=anon, recorded_cap=cap, extra=extra)
+        return extra, ("mature" if mature else "young")
 
     def uncovered_inflight_rows(self, hub_rows, native_ids):
         """Current Hub in-flight rows on this machine with no native census row yet."""
@@ -1953,7 +2045,7 @@ class PhysicalAdmission:
             disk_headroom = room if disk_headroom is None else min(disk_headroom, room)
         # Final fresh RAM sample after every slow read, before any spawn.
         self.admission_time_left(deadline)
-        self.revalidate_fallbacks(census, targets, boot_id, ns_ids, deadline, hub_rows=hub_rows, native_ids=native_ids)
+        reserve += self.revalidate_fallbacks(census, targets, boot_id, ns_ids, deadline, hub_rows=hub_rows, native_ids=native_ids)
         self.admission_time_left(deadline)
         available = self.sample_mem_available()
         if available - reserve - worker_bytes < ADMISSION_RAM_FLOOR_BYTES:
