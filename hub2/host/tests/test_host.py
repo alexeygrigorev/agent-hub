@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
+from agent_hub_host import resource_admission
 from agent_hub_host.client import ApiError, Client, save_config
 from agent_hub_host.cli import main as cli_main
 
@@ -121,6 +122,11 @@ class HostTests(unittest.TestCase):
         auth = patch('agent_hub_host.agent.local_claude_missing_contexts', return_value=[])
         self.auth_observer = auth.start()
         self.addCleanup(auth.stop)
+        # Lifecycle fixtures run against synthetic physical-RAM samples; dedicated
+        # admission tests narrow this holder to exact boundaries. Foreign fixtures
+        # reuse HostTests.setUp and inherit the same synthetic sampler.
+        self.sample_available = [64 * 1024**3]
+        self.bridge.resource_sample = lambda deadline: self.sample_available[0]
 
     def tearDown(self):
         # This fixture owns the asynchronous census and its thread-local journal.
@@ -383,6 +389,9 @@ class HostTests(unittest.TestCase):
         self.native.process = None
         with self.journal.db:
             self.journal.db.execute('DELETE FROM outbox')
+            # Fixture journal surgery removes the settled launch row; its
+            # admission reservation goes with it exactly as a release would.
+            self.journal.db.execute('DELETE FROM resource_reservations')
         self.native.calls.clear()
         return row, manifest, retired
 
@@ -1669,6 +1678,162 @@ class HostTests(unittest.TestCase):
         self.assertEqual(sent[-1]['stage'],'host_launch')
         self.assertEqual(sent[-1]['detail'],'Host operation failed.')
         self.assertNotIn('PRIVATE',json.dumps(sent))
+
+    # --- Same-journal pre-dispatch physical RAM admission (intake 111b251b). ---
+
+    def reservations(self):
+        return [tuple(row) for row in self.journal.db.execute(
+            'SELECT operation_id,session_id,epoch,native_id,allowance_bytes FROM resource_reservations')]
+
+    def exact_headroom(self, spare):
+        # Physical sample = floor + one new allowance + spare bytes above it.
+        self.sample_available[0] = (resource_admission.RESERVED_FLOOR_BYTES
+                                    + resource_admission.DEFAULT_ALLOWANCE_BYTES + spare)
+
+    def quiet_census(self):
+        # Registry observation stays synthetic-empty so admission mechanics
+        # tests make no census-related native calls of their own.
+        from types import SimpleNamespace
+        self.bridge.launcher.inventory = lambda: SimpleNamespace(fresh=lambda: True, rows=())
+
+    def test_admission_samples_physical_ram_and_binds_reservation_before_dispatch(self):
+        self.exact_headroom(4096)  # exactly floor + one allowance + spare passes
+        self.bridge.offer(self.offer())
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        argv = next(args for args, _ in self.native.calls if args[1] == 'start')
+        self.assertEqual(argv[argv.index('--memory') + 1], '1500M')
+        self.assertEqual(argv[argv.index('--pids') + 1], '256')
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('running', 1))
+        native_id = self.native.process['id']
+        self.assertEqual(self.reservations(), [('operation-1', 'session-1', 1, native_id,
+                                                resource_admission.DEFAULT_ALLOWANCE_BYTES)])
+
+    def test_admission_refuses_one_byte_short_and_settles_no_dispatch(self):
+        self.exact_headroom(-1)  # one byte below the floor+allowance headroom
+        self.quiet_census()
+        self.assertIsNone(self.bridge.offer(self.offer()))
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        self.assertEqual(self.reservations(), [])
+        receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertTrue(receipt['no_dispatch'])
+        self.assertEqual(receipt['failure_reason'], 'host_launch_queue_full')
+        self.assertEqual(receipt['detail'], 'Launch preparation was refused.')
+
+    def test_malformed_worker_caps_refuse_launch_without_clamping(self):
+        for memory_mb, pids in ((1501, 256), (1500, 257), (True, 256), ('1500', 256), (0, 256)):
+            with self.subTest(memory_mb=memory_mb, pids=pids):
+                self.bridge.launcher.config['memory_mb'] = memory_mb
+                self.bridge.launcher.config['pids'] = pids
+                self.assertIsNone(self.bridge.offer(self.offer()))
+                self.assertEqual(self.native.calls, [])
+                row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+                self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+                receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+                self.assertEqual(receipt['failure_reason'], 'launcher_capability_unavailable')
+                self.assertEqual(self.reservations(), [])
+                with self.journal.db:
+                    self.journal.db.execute('DELETE FROM launches')
+                    self.journal.db.execute('DELETE FROM outbox')
+
+    def test_sampler_failure_refuses_truthfully_without_marker_or_reservation(self):
+        self.quiet_census()
+        def broken(deadline):
+            raise RuntimeError('host_operation_failed')
+        self.bridge.resource_sample = broken
+        self.assertIsNone(self.bridge.offer(self.offer()))
+        self.assertEqual(self.native.calls, [])
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertEqual(receipt['failure_reason'], 'host_operation_failed')
+        self.assertEqual(self.reservations(), [])
+
+    def test_expired_dispatch_permit_refuses_spawn_and_keeps_uncertain_custody(self):
+        self.exact_headroom(4096)
+        with patch.object(resource_admission, 'PERMIT_WINDOW_SECONDS', 0):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                self.bridge.offer(self.offer())
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        row = self.journal.db.execute('SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('aborting', 1, None))
+        self.assertEqual(len(self.reservations()), 1)  # uncertain custody: held, never refunded
+
+    def test_stop_fenced_midlaunch_admission_refuses_pre_commit(self):
+        self.quiet_census()
+        offer = self.offer()
+        launch = self.bridge.launcher.launch
+
+        def fence_then_launch(task_id, specification):
+            with self.journal.db:
+                self.journal.db.execute('INSERT INTO stop_fences VALUES(?,?)',
+                                        (offer['session_id'], offer['epoch']))
+            return launch(task_id, specification)
+
+        with patch.object(self.bridge.launcher, 'launch', side_effect=fence_then_launch):
+            self.assertIsNone(self.bridge.offer(offer))
+        self.assertEqual(self.native.calls, [])
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        self.assertEqual(self.reservations(), [])
+
+    def test_qualified_exit_releases_the_exact_reservation(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.assertEqual(len(self.reservations()), 1)
+        self.native.process.update(phase='exited', exit={'code': 0, 'exited_at_ms': int(time.time() * 1000)},
+                                   containment_empty=True)
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'exited')
+        self.assertEqual(self.reservations(), [])
+        self.assertEqual(self.journal.db.execute(
+            "SELECT COUNT(*) FROM outbox WHERE path LIKE '%/finish'").fetchone()[0], 1)
+
+    def test_uncertain_aborting_launch_keeps_reservation(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.native.process = None  # vanished after dispatch: absence is never exit evidence
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET state='aborting'")
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_stop_after_marker_crash_keeps_uncertain_custody_and_reservation(self):
+        self.quiet_census()
+        self.exact_headroom(4096)
+        with self.journal.db as db:
+            # A post-marker crash: dispatched, unbound, resident unknown.
+            db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,"
+                       "state,interactive,runtime_deadline,native_dispatch_started) "
+                       "VALUES('operation-1','session-1',1,'digest',?, 'task-hub2-session-1',NULL,"
+                       "'launching',0,?,1)", (str(self.root), int(time.time() * 1000) + 60000))
+        self.reserve_bytes = resource_admission.DEFAULT_ALLOWANCE_BYTES
+        with self.journal.db as db:
+            db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
+                       'native_id,allowance_bytes,updated_at_ms) '
+                       "VALUES('operation-1','session-1',1,'digest','attempt',NULL,?,?)",
+                       (self.reserve_bytes, int(time.time() * 1000)))
+        result = self.bridge.command({'id': 'stop-after-marker', 'session_id': 'session-1',
+                                      'epoch': 1, 'kind': 'stop'})
+        self.assertEqual(result['error'], 'stop_unconfirmed')
+        self.assertFalse(any(args[1] in ('start', 'kill') for args, _ in self.native.calls))
+        row = self.journal.db.execute(
+            'SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('launching', 1, None))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_admission_is_private_to_this_journal_and_offers_replay_without_readmission(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.assertEqual(len(self.reservations()), 1)
+        self.assertEqual(self.journal.db.execute(
+            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
+        self.bridge.offer(self.offer())  # replayed offer adopts the running native
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        self.assertEqual(len(self.reservations()), 1)
 
 
 
