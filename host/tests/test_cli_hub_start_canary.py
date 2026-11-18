@@ -314,7 +314,14 @@ def _install_test_collectors():
     def read_hub_rows(self, deadline):
         log("hub_rows")
         return cfg().get("hub_rows", [])
+    def read_launcher_caps(self, deadline):
+        log("launcher_caps")
+        caps = cfg().get("launcher_caps", [1500 * 1024 ** 2, 256])
+        if not isinstance(caps, list):
+            raise StageFailure("admission", caps)
+        return caps[0], caps[1]
     Canary.read_hub_rows = read_hub_rows
+    Canary.read_launcher_caps = read_launcher_caps
     Canary.fetch_disk_floor_gb = fetch_disk_floor_gb
     Canary.acquire_quota = acquire_quota
     Canary.sample_mem_available = sample_mem_available
@@ -417,7 +424,7 @@ class CanaryTest(unittest.TestCase):
 
     def shim_inprocess(self, mod):
         """Install the synthetic collectors on an imported helper module for one test."""
-        saved = {n: getattr(mod.Canary, n) for n in ("read_hub_rows", "fetch_disk_floor_gb", "acquire_quota", "sample_mem_available", "read_census")}
+        saved = {n: getattr(mod.Canary, n) for n in ("read_hub_rows", "read_launcher_caps", "fetch_disk_floor_gb", "acquire_quota", "sample_mem_available", "read_census")}
         names = ("CANARY_WORKSPACE_CONFIG", "WORKSPACE_CONFIG_UID", "WORKSPACE_CONFIG_TRUST_ROOT")
         saved_globals = {n: getattr(mod, n) for n in names}
         def restore():
@@ -3920,6 +3927,7 @@ class AdmissionTests(unittest.TestCase):
             acquire_quota=lambda deadline: None,
             read_census=lambda deadline: [],
             read_hub_rows=lambda deadline: [],
+            read_launcher_caps=lambda deadline: (1500 * MIB, 256),
             sample_mem_available=lambda: 64 * GIB,
         )
         defaults.update(patches)
@@ -4045,7 +4053,7 @@ class AdmissionTests(unittest.TestCase):
 
     def test_memory_boundary_after_known_inflight_and_new_estimate(self):
         mod = self.mod()
-        inflight = [{"id": "s1", "state": "starting", "machine_id": "HOST-1", "native_id": None}]
+        inflight = [{"id": "s1", "state": "starting", "machine_id": "HOST-1", "native_id": None, "workspace": str(self.tmp)}]
         need = 10 * GIB + 1500 * MIB + 1500 * MIB
         ok = self.canary(read_hub_rows=lambda d: inflight, sample_mem_available=lambda: need)
         ok.admit()
@@ -4163,16 +4171,317 @@ class AdmissionTests(unittest.TestCase):
         unbounded = census_row(21, None, None, phase="starting", state="starting", worker_alive=None, limits={})
         self.assertHold(self.residency([], [unbounded], mem=64 * GIB), "resident_bound_unknown")
 
+    def test_census_reads_current_inventory_without_history_flag(self):
+        mod = self.mod()
+        seen = []
+        c = mod.Canary("shell", "x")
+        c.a = ["a"]
+        c.run = lambda argv, **kw: seen.append(argv) or (0, "[]", "")
+        self.assertEqual(c.read_census(time.monotonic() + 5), [])
+        self.assertEqual(seen, [["a", "list", "--json"]])
+        self.assertNotIn("--all", seen[0])
+
+    def test_null_or_absent_historical_terminal_fields_do_not_poison_admission(self):
+        floor_mem = 10 * GIB + 1500 * MIB
+        dead = []
+        for n, extra in enumerate((
+            dict(containment_empty=None, workload_pid=123),
+            dict(containment_empty=None, workload_pid=None, workload_cgroup=None),
+            dict(workload_pid=123),  # containment_empty absent, same stale pid reused by a second row
+            dict(containment_empty=None, workload_pid=None, workload_cgroup="/user.slice/gone.scope"),
+        ), start=30):
+            row = census_row(n, extra.get("workload_pid"), None, phase="exited", state="exited", worker_alive=False, containment_empty=None)
+            row.update(extra)
+            if "containment_empty" not in extra:
+                del row["containment_empty"]
+            row.pop("containment_cgroup_identity")
+            dead.append(row)
+        self.residency([], dead, mem=floor_mem).admit()
+        # A named cgroup that still exists but has no members is also not an obligation.
+        row = [dict(pid=999, cgroup="/user.slice/empty.scope", age=500, anon=1, current=2, rss_anon=1024, members=[])]
+        empty = census_row(40, None, "/user.slice/empty.scope", phase="failed", state="failed", worker_alive=False, containment_empty=None)
+        self.residency(row, [empty], mem=floor_mem).admit()
+
+    def test_current_unknown_or_live_rows_still_hold_and_state_alone_never_releases(self):
+        floor_mem = 10 * GIB + 1500 * MIB
+        cases = {
+            "state only, worker_alive unknown": census_row(50, 123, None, phase="exited", state="exited", worker_alive=None, containment_empty=None),
+            "state only, worker_alive absent": {k: v for k, v in census_row(51, 123, None, phase="failed", state="failed", containment_empty=None).items() if k != "worker_alive"},
+            "dead worker but non-terminal phase": census_row(52, 123, None, phase="running", state="running", worker_alive=False, containment_empty=None),
+            "terminal but containment reports members": census_row(53, 123, None, phase="exited", state="exited", worker_alive=False, containment_empty=False),
+        }
+        for label, row in cases.items():
+            with self.subTest(label):
+                # No synthetic process for the pid: still a HOLD (never zero), via the identity-bound proof.
+                self.assertHold(self.residency([], [row], mem=64 * GIB), "resident_measurement_unknown")
+        # Terminal NULL row whose named cgroup still has members is live, not history.
+        live = [dict(pid=777, cgroup="/user.slice/live.scope", age=10, anon=100 * MIB, current=120 * MIB, rss_anon=100 * MIB)]
+        row = census_row(54, 777, "/user.slice/live.scope", phase="exited", state="exited", worker_alive=False, containment_empty=None)
+        self.assertHold(self.residency(live, [row], mem=floor_mem + 1400 * MIB - 1), "memory_below_floor")
+        # Live rows keep identity-bound proof: a current worker without pid/identity holds.
+        self.assertHold(self.residency([], [census_row(55, None, None)], mem=64 * GIB), "resident_identity_unknown")
+
+    # ---- actual selected launcher caps ---------------------------------------------
+
+    def home_with_config(self, raw=None, mode=0o600, **config):
+        home = self.tmp / "fakehome"
+        shutil.rmtree(home, ignore_errors=True)
+        directory = home / ".config" / "agent-hub"
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+        body = {"machine_id": "HOST-1", "server": "https://x.invalid", "token": "SECRET-TOKEN-VALUE", "roots": {}, "engines": []}
+        body.update(config)
+        path = directory / "v2.json"
+        path.write_text(raw if raw is not None else json.dumps(body))
+        path.chmod(mode)
+        return home, path
+
+    def host_process(self, home, *, age=0.0, pid=8801, argv=None, cgroup=None, home_env=None):
+        """Synthetic Host daemon (hub2 serve) under the shared fake /proc; started `age` seconds ago."""
+        time.sleep(0.05)  # the config was written before the daemon "started"
+        proc, _ = synthetic_proc(self.tmp, boot_id="boot-1", rows=[])
+        directory = proc / str(pid)
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir()
+        argv = argv if argv is not None else [str(home / ".local/share/agent-hub2/releases/x/bin/python"),
+                                              str(home / ".local/share/agent-hub2/current/bin/hub2"), "serve", "--aplexer", "/bin/a"]
+        (directory / "cmdline").write_text("\0".join(argv) + "\0")
+        (directory / "cgroup").write_text("0::/user.slice/app.slice/" + (cgroup or "agent-hub2-host.service") + "\n")
+        ticks = int((time.clock_gettime(time.CLOCK_BOOTTIME) - age) * os.sysconf("SC_CLK_TCK"))
+        (directory / "environ").write_bytes(b"LANG=C\0HOME=" + os.fsencode(home if home_env is None else home_env) + b"\0TOKEN=SECRET-ENV-TOKEN\0")
+        (directory / "stat").write_text(f"{pid} (hub2) S " + " ".join(["0"] * 18 + [str(ticks)] + ["0"] * 10) + "\n")
+        return proc
+
+    def caps(self, home, machine="HOST-1", host=True):
+        mod = self.mod()
+        proc = self.host_process(home) if host else (self.tmp / "proc")
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            return mod.read_launcher_caps(mod.selected_launcher_config_path(), machine)
+
+    def assertCapsHold(self, home, reason, machine="HOST-1"):
+        with self.assertRaises(self.mod().StageFailure) as caught:
+            self.caps(home, machine)
+        self.assertEqual((caught.exception.stage, caught.exception.reason), ("admission", reason))
+        self.assertNotIn("SECRET-TOKEN-VALUE", repr(caught.exception.reason))
+
+    def test_launcher_caps_come_from_the_selected_host_config_with_source_defaults(self):
+        mod = self.mod()
+        home, path = self.home_with_config(launcher={"aplexer": "a", "routes": {}})
+        self.assertEqual(self.caps(home), (1500 * MIB, 256))  # keys absent: native_launch.py defaults
+        self.assertEqual(self.caps(self.home_with_config(launcher={"memory_mb": 1000, "pids": 128})[0]), (1000 * MIB, 128))
+        self.assertEqual(self.caps(self.home_with_config()[0]), (1500 * MIB, 256))  # no launcher key at all
+        self.assertEqual(self.caps(self.home_with_config(launcher=None)[0]), (1500 * MIB, 256))  # Host: launcher_config or {}
+        self.assertEqual(self.caps(self.home_with_config(launcher={"memory_mb": 1500, "pids": 256})[0]), (1500 * MIB, 256))
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertEqual(mod.selected_launcher_config_path(), home / ".config/agent-hub/v2.json")
+
+    def test_launcher_defaults_and_selection_match_the_maintained_host_source(self):
+        mod = self.mod()
+        launch = (ROOT / "hub2/host/agent_hub_host/native_launch.py").read_text()
+        self.assertIn('requested_mb = int(self.config.get("memory_mb", %d))' % mod.LAUNCHER_DEFAULT_MEMORY_MB, launch)
+        self.assertIn('"--pids", str(self.config.get("pids", %d))' % mod.LAUNCHER_DEFAULT_PIDS, launch)
+        self.assertIn('"--memory", f"{requested_mb}M"', launch)
+        cli = (ROOT / "hub2/host/agent_hub_host/cli.py").read_text()
+        self.assertIn('default=Path.home() / ".config/agent-hub/v2.json"', cli)
+        self.assertEqual(mod.LAUNCHER_CONFIG_RELATIVE, ".config/agent-hub/v2.json")
+        self.assertIn("launcher_config=config.get(\"launcher\")", cli)
+        self.assertIn("NativeLauncher(launcher_config or {}", (ROOT / "hub2/host/agent_hub_host/agent.py").read_text())
+        unit = (ROOT / "deploy/agent-hub2-host.service").read_text()
+        self.assertIn("hub2 serve\n", unit)
+        self.assertNotIn("--config", unit)
+
+    def test_launcher_caps_fail_closed_on_invalid_unsafe_mismatched_or_above_ceiling(self):
+        for label, launcher, reason in (
+            ("above memory ceiling", {"memory_mb": 1501}, "launcher_config_memory_cap_too_high"),
+            ("above pids ceiling", {"pids": 257}, "launcher_config_pids_cap_too_high"),
+            ("null memory", {"memory_mb": None}, "launcher_config_caps_invalid"),
+            ("bool memory", {"memory_mb": True}, "launcher_config_caps_invalid"),
+            ("string pids", {"pids": "256"}, "launcher_config_caps_invalid"),
+            ("float memory", {"memory_mb": 1500.0}, "launcher_config_caps_invalid"),
+            ("zero", {"memory_mb": 0}, "launcher_config_caps_invalid"),
+            ("negative pids", {"pids": -1}, "launcher_config_caps_invalid"),
+            ("non-dict launcher", [], "launcher_config_schema"),
+        ):
+            with self.subTest(label):
+                self.assertCapsHold(self.home_with_config(launcher=launcher)[0], reason)
+        self.assertCapsHold(self.home_with_config()[0], "launcher_config_machine_mismatch", machine="OTHER")
+        self.assertCapsHold(self.home_with_config(machine_id=7)[0], "launcher_config_machine_mismatch")
+        self.assertCapsHold(self.home_with_config(raw="[]")[0], "launcher_config_schema")
+        self.assertCapsHold(self.home_with_config(raw="{not json")[0], "launcher_config_json")
+        self.assertCapsHold(self.home_with_config(raw='{"machine_id":"HOST-1","machine_id":"HOST-1","token":"SECRET-TOKEN-VALUE"}')[0], "launcher_config_json")
+        self.assertCapsHold(self.home_with_config(raw=" " * (256 * 1024 + 1))[0], "launcher_config_size")
+        self.assertCapsHold(self.home_with_config(mode=0o644)[0], "launcher_config_unsafe")
+        self.assertCapsHold(self.home_with_config(mode=0o660)[0], "launcher_config_unsafe")
+        home, path = self.home_with_config()
+        extra = home / "link.json"
+        os.link(path, extra)
+        self.assertCapsHold(home, "launcher_config_unsafe")  # nlink != 1
+        extra.unlink()
+        real = home / "real.json"
+        path.rename(real)
+        path.symlink_to(real)
+        self.assertCapsHold(home, "launcher_config_symlink")
+        path.unlink()
+        self.assertCapsHold(home, "launcher_config_absent")
+        path.mkdir()
+        self.assertCapsHold(home, "launcher_config_not_regular")
+        home, _ = self.home_with_config()
+        (home / ".config" / "agent-hub").chmod(0o750)
+        self.assertCapsHold(home, "launcher_config_parent")
+        home, _ = self.home_with_config()
+        moved = home / ".config" / "agent-hub-real"
+        (home / ".config" / "agent-hub").rename(moved)
+        (home / ".config" / "agent-hub").symlink_to(moved)
+        self.assertCapsHold(home, "launcher_config_parent")
+
+    def test_launcher_caps_require_a_matching_started_after_config_host_daemon(self):
+        mod = self.mod()
+        home, path = self.home_with_config(launcher={"memory_mb": 1000})
+
+        def hold(reason, **kw):
+            proc = self.host_process(home, **kw)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+                with self.assertRaises(mod.StageFailure) as caught:
+                    mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+            self.assertEqual(caught.exception.reason, reason)
+        self.assertEqual(self.caps(home), (1000 * MIB, 256))
+        proc = self.host_process(home)
+        shutil.rmtree(proc / "8801")  # no Host daemon at all: the file's caps are unattributable
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+        self.assertEqual(caught.exception.reason, "launcher_config_host_unproven")
+        hold("launcher_config_host_unproven", argv=[str(home / ".local/share/agent-hub2/current/bin/hub2"), "--config", "/other.json", "serve"])
+        hold("launcher_config_host_unproven", argv=[str(home / ".local/share/agent-hub2/current/bin/hub2"), "serve", "--config=/other.json"])
+        hold("launcher_config_host_unproven", argv=["/elsewhere/bin/hub2", "serve"])  # not run from this home
+        hold("launcher_config_host_unproven", argv=[str(home / ".local/share/agent-hub2/current/bin/hub2"), "status"])
+        hold("launcher_config_host_unproven", cgroup="some-other.service")
+        hold("launcher_config_host_unproven", home_env="/home/someone-else")  # daemon HOME differs from the selected home
+        # Two Host daemons are ambiguous.
+        proc = self.host_process(home)
+        shutil.copytree(proc / "8801", proc / "8802")
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+        self.assertEqual(caught.exception.reason, "launcher_config_host_unproven")
+        # Config changed (mtime or ctime) after the daemon started: not what it loaded.
+        shutil.rmtree(proc / "8802")
+        proc = self.host_process(home)
+        time.sleep(0.05)
+        path.chmod(0o600)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+        self.assertEqual(caught.exception.reason, "launcher_config_changed_after_host_start")
+
+    def test_admission_uses_actual_launcher_memory_and_holds_on_unreadable_or_oversized_config(self):
+        mod = self.mod()
+        home, _ = self.home_with_config(launcher={"memory_mb": 1000})
+        c = self.canary(sample_mem_available=lambda: 10 * GIB + 1000 * MIB - 1)
+        c.read_launcher_caps = lambda deadline: mod.read_launcher_caps(mod.selected_launcher_config_path(), c.machine)
+        proc = self.host_process(home)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            self.assertHold(c, "memory_below_floor")
+            c.sample_mem_available = lambda: 10 * GIB + 1000 * MIB
+            c.admit()
+        home, _ = self.home_with_config(launcher={"memory_mb": 1501})
+        proc = self.host_process(home)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            self.assertHold(c, "launcher_config_memory_cap_too_high")
+        shutil.rmtree(home)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            self.assertHold(c, "launcher_config_absent")
+        # Uncovered in-flight tasks are never charged the (possibly smaller) selected cap: the 1500 MiB ceiling.
+        smaller = self.canary(read_launcher_caps=lambda d: (1000 * MIB, 256),
+                              read_hub_rows=lambda d: [{"id": "u", "state": "starting", "machine_id": "HOST-1", "native_id": None, "workspace": str(self.tmp)}],
+                              sample_mem_available=lambda: 10 * GIB + 1000 * MIB + 1500 * MIB - 1)
+        self.assertHold(smaller, "memory_below_floor")
+        smaller.sample_mem_available = lambda: 10 * GIB + 1000 * MIB + 1500 * MIB
+        smaller.admit()
+        # A seam returning out-of-range caps can never bypass the ceilings.
+        for caps in ((1501 * MIB, 256), (1500 * MIB, 257), (0, 256), (1500 * MIB, True), (1500 * MIB, 0)):
+            self.assertHold(self.canary(read_launcher_caps=lambda d, caps=caps: caps), "launcher_config_caps_invalid")
+
+    def test_production_collector_has_no_caller_selected_config_path(self):
+        source = (ROOT / "scripts" / "hub_start_canary.py").read_text()
+        body = source[source.index("def selected_launcher_config_path"):source.index("def read_launcher_caps")]
+        self.assertNotIn("os.environ", body)
+        self.assertNotIn("sys.argv", body)
+        self.assertNotIn("print(", source[source.index("def read_launcher_caps"):source.index("def parse_iso_utc")])
+
+    # ---- disk growth of other workers ----------------------------------------------
+
+    def disk_setup(self, young_rows, *, free, hub_rows=(), devices=None, rows_proc=(), mem=64 * GIB):
+        """Real admission with both canary paths on one fake device (id 1); worker devices are injected."""
+        c = self.residency(list(rows_proc), list(young_rows), mem=mem, hub_rows=hub_rows)
+        c.fetch_disk_floor_gb = lambda d: 20
+        c.disk_free_after_margin = lambda paths: {1: free}
+        c.growth_devices = lambda *paths: {1} if devices is None else devices(paths)
+        return c
+
+    def test_young_and_inflight_workers_on_the_same_device_are_charged(self):
+        floor, spike, per = 20 * GIB, 1024 * MIB, 512 * MIB
+        young = [dict(pid=6001, cgroup="/user.slice/y1.scope", age=10, anon=50 * MIB, current=60 * MIB, rss_anon=50 * MIB)]
+        census = [census_row(60, 6001, "/user.slice/y1.scope", workspace=str(self.tmp / "ws"))]
+        self.disk_setup(census, free=floor + spike + per, rows_proc=young).admit()
+        self.assertHold(self.disk_setup(census, free=floor + spike + per - 1, rows_proc=young), "disk_below_floor")
+        inflight = [{"id": "h1", "state": "starting", "machine_id": "HOST-1", "native_id": None, "workspace": str(self.tmp / "ws")}]
+        self.disk_setup([], free=floor + spike + per, hub_rows=inflight).admit()
+        self.assertHold(self.disk_setup([], free=floor + spike + per - 1, hub_rows=inflight), "disk_below_floor")
+        both = self.disk_setup(census, free=floor + spike + 2 * per, hub_rows=inflight, rows_proc=young)
+        both.admit()
+        self.assertHold(self.disk_setup(census, free=floor + spike + 2 * per - 1, hub_rows=inflight, rows_proc=young), "disk_below_floor")
+
+    def test_different_device_and_terminal_history_add_no_disk_charge_and_mature_same_device_is_charged(self):
+        floor, spike = 20 * GIB, 1024 * MIB
+        young = [dict(pid=6002, cgroup="/user.slice/y2.scope", age=10, anon=50 * MIB, current=60 * MIB, rss_anon=50 * MIB)]
+        census = [census_row(61, 6002, "/user.slice/y2.scope", workspace=str(self.tmp / "ws"))]
+        self.disk_setup(census, free=floor + spike, rows_proc=young, devices=lambda paths: {2}).admit()  # other device
+        mature = [dict(pid=6003, cgroup="/user.slice/m.scope", age=900, anon=50 * MIB, current=60 * MIB, rss_anon=50 * MIB)]
+        mcensus = [census_row(62, 6003, "/user.slice/m.scope", workspace=str(self.tmp / "ws"))]
+        # Mature RAM proof is not disk proof: a same-device mature worker is charged too.
+        self.disk_setup(mcensus, free=floor + spike + 512 * MIB, rows_proc=mature).admit()
+        self.assertHold(self.disk_setup(mcensus, free=floor + spike + 512 * MIB - 1, rows_proc=mature), "disk_below_floor")
+        self.disk_setup(mcensus, free=floor + spike, rows_proc=mature, devices=lambda paths: {2}).admit()
+        history = [census_row(63, 5, None, phase="exited", state="exited", worker_alive=False, containment_empty=None) for _ in range(3)]
+        history = [dict(r, id=f"aaaaaaaa-0000-4000-8000-{70 + i:012d}", workspace=str(self.tmp / "ws")) for i, r in enumerate(history)]
+        self.disk_setup(history, free=floor + spike).admit()
+        self.assertHold(self.disk_setup(history, free=floor + spike - 1), "disk_below_floor")  # floor boundary itself unchanged
+        elsewhere = [{"id": "h2", "state": "starting", "machine_id": "OTHER", "native_id": None, "workspace": str(self.tmp / "ws")}]
+        self.disk_setup([], free=floor + spike, hub_rows=elsewhere).admit()
+
+    def test_disk_charge_is_capped_at_the_launcher_active_reserve_cap(self):
+        floor, spike = 20 * GIB, 1024 * MIB
+        inflight = [{"id": f"h{i}", "state": "queued", "machine_id": "HOST-1", "native_id": None, "workspace": "/w"} for i in range(40)]
+        self.disk_setup([], free=floor + spike + 8192 * MIB, hub_rows=inflight, mem=400 * GIB).admit()
+        self.assertHold(self.disk_setup([], free=floor + spike + 8192 * MIB - 1, hub_rows=inflight, mem=400 * GIB), "disk_below_floor")
+
+    def test_unknown_or_stale_growth_location_holds(self):
+        floor, spike = 20 * GIB, 1024 * MIB
+        for hub_row in (
+            {"id": "h3", "state": "starting", "machine_id": "HOST-1", "native_id": None},
+            {"id": "h4", "state": "starting", "machine_id": "HOST-1", "native_id": None, "workspace": "relative/path"},
+        ):
+            c = self.disk_setup([], free=64 * GIB, hub_rows=[hub_row], devices=lambda paths: self.mod().Canary.growth_devices(*paths))
+            self.assertHold(c, "disk_growth_unknown")
+        young = [dict(pid=6004, cgroup="/user.slice/y4.scope", age=10, anon=50 * MIB, current=60 * MIB, rss_anon=50 * MIB)]
+        census = [census_row(64, 6004, "/user.slice/y4.scope", workspace=None)]
+        c = self.disk_setup(census, free=64 * GIB, rows_proc=young, devices=lambda paths: self.mod().Canary.growth_devices(*paths))
+        self.assertHold(c, "disk_growth_unknown")
+        # Real device resolution: a path under the test tree resolves to a real st_dev set; missing parents use the nearest ancestor.
+        devices = self.mod().Canary.growth_devices(str(self.tmp / "ws"))
+        self.assertEqual(devices, {os.stat(self.tmp).st_dev})
+
     def test_disk_floor_boundary_spike_and_device_accounting(self):
         gib = GIB
         c = self.canary(fetch_disk_floor_gb=lambda d: 27.5)
         floor = int(27.5 * gib)
-        spike = 512 * MIB
-        c.disk_free_after_margin = lambda paths: [floor + spike]
+        spike = 1024 * MIB  # start spike + the new worker's own known 512 MiB reserve
+        c.disk_free_after_margin = lambda paths: {1: floor + spike}
         c.admit()
-        c.disk_free_after_margin = lambda paths: [floor + spike - 1]
+        c.disk_free_after_margin = lambda paths: {1: floor + spike - 1}
         self.assertHold(c, "disk_below_floor")
-        c.disk_free_after_margin = lambda paths: [floor + spike + 5, floor + spike - 1]  # distinct devices each count
+        c.disk_free_after_margin = lambda paths: {1: floor + spike + 5, 2: floor + spike - 1}  # distinct devices each count
         self.assertHold(c, "disk_below_floor")
         for bad in (True, 0, 0.5, 1048577, float("nan"), "15", None):
             with self.subTest(bad=bad):
