@@ -813,11 +813,37 @@ def _engine_config(path, parse, default):
         return raw, default
 
 
-def _write_engine_config(path, raw, current):
+ENGINE_TOML_MAX_BYTES = 1048576  # Codex/ZAI config.toml only; same finite bound for read and write.
+
+
+class EngineTomlConfigError(ValueError):
+    """Fixed, content-free refusal for an unusable Codex/ZAI config.toml."""
+
+
+def _engine_toml_config(path):
+    """Current Codex/ZAI config.toml as (raw_bytes_or_None, text).
+
+    Only an absent file starts empty. A present file that is oversized (beyond
+    ENGINE_TOML_MAX_BYTES) or not valid UTF-8 is refused instead of being
+    replaced by empty defaults, so no settings are lost.
+    """
+    try:
+        raw = read_engine_file(path, ENGINE_TOML_MAX_BYTES)
+    except ValueError:
+        raise EngineTomlConfigError('engine config.toml exceeds the byte bound; refusing to replace it') from None
+    if raw is None:
+        return None, ''
+    try:
+        return raw, raw.decode('utf-8')
+    except UnicodeDecodeError:
+        raise EngineTomlConfigError('engine config.toml is not valid UTF-8; refusing to replace it') from None
+
+
+def _write_engine_config(path, raw, current, limit=131072):
     """Write only real changes, so an engine refresh never triggers a rewrite loop."""
     if raw == current:
         return
-    private_fs.atomic_write(path, raw, 131072, engine_owned=True)
+    private_fs.atomic_write(path, raw, limit, engine_owned=True)
     if os.name != 'nt':
         try:
             os.chmod(path, 0o600)
@@ -914,7 +940,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             codex_dir = home / '.codex'
             config_toml = codex_dir / 'config.toml'
             hooks_file = codex_dir / 'hooks.json'
-            current, content = _engine_config(config_toml, str, '')
+            current, content = _engine_toml_config(config_toml)
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
@@ -922,13 +948,16 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, hooks_file)
-            _write_engine_config(config_toml, updated.encode('utf-8'), current)
+            generated = updated.encode('utf-8')
+            if len(generated) > ENGINE_TOML_MAX_BYTES:
+                raise EngineTomlConfigError('generated engine config.toml exceeds the byte bound; not published')
+            _write_engine_config(config_toml, generated, current, ENGINE_TOML_MAX_BYTES)
 
         if provider in ('zai', None):
             zcodex_dir = home / '.zcodex'
             zconfig_toml = zcodex_dir / 'config.toml'
             zhooks_file = zcodex_dir / 'hooks.json'
-            current, content = _engine_config(zconfig_toml, str, '')
+            current, content = _engine_toml_config(zconfig_toml)
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
@@ -936,7 +965,10 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, zhooks_file)
-            _write_engine_config(zconfig_toml, updated.encode('utf-8'), current)
+            generated = updated.encode('utf-8')
+            if len(generated) > ENGINE_TOML_MAX_BYTES:
+                raise EngineTomlConfigError('generated engine config.toml exceeds the byte bound; not published')
+            _write_engine_config(zconfig_toml, generated, current, ENGINE_TOML_MAX_BYTES)
 
     # Claude Code
     if provider in ('claude', None):
