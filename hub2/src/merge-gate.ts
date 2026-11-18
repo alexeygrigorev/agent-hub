@@ -66,7 +66,7 @@ export function mergeEvidenceError(value: unknown): string | undefined {
   const e = value as Record<string, unknown>;
   if (typeof e.repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(e.repository)) return 'repository must be owner/name';
   if (typeof e.pr_url !== 'string' || !GITHUB_PR.test(e.pr_url)) return 'pr_url must identify a GitHub pull request';
-  if (e.base_ref !== 'main') return 'pull request base_ref must be main';
+  if (e.base_ref !== 'main' && e.base_ref !== 'master') return 'pull request base_ref must be main or master';
   if (typeof e.merged_at !== 'string' || !e.merged_at.trim() || !Number.isFinite(Date.parse(e.merged_at))) return 'pull request must be merged';
   for (const name of ['head_sha', 'checks_head_sha', 'merge_commit_sha', 'main_head_sha'] as const)
     if (typeof e[name] !== 'string' || !SHA.test(e[name] as string)) return `${name} must be a full commit SHA`;
@@ -94,7 +94,7 @@ export function mergeGate(required: boolean, value: unknown, expectedRepository?
   if (typeof e.pr_url !== 'string' || !GITHUB_PR.test(e.pr_url)) problems.push('a GitHub pull request is not identified');
   else if (typeof e.repository === 'string' && !e.pr_url.toLowerCase().startsWith(`https://github.com/${e.repository.toLowerCase()}/pull/`))
     problems.push(`the pull request ${e.pr_url} is not in ${e.repository}`);
-  if (e.base_ref !== 'main') problems.push('the pull request base is not main');
+  if (e.base_ref !== 'main' && e.base_ref !== 'master') problems.push('the pull request base is not main or master');
   if (typeof e.merged_at !== 'string' || !e.merged_at.trim() || !Number.isFinite(Date.parse(e.merged_at))) problems.push('the pull request is not merged');
   if (typeof e.head_sha !== 'string' || !SHA.test(e.head_sha)) problems.push('the pull request head SHA is missing or invalid');
   if (typeof e.checks_head_sha !== 'string' || String(e.checks_head_sha).toLowerCase() !== String(e.head_sha).toLowerCase()) problems.push('checks are not for the exact pull request head');

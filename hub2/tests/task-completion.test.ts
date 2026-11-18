@@ -1162,6 +1162,10 @@ test('merge-state is readable by operators and the intake worker only, and names
     await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'no-ci',evidence:noCi});
     state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
     assert.equal(state.merge_gate.ok,true,'a merged PR in a repository without CI is not blocked');
+    const masterNoCi={...noCi,base_ref:'master'};
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'master-no-ci',evidence:masterNoCi});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true,'a merged PR targeting master without CI is not blocked');
     await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'red',evidence:{...mergeProof,checks_state:'failure',checks_successful:1,checks_failed:1}});
     state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
     assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('green')));
