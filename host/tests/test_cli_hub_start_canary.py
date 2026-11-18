@@ -4,7 +4,7 @@ Mail renders to a sink; no real msmtp/sendmail is ever called.
 
 Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_cli_hub_start_canary
 """
-import http.server, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unittest
+import errno, http.server, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unittest
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -4221,6 +4221,368 @@ class AdmissionTests(unittest.TestCase):
         # Live rows keep identity-bound proof: a current worker without pid/identity holds.
         self.assertHold(self.residency([], [census_row(55, None, None)], mem=64 * GIB), "resident_identity_unknown")
 
+    # ---- current coordinator residency fallback -------------------------------------
+
+    BTIME = 1_800_000_000
+
+    def coordinator_world(self, rows, census, *, mem=64 * GIB, hub_rows=(), mutate=None):
+        """Synthetic /proc + cgroup tree for workers/workloads, with fresh namespaces, btime and memory.max.
+
+        rows are synthetic_proc rows; extra keys: max (memory.max text, default "max"), ns ("same" or "other").
+        """
+        mod = self.mod()
+        c = self.residency(rows, census, mem=mem, hub_rows=hub_rows)
+        proc, cg = self.tmp / "proc", self.tmp / "cgroup"
+        (proc / "stat").write_text(f"cpu  1 2 3\nintr 1 2 3\nbtime {self.BTIME}\nprocesses 5\n")
+        for row in rows:
+            pdir = proc / str(row["pid"]) / "ns"
+            pdir.mkdir(parents=True, exist_ok=True)
+            for name in ("cgroup", "mnt"):
+                link = pdir / name
+                link.unlink(missing_ok=True)
+                if row.get("ns") == "other":
+                    link.write_text("")
+                else:
+                    link.symlink_to(proc / "self" / "ns" / name)
+            (cg / row["cgroup"].lstrip("/") / "memory.max").write_text(row.get("max", "max") + "\n")
+        if mutate:
+            mutate(proc, cg)
+        return c
+
+    def birth_ms(self, age, skew=0.0):
+        return int((self.BTIME + (1000.0 - age) + skew) * 1000)
+
+    def worker_row(self, n, pid, cgroup, *, age=400, rss=300 * MIB, anon=300 * MIB, current=400 * MIB, **extra):
+        return dict(pid=pid, cgroup=cgroup, age=age, rss_anon=rss, anon=anon, current=current, **extra)
+
+    def coordinator_census(self, n, worker_pid, cgroup, *, age=400, workload_pid=None, skew=0.0, **extra):
+        row = census_row(n, workload_pid, "/user.slice/workload-%d.scope" % n, boot_id="old-boot", cap=1500 * MIB,
+                         worker_alive=True, worker_pid=worker_pid, worker_cgroup=cgroup, created_at_ms=self.birth_ms(age, skew))
+        row.update(extra)
+        return row
+
+    def test_exact_current_gap_live_worker_dead_workload_among_sixteen_rows(self):
+        rows, census = [], []
+        for n in range(15):
+            group = f"/user.slice/ok{n}.scope"
+            rows.append(self.worker_row(n, 7000 + n, group))
+            census.append(census_row(n, 7000 + n, group))
+        group = "/user.slice/coord.scope"
+        rows.append(self.worker_row(99, 7100, group))
+        census.append(self.coordinator_census(99, 7100, group, workload_pid=6999999))
+        self.assertEqual(len(census), 16)
+        floor = 10 * GIB + 1500 * MIB
+        self.coordinator_world(rows, census, mem=floor).admit()
+        self.assertHold(self.coordinator_world(rows, census, mem=floor - 1), "memory_below_floor")
+
+    def test_fallback_for_none_or_enoent_workload_and_worker_never_the_workload_scope(self):
+        group = "/user.slice/coord.scope"
+        rows = [self.worker_row(1, 7100, group)]
+        floor = 10 * GIB + 1500 * MIB
+        for label, workload_pid in (("none", None), ("enoent", 6999999)):
+            with self.subTest(label):
+                census = [self.coordinator_census(1, 7100, group, workload_pid=workload_pid)]
+                self.coordinator_world(rows, census, mem=floor).admit()
+        # A bare workload PID with no worker data is still a HOLD with the original reasons.
+        self.assertHold(self.coordinator_world([], [census_row(2, None, None)]), "resident_identity_unknown")
+        self.assertHold(self.coordinator_world([], [census_row(2, 6999999, None)]), "resident_measurement_unknown")
+
+    def test_no_fallback_for_other_errors_or_unproven_worker_liveness(self):
+        mod = self.mod()
+        group, wgroup = "/user.slice/coord.scope", "/user.slice/wl.scope"
+        worker = self.worker_row(1, 7100, group)
+        workload = self.worker_row(2, 7200, wgroup)
+
+        def census(**extra):
+            return [self.coordinator_census(1, 7100, group, workload_pid=7200, containment_cgroup_identity={"boot_id": "boot-1"},
+                                            workload_cgroup=wgroup, **extra)]
+
+        # Healthy existing workload: normal path, coordinator never consulted.
+        self.coordinator_world([worker, workload], census(), mem=10 * GIB + 1500 * MIB).admit()
+        # EACCES on the workload identity open is a HOLD, not a fallback.
+        real_open = os.open
+        denied = str(self.tmp / "proc" / "7200" / "stat")
+
+        def deny(path, *args, **kwargs):
+            if path == denied:
+                raise PermissionError(errno.EACCES, "denied")
+            return real_open(path, *args, **kwargs)
+
+        c = self.coordinator_world([worker, workload], census(), mem=64 * GIB)
+        with mock.patch.object(os, "open", side_effect=deny):
+            self.assertHold(c, "resident_measurement_unknown")
+        # Existing PID whose cgroup/membership disagrees holds; the live worker does not rescue it.
+        self.assertHold(self.coordinator_world([worker, dict(workload, members=[1])], census(), mem=64 * GIB), "resident_measurement_unknown")
+
+        def other_cgroup(proc, cg):
+            (proc / "7200" / "cgroup").write_text("0::/user.slice/elsewhere.scope\n")
+        self.assertHold(self.coordinator_world([worker, workload], census(), mem=64 * GIB, mutate=other_cgroup), "resident_measurement_unknown")
+        # A missing measurement file of an existing workload is not ENOENT at the identity open.
+        def drop_stat(proc, cg):
+            (cg / "user.slice/wl.scope/memory.stat").unlink()
+        self.assertHold(self.coordinator_world([worker, workload], census(), mem=64 * GIB, mutate=drop_stat), "resident_measurement_unknown")
+        # ENOENT workload but worker liveness not True, or malformed worker fields.
+        gone = 6999999
+        for label, extra in (("alive-unknown", dict(worker_alive=None)), ("dead-flag", dict(worker_alive=False)),
+                             ("alive-str", dict(worker_alive="true")), ("no-pid", dict(worker_pid=None)),
+                             ("bool-pid", dict(worker_pid=True)), ("neg-pid", dict(worker_pid=-5)),
+                             ("str-pid", dict(worker_pid="7100")), ("no-group", dict(worker_cgroup=None)),
+                             ("rel-group", dict(worker_cgroup="user.slice/coord.scope")),
+                             ("dotdot-group", dict(worker_cgroup="/user.slice/../x"))):
+            with self.subTest(label):
+                row = self.coordinator_census(1, 7100, group, workload_pid=gone)
+                row.update(extra)
+                self.assertHold(self.coordinator_world([worker], [row], mem=64 * GIB), "resident_measurement_unknown")
+        # Invalid workload PID types are never "absent".
+        for bad in (True, -4, 0, "7200", 1.5):
+            with self.subTest(bad=bad):
+                self.assertHold(self.coordinator_world([worker], [self.coordinator_census(1, 7100, group, workload_pid=bad)], mem=64 * GIB),
+                                "resident_identity_unknown")
+
+    def test_worker_birth_namespace_cgroup_membership_and_anonymous_failures(self):
+        group = "/user.slice/coord.scope"
+        floor = 10 * GIB + 1500 * MIB
+        base = self.worker_row(1, 7100, group)
+
+        def run(row=base, census_kwargs=None, mutate=None, **kw):
+            census = [self.coordinator_census(1, 7100, group, workload_pid=6999999, **(census_kwargs or {}))]
+            return self.coordinator_world([row], census, mem=64 * GIB, mutate=mutate)
+
+        # SDK created_at_ms may precede the kernel start by up to 30 s or follow it by up to 2 s; beyond is another incarnation.
+        for skew in (-30.0, 0.0, 2.0):
+            with self.subTest(skew=skew):
+                self.coordinator_world([base], [self.coordinator_census(1, 7100, group, workload_pid=6999999, skew=skew)], mem=floor).admit()
+        for skew in (-31.0, 3.0, 3600.0):
+            with self.subTest(skew=skew):
+                self.assertHold(run(census_kwargs=dict(skew=skew)), "resident_identity_unknown")
+        for bad in (None, 0, -1, True, 1.5e12, "1"):
+            with self.subTest(created=bad):
+                self.assertHold(run(census_kwargs=dict(created_at_ms=bad)), "resident_identity_unknown")
+        self.assertHold(self.coordinator_world([dict(base, ns="other")], [self.coordinator_census(1, 7100, group, workload_pid=6999999)]),
+                        "resident_identity_unknown")
+        self.assertHold(run(mutate=lambda proc, cg: (proc / "7100" / "cgroup").write_text("0::/user.slice/other.scope\n")), "resident_identity_unknown")
+        self.assertHold(run(mutate=lambda proc, cg: (proc / "7100" / "cgroup").write_text("0::/user.slice/coord.scope\n0::/x\n")), "resident_identity_unknown")
+        self.assertHold(run(row=dict(base, members=[1, 2])), "resident_identity_unknown")
+        self.assertHold(run(row=dict(base, rss_anon=0)), "resident_anonymous_unknown")
+        self.assertHold(run(row=dict(base, anon=0)), "resident_anonymous_unknown")
+        self.assertHold(run(row=dict(base, anon=500 * MIB, current=400 * MIB)), "resident_anonymous_unknown")
+        self.assertHold(run(mutate=lambda proc, cg: (proc / "7100" / "stat").write_text("7100 (w) Z " + " ".join(["0"] * 30) + "\n")),
+                        "resident_identity_unknown")
+        self.assertHold(run(mutate=lambda proc, cg: (cg / "user.slice/coord.scope/memory.current").unlink()), "resident_measurement_unknown")
+        self.assertHold(run(mutate=lambda proc, cg: (proc / "stat").write_text("cpu 1\n")), "resident_identity_unknown")
+        # Kernel boot differs from the sampled one.
+        c = run()
+        original = c.sample_coordinator
+
+        def reboot(target, boot_id, ns_ids):
+            (self.tmp / "proc/sys/kernel/random/boot_id").write_text("boot-2\n")
+            return original(target, boot_id, ns_ids)
+
+        c.sample_coordinator = reboot
+        self.assertHold(c, "resident_identity_unknown")
+
+    def test_worker_pid_or_cgroup_replacement_between_samples_and_at_final_check_hold(self):
+        group = "/user.slice/coord.scope"
+        floor = 10 * GIB + 1500 * MIB
+        census = [self.coordinator_census(1, 7100, group, workload_pid=6999999)]
+
+        def fresh():
+            return self.coordinator_world([self.worker_row(1, 7100, group)], census, mem=floor)
+
+        def after_sample(n, change):
+            c = fresh()
+            original, calls = c.sample_coordinator, []
+
+            def wrapped(*args, **kwargs):
+                if len(calls) == n:
+                    change()
+                calls.append(1)
+                return original(*args, **kwargs)
+
+            c.sample_coordinator = wrapped
+            return c
+
+        proc, cg = self.tmp / "proc", self.tmp / "cgroup"
+        ticks = lambda age: int((1000.0 - age) * os.sysconf("SC_CLK_TCK"))
+
+        def restart():
+            (proc / "7100/stat").write_text("7100 (w) S " + " ".join(["0"] * 18 + [str(ticks(5))] + ["0"] * 10) + "\n")
+
+        def replace_dir():
+            os.rename(cg / "user.slice/coord.scope", cg / f"user.slice/coord.old{time.monotonic_ns()}")  # keep the old inode alive: no reuse
+            for name, text in (("cgroup.procs", "7100\n"), ("memory.stat", f"anon {300 * MIB}\n"), ("memory.current", f"{400 * MIB}\n"), ("memory.max", "max\n")):
+                (cg / "user.slice/coord.scope").mkdir(exist_ok=True)
+                (cg / "user.slice/coord.scope" / name).write_text(text)
+
+        # second sample vs first, and the final revalidation sample vs the credited identity
+        for n, label in ((1, "between samples"), (2, "final")):
+            with self.subTest("restart " + label):
+                c = after_sample(n, restart)
+                self.assertHold(c, "resident_identity_unstable" if n == 1 else "resident_fallback_changed")
+        with self.subTest("cgroup replaced at final"):
+            self.assertHold(after_sample(2, replace_dir), "resident_fallback_changed")
+        with self.subTest("cgroup replaced between samples"):
+            self.assertHold(after_sample(1, replace_dir), "resident_identity_unstable")
+        with self.subTest("unchanged passes"):
+            fresh().admit()
+
+    def test_shared_service_cgroup_needs_per_pid_proof_and_distinct_chosen_pids(self):
+        group = "/system.slice/hub.service"
+        floor = 10 * GIB + 1500 * MIB
+        pair = [self.worker_row(1, 7301, group, members=[7301, 7302, 9999]), self.worker_row(2, 7302, group, members=[7301, 7302, 9999])]
+        census = [self.coordinator_census(1, 7301, group, workload_pid=None), self.coordinator_census(2, 7302, group, workload_pid=6999999)]
+        self.coordinator_world(pair, census, mem=floor).admit()
+        # A unique cgroup map entry still forces per-PID proof: a group that merely has anon memory is not enough.
+        solo = [self.worker_row(1, 7301, group, rss=0, members=[7301, 9999])]
+        self.assertHold(self.coordinator_world(solo, census[:1], mem=64 * GIB), "resident_anonymous_unknown")
+        self.assertHold(self.coordinator_world([pair[0], dict(pair[1], rss_anon=0)], census, mem=64 * GIB), "resident_anonymous_unknown")
+        # Duplicate chosen PID, directly or workload-vs-worker, is ambiguous before any proof is read.
+        dup = [self.coordinator_census(1, 7301, group), self.coordinator_census(2, 7301, group)]
+        self.assertHold(self.coordinator_world(pair, dup, mem=64 * GIB), "resident_identity_ambiguous")
+        cross = [census_row(3, 7301, "/system.slice/other.scope"), self.coordinator_census(1, 7301, group)]
+        self.assertHold(self.coordinator_world(pair, cross, mem=64 * GIB), "resident_identity_ambiguous")
+        # Two workloads sharing a group with a coordinator of another row still need their own PID proof.
+        mixed = [census_row(4, 7401, group), self.coordinator_census(1, 7301, group)]
+        rows = [self.worker_row(4, 7401, group, members=[7301, 7401]), self.worker_row(1, 7301, group, members=[7301, 7401])]
+        self.coordinator_world(rows, mixed, mem=floor).admit()
+        self.assertHold(self.coordinator_world([dict(rows[0], rss_anon=0), rows[1]], mixed, mem=floor + 1500 * MIB - 1), "memory_below_floor")
+
+    def test_mature_coordinator_reserves_zero_even_unbounded_but_young_needs_actual_finite_cap(self):
+        group = "/user.slice/coord.scope"
+        floor = 10 * GIB + 1500 * MIB
+        census = lambda age, **extra: [self.coordinator_census(1, 7100, group, age=age, workload_pid=6999999, **extra)]
+        mature = lambda **extra: self.worker_row(1, 7100, group, age=181, **extra)
+        self.coordinator_world([mature(max="max")], census(181), mem=floor).admit()
+        self.assertHold(self.coordinator_world([mature(max="max")], census(181), mem=floor - 1), "memory_below_floor")
+        # 179 s is young; memory.max=max is an unknown bound, and the SDK workload 1500 MiB limit is never borrowed.
+        young = lambda **extra: self.worker_row(1, 7100, group, age=179, **extra)
+        self.assertHold(self.coordinator_world([young(max="max")], census(179), mem=64 * GIB), "resident_bound_unknown")
+        # Mature age but not in running state is uncertain.
+        self.assertHold(self.coordinator_world([mature(max="max")], census(181, state="starting"), mem=64 * GIB), "resident_bound_unknown")
+        self.assertHold(self.coordinator_world([mature(max="max")], census(181, phase="exiting"), mem=64 * GIB), "resident_bound_unknown")
+        # Finite kernel cap is charged whole (never divided, never the workload cap), also above 1500 MiB.
+        for cap in (800 * MIB, 2000 * MIB):
+            with self.subTest(cap=cap):
+                need = floor + cap
+                self.coordinator_world([young(max=str(cap))], census(179), mem=need).admit()
+                self.assertHold(self.coordinator_world([young(max=str(cap))], census(179), mem=need - 1), "memory_below_floor")
+        for text in ("0", "-1", "garbage", ""):
+            with self.subTest(max=text):
+                self.assertHold(self.coordinator_world([young(max=text)], census(179), mem=64 * GIB), "resident_bound_unknown")
+        # Shared finite cap is charged conservatively per row.
+        shared = "/system.slice/hub.service"
+        pair = [self.worker_row(1, 7301, shared, age=10, max=str(500 * MIB), members=[7301, 7302]),
+                self.worker_row(2, 7302, shared, age=10, max=str(500 * MIB), members=[7301, 7302])]
+        two = [self.coordinator_census(1, 7301, shared, age=10), self.coordinator_census(2, 7302, shared, age=10)]
+        self.coordinator_world(pair, two, mem=floor + 1000 * MIB).admit()
+        self.assertHold(self.coordinator_world(pair, two, mem=floor + 1000 * MIB - 1), "memory_below_floor")
+
+    def test_fallback_premise_selection_and_census_must_survive_to_final_sampling(self):
+        group = "/user.slice/coord.scope"
+        rows = [self.worker_row(1, 7100, group)]
+        base = self.coordinator_census(1, 7100, group, workload_pid=None)
+
+        def run(final, *, premise_pid=None):
+            seen = []
+            c = self.coordinator_world(rows, [base], mem=64 * GIB)
+            c.read_census = lambda d: seen.append(d) or ([base] if len(seen) == 1 else final)
+            return c, seen
+
+        c, seen = run([base])
+        c.admit()
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])  # same original deadline: not renewed
+        changes = {
+            "workload appeared": dict(base, workload_pid=7100),
+            "workload replaced": dict(base, workload_pid=8888),
+            "worker pid changed": dict(base, worker_pid=7101),
+            "worker group changed": dict(base, worker_cgroup="/user.slice/other.scope"),
+            "created changed": dict(base, created_at_ms=base["created_at_ms"] + 1),
+            "worker liveness changed": dict(base, worker_alive=False),
+            "limits changed": dict(base, limits={"memory_bytes": 1}),
+            "state changed": dict(base, state="stopping"),
+        }
+        for label, changed in changes.items():
+            with self.subTest(label):
+                c, _ = run([changed])
+                self.assertHold(c, "resident_fallback_changed")
+        with self.subTest("row vanished / extra row"):
+            c, _ = run([])
+            self.assertHold(c, "resident_fallback_changed")
+            c, _ = run([base, census_row(5, 7777, "/user.slice/new.scope")])
+            self.assertHold(c, "resident_fallback_changed")
+        # ENOENT premise: the workload PID reappears in /proc without any census change.
+        enoent = self.coordinator_census(1, 7100, group, workload_pid=6999999)
+        c = self.coordinator_world(rows, [enoent], mem=64 * GIB)
+        count = []
+
+        def appear(deadline):
+            count.append(1)
+            if len(count) == 2:
+                (self.tmp / "proc/6999999").mkdir()
+                (self.tmp / "proc/6999999/stat").write_text("6999999 (w) S " + " ".join(["0"] * 30) + "\n")
+            return [enoent]
+
+        c.read_census = appear
+        self.assertHold(c, "resident_fallback_changed")
+        # Non-fallback admissions never take the extra census read.
+        plain = [census_row(1, 7200, "/user.slice/wl.scope")]
+        seen = []
+        c = self.coordinator_world([self.worker_row(1, 7200, "/user.slice/wl.scope")], plain, mem=64 * GIB)
+        c.read_census = lambda d: seen.append(d) or plain
+        c.admit()
+        self.assertEqual(len(seen), 1)
+
+    def test_fallback_keeps_original_deadline_and_replay_seam_hold(self):
+        group = "/user.slice/coord.scope"
+        rows = [self.worker_row(1, 7100, group)]
+        base = self.coordinator_census(1, 7100, group, workload_pid=None)
+        c = self.coordinator_world(rows, [base], mem=64 * GIB)
+        calls = []
+        c.active_deadline = time.monotonic() + 1.0
+
+        def expire(deadline):
+            calls.append(1)
+            if len(calls) == 2:
+                time.sleep(1.1)  # the final slow read consumes the original budget
+            return [base]
+
+        c.read_census = expire
+        self.assertHold(c, "admission_deadline_exceeded")
+        # Replay seam: a changed selection is a refusal that skips the replay and records the typed reason.
+        c = self.coordinator_world(rows, [base], mem=64 * GIB)
+        c.read_census = lambda d: [base] if not calls.append(2) and calls.count(2) % 2 else [dict(base, workload_pid=7100)]
+        calls.clear()
+        self.assertFalse(c.admission_allows(time.monotonic() + 5))
+        self.assertEqual(c.admission_hold, "resident_fallback_changed")
+        # An expired caller deadline stays expired (no renewal) before any proc is read.
+        c = self.coordinator_world(rows, [base], mem=64 * GIB)
+        self.assertHold(c, "admission_deadline_exceeded", deadline=time.monotonic() - 1)
+
+    def test_birth_window_btime_and_cgroup_helpers(self):
+        mod = self.mod()
+        hz = 100
+        self.assertTrue(mod.birth_matches(10_000, 0, 10, hz))
+        self.assertTrue(mod.birth_matches(10_000, 0, 8, hz))
+        self.assertTrue(mod.birth_matches(10_000, 0, 40, hz))
+        self.assertFalse(mod.birth_matches(10_000, 0, 7, hz))
+        self.assertFalse(mod.birth_matches(10_000, 0, 41, hz))
+        for bad in (None, 0, -1, True, 1.0, "1"):
+            self.assertFalse(mod.birth_matches(bad, 0, 10, hz))
+        for good in ("/a/b", "/user.slice/w.scope"):
+            self.assertEqual(mod.relative_cgroup(good), good)
+        for bad in (None, "", "/", "a/b", "/a//b", "/a/../b", "/a/./b", "/a/", "/a\0b", 5):
+            self.assertIsNone(mod.relative_cgroup(bad), bad)
+        root = self.tmp / "btime-proc"
+        root.mkdir()
+        with mock.patch.object(mod, "PROC_ROOT", str(root)):
+            (root / "stat").write_text("intr " + "1 " * 100000 + "\nbtime 123456\n")
+            self.assertEqual(mod.read_proc_btime(), 123456)
+            for text in ("cpu 1\n", "btime 0\n", "btime x\n"):
+                (root / "stat").write_text(text)
+                with self.assertRaises(ValueError):
+                    mod.read_proc_btime()
+
     # ---- actual selected launcher caps ---------------------------------------------
 
     def home_with_config(self, raw=None, mode=0o600, **config):
@@ -4521,6 +4883,45 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNone(mod.evaluate_quota({"claude": reserve}, require_eligible_route=True, now=now))
         self.assertEqual(mod.evaluate_quota([], require_eligible_route=False, now=now), "quota_unparseable")
         self.assertIsNone(mod.evaluate_quota({"codex": cases["limit"]}, require_eligible_route=False, now=now))  # shell: acquisition only
+
+    def test_null_optional_plan_window_does_not_poison_usable_route_but_required_unknowns_hold(self):
+        mod = self.mod()
+        now = datetime_now()
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        reset = "2999-01-01T00:00:00Z"
+        null = {"percent_remaining": None, "reset_at": None}
+        live = lambda pct: {"percent_remaining": pct, "reset_at": reset}
+
+        def route(windows, **extra):
+            return dict({"status": "ok", "observed_at": stamp, "details": {"limit_reached": False, "observed_at": stamp}, "windows": windows}, **extra)
+
+        def verdict(name, windows, **extra):
+            return mod.evaluate_quota({name: route(windows, **extra)}, require_eligible_route=True, now=now)
+
+        # Real quse shape: healthy Claude with a nullable monthly slot is usable; so is Codex with null 5h/monthly.
+        self.assertIsNone(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null)}))
+        self.assertIsNone(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null, present=False)}))
+        self.assertIsNone(verdict("codex", {"5h": dict(null), "7d": live(60), "monthly": dict(null)}))
+        # Exactly the optional slot is dropped; every other unknown stays fail-closed.
+        bad = "quota_no_eligible_route"
+        self.assertEqual(verdict("claude", {"5h": dict(null), "7d": live(60), "monthly": dict(null)}), bad)  # required window unknown
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": dict(null), "monthly": dict(null)}), bad)
+        self.assertEqual(verdict("codex", {"5h": live(80), "7d": dict(null)}), bad)
+        self.assertEqual(verdict("go", {"5h": live(80), "7d": live(60), "monthly": dict(null)}), bad)  # not optional for this provider
+        self.assertEqual(verdict("claude", {"5h": live(80), "weekly_opus": dict(null)}), bad)  # unlisted window
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null, present=True)}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null, error="boom")}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": {"percent_remaining": None, "reset_at": reset}}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": {"percent_remaining": 50, "reset_at": None, "present": "yes"}}), bad)
+        self.assertEqual(verdict("claude", {"monthly": dict(null)}), bad)  # nothing usable left
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": live(0)}), bad)  # present optional window is still checked
+        self.assertEqual(verdict("claude", {"5h": live(0), "7d": live(60), "monthly": dict(null)}), bad)  # exhausted
+        self.assertEqual(verdict("codex", {"7d": live(15), "5h": dict(null)}), bad)  # Codex reserve
+        self.assertIsNone(verdict("codex", {"7d": live(16), "5h": dict(null)}))
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, stale=True), bad)
+        old = (now - __import__("datetime").timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, observed_at=old, details={"limit_reached": False, "observed_at": old}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, details={"limit_reached": True, "observed_at": stamp}), bad)
 
     def test_quota_failure_is_closed_and_raw_output_never_leaks(self):
         secret = "SECRET-ACCOUNT-xyz"
