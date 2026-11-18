@@ -82,7 +82,8 @@ def _checks(repo: str, sha: str, cwd: str, runner: Callable) -> dict:
     failed += sum(1 for item in statuses if isinstance(item, dict) and item.get('state') not in {'success', 'pending'})
     # GitHub returns combined_state='pending' when there are 0 legacy commit statuses.
     has_statuses = len(statuses) > 0
-    state = 'success' if total > 0 and actually_succeeded > 0 and successful == total and (not has_statuses or combined_state == 'success') else \
+    state = 'none' if total == 0 else \
+        'success' if actually_succeeded > 0 and successful == total and (not has_statuses or combined_state == 'success') else \
         'pending' if pending or (has_statuses and combined_state == 'pending') else 'failure'
     return {'checks_head_sha': sha, 'checks_state': state, 'checks_total': total,
             'checks_successful': successful, 'checks_pending': pending, 'checks_failed': failed}
@@ -126,13 +127,15 @@ def collect(repo_path: Optional[str] = None, pr: Optional[str] = None,
             evidence.update(_checks(repository, evidence['head_sha'], cwd, runner))
         else:
             evidence['observation_error'] = 'GitHub pull request head SHA is missing or invalid'
-    fetch = _run(runner, ['git', 'fetch', '--quiet', 'origin', 'main'], cwd, 120)
-    main = _run(runner, ['git', 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'], cwd)
+    target_branch = evidence['base_ref'] if evidence['base_ref'] in ('main', 'master') else 'main'
+    target_ref = f'refs/remotes/origin/{target_branch}'
+    fetch = _run(runner, ['git', 'fetch', '--quiet', 'origin', target_branch], cwd, 120)
+    main = _run(runner, ['git', 'rev-parse', '--verify', f'{target_ref}^{{commit}}'], cwd)
     if fetch is None or fetch.returncode != 0 or main is None or main.returncode != 0:
-        evidence['observation_error'] = 'origin/main could not be fetched and verified'
+        evidence['observation_error'] = f'origin/{target_branch} could not be fetched and verified'
     else:
         evidence['main_head_sha'] = (main.stdout or '').strip().lower()
         if SHA.fullmatch(str(evidence.get('merge_commit_sha') or '')):
-            ancestor = _run(runner, ['git', 'merge-base', '--is-ancestor', evidence['merge_commit_sha'], 'refs/remotes/origin/main'], cwd)
+            ancestor = _run(runner, ['git', 'merge-base', '--is-ancestor', evidence['merge_commit_sha'], target_ref], cwd)
             evidence['merge_commit_in_main'] = ancestor is not None and ancestor.returncode == 0
     return evidence

@@ -108,6 +108,41 @@ class MergeEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["observation_error"], "origin is not a GitHub repository")
         self.assertFalse(any(call and call[0] == "gh" for call in calls))
 
+    def test_collects_master_zero_check_repo_as_none_state(self):
+        head = "d" * 40
+        merge = "e" * 40
+        master = "f" * 40
+
+        def runner(argv, **kwargs):
+            if argv == ["git", "rev-parse", "--show-toplevel"]:
+                return subprocess.CompletedProcess(argv, 0, "/repo\n", "")
+            if argv == ["git", "remote", "get-url", "origin"]:
+                return subprocess.CompletedProcess(argv, 0, "git@github.com:org/zero-ci.git\n", "")
+            if argv[:3] == ["gh", "pr", "view"]:
+                result = {"url": "https://github.com/org/zero-ci/pull/7", "state": "MERGED", "baseRefName": "master",
+                          "headRefOid": head, "mergedAt": "2026-11-18T10:00:00Z", "mergeCommit": {"oid": merge}}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(result), "")
+            if argv[:4] == ["gh", "api", "--paginate", "--slurp"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"check_runs": []}]), "")
+            if argv[:2] == ["gh", "api"] and argv[-1].endswith("/status"):
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "pending", "statuses": []}), "")
+            if argv == ["git", "fetch", "--quiet", "origin", "master"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv == ["git", "rev-parse", "--verify", "refs/remotes/origin/master^{commit}"]:
+                return subprocess.CompletedProcess(argv, 0, master + "\n", "")
+            if argv == ["git", "merge-base", "--is-ancestor", merge, "refs/remotes/origin/master"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            raise AssertionError(argv)
+
+        evidence = collect("/repo", "7", runner,
+                           lambda: datetime(2026, 11, 18, 10, 1, tzinfo=timezone.utc))
+        self.assertEqual(evidence["base_ref"], "master")
+        self.assertEqual(evidence["checks_state"], "none")
+        self.assertEqual(evidence["checks_total"], 0)
+        self.assertEqual(evidence["main_head_sha"], master)
+        self.assertTrue(evidence["merge_commit_in_main"])
+        self.assertNotIn("observation_error", evidence)
+
 
 if __name__ == "__main__":
     unittest.main()

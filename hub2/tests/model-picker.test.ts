@@ -286,7 +286,7 @@ test('pool spreads across engines and keeps automatic Luna/Astra/unadvertised en
   const route=await pickModelRoute(env,{interactive:false},()=>(i+0.5)/200);
   seen.set(route.policy_id,(seen.get(route.policy_id)||0)+1);
  }
- assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse'].sort(),'all four surviving default routes stay usable');
+ assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse','zai-glm-flash'].sort(),'all five surviving default routes stay usable');
  assert.ok(!seen.has('codex-astra-medium'));
  assert.ok(!seen.has('gemini-argon-medium'),'engine no host advertises is not picked');
  assert.ok(!seen.has('codex-luna-max'),'Luna must never be an automatic default');
@@ -641,14 +641,15 @@ function hydrogenFixture(): RoutingSnapshot {
   accounts:new Map(candidates.map((row:any)=>[row.account_id,{account:{enabled:true},credential_usable:true,fresh:true,hosts:['h1'],quota:{remaining:80,captured_at:now,valid_until:now+900000}}])),
   machines:new Map([['h1',{connected:true,engines:['codex','claude','antigravity','go','zai'],capabilities:['headless','interactive','effort:codex','effort:claude','effort:antigravity']} ]])};
 }
-test('ordinary default/fix/implement in both modes and quick/daily excludes Argon and stale Flash',()=>{
+test('ordinary default/fix/implement in both modes and quick/daily excludes Argon and Antigravity Flash',()=>{
  for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
   const result=buildRoutingPool(hydrogenFixture(),{interactive,purpose,tier});
   const models=result.options.map(row=>row.value.model);
   assert(models.includes('gemini-4-hydrogen-medium'));
   assert(models.includes('gpt-6.1-sol'));
-  assert(!models.some(model=>/argon|flash/.test(model)));
-  for(const draw of [0,.25,.5,.75,.999999])assert(!/argon|flash/.test(weightedChoice(result.options,()=>draw).model));
+  assert(models.includes('glm-5.3-flash'));
+  assert(!models.some(model=>/gemini-4-(?:argon|flash)/.test(model)));
+  for(const draw of [0,.25,.5,.75,.999999])assert(!/gemini-4-(?:argon|flash)/.test(weightedChoice(result.options,()=>draw).model));
  }
 });
 test('review/think/deep and explicit Sol/Fable/Argon preserve existing selection',()=>{
@@ -672,7 +673,7 @@ test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon 
 });
 
 
-test('committed ZAI route works explicitly and for review/deep while Hydrogen stays ordinary', () => {
+test('committed ZAI route works in ordinary pool, --engine zai, explicit and review/deep while Hydrogen replaces Antigravity Flash/Argon', () => {
  const snapshot=hydrogenFixture();
  snapshot.policy.candidates=hydrogenPolicy.candidates;
  snapshot.machines.get('h1')!.capabilities!.push('effort:zai');
@@ -680,9 +681,10 @@ test('committed ZAI route works explicitly and for review/deep while Hydrogen st
  for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
   const models=buildRoutingPool(snapshot,{interactive,purpose,tier}).options.map(row=>row.value.model);
   assert(models.includes('gemini-4-hydrogen-medium'));
-  assert(!models.some(model=>/flash|gemini-4-argon/i.test(model)));
+  assert(models.includes('glm-5.3-flash'));
+  assert(!models.some(model=>/gemini-4-(?:argon|flash)/i.test(model)));
  }
- for(const input of [{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const}]){
+ for(const input of [{engine:'zai'},{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const}]){
   assert(buildRoutingPool(snapshot,{interactive:false,...input}).options.some(row=>row.value.policy_id===id));
  }
  // A deep tier prefers strong models, so the flash route is only its advisory fallback.
@@ -690,8 +692,9 @@ test('committed ZAI route works explicitly and for review/deep while Hydrogen st
  const explicit=buildRoutingPool(snapshot,{interactive:false,engine:'zai',model:'glm-5.3-flash',effort:'medium',purpose:'implement'});
  assert.deepEqual(explicit.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
   [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
- assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'zai'}),
-  (error:any)=>error.code==='model_policy_unavailable');
+ const byEngine=buildRoutingPool(snapshot,{interactive:false,engine:'zai'});
+ assert.deepEqual(byEngine.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
+  [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
 });
 
 // ---- Codex reserve (AGENTS.md quota gate): fresh known quota strictly above 15%, fail closed ----
