@@ -1352,6 +1352,32 @@ def read_fd_mount_id(fd):
     return parse_fdinfo_mount_id(read_text_limited(f"{PROC_ROOT}/self/fdinfo/{fd}"))
 
 
+def open_target_cgroup_root(pid_fd):
+    """Directory fd of the cgroup mount root as the CHOSEN process sees it, opened relative to its held /proc/<pid> fd.
+
+    Only the literal ``root`` entry of that bound proc directory may follow the kernel's procfs magic link (O_NOFOLLOW on
+    it would reject the very mechanism); this is a deliberately bounded exception, never generic symlink following. The
+    fixed ``sys/fs/cgroup`` components below it are then walked one by one with O_NOFOLLOW.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("root", flags, dir_fd=pid_fd)
+    try:
+        for part in ("sys", "fs", "cgroup"):
+            nxt = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def parse_stat_state_ticks(raw):
+    """(state, start ticks) of a /proc/<pid>/stat text; ValueError/IndexError when malformed."""
+    fields = raw[raw.rindex(")") + 2:].split()
+    return fields[0], int(fields[19])
+
+
 PROVIDED_COORDINATES = (
     "cgroup_namespace_device", "cgroup_namespace_inode", "mount_namespace_device", "mount_namespace_inode",
     "cgroup_root_device", "cgroup_root_inode", "cgroup_mount_id",
@@ -1664,7 +1690,8 @@ class PhysicalAdmission:
         """
         pid, group = target["pid"], target["group"]
         provided = target.get("provided")
-        fd = root_fd = None
+        fd = root_fd = pid_fd = troot_fd = tscope_fd = None
+        differing = False
         try:
             if read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip() != boot_id:
                 raise StageFailure("admission", "resident_identity_unknown")
@@ -1677,12 +1704,49 @@ class PhysicalAdmission:
             ns_stats = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}") for name in ("cgroup", "mnt")}
             namespaces = {name: st.st_ino for name, st in ns_stats.items()}
             self_stats = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
+            ident = lambda st: (st.st_dev, st.st_ino)
+            # Differing MNT only: same cgroup namespace (never translated) but the target and this observer live in
+            # different mount namespaces (e.g. PrivateTmp). Everything else keeps the exact same-namespace proof.
+            differing = ident(ns_stats["cgroup"]) == ident(self_stats["cgroup"]) and ident(ns_stats["mnt"]) != ident(self_stats["mnt"])
             if groups != [group] and provided is not None:
                 raise StageFailure("admission", "resident_measurement_unknown")  # the provided pid is not in its recorded cgroup
-            if groups != [group] or namespaces != ns_ids:
+            if groups != [group] or (not differing and namespaces != ns_ids) or (
+                    differing and (namespaces["cgroup"] != ns_ids["cgroup"] or self_stats["mnt"].st_ino != ns_ids["mnt"])):
                 raise StageFailure("admission", "resident_identity_unknown")
             root = mount_id = None
-            if provided is not None:
+            if differing:
+                # Bind the CHOSEN process directory, re-prove it through that held directory, then view the cgroup
+                # objects through ITS kernel root: they must be the very objects this observer holds.
+                dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                pid_fd = os.open(f"{PROC_ROOT}/{pid}", dir_flags)
+                pid_stat = os.fstat(pid_fd)
+                if ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                state_held, ticks_held = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
+                if state_held in ("Z", "X") or ticks_held != start_ticks:
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if [line[3:] for line in read_at_limited(pid_fd, "cgroup").splitlines() if line.startswith("0::")] != [group]:
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if any(ident(os.stat(f"ns/{name}", dir_fd=pid_fd)) != ident(ns_stats[name]) for name in ("cgroup", "mnt")):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                root_fd = os.open(CGROUP_ROOT, dir_flags)
+                root = os.fstat(root_fd)
+                if ident(os.stat(CGROUP_ROOT)) != ident(root):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                troot_fd = open_target_cgroup_root(pid_fd)
+                troot = os.fstat(troot_fd)
+                mount_id = read_fd_mount_id(troot_fd)
+                if ident(troot) != ident(root):
+                    raise StageFailure("admission", "resident_identity_unknown")
+                if provided is not None:
+                    actual = {
+                        "cgroup_namespace_device": ns_stats["cgroup"].st_dev, "cgroup_namespace_inode": ns_stats["cgroup"].st_ino,
+                        "mount_namespace_device": ns_stats["mnt"].st_dev, "mount_namespace_inode": ns_stats["mnt"].st_ino,
+                        "cgroup_root_device": troot.st_dev, "cgroup_root_inode": troot.st_ino, "cgroup_mount_id": mount_id,
+                    }
+                    if any(actual[key] != value for key, value in provided.items()):
+                        raise StageFailure("admission", "resident_identity_unknown")
+            elif provided is not None:
                 root_fd = os.open(CGROUP_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
                 root, mount_id = os.fstat(root_fd), read_fd_mount_id(root_fd)
                 root_path = os.stat(CGROUP_ROOT)
@@ -1697,6 +1761,11 @@ class PhysicalAdmission:
                     raise StageFailure("admission", "resident_identity_unknown")
             fd = open_cgroup_dir(group, root_fd) if root_fd is not None else open_cgroup_dir(group)
             opened = os.fstat(fd)
+            if differing:
+                tscope_fd = open_cgroup_dir(group, troot_fd)
+                tscope = os.fstat(tscope_fd)
+                if ident(tscope) != ident(opened):
+                    raise StageFailure("admission", "resident_identity_unknown")
             members = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
             mem_stat = {}
             for line in read_at_limited(fd, "memory.stat").splitlines():
@@ -1720,12 +1789,41 @@ class PhysicalAdmission:
             # The namespace tuple was read before the memory reads: re-read the chosen PID's AND this process's
             # cgroup/mnt namespaces (dev, inode) at the end; initial chosen, initial/current self and the provided
             # coordinates must all be one and the same, so a switch during the memory reads cannot pass stale.
-            final_ns = {who: {name: os.stat(f"{PROC_ROOT}/{path}/ns/{name}") for name in ("cgroup", "mnt")} for who, path in (("pid", pid), ("self", "self"))}
-            ident = lambda st: (st.st_dev, st.st_ino)
-            for name in ("cgroup", "mnt"):
-                if len({ident(ns_stats[name]), ident(self_stats[name]), ident(final_ns["pid"][name]), ident(final_ns["self"][name])}) != 1:
+            if differing:
+                # Target and observer mount namespaces are each stable on their own; the cgroup namespaces stay one.
+                final_pid = {name: os.stat(f"ns/{name}", dir_fd=pid_fd) for name in ("cgroup", "mnt")}
+                final_self = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
+                if (len({ident(ns_stats["cgroup"]), ident(self_stats["cgroup"]), ident(final_pid["cgroup"]), ident(final_self["cgroup"])}) != 1
+                        or ident(final_pid["mnt"]) != ident(ns_stats["mnt"]) or ident(final_self["mnt"]) != ident(self_stats["mnt"])
+                        or final_self["cgroup"].st_ino != ns_ids["cgroup"] or final_self["mnt"].st_ino != ns_ids["mnt"]):
                     raise StageFailure("admission", "resident_identity_unstable")
-            if provided is not None:
+                state_end, ticks_end = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
+                if (state_end in ("Z", "X") or ticks_end != start_ticks or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)
+                        or ident(os.fstat(pid_fd)) != ident(pid_stat)
+                        or ident(os.fstat(root_fd)) != ident(root) or ident(os.stat(CGROUP_ROOT)) != ident(root)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                # Reopen the target view from scratch through the same held process directory: a retained fd alone
+                # cannot show the current pathname still names the same objects and the same mount instance.
+                troot_again = open_target_cgroup_root(pid_fd)
+                try:
+                    tscope_again = open_cgroup_dir(group, troot_again)
+                    try:
+                        if (ident(os.fstat(troot_again)) != ident(troot) or read_fd_mount_id(troot_again) != mount_id
+                                or ident(os.fstat(tscope_again)) != ident(tscope)):
+                            raise StageFailure("admission", "resident_identity_unstable")
+                    finally:
+                        os.close(tscope_again)
+                finally:
+                    os.close(troot_again)
+                if (ident(os.fstat(troot_fd)) != ident(troot) or read_fd_mount_id(troot_fd) != mount_id
+                        or ident(os.fstat(tscope_fd)) != ident(tscope)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+            else:
+                final_ns = {who: {name: os.stat(f"{PROC_ROOT}/{path}/ns/{name}") for name in ("cgroup", "mnt")} for who, path in (("pid", pid), ("self", "self"))}
+                for name in ("cgroup", "mnt"):
+                    if len({ident(ns_stats[name]), ident(self_stats[name]), ident(final_ns["pid"][name]), ident(final_ns["self"][name])}) != 1:
+                        raise StageFailure("admission", "resident_identity_unstable")
+            if provided is not None and not differing:
                 root_after, mount_after, root_path_after = os.fstat(root_fd), read_fd_mount_id(root_fd), os.stat(CGROUP_ROOT)
                 if ((root_after.st_dev, root_after.st_ino, mount_after) != (root.st_dev, root.st_ino, mount_id)
                         or (root_path_after.st_dev, root_path_after.st_ino) != (root.st_dev, root.st_ino)):
@@ -1733,7 +1831,7 @@ class PhysicalAdmission:
         except (OSError, ValueError, KeyError, IndexError):
             raise StageFailure("admission", "resident_measurement_unknown")
         finally:
-            for held in (fd, root_fd):
+            for held in (fd, root_fd, pid_fd, troot_fd, tscope_fd):
                 if held is not None:
                     os.close(held)
         try:
@@ -1746,6 +1844,9 @@ class PhysicalAdmission:
             identity = (boot_id, start_ticks, group, opened.st_dev, opened.st_ino, tuple(sorted(namespaces.items())))
             if provided is not None:
                 identity += (pid, ns_stats["cgroup"].st_dev, ns_stats["mnt"].st_dev, root.st_dev, root.st_ino, mount_id)
+            if differing:
+                identity += ("target_view", ident(ns_stats["mnt"]), ident(self_stats["mnt"]), ident(self_stats["cgroup"]),
+                             ident(root), mount_id, ident(opened))
             return {
                 "identity": identity,
                 "start_ticks": start_ticks, "rss_anon": rss_anon, "group_anon": mem_stat["anon"], "group_current": current,
