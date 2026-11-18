@@ -179,7 +179,13 @@ class _ManagedObserver:
 
     def emit(self, phase, decision=None, condition=None, flags=None, *, recipient_class="none"):
         try:
-            return self.client.emit(phase, decision, condition, flags, recipient_class=recipient_class)
+            return self.client.emit(
+                phase,
+                decision=decision,
+                condition=condition,
+                flags=flags,
+                recipient_class=recipient_class,
+            )
         except BaseException as error:
             self.fail()
             if not isinstance(error, Exception):
