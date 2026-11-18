@@ -85,16 +85,21 @@ owner for the whole mutation window: the deploy job stages the exact candidate
 `deploy/vm/provision-node24.sh` bytes to a SHA-bound path under
 `/opt/agent-hub/.local/tmp` over the normal deploy-key SSH (never a remote
 curl setup script), then invokes the transaction once with the trailing
-`provision-node24` token. The transaction derives the staged path from the
-validated deploy SHA alone, re-validates the staged bytes (regular file, not a
-symlink, invoking-user owned, not group/other writable, size-bounded, parses)
-and runs them INSIDE its existing `.deploy-transaction.lock`, after all
-application preconditions and before any checkout, npm dependency,
-transaction-state, configuration or systemd-unit mutation. A competing
-transaction therefore cannot acquire the lock between package verification and
-the application stage: custody is continuous, never nested, and never trusted
-from an environment flag — the provisioner proves inheritance by an
-independent non-blocking acquisition of the same lock file that must fail.
+`provision-node24` token and the Node24-qualified previous release SHA. The
+transaction derives the staged path from the validated deploy SHA alone,
+verifies the staged bytes against the immutable candidate Git object
+`${deploy_sha}:deploy/vm/provision-node24.sh` (plus regular-file, non-symlink,
+invoking-user ownership, non-group/other-writable, size-bounded, and syntax
+checks, executed from a private `0600` copy), binds the VM's under-lock `HEAD`
+to the qualified previous release SHA, and runs the provisioner INSIDE its
+existing `.deploy-transaction.lock`, after all application preconditions and
+before any checkout, npm dependency, transaction-state, configuration or
+systemd-unit mutation. A competing transaction therefore cannot acquire the lock
+between package verification and the application stage: custody is continuous,
+never nested, and never trusted from an environment flag or mere contention —
+the provisioner proves inheritance of the parent's actual open-file-description
+(`AGENT_HUB_NODE24_LOCK_FD`) bound to the fixed `.deploy-transaction.lock`
+inode while an independent acquisition fails with `EAGAIN`/`EWOULDBLOCK`.
 The provisioner:
 
 - supports exactly Ubuntu 24.04 (`noble`) and Debian 12 (`bookworm`) on
