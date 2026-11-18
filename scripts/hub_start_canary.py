@@ -11,7 +11,7 @@ ALERT_FROM = "alerts@dtcdev.click"
 MSMTP_ACCOUNT = "alerts"
 MARKER = "CANARY-OK"
 PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "printf CANARY-OK; sleep 30"}
-STAGES = ("helper_version", "lock", "host_release", "health", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
+STAGES = ("helper_version", "lock", "host_release", "health", "admission", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
 FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
 HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py")
@@ -710,6 +710,260 @@ def paired_stream_output_ok(captured, expected, engine):
     return proven
 
 
+# ---- fixed workspace authority and finite pre-start admission --------------
+
+# Root-owned, non-secret, fixed path. Deliberately not overridable through the
+# environment or an argument: callers (including the forced wrapper, which runs
+# under env -i) cannot select a different production config.
+CANARY_WORKSPACE_CONFIG = "/etc/agent-hub/canary-workspace.json"
+WORKSPACE_CONFIG_MAX_BYTES = 4096
+WORKSPACE_CONFIG_UID = 0
+WORKSPACE_CONFIG_TRUST_ROOT = "/"
+ADMISSION_BUDGET_S = 60.0
+ADMISSION_RAM_FLOOR_BYTES = 10 * 1024 ** 3
+NEW_WORKER_MEMORY_BYTES = 1500 * 1024 ** 2
+NEW_WORKER_PIDS = 256
+ADMISSION_DISK_SPIKE_BYTES = 512 * 1024 ** 2
+DISK_FLOOR_GB_RANGE = (1, 1048576)
+MATURE_RESIDENT_AGE_S = 180.0
+QUOTA_STALE_S = 1200.0
+CODEX_QUOTA_RESERVE_PERCENT = 15.0
+ADMISSION_JSON_MAX_BYTES = 16 * 1024 * 1024
+ADMISSION_MAX_ROWS = 5000
+PROC_ROOT = "/proc"
+CGROUP_ROOT = "/sys/fs/cgroup"
+# Hub session states with no live physical obligation vs. states that reserve capacity.
+HUB_TERMINAL_STATES = frozenset((
+    "failed", "stopped", "cancelled", "closed", "aborted", "lost", "completed", "completed-awaiting-review", "exited", "archived",
+))
+HUB_INFLIGHT_STATES = frozenset(("queued", "pending", "dispatching", "starting", "running", "exiting", "stopping", "needs_attention"))
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+# Fixed bridge executed through the already whole-archive-verified CLI (sealed
+# memfd, isolated interpreter). It issues exactly one authenticated GET through
+# the existing client with the effective human profile, no worker/env-token
+# fallback and no 401 refresh; the parent enforces the request deadline.
+ADMISSION_BRIDGE = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from agent_hub_host import auth, bus, config, worker_auth
+def _no_refresh(*args, **kwargs):
+    raise RuntimeError("refresh_disabled")
+auth.refresh_token = _no_refresh
+try:
+    if worker_auth.is_v2_worker() or any(os.environ.get(k) for k in ("HUB_CONFIG_FILE", "HUB_JOB_TOKEN", "HUB_TOKEN")):
+        raise RuntimeError("not_human")
+    human = config.load_human_config()
+    if not isinstance(human, dict) or not isinstance(human.get("access_token"), str) or not human.get("access_token"):
+        raise RuntimeError("not_human")
+    data = bus._do_request("GET", "/api/resource-settings")
+    settings = data.get("resource_settings") if isinstance(data, dict) else None
+    floor = settings.get("disk_floor_gb") if isinstance(settings, dict) else None
+    print(json.dumps({"disk_floor_gb": floor}))
+except BaseException:
+    sys.exit(3)
+"""
+
+
+def _closed_json(raw, limit):
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "replace")) > limit:
+        raise ValueError("json too large")
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and value == value and value not in (float("inf"), float("-inf"))
+
+
+def _nofollow_ancestors(path, trust_root):
+    """Ancestor directories of path from trust_root downward (trust_root first)."""
+    parts = []
+    cur = pathlib.Path(path).parent
+    root = pathlib.Path(trust_root)
+    while True:
+        parts.append(cur)
+        if cur == root or cur.parent == cur:
+            break
+        cur = cur.parent
+    if parts[-1] != root:
+        raise OSError(errno.EINVAL, "config outside trust root")
+    return list(reversed(parts))
+
+
+def read_workspace_config(path=None):
+    """Return the configured DATA workspace, or None when the file is absent.
+
+    Present but unsafe or malformed config raises StageFailure and never falls
+    back. The file is non-secret and read by UID 1000, so root:root 0644 is
+    the expected mode; only group/world write is refused.
+    """
+    path = CANARY_WORKSPACE_CONFIG if path is None else path
+    def fail(reason):
+        raise StageFailure("admission", "workspace_config_" + reason)
+    try:
+        ancestors = _nofollow_ancestors(path, WORKSPACE_CONFIG_TRUST_ROOT)
+    except OSError:
+        fail("path")
+    absent = False
+    for directory in ancestors:
+        try:
+            st = os.lstat(directory)
+        except FileNotFoundError:
+            absent = True
+            break
+        except OSError:
+            fail("parent")
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            fail("parent")
+        if st.st_uid not in (0, WORKSPACE_CONFIG_UID) or (st.st_mode & 0o022):
+            fail("parent")
+    if absent:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        fail("symlink" if error.errno == errno.ELOOP else "unreadable")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail("not_regular")
+        if before.st_uid != WORKSPACE_CONFIG_UID:
+            fail("owner")
+        if before.st_nlink != 1:
+            fail("nlink")
+        if before.st_mode & 0o022:
+            fail("writable")
+        if before.st_size > WORKSPACE_CONFIG_MAX_BYTES:
+            fail("size")
+        raw = os.read(fd, WORKSPACE_CONFIG_MAX_BYTES + 1)
+        after = os.fstat(fd)
+        if len(raw) > WORKSPACE_CONFIG_MAX_BYTES:
+            fail("size")
+        if (before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns, before.st_uid, before.st_mode) != (
+            after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns, after.st_uid, after.st_mode
+        ) or len(raw) != after.st_size:
+            fail("unstable")
+    except OSError:
+        fail("unreadable")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError):
+        fail("json")
+    if not isinstance(data, dict) or set(data) != {"workspace"}:
+        fail("schema")
+    workspace = data["workspace"]
+    if (not isinstance(workspace, str) or not workspace.startswith("/") or "\0" in workspace
+            or len(workspace) > 1024 or os.path.normpath(workspace) != workspace or workspace == "/"):
+        fail("schema")
+    return workspace
+
+
+def parse_iso_utc(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def quota_route_usable(name, route, now):
+    """Mirror of the maintained quota sanitizer's fail-closed acceptance of one route.
+
+    Pure and in-memory; raw quota is never retained or printed. A route is
+    usable only when it is status ok, fresh, not stale/limit-reached, every
+    window is well formed, and the lowest present remaining percentage is
+    strictly above the provider reserve (OpenAI Codex: 15).
+    """
+    if not isinstance(route, dict) or route.get("status") != "ok" or route.get("error") is not None:
+        return False
+    details = route.get("details") if route.get("details") is not None else {}
+    if not isinstance(details, dict) or details.get("limit_reached") is True:
+        return False
+    if details.get("limit_reached") is not None and type(details.get("limit_reached")) is not bool:
+        return False
+    for holder in (route, details):
+        if holder.get("stale") not in (None, False):
+            return False
+    observed = [holder["observed_at"] for holder in (route, details) if holder.get("observed_at") is not None]
+    parsed = [parse_iso_utc(value) for value in observed]
+    if any(value is None for value in parsed) or (len(parsed) == 2 and parsed[0] != parsed[1]):
+        return False
+    if parsed:
+        age = (now - parsed[0]).total_seconds()
+        if not 0 <= age < QUOTA_STALE_S:
+            return False
+    windows = route.get("windows")
+    if not isinstance(windows, dict) or not 1 <= len(windows) <= 32:
+        return False
+    lowest = None
+    for window in windows.values():
+        if not isinstance(window, dict) or window.get("error") is not None or window.get("present") is False:
+            return False
+        percent = window.get("percent_remaining")
+        if not _finite_number(percent) or not 0 <= percent <= 100:
+            return False
+        if window.get("reset_at") is not None and parse_iso_utc(window["reset_at"]) is None:
+            return False
+        lowest = percent if lowest is None else min(lowest, percent)
+    reserve = CODEX_QUOTA_RESERVE_PERCENT if name in ("codex", "codex-orin") else 0.0
+    return lowest is not None and lowest > reserve
+
+
+def evaluate_quota(raw, *, require_eligible_route, now=None):
+    """Return None when quota acquisition is acceptable, else a closed reason."""
+    if not isinstance(raw, dict):
+        return "quota_unparseable"
+    if not require_eligible_route:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if any(quota_route_usable(name, route, now) for name, route in raw.items() if isinstance(name, str)):
+        return None
+    return "quota_no_eligible_route"
+
+
+def read_text_limited(path, limit=65536):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "proc file too large")
+    return data.decode("utf-8", "replace")
+
+
+def parse_meminfo_available(text):
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == "kB" and parts[1].isdigit():
+                return int(parts[1]) * 1024
+            return None
+    return None
+
+
+def nearest_existing(path):
+    cur = pathlib.Path(os.path.abspath(path))
+    while True:
+        try:
+            if os.path.lexists(cur):
+                return pathlib.Path(os.path.realpath(cur))
+        except OSError:
+            return None
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+
+
+
 class Canary:
     def __init__(
         self,
@@ -737,6 +991,9 @@ class Canary:
         self.host_updater_trigger = "not_needed"
         self.host_updater_trigger_error = None
         self.pyz_fd = None
+        self.bridge_fd = None
+        self.admission_hold = None
+        self.workspace_source = "env_default"
         self.hub_pass_fds = ()
         self.lock_fd = None
         self.state_dir_path = None
@@ -842,6 +1099,300 @@ class Canary:
         self._zai_native_binding = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
+
+    # ---- workspace authority ------------------------------------------------
+
+    def resolve_workspace(self):
+        """Fixed root-owned config wins over env/default; invalid never falls back."""
+        self.current_stage = "admission"
+        configured = read_workspace_config()
+        if configured is not None:
+            self.workspace = configured
+            self.workspace_source = "root_config"
+        else:
+            self.workspace_source = "env_default"
+
+    # ---- admission collectors (each is a narrow, replaceable seam) ----------
+
+    def admission_deadline(self, deadline):
+        if deadline is None:
+            deadline = time.monotonic() + ADMISSION_BUDGET_S
+        if not self.in_cleanup and self.active_deadline is not None:
+            deadline = min(deadline, self.active_deadline)
+        return deadline
+
+    @staticmethod
+    def admission_time_left(deadline):
+        if time.monotonic() >= deadline:
+            raise StageFailure("admission", "admission_deadline_exceeded")
+
+    def sample_mem_available(self):
+        try:
+            value = parse_meminfo_available(read_text_limited(f"{PROC_ROOT}/meminfo"))
+        except OSError:
+            value = None
+        if type(value) is not int or value <= 0:
+            raise StageFailure("admission", "mem_available_unknown")
+        return value
+
+    def bridge_artifact_fd(self):
+        """Sealed fd of the whole-archive-verified CLI (candidate), or of the owned periodic CLI."""
+        if self.pyz_fd is not None:
+            return self.pyz_fd
+        if self.bridge_fd is not None:
+            return self.bridge_fd
+        if len(self.hub) != 1:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        import io, shutil, zipfile
+        found = shutil.which(self.hub[0])
+        if not found:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        try:
+            real = os.path.realpath(found)
+            st = os.lstat(real)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.geteuid()) or (st.st_mode & 0o022):
+                raise StageFailure("admission", "cli_artifact_unbindable")
+            data = read_regular_nofollow(real)
+            if not zipfile.is_zipfile(io.BytesIO(data)):
+                raise StageFailure("admission", "cli_artifact_unbindable")
+            self.bridge_fd = create_sealed_pyz_fd(data)
+        except OSError:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        return self.bridge_fd
+
+    def fetch_disk_floor_gb(self, deadline):
+        fd = self.bridge_artifact_fd()
+        rc, out, _ = self.run(
+            [sys.executable, "-I", "-S", "-c", ADMISSION_BRIDGE, f"/proc/self/fd/{fd}"],
+            deadline=deadline, pass_fd=fd,
+        )
+        if rc != 0:
+            raise StageFailure("admission", "resource_settings_timeout" if rc == 124 else "resource_settings_unavailable")
+        try:
+            data = _closed_json(out, 4096)
+        except ValueError:
+            raise StageFailure("admission", "resource_settings_invalid")
+        floor = data.get("disk_floor_gb") if isinstance(data, dict) and set(data) == {"disk_floor_gb"} else None
+        if not _finite_number(floor) or not DISK_FLOOR_GB_RANGE[0] <= floor <= DISK_FLOOR_GB_RANGE[1]:
+            raise StageFailure("admission", "resource_settings_invalid")
+        return floor
+
+    def acquire_quota(self, deadline):
+        rc, out, _ = self.run(["quse", "--json"], deadline=deadline)
+        if rc != 0:
+            raise StageFailure("admission", "quota_timeout" if rc == 124 else "quota_acquisition_failed")
+        try:
+            raw = _closed_json(out, 1024 * 1024)
+        except ValueError:
+            raise StageFailure("admission", "quota_unparseable")
+        reason = evaluate_quota(raw, require_eligible_route=(self.mode == "full"))
+        del raw, out
+        if reason:
+            raise StageFailure("admission", reason)
+
+    def read_census(self, deadline):
+        rc, out, _ = self.run([*self.a, "list", "--all", "--json"], deadline=deadline)
+        if rc != 0:
+            raise StageFailure("admission", "native_inventory_unavailable")
+        try:
+            rows = _closed_json(out, ADMISSION_JSON_MAX_BYTES)
+        except ValueError:
+            raise StageFailure("admission", "native_inventory_invalid")
+        if not isinstance(rows, list) or len(rows) > ADMISSION_MAX_ROWS or not all(isinstance(r, dict) for r in rows):
+            raise StageFailure("admission", "native_inventory_invalid")
+        return rows
+
+    def read_hub_rows(self, deadline):
+        try:
+            return self.list_items("admission", deadline)
+        except StageFailure:
+            raise StageFailure("admission", "managed_inflight_unavailable")
+
+    def boottime(self):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+    def namespace_inode(self, name):
+        return os.stat(f"{PROC_ROOT}/self/ns/{name}").st_ino
+
+    def measure_pid(self, row, pid):
+        """One identity+memory sample for a census row's workload; raises OSError/ValueError if unknowable."""
+        cgroup = row["workload_cgroup"]
+        if (not isinstance(cgroup, str) or not cgroup.startswith("/") or "\0" in cgroup
+                or ".." in cgroup.split("/")):
+            raise ValueError("cgroup")
+        group = f"{CGROUP_ROOT}{cgroup}"
+        stat_text = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+        fields = stat_text[stat_text.rindex(")") + 2:].split()
+        start_ticks = int(fields[19])
+        if f"0::{cgroup}" not in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines():
+            raise ValueError("pid not in cgroup")
+        members = {int(x) for x in read_text_limited(f"{group}/cgroup.procs").split()}
+        if pid not in members:
+            raise ValueError("pid not a member")
+        status = {}
+        for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
+            if ":" in line:
+                key, _, value = line.partition(":")
+                status[key] = value.split()
+        rss_anon = int(status["RssAnon"][0]) * 1024
+        mem_stat = {}
+        for line in read_text_limited(f"{group}/memory.stat").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                mem_stat[parts[0]] = int(parts[1])
+        current = int(read_text_limited(f"{group}/memory.current").strip())
+        return {
+            "start_ticks": start_ticks, "members": frozenset(members), "rss_anon": rss_anon,
+            "group_anon": mem_stat["anon"], "group_current": current,
+        }
+
+    def row_memory_cap(self, row):
+        limits = row.get("limits")
+        cap = limits.get("memory_bytes") if isinstance(limits, dict) else None
+        if type(cap) is int and cap > 0:
+            return cap
+        return None
+
+    def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now):
+        """Extra bytes this current native row may still claim beyond what MemAvailable already reflects."""
+        if row.get("worker_alive") is False and row.get("containment_empty") is True:
+            return 0
+        phase, state = row.get("phase"), row.get("state")
+        if phase in ("exited", "failed") and row.get("worker_alive") is False and row.get("containment_empty") is True:
+            return 0
+        cap = self.row_memory_cap(row)
+        pid = row.get("workload_pid")
+        if pid is None and (phase == "starting" or state == "starting"):
+            if cap is None:
+                raise StageFailure("admission", "resident_bound_unknown")
+            return cap
+        identity = row.get("containment_cgroup_identity")
+        if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
+            raise StageFailure("admission", "resident_identity_unknown")
+        for key, name in (("cgroup_namespace_inode", "cgroup"), ("mount_namespace_inode", "mnt")):
+            if key in identity and type(identity[key]) is int and identity[key] != ns_ids[name]:
+                raise StageFailure("admission", "resident_identity_unknown")
+        try:
+            first = self.measure_pid(row, pid)
+            second = self.measure_pid(row, pid)
+        except (OSError, ValueError, KeyError, IndexError):
+            raise StageFailure("admission", "resident_measurement_unknown")
+        if first["start_ticks"] != second["start_ticks"] or first["members"] != second["members"] or pid not in first["members"]:
+            raise StageFailure("admission", "resident_identity_unstable")
+        ticks = os.sysconf("SC_CLK_TCK")
+        age = boot_now - first["start_ticks"] / ticks
+        if not _finite_number(age) or age < 0:
+            raise StageFailure("admission", "resident_age_unknown")
+        group_ok = 0 < first["group_anon"] <= first["group_current"] and 0 < second["group_anon"] <= second["group_current"]
+        pid_ok = first["rss_anon"] > 0 and second["rss_anon"] > 0
+        if shared:
+            # A shared cgroup cannot prove one row's usage: per-PID anonymous memory only.
+            mature_ok = pid_ok
+            anon = min(first["rss_anon"], second["rss_anon"])
+        else:
+            mature_ok = pid_ok and group_ok
+            anon = min(first["group_anon"], second["group_anon"])
+        if age >= MATURE_RESIDENT_AGE_S and mature_ok:
+            return 0
+        if cap is None:
+            raise StageFailure("admission", "resident_bound_unknown")
+        return max(0, cap - anon) if mature_ok else cap
+
+    def uncovered_inflight_reserve(self, hub_rows, native_ids):
+        reserve = 0
+        for item in hub_rows:
+            if not isinstance(item, dict):
+                raise StageFailure("admission", "managed_inflight_invalid")
+            host = item.get("host") or item.get("machine_id") or item.get("machine")
+            if host is not None and host != self.machine:
+                continue
+            state = item.get("state")
+            if state in HUB_TERMINAL_STATES:
+                continue
+            if state not in HUB_INFLIGHT_STATES:
+                raise StageFailure("admission", "managed_inflight_unknown_state")
+            native = item.get("native_id")
+            if isinstance(native, str) and native.lower() in native_ids:
+                continue
+            reserve += NEW_WORKER_MEMORY_BYTES
+        return reserve
+
+    def disk_free_after_margin(self, paths):
+        seen = {}
+        for path in paths:
+            existing = nearest_existing(path)
+            if existing is None:
+                raise StageFailure("admission", "disk_unknown")
+            try:
+                st = os.stat(existing)
+                vfs = os.statvfs(existing)
+            except OSError:
+                raise StageFailure("admission", "disk_unknown")
+            seen.setdefault(st.st_dev, vfs.f_bavail * vfs.f_frsize)
+        return list(seen.values())
+
+    def admit(self, deadline=None, workspace=None, *, seam="start"):
+        """Finite fresh pre-start admission. Raises StageFailure('admission', closed_reason)."""
+        self.current_stage = "admission" if not self.in_cleanup else self.current_stage
+        deadline = self.admission_deadline(deadline)
+        workspace = self.workspace if workspace is None else workspace
+        if (not isinstance(workspace, str) or not workspace.startswith("/") or "\0" in workspace):
+            raise StageFailure("admission", "workspace_invalid")
+        self.admission_time_left(deadline)
+        floor_gb = self.fetch_disk_floor_gb(deadline)
+        self.admission_time_left(deadline)
+        self.acquire_quota(deadline)
+        self.admission_time_left(deadline)
+        census = self.read_census(deadline)
+        hub_rows = self.read_hub_rows(deadline)
+        self.admission_time_left(deadline)
+        try:
+            boot_id = read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip()
+            ns_ids = {"cgroup": self.namespace_inode("cgroup"), "mnt": self.namespace_inode("mnt")}
+            boot_now = self.boottime()
+        except (OSError, ValueError):
+            raise StageFailure("admission", "resident_identity_unknown")
+        native_ids, by_pid, by_group = set(), {}, {}
+        for row in census:
+            native_id = row.get("id")
+            if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id) or native_id.lower() in native_ids:
+                raise StageFailure("admission", "native_inventory_invalid")
+            native_ids.add(native_id.lower())
+            by_pid.setdefault(row.get("workload_pid"), []).append(native_id)
+            by_group.setdefault(row.get("workload_cgroup"), []).append(native_id)
+        reserve = 0
+        for row in census:
+            pid, group = row.get("workload_pid"), row.get("workload_cgroup")
+            shared = len(by_group.get(group, ())) > 1 and group is not None
+            if pid is not None and len(by_pid.get(pid, ())) > 1:
+                raise StageFailure("admission", "resident_identity_ambiguous")
+            reserve += self.resident_reserve(row, shared, boot_id, ns_ids, boot_now)
+        reserve += self.uncovered_inflight_reserve(hub_rows, native_ids)
+        # Disk: actual resolved cwd and own TMP filesystems, one charge per device.
+        resolved = os.path.realpath(workspace)
+        tmp_dir = os.path.join(resolved, ".local", "tmp")
+        floor_bytes = int(floor_gb * 1024 ** 3)
+        for free in self.disk_free_after_margin([resolved, tmp_dir]):
+            if free - ADMISSION_DISK_SPIKE_BYTES < floor_bytes:
+                raise StageFailure("admission", "disk_below_floor")
+        # Final fresh RAM sample after every slow read, before any spawn.
+        self.admission_time_left(deadline)
+        available = self.sample_mem_available()
+        if available - reserve - NEW_WORKER_MEMORY_BYTES < ADMISSION_RAM_FLOOR_BYTES:
+            raise StageFailure("admission", "memory_below_floor")
+        self.admission_time_left(deadline)
+
+    def admission_allows(self, deadline, workspace=None):
+        """Replay-seam wrapper: True only when a fresh admission passes."""
+        stage = self.current_stage
+        try:
+            self.admit(deadline, workspace, seam="replay")
+            return True
+        except StageFailure as failure:
+            self.admission_hold = failure.reason
+            return False
+        finally:
+            self.current_stage = stage
 
     def stage_deadline(self, timeout_s):
         target = time.monotonic() + timeout_s
@@ -1281,7 +1832,11 @@ class Canary:
         workspace = rec.get("workspace") if isinstance(rec.get("workspace"), str) and rec.get("workspace") else None
         if not key or not repo or not machine or not workspace:
             raise StageFailure("cleanup", "prior_pending_corrupt")
-        if not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode")):
+        if (not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode"))
+                and self.admission_allows(deadline, rec["workspace"])):
+            # Replays keep the ORIGINAL recorded workspace/key/body; admission only
+            # decides whether a possible new START may be sent now. When it is held
+            # the pending file is retained and resolution continues by lookup only.
             replay_args = [
                 *self.hub, "sessions", "start", "--no-wait",
                 "--repo", rec["repo"], "--machine", rec["machine"],
@@ -1362,7 +1917,7 @@ class Canary:
             deadline = self.stage_deadline(self.stop_timeout)
             self._reconcile_one_pending_file(pfile, deadline)
 
-    def run(self, argv, timeout=None, *, deadline=None, env=None):
+    def run(self, argv, timeout=None, *, deadline=None, env=None, pass_fd=None):
         limit = self.cmd_timeout if timeout is None else timeout
         effective_deadline = deadline
         if not self.in_cleanup and self.active_deadline is not None:
@@ -1372,6 +1927,8 @@ class Canary:
         if limit <= 0:
             return 124, "", ""
         pass_fds = self.hub_pass_fds if (self.pyz_fd is not None and f"/proc/self/fd/{self.pyz_fd}" in argv) else ()
+        if pass_fd is not None and f"/proc/self/fd/{pass_fd}" in argv:
+            pass_fds = (pass_fd,)
         try:
             proc = subprocess.Popen(
                 argv,
@@ -1479,6 +2036,10 @@ class Canary:
         return True
 
     def start(self):
+        self.current_stage = "admission"
+        # Fresh admission before EVERY possible Hub START; refusal happens before
+        # any pending state or session exists, so there is nothing to clean up.
+        self.admit(self.stage_deadline(ADMISSION_BUDGET_S))
         self.current_stage = "start"
         ensure_private_dir(self.workspace, stage="start", prefix="workspace")
         self.started_at = time.monotonic()
@@ -1926,8 +2487,9 @@ class Canary:
         if not self.session and self.start_attempted:
             # A lost or interrupted response is reconciled first with the identical
             # idempotent key and payload, then by unambiguous client_key/key + scope.
-            _, out, _ = self.run(self.start_args(), deadline=limit_deadline)
-            self.remember_receipt(out)
+            if self.admission_allows(limit_deadline):
+                _, out, _ = self.run(self.start_args(), deadline=limit_deadline)
+                self.remember_receipt(out)
             if not self.session:
                 try:
                     items = self.list_items("cleanup", limit_deadline)
@@ -1995,6 +2557,7 @@ class Canary:
         try:
             self.active_deadline = time.monotonic() + self.active_budget
             self.verify_helper_digest()
+            self.resolve_workspace()
             self.acquire_deploy_gate_lock()
             self.verify_candidate_host_release()
             self.reconcile_prior_pending()
@@ -2053,6 +2616,12 @@ class Canary:
                     pass
                 self.pyz_fd = None
                 self.hub_pass_fds = ()
+            if self.bridge_fd is not None:
+                try:
+                    os.close(self.bridge_fd)
+                except OSError:
+                    pass
+                self.bridge_fd = None
             if self.lock_fd is not None:
                 try:
                     os.close(self.lock_fd)
