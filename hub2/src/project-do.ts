@@ -650,6 +650,10 @@ export class ProjectDO {
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
         this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
       }
+      if(next.status==='accepted'&&!INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
+        const context=this.intakeContext(row.id),settled=this.acceptedContext(context);
+        if(settled!==context)this.appendEvent(row.id,'accepted-context:'+row.id+':'+key,COMPLETION_ACTOR,'intake_context_updated',settled,at);
+      }
       if(typeof body.code_task==='boolean'){
         const source=(this.parse(row.source_json) as JsonRecord|null)??{},was=codeTask(source);
         this.db.run('UPDATE intakes SET source_json=? WHERE id=?',JSON.stringify({...source,code_task:body.code_task}),row.id);
@@ -1556,6 +1560,10 @@ export class ProjectDO {
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
         stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
+      if(status==='accepted'){
+        const context=this.intakeContext(intake.id),settled=this.acceptedContext(context);
+        if(settled!==context)this.appendEvent(intake.id,'accepted-context:'+saga.operation_id,COMPLETION_ACTOR,'intake_context_updated',settled,now);
+      }
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
     });
@@ -1660,7 +1668,9 @@ export class ProjectDO {
     }
     this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
       passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
-      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,
+      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',
+        reason:explicit?(mergeBlocked?'merge_gate_blocked':'acceptance_verification_append'):reason,
+        ...(explicit?{exit_reason:reason}:{}),
         ...(missing?{cause:missing}:{}),...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
     return record;
   }
@@ -2191,11 +2201,20 @@ export class ProjectDO {
     return event ? this.parse(event.body_json) as JsonRecord : Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,null]));
   }
 
+  /** Accepted work is finished: drop blocker/alert text left by an earlier
+   * unfinished attempt so current_state/next_step stay truthful. */
+  private acceptedContext(context:JsonRecord):JsonRecord{
+    const stale=typeof context.current_state==='string'&&/^Hub (could not finish this intake automatically|refused to accept code work)/.test(context.current_state);
+    if(!stale)return context;
+    return {...context,current_state:'Accepted: independent acceptance verification passed.',next_step:'None; this intake is finished.',
+      owner:context.owner===DEVELOPER_ALERT_RECIPIENT?null:context.owner??null};
+  }
+
   private viewIntake(row: IntakeRow): JsonRecord {
     const saga = row.session_id ? this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id = ?', row.session_id) : undefined;
     return {
       id: row.id, project: row.project, title: row.title, text: row.text,
-      ...this.intakeContext(row.id),
+      ...(row.status==='accepted'?this.acceptedContext(this.intakeContext(row.id)):this.intakeContext(row.id)),
       acceptance_criteria: this.parse(row.acceptance_criteria_json), status: row.status,
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
       linked_sessions: this.sessionLinks.links(row.id),
