@@ -751,6 +751,9 @@ DISK_FLOOR_GB_RANGE = (1, 1048576)
 MATURE_RESIDENT_AGE_S = 180.0
 QUOTA_STALE_S = 1200.0
 CODEX_QUOTA_RESERVE_PERCENT = 15.0
+# Mirrors agent-quota-launcher launcher/provider_admission.py ABSENT_OPTIONAL (quse route name -> optional plan windows).
+QUOTA_ABSENT_OPTIONAL_WINDOWS = {"claude": frozenset(("monthly",)), "codex": frozenset(("5h", "monthly")),
+                                 "codex-orin": frozenset(("5h", "monthly"))}
 ADMISSION_JSON_MAX_BYTES = 16 * 1024 * 1024
 ADMISSION_MAX_ROWS = 5000
 PROC_ROOT = "/proc"
@@ -1051,7 +1054,10 @@ def quota_route_usable(name, route, now):
     Pure and in-memory; raw quota is never retained or printed. A route is
     usable only when it is status ok, fresh, not stale/limit-reached, every
     window is well formed, and the lowest present remaining percentage is
-    strictly above the provider reserve (OpenAI Codex: 15).
+    strictly above the provider reserve (OpenAI Codex: 15). A fully null
+    window (no percentage, no reset, not explicitly present) is skipped only
+    when it is a provider-optional plan window (Claude monthly; Codex 5h and
+    monthly); a null required or unlisted window is never ignored.
     """
     if not isinstance(route, dict) or route.get("status") != "ok" or route.get("error") is not None:
         return False
@@ -1075,8 +1081,19 @@ def quota_route_usable(name, route, now):
     if not isinstance(windows, dict) or not 1 <= len(windows) <= 32:
         return False
     lowest = None
-    for window in windows.values():
-        if not isinstance(window, dict) or window.get("error") is not None or window.get("present") is False:
+    for window_name, window in windows.items():
+        if not isinstance(window, dict) or window.get("error") is not None:
+            return False
+        if "present" in window and type(window["present"]) is not bool:
+            return False
+        # quse's canonical null slot is an absent plan window only where the maintained
+        # sanitizer's ABSENT_OPTIONAL permits it for this provider; any other null/unknown
+        # window (and an explicit error, checked above) is still fail-closed.
+        if (window_name in QUOTA_ABSENT_OPTIONAL_WINDOWS.get(name, ())
+                and window.get("percent_remaining") is None and window.get("reset_at") is None
+                and window.get("present") is not True):
+            continue
+        if window.get("present") is False:
             return False
         percent = window.get("percent_remaining")
         if not _finite_number(percent) or not 0 <= percent <= 100:
@@ -1109,6 +1126,85 @@ def read_text_limited(path, limit=65536):
     if len(data) > limit:
         raise OSError(errno.EFBIG, "proc file too large")
     return data.decode("utf-8", "replace")
+
+
+BIRTH_WINDOW_S = (-2.0, 30.0)  # kernel start (btime + starttime) minus SDK created_at_ms, as qualified for current launches
+PROC_STAT_MAX_BYTES = 4 * 1024 * 1024
+CENSUS_SIGNATURE_FIELDS = (
+    "worker_alive", "worker_pid", "worker_cgroup", "workload_pid", "workload_cgroup", "state", "phase",
+    "created_at_ms", "workspace", "cwd", "limits", "containment_empty",
+)
+
+
+def read_proc_btime():
+    """Kernel boot wall-clock seconds from /proc/stat, read in bounded chunks (the intr line can be huge)."""
+    fd = os.open(f"{PROC_ROOT}/stat", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        data = b""
+        while len(data) <= PROC_STAT_MAX_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > PROC_STAT_MAX_BYTES:
+        raise OSError(errno.EFBIG, "proc stat too large")
+    for line in data.decode("utf-8", "replace").splitlines():
+        if line.startswith("btime "):
+            value = int(line.split()[1])
+            if value > 0:
+                return value
+    raise ValueError("btime")
+
+
+def birth_matches(created_ms, start_ticks, btime, hz):
+    return (type(created_ms) is int and created_ms > 0 and type(start_ticks) is int and btime > 0 and hz > 0
+            and BIRTH_WINDOW_S[0] <= btime + start_ticks / hz - created_ms / 1000 <= BIRTH_WINDOW_S[1])
+
+
+def relative_cgroup(raw):
+    """Normalized '/a/b' cgroup path relative to the cgroup root, or None when malformed."""
+    if not isinstance(raw, str) or not raw.startswith("/") or "\0" in raw:
+        return None
+    if raw.startswith(CGROUP_ROOT + "/"):
+        raw = raw[len(CGROUP_ROOT):]
+    parts = raw.split("/")[1:]
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    return raw
+
+
+def read_at_limited(dir_fd, name, limit=65536):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+    try:
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "cgroup file too large")
+    return data.decode("utf-8", "replace")
+
+
+def open_cgroup_dir(group):
+    """Directory fd of a cgroup reached component-by-component without following symlinks."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(CGROUP_ROOT, flags)
+    try:
+        for part in group.split("/")[1:]:
+            nxt = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def census_signature(census):
+    def freeze(row):
+        return tuple(json.dumps(row.get(field), sort_keys=True, default=str) for field in CENSUS_SIGNATURE_FIELDS)
+    return {row.get("id"): freeze(row) for row in census}
 
 
 def parse_meminfo_available(text):
@@ -1465,7 +1561,148 @@ class Canary:
             return cap
         return None
 
-    def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now):
+    def workload_pid_absent(self, pid):
+        """True only when opening the workload's /proc/PID identity genuinely returns ENOENT."""
+        try:
+            fd = os.open(f"{PROC_ROOT}/{pid}/stat", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            raise StageFailure("admission", "resident_measurement_unknown")
+        os.close(fd)
+        return False
+
+    def select_residency_target(self, row):
+        """Chosen live PID/cgroup of a live current row, resolved BEFORE the duplicate/shared maps.
+
+        The workload is chosen unless its PID is None (not starting) or opening its
+        /proc/PID identity returns ENOENT. Only then is the SAME row's native
+        coordinator (worker_pid/worker_cgroup, worker_alive is True) selected. Any other
+        condition (existing PID, EACCES, invalid type) stays on the workload path and holds there.
+        """
+        pid, phase, state = row.get("workload_pid"), row.get("phase"), row.get("state")
+        workload = {"kind": "workload", "pid": pid, "group": row.get("workload_cgroup")}
+        if pid is None:
+            if phase == "starting" or state == "starting":
+                return workload  # starting rows keep their recorded-cap reservation
+            premise, failure = "none", "resident_identity_unknown"
+        elif type(pid) is int and pid > 0:
+            if not self.workload_pid_absent(pid):
+                return workload
+            premise, failure = "enoent", "resident_measurement_unknown"
+        else:
+            return workload
+        worker_pid, worker_group = row.get("worker_pid"), relative_cgroup(row.get("worker_cgroup"))
+        if row.get("worker_alive") is not True or type(worker_pid) is not int or worker_pid <= 0 or worker_group is None:
+            raise StageFailure("admission", failure)
+        return {"kind": "coordinator", "pid": worker_pid, "group": worker_group, "premise": premise}
+
+    def sample_coordinator(self, target, boot_id, ns_ids):
+        """One fresh kernel sample of the chosen coordinator: identity plus anonymous/cap accounting."""
+        pid, group = target["pid"], target["group"]
+        try:
+            if read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip() != boot_id:
+                raise StageFailure("admission", "resident_identity_unknown")
+            raw = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+            fields = raw[raw.rindex(")") + 2:].split()
+            if fields[0] in ("Z", "X"):
+                raise StageFailure("admission", "resident_identity_unknown")
+            start_ticks = int(fields[19])
+            groups = [line[3:] for line in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines() if line.startswith("0::")]
+            namespaces = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}").st_ino for name in ("cgroup", "mnt")}
+            if groups != [group] or namespaces != ns_ids:
+                raise StageFailure("admission", "resident_identity_unknown")
+            fd = open_cgroup_dir(group)
+            try:
+                opened = os.fstat(fd)
+                members = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+                mem_stat = {}
+                for line in read_at_limited(fd, "memory.stat").splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[1].isdigit():
+                        mem_stat[parts[0]] = int(parts[1])
+                current = int(read_at_limited(fd, "memory.current").strip())
+                maximum = read_at_limited(fd, "memory.max").strip()
+                status = {}
+                for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
+                    if ":" in line:
+                        key, _, value = line.partition(":")
+                        status[key] = value.split()
+                rss_anon = int(status["RssAnon"][0]) * 1024
+                raw_again = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+                after = os.fstat(fd)
+                on_path = os.stat(f"{CGROUP_ROOT}{group}")
+                members_again = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            finally:
+                os.close(fd)
+            if (int(raw_again[raw_again.rindex(")") + 2:].split()[19]) != start_ticks
+                    or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                    or (on_path.st_dev, on_path.st_ino) != (opened.st_dev, opened.st_ino)):
+                raise StageFailure("admission", "resident_identity_unstable")
+            if pid not in members or pid not in members_again:
+                raise StageFailure("admission", "resident_identity_unknown")
+            return {
+                "identity": (boot_id, start_ticks, group, opened.st_dev, opened.st_ino, tuple(sorted(namespaces.items()))),
+                "start_ticks": start_ticks, "rss_anon": rss_anon, "group_anon": mem_stat["anon"], "group_current": current,
+                "cap": int(maximum) if maximum.isdecimal() and int(maximum) > 0 else None,
+            }
+        except (OSError, ValueError, KeyError, IndexError):
+            raise StageFailure("admission", "resident_measurement_unknown")
+
+    def coordinator_reserve(self, row, target, boot_id, ns_ids, boot_now, btime, deadline):
+        """Reserve for a chosen native coordinator, proven only by its own current kernel identity.
+
+        The workload's recorded scope, identity and caps prove nothing here. A mature
+        (>= 180 s), positively resident coordinator reserves 0 extra even with memory.max=max
+        (already counted in MemAvailable; not a growth bound). A young or uncertain one needs
+        a finite kernel cap, charged whole per row, else the admission holds.
+        """
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        first = self.sample_coordinator(target, boot_id, ns_ids)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        second = self.sample_coordinator(target, boot_id, ns_ids)
+        if first["identity"] != second["identity"]:
+            raise StageFailure("admission", "resident_identity_unstable")
+        ticks = os.sysconf("SC_CLK_TCK")
+        try:
+            if btime is None:
+                btime = read_proc_btime()
+        except (OSError, ValueError):
+            raise StageFailure("admission", "resident_identity_unknown")
+        if not birth_matches(row.get("created_at_ms"), first["start_ticks"], btime, ticks):
+            raise StageFailure("admission", "resident_identity_unknown")
+        age = boot_now - first["start_ticks"] / ticks
+        if not _finite_number(age) or age < 0:
+            raise StageFailure("admission", "resident_age_unknown")
+        for sample in (first, second):
+            if sample["rss_anon"] <= 0 or not 0 < sample["group_anon"] <= sample["group_current"]:
+                raise StageFailure("admission", "resident_anonymous_unknown")
+        target["identity"] = first["identity"]
+        if age >= MATURE_RESIDENT_AGE_S and row.get("state") == "running" and row.get("phase") == "running":
+            return 0, "mature"
+        if first["cap"] is None or first["cap"] != second["cap"]:
+            raise StageFailure("admission", "resident_bound_unknown")
+        return first["cap"], "young"
+
+    def revalidate_fallbacks(self, census, targets, boot_id, ns_ids, deadline):
+        """Final bounded check: the fallback premise, selection and chosen identity are still the sampled ones."""
+        fallbacks = [(row, targets[row["id"]]) for row in census if targets.get(row.get("id"), {}).get("kind") == "coordinator"]
+        if not fallbacks:
+            return
+        self.admission_time_left(deadline)
+        final = self.read_census(deadline)
+        if census_signature(final) != census_signature(census):
+            raise StageFailure("admission", "resident_fallback_changed")
+        for row, target in fallbacks:
+            self.admission_time_left(deadline)
+            if row.get("workload_pid") is not None and not self.workload_pid_absent(row["workload_pid"]):
+                raise StageFailure("admission", "resident_fallback_changed")
+            if self.sample_coordinator(target, boot_id, ns_ids)["identity"] != target["identity"]:
+                raise StageFailure("admission", "resident_fallback_changed")
+
+    def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now, *, target=None, btime=None, deadline=None):
         """(extra bytes, kind) this current native row may still claim beyond what MemAvailable already reflects.
 
         kind is "dead" (positively no obligation), "mature" (identity-bound proven
@@ -1473,6 +1710,10 @@ class Canary:
         """
         if self.row_positively_dead(row):
             return 0, "dead"
+        if target is None:
+            target = self.select_residency_target(row)
+        if target["kind"] == "coordinator":
+            return self.coordinator_reserve(row, target, boot_id, ns_ids, boot_now, btime, deadline)
         phase, state = row.get("phase"), row.get("state")
         cap = self.row_memory_cap(row)
         pid = row.get("workload_pid")
@@ -1602,17 +1843,25 @@ class Canary:
         # Positively dead rows carry no live pid/cgroup claim: they join neither the
         # identity-ambiguity maps nor the reserves (their stale pid/cgroup may be reused).
         live = [row for row in census if not self.row_positively_dead(row)]
+        # Resolve every row's CHOSEN live PID/group (workload, or coordinator fallback) before the maps.
+        targets = {}
         for row in live:
-            by_pid.setdefault(row.get("workload_pid"), []).append(row["id"])
-            by_group.setdefault(row.get("workload_cgroup"), []).append(row["id"])
+            self.admission_time_left(deadline)
+            targets[row["id"]] = self.select_residency_target(row)
+        for row in live:
+            target = targets[row["id"]]
+            by_pid.setdefault(target["pid"], []).append(row["id"])
+            by_group.setdefault(target["group"], []).append(row["id"])
         reserve = 0
         growing = []  # (workspace, cwd) of every live current worker / uncovered task that may still write to disk
         for row in live:
-            pid, group = row.get("workload_pid"), row.get("workload_cgroup")
+            target = targets[row["id"]]
+            pid, group = target["pid"], target["group"]
+            # (A coordinator's cgroup may hold other processes: coordinator_reserve always proves per PID.)
             shared = len(by_group.get(group, ())) > 1 and group is not None
             if pid is not None and len(by_pid.get(pid, ())) > 1:
                 raise StageFailure("admission", "resident_identity_ambiguous")
-            extra, _kind = self.resident_reserve(row, shared, boot_id, ns_ids, boot_now)
+            extra, _kind = self.resident_reserve(row, shared, boot_id, ns_ids, boot_now, target=target, deadline=deadline)
             reserve += extra
             growing.append((row.get("workspace"), row.get("cwd")))  # RAM maturity proves nothing about disk
         uncovered = self.uncovered_inflight_rows(hub_rows, native_ids)
@@ -1636,6 +1885,8 @@ class Canary:
             if free - ADMISSION_DISK_SPIKE_BYTES - ADMISSION_DISK_WORKER_RESERVE_BYTES - charged[device] < floor_bytes:
                 raise StageFailure("admission", "disk_below_floor")
         # Final fresh RAM sample after every slow read, before any spawn.
+        self.admission_time_left(deadline)
+        self.revalidate_fallbacks(census, targets, boot_id, ns_ids, deadline)
         self.admission_time_left(deadline)
         available = self.sample_mem_available()
         if available - reserve - worker_bytes < ADMISSION_RAM_FLOOR_BYTES:
