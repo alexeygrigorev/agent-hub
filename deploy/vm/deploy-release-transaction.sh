@@ -96,23 +96,90 @@ require_node24_runtime() {
 # no transaction state exists yet, nothing to roll back, and the OS package
 # manager owns its own recovery.
 provision_node24_runtime() {
-  local staged="$TMPDIR/ci-node24-provision-$1/provision-node24.sh" mode
+  local deploy_sha="$1"
+  local staged="$TMPDIR/ci-node24-provision-$deploy_sha/provision-node24.sh"
+  local verified_dir verified_script rc=0
   [[ -f "$staged" && ! -L "$staged" ]] \
-    || fail "the staged Node24 provisioner for $1 is missing or not a regular file at $staged; the deploy workflow must stage deploy/vm/provision-node24.sh over normal CI SSH first"
+    || fail "the staged Node24 provisioner for $deploy_sha is missing or not a regular file at $staged; the deploy workflow must stage deploy/vm/provision-node24.sh over normal CI SSH first"
   [[ "$(stat -c %u "$staged")" == "$EUID" ]] \
     || fail "the staged Node24 provisioner is not owned by the invoking user; refusing untrusted provisioner bytes"
+  local mode
   mode="$(stat -c %a "$staged")"
   [[ $((8#$mode & 8#022)) == 0 ]] \
     || fail "the staged Node24 provisioner is group/other writable ($mode); refusing untrusted provisioner bytes"
   [[ "$(stat -c %s "$staged")" -le 262144 ]] \
     || fail "the staged Node24 provisioner exceeds the bounded size; refusing untrusted provisioner bytes"
-  bash -n "$staged" || fail "the staged Node24 provisioner does not parse"
+
+  verified_dir="$(mktemp -d "$TMPDIR/ci-node24-verified.XXXXXXXX")"
+  chmod 700 "$verified_dir"
+  verified_script="$verified_dir/provision-node24.sh"
+  if ! python3 - "$REPO" "$deploy_sha" "$staged" "$verified_script" <<'PY'
+import hashlib, os, stat, subprocess, sys
+
+repo, deploy_sha, staged_path, verified_path = sys.argv[1:5]
+proc = subprocess.run(
+    ['git', '-C', repo, 'show', f'{deploy_sha}:deploy/vm/provision-node24.sh'],
+    capture_output=True,
+)
+if proc.returncode != 0:
+    print(f'ERROR: candidate {deploy_sha} has no deploy/vm/provision-node24.sh object', file=sys.stderr)
+    sys.exit(1)
+expected_bytes = proc.stdout
+if len(expected_bytes) > 262144:
+    print('ERROR: candidate provisioner exceeds the bounded size', file=sys.stderr)
+    sys.exit(1)
+expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+
+fd = os.open(staged_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o022) != 0 or info.st_size > 262144:
+        print('ERROR: staged Node24 provisioner failed descriptor custody checks', file=sys.stderr)
+        sys.exit(1)
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    staged_bytes = b''.join(chunks)
+finally:
+    os.close(fd)
+
+staged_digest = hashlib.sha256(staged_bytes).hexdigest()
+if staged_digest != expected_digest:
+    print(
+        f'ERROR: staged Node24 provisioner digest {staged_digest} does not match candidate {deploy_sha} ({expected_digest}); refusing untrusted provisioner bytes',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+out_fd = os.open(verified_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(out_fd, staged_bytes)
+finally:
+    os.close(out_fd)
+PY
+  then
+    rm -rf -- "$verified_dir"
+    exit 1
+  fi
+
+  if ! bash -n "$verified_script"; then
+    rm -rf -- "$verified_dir"
+    fail "the staged Node24 provisioner does not parse"
+  fi
   printf 'Node24 provision: running the staged candidate provisioner under this transaction deploy lock.\n'
   # stdin is /dev/null so the child can never consume the transaction script
-  # bash is still streaming from stdin.
+  # bash is still streaming from stdin. fd 9 is kept open so the child proves
+  # genuine inherited open-file-description custody on the fixed lock inode.
   AGENT_HUB_NODE24_LOCK_INHERITED="$TMPDIR/.deploy-transaction.lock" \
-    bash "$staged" </dev/null \
-    || fail "Node24 runtime provisioning failed inside the deploy transaction; no application effect was performed and no automatic OS rollback exists (the package manager owns recovery)"
+    AGENT_HUB_NODE24_LOCK_FD=9 \
+    bash "$verified_script" </dev/null || rc=$?
+  rm -rf -- "$verified_dir"
+  if [[ "$rc" -ne 0 ]]; then
+    fail "Node24 runtime provisioning failed inside the deploy transaction; no application effect was performed and no automatic OS rollback exists (the package manager owns recovery)"
+  fi
 }
 
 validate_hub_caddyfile() {
@@ -548,7 +615,7 @@ restore_previous_release() {
 }
 
 apply_release() {
-  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" provision_arg="${5:-}" previous_sha local_status publication_token schema_mode
+  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" provision_arg="${5:-}" qualified_previous_sha="${6:-}" previous_sha local_status publication_token schema_mode
   local -a asset_args=()
   [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deploy SHA must be a full lowercase Git commit SHA"
   [[ "$release_mode" == bootstrap || "$release_mode" == active ]] \
@@ -559,6 +626,10 @@ apply_release() {
     || fail "matched CLI publication requires an active deploy"
   [[ "$provision_arg" == "" || "$provision_arg" == provision-node24 ]] \
     || fail "the only optional trailing apply argument is provision-node24"
+  if [[ "$provision_arg" == provision-node24 || -n "$qualified_previous_sha" ]]; then
+    [[ "$qualified_previous_sha" =~ ^(none|[0-9a-f]{40})$ ]] \
+      || fail "qualified previous release SHA must be 'none' or a full lowercase Git commit SHA"
+  fi
   [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
   cd "$REPO" || fail "cannot enter Hub repository checkout: $REPO"
   [[ -f "$REPO/.dev.vars" ]] \
@@ -575,6 +646,12 @@ apply_release() {
   local_status="$(git -C "$REPO" status --porcelain --untracked-files=all)"
   [[ -z "$local_status" ]] \
     || fail "refusing deployment because the VM checkout has uncommitted files"
+
+  previous_sha="$(git -C "$REPO" rev-parse HEAD)"
+  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
+  if [[ -n "$qualified_previous_sha" && "$qualified_previous_sha" != "$previous_sha" ]]; then
+    fail "current VM revision $previous_sha does not match the Node24-qualified previous release $qualified_previous_sha; refusing to provision or mutate before re-qualifying $previous_sha on Node24"
+  fi
 
   # Runtime phase, still under this transaction's single deploy lock and
   # before any candidate checkout, npm dependency mutation, transaction state
@@ -604,8 +681,6 @@ apply_release() {
       || fail "candidate Hub site must validate and retain the Hub upstream"
   fi
 
-  previous_sha="$(git -C "$REPO" rev-parse HEAD)"
-  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
   if [[ "$caddy_mode" == full ]]; then
     validate_shared_caddyfile || fail "shared Caddyfile must import /etc/caddy/sites/*.caddy; aws-infra owns that migration"
   fi
@@ -794,9 +869,9 @@ if [[ "$operation" =~ ^(apply|publish|rollback|commit)$ ]]; then
 fi
 case "$operation" in
   apply)
-    [[ $# -ge 3 && $# -le 6 ]] \
-      || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only] [legacy|matched-cli] [provision-node24]"
-    apply_release "$2" "$3" "${4:-full}" "${5:-legacy}" "${6:-}"
+    [[ $# -ge 3 && $# -le 7 ]] \
+      || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only] [legacy|matched-cli] [provision-node24] [qualified-previous-sha|none]"
+    apply_release "$2" "$3" "${4:-full}" "${5:-legacy}" "${6:-}" "${7:-}"
     ;;
   rollback)
     [[ $# == 1 ]] || fail "usage: $0 rollback"

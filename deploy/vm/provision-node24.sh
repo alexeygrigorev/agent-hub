@@ -206,8 +206,11 @@ install_sources_entry() {
   local expected current
   expected="$(expected_sources_line)"
   # Same custody rule as the keyring: a symlink or any non-regular entry is
-  # preserved and refused, never written through.
+  # preserved and refused before reading, never dereferenced or written through.
   if [[ -L "$SOURCES_FILE" || -e "$SOURCES_FILE" ]]; then
+    if [[ ! -f "$SOURCES_FILE" || -L "$SOURCES_FILE" ]]; then
+      fail "$SOURCES_FILE is a symlink or non-regular entry; refusing to dereference or overwrite (operator reconciliation required)"
+    fi
     current="$(cat "$SOURCES_FILE")" \
       || fail "cannot read the existing NodeSource apt source at $SOURCES_FILE"
     if [[ "$current" == "$expected" ]]; then
@@ -312,20 +315,56 @@ main() {
   # Mutation phase under the single deploy-lock owner. Standalone runs acquire
   # the same non-blocking transaction lock here. When the deploy transaction
   # invokes this script inside its already-held lock, custody is never trusted
-  # from the environment: it is proven by an independent non-blocking
-  # acquisition of the same lock file, which must fail while another owner —
-  # the invoking transaction — holds it. This proves a competing transaction
-  # cannot acquire the lock between package verification and the app stage.
+  # from an environment string or mere contention: the child must inherit the
+  # parent's actual open-file-description (AGENT_HUB_NODE24_LOCK_FD) bound to
+  # the fixed DEPLOY_LOCK inode, proven by both (a) an independent OFD failing
+  # with EAGAIN/EWOULDBLOCK and (b) non-blocking LOCK_EX on the inherited FD
+  # succeeding (same OFD).
   DEPLOY_LOCK="$REPO/.local/tmp/.deploy-transaction.lock"
   mkdir -p "$REPO/.local/tmp"
   chmod 750 "$REPO/.local/tmp"
-  if [[ -n "${AGENT_HUB_NODE24_LOCK_INHERITED:-}" ]]; then
-    [[ "$AGENT_HUB_NODE24_LOCK_INHERITED" == "$DEPLOY_LOCK" ]] \
-      || fail "provisioner was invoked with a foreign lock custody path: $AGENT_HUB_NODE24_LOCK_INHERITED"
-    if flock -n "$DEPLOY_LOCK" true; then
-      fail "deploy-lock custody was not inherited: no owner holds $DEPLOY_LOCK; refusing to mutate packages without the single deploy-lock owner"
-    fi
+  if [[ -n "${AGENT_HUB_NODE24_LOCK_INHERITED:-}" || -n "${AGENT_HUB_NODE24_LOCK_FD:-}" ]]; then
+    [[ "${AGENT_HUB_NODE24_LOCK_INHERITED:-}" == "$DEPLOY_LOCK" ]] \
+      || fail "provisioner was invoked with a foreign lock custody path: ${AGENT_HUB_NODE24_LOCK_INHERITED:-<unset>}"
+    [[ "${AGENT_HUB_NODE24_LOCK_FD:-}" =~ ^[0-9]+$ && "${AGENT_HUB_NODE24_LOCK_FD}" -ge 3 ]] \
+      || fail "provisioner was invoked without a valid inherited deploy-lock descriptor"
+    python3 - "$DEPLOY_LOCK" "$AGENT_HUB_NODE24_LOCK_FD" <<'PY' \
+      || fail "deploy-lock custody was not inherited: $DEPLOY_LOCK descriptor ${AGENT_HUB_NODE24_LOCK_FD} is not the held transaction lock"
+import errno, fcntl, os, stat, sys
+
+lock_path = sys.argv[1]
+lock_fd = int(sys.argv[2])
+
+try:
+    path_stat = os.lstat(lock_path)
+    fd_stat = os.fstat(lock_fd)
+except OSError:
+    sys.exit(1)
+
+if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
+    sys.exit(1)
+if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+    sys.exit(1)
+
+probe_fd = os.open(lock_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    try:
+        fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+            sys.exit(1)
+    else:
+        sys.exit(1)
+finally:
+    os.close(probe_fd)
+
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+PY
   else
+    [[ ! -L "$DEPLOY_LOCK" ]] || fail "deploy lock path $DEPLOY_LOCK is a symlink; refusing to lock"
     exec 9>>"$DEPLOY_LOCK"
     flock -n 9 || fail "another Hub2 deploy transaction operation is running; provisioning Node24 concurrently is not allowed"
   fi

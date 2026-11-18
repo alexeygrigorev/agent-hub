@@ -272,9 +272,9 @@ fi
             lines.append('        500 http://archive.ubuntu.com/ubuntu noble/main amd64 Packages')
         return '\n'.join(lines) + '\n'
 
-    def run_provisioner(self, **extra):
+    def run_provisioner(self, pass_fds=(), **extra):
         return subprocess.run(['/bin/bash', str(PROVISIONER)], cwd=str(self.root), env=self.env(**extra),
-                              capture_output=True, text=True, timeout=30)
+                              pass_fds=pass_fds, capture_output=True, text=True, timeout=30)
 
     def commands(self):
         return [line for line in self.log.read_text(encoding='utf-8').splitlines() if line]
@@ -506,8 +506,39 @@ class ProvisionerRefusalTests(ProvisionerTestCase):
         target.write_text('deb https://example.invalid/node nodistro main\n', encoding='utf-8')
         self.sandbox.sources.symlink_to(target)
         result = self.sandbox.run_provisioner()
-        self.assertRefused(result, 'refusing to overwrite a foreign or mutated apt source')
+        self.assertRefused(result, 'symlink or non-regular entry')
         self.assertTrue(self.sandbox.sources.is_symlink())
+        self.assertEqual(target.read_text(encoding='utf-8'), 'deb https://example.invalid/node nodistro main\n')
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_symlinked_apt_source_with_exact_content_refuses_and_preserves_link(self):
+        # R3: Even when the symlink target contains the exact expected line,
+        # the symlink must be refused before dereferencing or comparing.
+        expected = (
+            f'deb [arch={self.sandbox.state["arch"]} signed-by={self.sandbox.keyring}] '
+            f'{PIN_REPO} nodistro main\n'
+        )
+        target = self.sandbox.sources.parent / 'linked-expected.list'
+        target.write_text(expected, encoding='utf-8')
+        self.sandbox.sources.symlink_to(target)
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'symlink or non-regular entry')
+        self.assertTrue(self.sandbox.sources.is_symlink())
+        self.assertEqual(target.read_text(encoding='utf-8'), expected)
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_dangling_apt_source_symlink_refuses(self):
+        self.sandbox.sources.symlink_to(self.sandbox.sources.parent / 'missing-source.list')
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'symlink or non-regular entry')
+        self.assertTrue(self.sandbox.sources.is_symlink())
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_non_regular_apt_source_refuses(self):
+        self.sandbox.sources.mkdir()
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'symlink or non-regular entry')
+        self.assertTrue(self.sandbox.sources.is_dir())
         self.assertNotIn('apt-get', self.sandbox.command_prefixes())
 
     def test_candidate_from_foreign_origin_refuses_before_download(self):
@@ -626,36 +657,102 @@ class ProvisionerFailureReceiptTests(ProvisionerTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_inherited_custody_under_a_real_lock_owner_provisions(self):
-        # The deploy transaction invokes the provisioner inside its own held
-        # lock; custody is proven, not trusted, so the flow proceeds.
+        # R1: The deploy transaction passes its actual held open-file-description
+        # on .deploy-transaction.lock to the child provisioner; the child
+        # proves same-OFD custody and parent lock continuity persists after exit.
         lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
         with open(lock_path, 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.sandbox.run_provisioner(
-                AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path))
+                pass_fds=(lock.fileno(),),
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path),
+                AGENT_HUB_NODE24_LOCK_FD=str(lock.fileno()),
+            )
+            # Parent lock continuity after child exits: an independent OFD must still fail.
+            probe = os.open(lock_path, os.O_RDONLY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(probe)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('runtime ready for the deploy transaction', result.stdout)
         self.assertIn('apt-get', self.sandbox.command_prefixes())
 
     def test_inherited_custody_without_a_real_lock_owner_refuses(self):
         # An environment flag alone proves nothing: with no owner holding the
-        # lock, an independent acquisition succeeds and the run must refuse.
+        # lock and no inherited fd, the run must refuse before any effect.
         lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
         lock_path.write_text('', encoding='utf-8')
         result = self.sandbox.run_provisioner(
-            AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path))
+            AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path),
+            AGENT_HUB_NODE24_LOCK_FD='9',
+        )
         self.assertRefused(result, 'deploy-lock custody was not inherited')
         prefixes = self.sandbox.command_prefixes()
         self.assertNotIn('apt-get', prefixes)
         self.assertNotIn('curl', prefixes)
         self.assertFalse(self.sandbox.sources.exists())
 
+    def test_inherited_custody_flag_only_while_foreign_owner_holds_lock_refuses(self):
+        # R1 negative: a foreign process holds the lock, and a caller sets the
+        # inherited env flag without passing the owner's open-file-description.
+        lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
+        with open(lock_path, 'w') as foreign_lock:
+            fcntl.flock(foreign_lock, fcntl.LOCK_EX)
+            result = self.sandbox.run_provisioner(
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path),
+                AGENT_HUB_NODE24_LOCK_FD='9',
+            )
+        self.assertRefused(result, 'deploy-lock custody was not inherited')
+        prefixes = self.sandbox.command_prefixes()
+        self.assertNotIn('apt-get', prefixes)
+        self.assertNotIn('curl', prefixes)
+        self.assertFalse(self.sandbox.sources.exists())
+
+    def test_inherited_custody_with_different_ofd_while_foreign_owner_holds_lock_refuses(self):
+        # R1 negative: even when the passed fd points to the right lock inode, if it is a
+        # different open-file-description from the foreign lock holder, it refuses.
+        lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
+        with open(lock_path, 'w') as foreign_lock:
+            fcntl.flock(foreign_lock, fcntl.LOCK_EX)
+            other_ofd = os.open(lock_path, os.O_RDONLY)
+            try:
+                result = self.sandbox.run_provisioner(
+                    pass_fds=(other_ofd,),
+                    AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path),
+                    AGENT_HUB_NODE24_LOCK_FD=str(other_ofd),
+                )
+            finally:
+                os.close(other_ofd)
+        self.assertRefused(result, 'deploy-lock custody was not inherited')
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+        self.assertNotIn('curl', self.sandbox.command_prefixes())
+
+    def test_inherited_custody_with_unlocked_fd_and_no_owner_refuses(self):
+        # R1 negative: an open fd on the lock inode without an active lock holder refuses.
+        lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
+        lock_path.write_text('', encoding='utf-8')
+        unlocked_fd = os.open(lock_path, os.O_RDONLY)
+        try:
+            result = self.sandbox.run_provisioner(
+                pass_fds=(unlocked_fd,),
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path),
+                AGENT_HUB_NODE24_LOCK_FD=str(unlocked_fd),
+            )
+        finally:
+            os.close(unlocked_fd)
+        self.assertRefused(result, 'deploy-lock custody was not inherited')
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
     def test_foreign_inherited_lock_path_refuses(self):
         other = self.sandbox.root / 'elsewhere.lock'
         with open(other, 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             result = self.sandbox.run_provisioner(
-                AGENT_HUB_NODE24_LOCK_INHERITED=str(other))
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(other),
+                AGENT_HUB_NODE24_LOCK_FD='9',
+            )
         self.assertRefused(result, 'foreign lock custody path')
         self.assertNotIn('apt-get', self.sandbox.command_prefixes())
 
@@ -664,15 +761,18 @@ class ProvisionerFailureReceiptTests(ProvisionerTestCase):
         # application transaction. The transaction derives the staged
         # provisioner path from the validated deploy SHA and invokes it inside
         # its held fd9 lock; the provisioner never opens a nested flock in
-        # that mode and never trusts a skip-lock flag — custody is proven by a
-        # failing independent acquisition of the same lock file.
+        # that mode and never trusts a skip-lock flag — custody is proven by
+        # binding the inherited fd to the fixed lock inode and verifying same-OFD
+        # ownership while an independent acquisition fails.
         self.assertIn('flock -n 9', PROVISIONER_SOURCE)
         self.assertIn('.deploy-transaction.lock', PROVISIONER_SOURCE)
         self.assertIn('.deploy-transaction.lock', TRANSACTION_SOURCE)
         self.assertIn('AGENT_HUB_NODE24_LOCK_INHERITED', PROVISIONER_SOURCE)
+        self.assertIn('AGENT_HUB_NODE24_LOCK_FD', PROVISIONER_SOURCE)
+        self.assertIn('AGENT_HUB_NODE24_LOCK_FD=9', TRANSACTION_SOURCE)
         self.assertIn('deploy-lock custody was not inherited', PROVISIONER_SOURCE)
         self.assertIn('provision_node24_runtime', TRANSACTION_SOURCE)
-        self.assertIn('ci-node24-provision-$1/provision-node24.sh', TRANSACTION_SOURCE)
+        self.assertIn('ci-node24-provision-$deploy_sha/provision-node24.sh', TRANSACTION_SOURCE)
         # No skip-lock escape hatch exists anywhere in the feature.
         for source in (PROVISIONER_SOURCE, TRANSACTION_SOURCE, INSTALLER_SOURCE):
             self.assertNotRegex(source, r'SKIP_LOCK|SKIPLOCK|LOCK_SKIP|NO_LOCK')
@@ -686,10 +786,13 @@ class ProvisionerFailureReceiptTests(ProvisionerTestCase):
                       'install -d -o root -g root -m 700 "$TRANSACTION_DIR"'):
             self.assertLess(invoke_idx, apply_body.index(later),
                             f'provisioning must precede: {later}')
-        # The provisioner's inherited mode proves custody instead of trusting
-        # the environment: an independent acquisition must fail for it to run.
+        # The provisioner's inherited mode proves genuine inherited-OFD custody
+        # bound to the fixed lock inode instead of trusting an env string or
+        # mere contention: an independent probe must fail with EAGAIN/EWOULDBLOCK
+        # AND non-blocking LOCK_EX on the inherited fd must succeed.
         custody = function_body(PROVISIONER_SOURCE, 'main')
-        self.assertIn('if flock -n "$DEPLOY_LOCK" true; then', custody)
+        self.assertIn('fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)', custody)
+        self.assertIn('fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)', custody)
         self.assertLess(custody.index('deploy-lock custody was not inherited'),
                         custody.index('PROVISION_WORK="$(mktemp'))
 
@@ -856,8 +959,9 @@ class TransactionOrderingTests(unittest.TestCase):
                         f'printf \'{V24}\\n\'\n')
         node.chmod(0o755)
         self._prepare_repo()
-        self.candidate = subprocess.run(['git', '-C', str(self.work), 'rev-parse', 'HEAD'],
-                                        capture_output=True, text=True, check=True).stdout.strip()
+        self.previous_sha = subprocess.run(['git', '-C', str(self.work), 'rev-parse', 'HEAD'],
+                                           capture_output=True, text=True, check=True).stdout.strip()
+        self.candidate = self.previous_sha
 
     def _prepare_repo(self):
         def git(*args):
@@ -876,7 +980,7 @@ class TransactionOrderingTests(unittest.TestCase):
         git('-C', str(self.work), 'config', 'user.email', 'fixture@example.invalid')
         (self.work / '.dev.vars').write_text('HUB2_RELEASE_MODE=bootstrap\n', encoding='utf-8')
 
-    def run_apply(self, runtime_fixture=True, service_version=V22, provision=False):
+    def run_apply(self, runtime_fixture=True, service_version=V22, provision=False, qualified_previous_sha=None):
         service_node = self.root / 'service-node'
         if runtime_fixture:
             service_node.write_text(f'#!/usr/bin/env bash\nprintf \'{service_version}\\n\'\n')
@@ -896,14 +1000,28 @@ class TransactionOrderingTests(unittest.TestCase):
         args = ['apply', self.candidate, 'bootstrap', 'hub-only', 'legacy']
         if provision:
             args.append('provision-node24')
+            args.append(qualified_previous_sha if qualified_previous_sha is not None else self.previous_sha)
         return subprocess.run(['/bin/bash', str(TRANSACTION), *args],
                               cwd=str(self.root), env=env, capture_output=True, text=True, timeout=120)
 
     def stage_provisioner_fixture(self, body):
-        """Stages a candidate provisioner fixture at the transaction-derived path."""
+        """Commits candidate provision-node24.sh bytes and stages them at the SHA-derived path."""
+        script_bytes = f'#!/usr/bin/env bash\n{body}\n'
+        provisioner_in_repo = self.seed / 'deploy/vm/provision-node24.sh'
+        provisioner_in_repo.parent.mkdir(parents=True, exist_ok=True)
+        provisioner_in_repo.write_text(script_bytes, encoding='utf-8')
+        provisioner_in_repo.chmod(0o755)
+        subprocess.run(['git', '-C', str(self.seed), 'add', 'deploy/vm/provision-node24.sh'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'commit', '-qm', 'candidate provisioner fixture'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'push', '-q', str(self.remote), 'main'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        self.candidate = subprocess.run(['git', '-C', str(self.seed), 'rev-parse', 'HEAD'],
+                                        capture_output=True, text=True, check=True, timeout=30).stdout.strip()
         staged = self.work / '.local/tmp' / f'ci-node24-provision-{self.candidate}' / 'provision-node24.sh'
         staged.parent.mkdir(parents=True, exist_ok=True)
-        staged.write_text(f'#!/usr/bin/env bash\n{body}\n', encoding='utf-8')
+        staged.write_text(script_bytes, encoding='utf-8')
         staged.chmod(0o750)
         return staged
 
@@ -964,6 +1082,46 @@ class TransactionOrderingTests(unittest.TestCase):
         result = self.run_apply(runtime_fixture=False, provision=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('group/other writable', result.stderr)
+        self.assertFalse(self.state.exists())
+
+    def test_altered_staged_provisioner_with_valid_owner_and_mode_refuses(self):
+        # R2: Same-owner, mode-valid, syntactically valid staged script whose
+        # bytes differ from deploy_sha:deploy/vm/provision-node24.sh must refuse
+        # before execution and before any package/app effect.
+        staged = self.stage_provisioner_fixture('printf \'%s\\n\' "expected candidate" >> "{}"\nexit 0\n'.format(self.log))
+        staged.write_text(f'#!/usr/bin/env bash\nprintf \'%s\\n\' "altered script executed" >> "{self.log}"\nexit 0\n', encoding='utf-8')
+        staged.chmod(0o750)
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not match candidate', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('altered script executed', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_previous_sha_mismatch_under_lock_refuses_before_provisioning_or_app_effects(self):
+        # R4: If VM HEAD changed since the unlocked CI current-sha read, apply
+        # must refuse under the held deploy lock before provisioning or app effects.
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        wrong_sha = '0' * 40
+        result = self.run_apply(runtime_fixture=False, provision=True, qualified_previous_sha=wrong_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not match the Node24-qualified previous release', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_previous_sha_none_when_checkout_exists_refuses_before_provisioning(self):
+        # R4: Passing 'none' when the VM checkout actually has a HEAD revision
+        # must refuse before provisioning or app effects.
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        result = self.run_apply(runtime_fixture=False, provision=True, qualified_previous_sha='none')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('does not match the Node24-qualified previous release', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
         self.assertFalse(self.state.exists())
 
     def run_current_sha(self, repo):
@@ -1063,7 +1221,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         staging_idx = step.index('tar -C deploy/vm -cf - provision-node24.sh')
         invoke_idx = step.index('bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode"')
         self.assertLess(staging_idx, invoke_idx, 'staging must precede the transaction invocation')
-        self.assertIn('provision-node24 \\\n            < deploy/vm/deploy-release-transaction.sh', step)
+        self.assertIn('provision-node24 "$PREVIOUS_SHA" \\\n            < deploy/vm/deploy-release-transaction.sh', step)
         # The provisioner bytes are never executed directly over SSH: the
         # transaction is the only runner of the staged script on the VM.
         self.assertNotIn('< deploy/vm/provision-node24.sh', self.DEPLOY)
@@ -1076,7 +1234,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
                       'the deploy gate must stay exactly on the release contract')
         self.assertNotIn('previous-release-compatibility]', self.DEPLOY)
         self.assertIn('provision_node24_runtime "$deploy_sha"', TRANSACTION_SOURCE)
-        self.assertIn('ci-node24-provision-$1/provision-node24.sh', TRANSACTION_SOURCE)
+        self.assertIn('ci-node24-provision-$deploy_sha/provision-node24.sh', TRANSACTION_SOURCE)
 
     def test_forward_previous_release_compatibility_proves_the_deployed_source(self):
         # Qualification control, inside the gated deploy job: the normal

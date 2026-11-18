@@ -364,6 +364,7 @@ jobs:
           CONFIRM_BOOTSTRAP: ${{ inputs.confirm_bootstrap }}
           HUB_ONLY: ${{ inputs.hub_only }}
           DEPLOY_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ steps.previous_release.outputs.sha }}
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           set -euo pipefail
@@ -383,10 +384,12 @@ jobs:
             *) echo "invalid hub_only value" >&2; exit 2 ;;
           esac
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          [[ "$PREVIOUS_SHA" =~ ^(none|[0-9a-f]{40})$ ]] || { echo "invalid qualified previous release identity" >&2; exit 2; }
           test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
           # Stage the exact candidate provisioner bytes over normal CI SSH to a
           # SHA-bound path (never a remote curl setup script). The transaction
-          # invoked below then derives that path from the same validated SHA.
+          # invoked below then derives that path from the same validated SHA and
+          # verifies its bytes against the immutable candidate Git object.
           tar -C deploy/vm -cf - provision-node24.sh | ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
@@ -394,13 +397,14 @@ jobs:
             "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; chmod 750 \"\$stage_dir/provision-node24.sh\"; test \"\$(stat -c %s \"\$stage_dir/provision-node24.sh\")\" -le 262144; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
           # ONE SSH transaction invocation owns the existing deploy lock across
           # runtime provisioning and all application effects: the transaction
-          # runs the staged provisioner inside its own held lock before any
+          # binds the Node24-qualified previous release SHA and runs the
+          # verified staged provisioner inside its own held lock before any
           # npm/source/config/unit mutation, so a competing transaction cannot
           # interleave between package verification and the app stage.
           ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" provision-node24 \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" provision-node24 "$PREVIOUS_SHA" \
             < deploy/vm/deploy-release-transaction.sh
       - name: Read Hub API health on the configured client URL
         env:
