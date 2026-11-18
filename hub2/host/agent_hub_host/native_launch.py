@@ -1119,9 +1119,7 @@ class NativeLauncher:
         # Mode/effort/goal capability gating already happened in the Bridge's
         # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
-        from . import resource_admission
-        resource_admission.caps(self.config.get("memory_mb", 1500), self.config.get("pids", 256))
-        requested_mb = self.config.get("memory_mb", 1500)
+        requested_mb = int(self.config.get("memory_mb", 1500))
         goal = specification["prompt"]
         fa_path = workspace / ".local" / f"first-action-{task_id}.json"
         fa_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1243,16 +1241,13 @@ class NativeLauncher:
         before_dispatch = specification.get('before_native_dispatch')
         if diagnostic is not None:
             diagnostic.before_dispatch()
-        admission_permit = before_dispatch() if before_dispatch else None
+        if before_dispatch:
+            before_dispatch()
         try:
             # The durable dispatch marker may have consumed the remaining budget.
             # Time-only: the callback legitimately changed dispatch_started to 1.
             if diagnostic is not None:
                 diagnostic.check()
-            if admission_permit is not None:
-                if type(admission_permit) is not resource_admission.Permit:
-                    raise resource_admission.Refused('host_memory_reservation_unknown')
-                admission_permit.check()
             result = self.runner(argv, text=True, encoding='utf-8', errors='replace', capture_output=True,
                                  timeout=35, check=False,
                                  env=env, cwd=specification["workspace"])

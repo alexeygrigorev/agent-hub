@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from . import native_launch, launch_reaper, credential_delivery, resource_admission
+from . import native_launch, launch_reaper, credential_delivery
 from .implement_workspace import prepare_workspace, _identity_and_ref
 from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
@@ -76,8 +76,6 @@ class Journal:
             self.db.execute("ALTER TABLE launches ADD COLUMN legacy_failure_json TEXT")
         if "workspace_repair_digest" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
             self.db.execute("ALTER TABLE launches ADD COLUMN workspace_repair_digest TEXT")
-        if "admission_json" not in {row[1] for row in self.db.execute("PRAGMA table_info(launches)")}:
-            self.db.execute("ALTER TABLE launches ADD COLUMN admission_json TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
         launch_reaper.initialize(self)
 
@@ -637,7 +635,7 @@ class Bridge:
                 raise ValueError('native_reconciliation_required')
             with db:
                 changed = db.execute(
-                    "UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=?,runtime_deadline=NULL,admission_json=NULL "
+                    "UPDATE launches SET operation_id=?,epoch=?,digest=?,workspace=?,tag=?,interactive=?,runtime_deadline=NULL "
                     "WHERE session_id=? AND operation_id=? AND epoch=? AND state='pending_admission' AND native_id IS NULL",
                     (operation, epoch, digest, launch['workspace'], 'task-hub2-'+session, int(launch['interactive']),
                      session, previous['operation_id'], previous['epoch']))
@@ -709,10 +707,10 @@ class Bridge:
             launch['native_identity_observed'] = lambda native_id: self.bind_dispatched_native(operation, session, epoch, native_id)
             with db:
                 changed = db.execute(
-                    "UPDATE launches SET state='launching',runtime_deadline=?,native_dispatch_started=0,admission_json=? "
+                    "UPDATE launches SET state='launching',runtime_deadline=?,native_dispatch_started=0 "
                     "WHERE operation_id=? AND session_id=? AND epoch=? AND state='pending_admission' AND native_id IS NULL "
                     "AND NOT EXISTS(SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?)",
-                    (launch['runtime_deadline'], resource_admission.starting({'operation_id':operation,'session_id':session,'epoch':epoch}), operation, session, epoch, session, epoch))
+                    (launch['runtime_deadline'], operation, session, epoch, session, epoch))
                 if changed.rowcount != 1:
                     return None
             try:
@@ -738,8 +736,6 @@ class Bridge:
             with db:
                 db.execute("UPDATE launches SET native_id=?,state='running' WHERE operation_id=?",
                            (native["id"], operation))
-                bound = db.execute("SELECT * FROM launches WHERE operation_id=?", (operation,)).fetchone()
-                resource_admission.bind(db, bound, native)
         row = db.execute("SELECT * FROM launches WHERE operation_id=?", (operation,)).fetchone()
         if row["state"] == "prompt_pending":
             raise RuntimeError("prompt_delivery_uncertain")
@@ -824,13 +820,13 @@ class Bridge:
         return hashlib.sha256(canonical([self.machine_id, session, operation, epoch]).encode()).hexdigest()
 
     def mark_native_dispatch(self, operation, session, epoch):
-        try:
-            return resource_admission.admit(self.journal.db, operation, session, epoch)
-        except resource_admission.Refused as error:
-            logging.getLogger(__name__).warning('Resource admission refused reason=%s', error.reason)
-            raise
-        except sqlite3.Error:
-            raise resource_admission.Refused('host_memory_reservation_unknown') from None
+        with self.journal.db as db:
+            changed = db.execute(
+                "UPDATE launches SET native_dispatch_started=1 WHERE operation_id=? AND session_id=? AND epoch=? "
+                "AND state='launching' AND native_dispatch_started=0 AND native_id IS NULL",
+                (operation, session, epoch))
+            if changed.rowcount != 1:
+                raise RuntimeError('native_dispatch_fence_conflict')
 
     def bind_dispatched_native(self, operation, session, epoch, native_id):
         with self.journal.db as db:
@@ -873,7 +869,6 @@ class Bridge:
                 (operation, session, epoch))
             if changed.rowcount != 1:
                 return
-            resource_admission.release(db, row, 'no_dispatch')
             self.journal.enqueue(f"no-dispatch:{operation}:{epoch}", f"/api/sessions/{session}/finish",
                                  {"operation_id": operation, "epoch": epoch, "native_id": None,
                                   "launch_failed": True, "no_dispatch": True,
@@ -904,7 +899,6 @@ class Bridge:
                     (canonical(payload), operation, session, epoch, row['digest'], row['workspace'], row['tag'], row['state']))
                 if changed.rowcount != 1:
                     return
-                resource_admission.release(self.journal.db, row, 'qualified_legacy_absence')
                 self.journal.enqueue(f"legacy-unobserved:{operation}:{epoch}", f"/api/sessions/{session}/finish", payload)
 
     def settle_legacy_census(self, inventory):
@@ -1047,9 +1041,6 @@ class Bridge:
                 with self.journal.db:
                     self.journal.db.execute("UPDATE launches SET state='aborting' WHERE operation_id=? AND state='launching'",(row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
-            if row['state'] == 'running' and native.get('phase') in ('running','working'):
-                with self.journal.db as admission_db:
-                    resource_admission.bind(admission_db, row, native)
             phase = native.get("phase", native.get("state"))
             deadline = row['runtime_deadline']
             if row['state']=='running' and type(deadline) is int and int(time.time()*1000)>=deadline and phase!='exited':
@@ -1114,7 +1105,6 @@ class Bridge:
                         continue
                 else:
                     self.journal.db.execute("UPDATE launches SET state='exited' WHERE operation_id=?", (row["operation_id"],))
-                resource_admission.release(self.journal.db, row, 'qualified_exit')
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
@@ -1240,7 +1230,6 @@ class Bridge:
                     (row['operation_id'], row['session_id'], row['epoch']))
                 if changed.rowcount != 1:
                     raise ValueError('command_fence_conflict')
-                resource_admission.release(db, row, 'no_dispatch')
                 result = {'stopped': True, 'evidence': 'dispatch_fenced'}
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
