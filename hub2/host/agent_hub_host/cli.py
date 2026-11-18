@@ -103,7 +103,7 @@ def main(argv=None):
             from . import alert_authority as ram
             from .quota_dispatch import configured_same_process, run_same_process_quota
             from .quota_dispatch_manager import (
-                FanotifyReader, SourceGate, close_held_source, hold_source_fd, prepare_selected_quota,
+                FanotifyReader, SourceGate, close_held_source, consume_handoff_fd, hold_source_fd, prepare_selected_quota,
             )
             spec = configured_same_process(config.get("quota_same_process"))
             if not args.enable or spec is None:
@@ -113,24 +113,38 @@ def main(argv=None):
             quota_path = str(Path(src_dir) / "hub-quota-publish.py")
             client_path = str(Path(src_dir) / "hub_alert_client.py")
             prelude_path = str(Path(src_dir) / "hub-alert-quota-dispatch.py")
-            primary_args = ["--check"]
+            primary_args = list(spec.get("primary_args") or ["--check"])
             held = []
             gate = None
             group = None
+            interp_fd = None
             verified_quota_raw = None
             try:
-                quota_fd = hold_source_fd(src_dir, "hub-quota-publish.py")
-                held.append(quota_fd)
-                verified_quota_raw = quota_fd.raw
-                client_fd = hold_source_fd(src_dir, "hub_alert_client.py")
-                held.append(client_fd)
-                prelude_fd = hold_source_fd(src_dir, "hub-alert-quota-dispatch.py")
-                held.append(prelude_fd)
-                gate = SourceGate(spec["gate_directory"])
-                group = FanotifyReader.open_group((quota_fd,))
+                if args.handoff_fd is not None:
+                    adopted = consume_handoff_fd(args.handoff_fd, spec["gate_directory"])
+                    quota_fd, client_fd, prelude_fd = adopted["source"], adopted["client"], adopted["prelude"]
+                    held.extend((quota_fd, client_fd, prelude_fd))
+                    verified_quota_raw = quota_fd.raw
+                    gate = adopted["gate"]
+                    group = adopted["fan_group"]
+                    interp_fd = adopted["interp_fd"]
+                    interp_pin = adopted["interpreter_pin"]
+                    py_bin = interp_pin["path"]
+                else:
+                    quota_fd = hold_source_fd(src_dir, "hub-quota-publish.py")
+                    held.append(quota_fd)
+                    verified_quota_raw = quota_fd.raw
+                    client_fd = hold_source_fd(src_dir, "hub_alert_client.py")
+                    held.append(client_fd)
+                    prelude_fd = hold_source_fd(src_dir, "hub-alert-quota-dispatch.py")
+                    held.append(prelude_fd)
+                    gate = SourceGate(spec["gate_directory"])
+                    group = FanotifyReader.open_group((quota_fd,))
+                    interp_pin = None
+                    py_bin = "/usr/bin/python3"
                 deadline = time.monotonic() + 40.0
                 exec_argv = lambda dl_ns: [
-                    "/usr/bin/python3", "-I", "-S", prelude_path,
+                    py_bin, "-I", "-S", prelude_path,
                     str(dl_ns), quota_fd.pin.sha256, client_fd.pin.sha256,
                     spec["gate_directory"], quota_path, client_path, "--", *primary_args,
                 ]
@@ -138,14 +152,18 @@ def main(argv=None):
                 prepared = prepare_selected_quota(
                     source=quota_fd, companions=(client_fd, prelude_fd), gate=gate, group=group,
                     plan=plan, exec_argv=exec_argv, service_deadline=deadline,
+                    interpreter_pin=interp_pin, retained_source_fd=quota_fd.fd,
+                    extra_cleanup=(lambda: os.close(interp_fd)) if interp_fd is not None else None,
                 )
-            except (OSError, ram.Unknown) as error:
+            except (OSError, ValueError, ram.Unknown) as error:
                 if gate is not None:
                     gate.cleanup()
                 for item in held:
                     close_held_source(item)
                 if group is not None:
                     os.close(group)
+                if interp_fd is not None:
+                    os.close(interp_fd)
                 reason = error.args[0] if isinstance(error, ram.Unknown) and error.args else type(error).__name__
                 if verified_quota_raw is None:
                     # Source pin/open itself rejected: never execute unverified/rejected quota_path.

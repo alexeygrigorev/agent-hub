@@ -226,10 +226,11 @@ def configured_same_process(value):
     from pathlib import Path
     import os
     try:
-        ram.require(type(value) is dict and set(value) == {
+        allowed_keys = {
             'v', 'enabled', 'broker_directory', 'gate_directory',
             'source_directory', 'unit', 'cgroup',
-        })
+        }
+        ram.require(type(value) is dict and allowed_keys <= set(value) <= (allowed_keys | {'primary_args'}))
         ram.require(type(value['v']) is int and value['v'] == 1 and value['enabled'] is True)
         for key in ('broker_directory', 'gate_directory', 'source_directory'):
             directory = value[key]
@@ -240,6 +241,10 @@ def configured_same_process(value):
         cgroup = value['cgroup']
         ram.require(type(unit) is str and unit.endswith('.service') and '/' not in unit and len(unit) <= 128)
         ram.require(type(cgroup) is str and cgroup.startswith('/') and '\x00' not in cgroup and len(cgroup) <= 256)
+        if 'primary_args' in value:
+            pargs = value['primary_args']
+            ram.require(type(pargs) is list and 1 <= len(pargs) <= 32
+                        and all(type(a) is str and '\x00' not in a and len(a) <= 256 for a in pargs))
         return dict(value)
     except Exception:
         return None
