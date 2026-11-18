@@ -650,6 +650,7 @@ export class ProjectDO {
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
         this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
       }
+      if(next.status==='accepted')this.clearAcceptedContext(row.id,'edit:'+key,at);
       if(typeof body.code_task==='boolean'){
         const source=(this.parse(row.source_json) as JsonRecord|null)??{},was=codeTask(source);
         this.db.run('UPDATE intakes SET source_json=? WHERE id=?',JSON.stringify({...source,code_task:body.code_task}),row.id);
@@ -1555,6 +1556,7 @@ export class ProjectDO {
       }
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
         stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
+      if(status==='accepted')this.clearAcceptedContext(intake.id,saga.operation_id,now);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -1660,7 +1662,9 @@ export class ProjectDO {
     }
     this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
       passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
-      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,
+      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',
+        reason:explicit?(mergeBlocked?'merge_gate_blocked':'recorded_acceptance_verification'):reason,
+        ...(explicit?{verdict_source:'worker_append',exit_reason:reason==='verifier_exit_without_verdict'?'verifier_exit_zero':reason}:{}),
         ...(missing?{cause:missing}:{}),...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
     return record;
   }
@@ -2186,6 +2190,13 @@ export class ProjectDO {
   }
 
   /** Context snapshots live in the existing event journal, preserving rollback schema compatibility. */
+  private clearAcceptedContext(id:string,key:string,now:number):void{
+    const context=this.intakeContext(id);
+    if(context.current_state===null&&context.next_step===null)return;
+    this.appendEvent(id,'accepted-context:'+id+':'+key,COMPLETION_ACTOR,'intake_context_updated',
+      {...context,current_state:null,next_step:null},now);
+  }
+
   private intakeContext(id: string): JsonRecord {
     const event = this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' ORDER BY seq DESC LIMIT 1", id);
     return event ? this.parse(event.body_json) as JsonRecord : Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,null]));

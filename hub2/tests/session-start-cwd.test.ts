@@ -41,14 +41,30 @@ function fixture(options: { refusal?: { status: number; error: string }; createS
     }),
   };
   const env = { CONTROL: control, PROJECTS: projects, HUB2_DEV_OPERATOR_TOKEN: token } as any;
-  const post = (path: string, body: Record<string, unknown>) => worker.fetch(new Request('https://hub.test' + path, {
+  const post = (path: string, body: Record<string, unknown>, headers: Record<string,string> = {}) => worker.fetch(new Request('https://hub.test' + path, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Origin: 'https://hub.test' },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Origin: 'https://hub.test', ...headers },
     body: JSON.stringify(body),
   }), env);
   const start = (body: Record<string, unknown>) => post('/api/sessions', { key: 'start-key-00000001', mode: 'headless', brief: 'Do the task', ...body });
   return { projectCalls, start, post };
 }
+
+test('short CLI keys and header keys reach the intake start unchanged; invalid keys name the constraint',async()=>{
+  const f=fixture();
+  assert.equal((await f.start({key:'hss-3',repo:'org/app',intake_task_id:'intake-given'})).status,201);
+  assert.equal(f.projectCalls.at(-1)!.body.key,'hss-3');
+  assert.equal((await f.post('/api/sessions',{mode:'headless',brief:'Check',intake_task_id:'intake-given'},
+    {'Idempotency-Key':'header-key'})).status,201);
+  assert.equal(f.projectCalls.at(-1)!.body.key,'header-key');
+  for(const key of [undefined,'',null,7,'bad key','x'.repeat(129)]){
+    const response=await f.start({key,repo:'org/app'});
+    assert.equal(response.status,400);
+    const body=await response.json() as any;
+    assert.equal(body.error,key===undefined||key===''?'idempotency_key_required':'invalid_idempotency_key');
+    assert.match(body.detail,key===undefined||key===''?/pass --key/:/1-128 characters/);
+  }
+});
 
 test('--cwd is the launch workspace; the repository only names the project', async () => {
   const f = fixture();
