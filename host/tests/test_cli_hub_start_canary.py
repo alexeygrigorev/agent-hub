@@ -6952,6 +6952,71 @@ class AdmissionTests(unittest.TestCase):
                         self.assertHeld(self._view_churn(kind, change, nth),
                                         reason or ("resident_measurement_unknown" if kind == "provided" else "resident_identity_unknown"))
 
+    def _mutate_after_final_view_read(self, kind, change, nth):
+        """Run `change` right after the LAST target-view fdinfo read (the held target root fd) of sample nth: after the
+        final reopens, so only a boundary check placed after ALL view reads can still observe it."""
+        mod, calls, pending, real, real_text = self.mod(), [], [], self.mod().read_fd_mount_id, self.mod().read_text_limited
+
+        def fdinfo(fd):
+            value = real(fd)
+            calls.append(1)
+            if change is not None and len(calls) == 3 * nth:  # three view reads per differing sample; the third is last
+                undo = change(self.VIEW_PIDS[kind])
+                if undo is not None:
+                    pending.append(undo)
+            return value
+
+        def text(*args, **kwargs):
+            while pending:  # a transient change is undone before anything of the NEXT sample reads, so only this sample's end can see it
+                pending.pop()()
+            return real_text(*args, **kwargs)
+
+        patchers = [mock.patch.object(mod, name, fake) for name, fake in (("read_fd_mount_id", fdinfo), ("read_text_limited", text))]
+        for patcher in patchers:
+            patcher.start()
+        return lambda: [patcher.stop() for patcher in reversed(patchers)]  # a hook must not outlive its own case
+
+    def test_differing_view_changes_during_the_final_view_reads_hold(self):
+        """Root review R1/R2: namespace, group and membership changes that land DURING the final target-root/scope/fdinfo
+        reads (after the earlier end snapshot) must still hold; the same world without the change stays PASS."""
+        def move_group(pid):  # transient: restored before the next sample, so only the end of THIS sample can see it
+            path = self.tmp / "proc" / str(pid) / "cgroup"
+            original = path.read_text()
+            path.write_text("0::/user.slice/elsewhere.scope\n")
+            return lambda: path.write_text(original)
+
+        def leave_membership(pid):
+            procs = self.tmp / "cgroup" / self.PGROUP.lstrip("/") / "cgroup.procs"
+            original = procs.read_text()
+            self.procs(self.PGROUP, [4999])
+            return lambda: procs.write_text(original)
+
+        cases = {
+            "target mnt namespace switches": (lambda pid: self._replace_ns(str(pid), "mnt"), "resident_identity_unstable"),
+            "target cgroup namespace switches": (lambda pid: self._replace_ns(str(pid), "cgroup"), "resident_identity_unstable"),
+            "observer mnt namespace switches": (lambda pid: self._replace_ns("self", "mnt"), "resident_identity_unstable"),
+            "observer cgroup namespace switches": (lambda pid: self._replace_ns("self", "cgroup"), "resident_identity_unstable"),
+            "chosen pid group moves": (move_group, "resident_identity_unstable"),
+            "chosen pid leaves the held scope membership": (leave_membership, None),
+        }
+        for kind in self.VIEW_PIDS:
+            with self.subTest(f"{kind}: stable control passes"):
+                c, _census = self.view_world(kind)
+                stop = self._mutate_after_final_view_read(kind, None, 1)
+                try:
+                    c.admit()
+                finally:
+                    stop()
+            for nth in (1, 2, 3):
+                for label, (change, reason) in cases.items():
+                    with self.subTest(f"{kind}: sample {nth}: {label}"):
+                        c, _census = self.view_world(kind)
+                        stop = self._mutate_after_final_view_read(kind, change, nth)
+                        try:
+                            self.assertHeld(c, reason or ("resident_measurement_unknown" if kind == "provided" else "resident_identity_unknown"))
+                        finally:
+                            stop()
+
     def _shift_dev(self, match, start):
         """From the start-th matching stat on, report a different st_dev (an inode-identical but device-different object)."""
         real, seen = os.stat, []
@@ -6984,38 +7049,41 @@ class AdmissionTests(unittest.TestCase):
                 self.assertHeld(c, "resident_identity_unstable")
 
     def test_differing_view_provided_coordinates_bind_the_target_objects(self):
-        """PROVIDED coordinates describe the TARGET mount namespace and cgroup mount root, never the observer's clone."""
+        """PROVIDED coordinates describe the TARGET mount namespace and cgroup mount root, never the observer's clone.
+
+        Every case builds its OWN world (the synthetic root is recreated, so its root inode differs) and derives the
+        baseline coordinates from THAT world; only the intended override is then applied."""
         pid, group = self.VIEW_PIDS["provided"], self.PGROUP
-        c, census = self.view_world("provided")
-        full = census[0]["containment_cgroup_identity"]
-        self.assertNotEqual(full["cgroup_mount_id"], self.MOUNT_ID)
-        scope = os.stat(self.tmp / "cgroup" / group.lstrip("/"))
-        observer_mnt = os.stat(self.tmp / "proc/self/ns/mnt")
 
-        def admit(identity):
+        def world(build):
             c, census = self.view_world("provided")
-            census[0]["containment_cgroup_identity"] = identity
-            return c
+            self.observer_mnt = os.stat(self.tmp / "proc/self/ns/mnt")
+            full = census[0]["containment_cgroup_identity"]
+            census[0]["containment_cgroup_identity"] = build(full, os.stat(self.tmp / "cgroup" / group.lstrip("/")))
+            return c, full
 
-        admit(full).admit()
-        admit({"boot_id": "boot-1"}).admit()
+        c, full = world(lambda full, scope: full)
+        self.assertNotEqual(full["cgroup_mount_id"], self.MOUNT_ID)
+        c.admit()
+        world(lambda full, scope: {"boot_id": "boot-1"})[0].admit()
         for key in self.mod().PROVIDED_COORDINATES:
             with self.subTest("alone passes: " + key):
-                admit({"boot_id": "boot-1", key: full[key]}).admit()
-            for label, value in {"+1": full[key] + 1, "bool": True, "float": float(full[key]), "string": str(full[key]), "null": None,
-                                 "zero": 0, "negative": -full[key]}.items():
+                world(lambda full, scope: {"boot_id": "boot-1", key: full[key]})[0].admit()
+            for label, make in {"+1": lambda v: v + 1, "bool": lambda v: True, "float": float, "string": str, "null": lambda v: None,
+                                "zero": lambda v: 0, "negative": lambda v: -v}.items():
                 with self.subTest(f"{key}: {label}"):
-                    self.assertHeld(admit({"boot_id": "boot-1", key: value}), "resident_identity_unknown")
+                    self.assertHeld(world(lambda full, scope: {"boot_id": "boot-1", key: make(full[key])})[0], "resident_identity_unknown")
         for label, override in {
-            "observer clone mount id": {"cgroup_mount_id": self.MOUNT_ID},
-            "observer mnt namespace inode": {"mount_namespace_inode": observer_mnt.st_ino},
-            "scope inode as root inode": {"cgroup_root_inode": scope.st_ino},
-            "wrong root device": {"cgroup_root_device": full["cgroup_root_device"] + 1},
+            "observer clone mount id": lambda full, scope: {"cgroup_mount_id": self.MOUNT_ID},
+            "observer mnt namespace inode": lambda full, scope: {"mount_namespace_inode": self.observer_mnt.st_ino},
+            "scope inode as root inode": lambda full, scope: {"cgroup_root_inode": scope.st_ino},
+            "wrong root device": lambda full, scope: {"cgroup_root_device": full["cgroup_root_device"] + 1},
         }.items():
             with self.subTest(label):
-                self.assertHeld(admit(dict(full, **override)), "resident_identity_unknown")
+                self.assertHeld(world(lambda full, scope: dict(full, **override(full, scope)))[0], "resident_identity_unknown")
         # A final-only change of a present coordinate (e.g. to the observer's clone id) is a changed census, never credit.
         c, census = self.view_world("provided")
+        full = census[0]["containment_cgroup_identity"]
         seen = []
         c.read_census = lambda d: seen.append(1) or ([census_row(1, pid, group, containment_cgroup_identity=full)] if len(seen) == 1 else
                                                    [census_row(1, pid, group, containment_cgroup_identity=dict(full, cgroup_mount_id=self.MOUNT_ID))])

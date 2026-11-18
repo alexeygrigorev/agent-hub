@@ -1791,17 +1791,6 @@ class PhysicalAdmission:
             # coordinates must all be one and the same, so a switch during the memory reads cannot pass stale.
             if differing:
                 # Target and observer mount namespaces are each stable on their own; the cgroup namespaces stay one.
-                final_pid = {name: os.stat(f"ns/{name}", dir_fd=pid_fd) for name in ("cgroup", "mnt")}
-                final_self = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
-                if (len({ident(ns_stats["cgroup"]), ident(self_stats["cgroup"]), ident(final_pid["cgroup"]), ident(final_self["cgroup"])}) != 1
-                        or ident(final_pid["mnt"]) != ident(ns_stats["mnt"]) or ident(final_self["mnt"]) != ident(self_stats["mnt"])
-                        or final_self["cgroup"].st_ino != ns_ids["cgroup"] or final_self["mnt"].st_ino != ns_ids["mnt"]):
-                    raise StageFailure("admission", "resident_identity_unstable")
-                state_end, ticks_end = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
-                if (state_end in ("Z", "X") or ticks_end != start_ticks or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)
-                        or ident(os.fstat(pid_fd)) != ident(pid_stat)
-                        or ident(os.fstat(root_fd)) != ident(root) or ident(os.stat(CGROUP_ROOT)) != ident(root)):
-                    raise StageFailure("admission", "resident_identity_unstable")
                 # Reopen the target view from scratch through the same held process directory: a retained fd alone
                 # cannot show the current pathname still names the same objects and the same mount instance.
                 troot_again = open_target_cgroup_root(pid_fd)
@@ -1818,6 +1807,25 @@ class PhysicalAdmission:
                 if (ident(os.fstat(troot_fd)) != ident(troot) or read_fd_mount_id(troot_fd) != mount_id
                         or ident(os.fstat(tscope_fd)) != ident(tscope)):
                     raise StageFailure("admission", "resident_identity_unstable")
+                # END boundary, AFTER every target-view reopen and fdinfo read above: re-read the held chosen PID's
+                # live state/start/group, its membership in the held scope, the numeric process directory and the chosen
+                # and self namespace tuples, so a change during those final reads can never pass a stale snapshot.
+                final_pid = {name: os.stat(f"ns/{name}", dir_fd=pid_fd) for name in ("cgroup", "mnt")}
+                final_self = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
+                if (len({ident(ns_stats["cgroup"]), ident(self_stats["cgroup"]), ident(final_pid["cgroup"]), ident(final_self["cgroup"])}) != 1
+                        or ident(final_pid["mnt"]) != ident(ns_stats["mnt"]) or ident(final_self["mnt"]) != ident(self_stats["mnt"])
+                        or final_self["cgroup"].st_ino != ns_ids["cgroup"] or final_self["mnt"].st_ino != ns_ids["mnt"]):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                state_end, ticks_end = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
+                if (state_end in ("Z", "X") or ticks_end != start_ticks or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)
+                        or ident(os.fstat(pid_fd)) != ident(pid_stat)
+                        or ident(os.fstat(root_fd)) != ident(root) or ident(os.stat(CGROUP_ROOT)) != ident(root)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if ([line[3:] for line in read_at_limited(pid_fd, "cgroup").splitlines() if line.startswith("0::")] != [group]
+                        or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if pid not in {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}:
+                    raise StageFailure("admission", "resident_measurement_unknown" if provided is not None else "resident_identity_unknown")
             else:
                 final_ns = {who: {name: os.stat(f"{PROC_ROOT}/{path}/ns/{name}") for name in ("cgroup", "mnt")} for who, path in (("pid", pid), ("self", "self"))}
                 for name in ("cgroup", "mnt"):
