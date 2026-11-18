@@ -12,6 +12,7 @@ from pathlib import Path
 import select
 import socket
 import stat
+import struct
 import sys
 import time
 import types
@@ -81,6 +82,35 @@ def recv(channel, end):
     return raw
 
 
+def recv_open(channel, end):
+    """Receive open:<context> with optional single SCM_RIGHTS retained-source FD."""
+    remaining = end - time.monotonic()
+    if remaining <= 0 or not select.select([channel], [], [], remaining)[0]:
+        raise TimeoutError()
+    raw, anc, flags, _addr = channel.recvmsg(2049, socket.CMSG_SPACE(4), socket.MSG_DONTWAIT)
+    if not raw or len(raw) > 2048 or (flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)):
+        for _lvl, ctype, cdata in anc:
+            if ctype == socket.SCM_RIGHTS:
+                for i in range(0, len(cdata) - 3, 4):
+                    try:
+                        os.close(struct.unpack_from('i', cdata, i)[0])
+                    except OSError:
+                        pass
+        raise RuntimeError('channel_unqualified')
+    if not anc:
+        return raw, None
+    if len(anc) == 1 and anc[0][0] == socket.SOL_SOCKET and anc[0][1] == socket.SCM_RIGHTS and len(anc[0][2]) == 4:
+        return raw, struct.unpack('i', anc[0][2])[0]
+    for _lvl, ctype, cdata in anc:
+        if ctype == socket.SCM_RIGHTS:
+            for i in range(0, len(cdata) - 3, 4):
+                try:
+                    os.close(struct.unpack_from('i', cdata, i)[0])
+                except OSError:
+                    pass
+    raise RuntimeError('channel_unqualified')
+
+
 def send(channel, raw, end):
     remaining = end - time.monotonic()
     if remaining <= 0 or not select.select([], [channel], [], remaining)[1] or channel.send(raw) != len(raw):
@@ -118,6 +148,7 @@ def main(argv, *, retained_fd=None):
     channel = None
     context = None
     qualified = False
+    transferred_fd = None
     if end > time.monotonic():
         try:
             channel = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -127,7 +158,7 @@ def main(argv, *, retained_fd=None):
             except BlockingIOError:
                 pass
             send(channel, b'held-before-quota-source', end)
-            command = recv(channel, end)
+            command, transferred_fd = recv_open(channel, end)
             if len(command) == 37 and command.startswith(b'open:'):
                 candidate = command[5:].decode('ascii')
                 if len(candidate) == 32 and all(c in '0123456789abcdef' for c in candidate):
@@ -138,10 +169,17 @@ def main(argv, *, retained_fd=None):
     try:
         quota_raw = acquired(quota_path, quota_sha)
     except Exception:
-        # Path swapped or unreadable after selection: run verified retained original once unqualified.
-        quota_raw = _read_verified_fd(retained_fd, quota_sha, allow_unlinked=True)
+        # Path swapped or unreadable after selection: run verified retained/transferred original once unqualified.
+        fallback_fd = transferred_fd if transferred_fd is not None else retained_fd
+        quota_raw = _read_verified_fd(fallback_fd, quota_sha, allow_unlinked=True)
         context = None
         qualified = False
+    finally:
+        if transferred_fd is not None:
+            try:
+                os.close(transferred_fd)
+            except OSError:
+                pass
 
     helper_raw = None
     if context is not None:

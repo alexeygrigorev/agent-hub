@@ -1175,7 +1175,7 @@ class SameProcessLifecycleTests(unittest.TestCase):
         os.close(interp_fd)
         self.assertGreater(interp_pin['size'], 262144)
         self.assertEqual(len(interp_pin['sha256']), 64)
-        # Staged handoff passes inherited FDs + read-only pipe manifest to runner after privilege drop
+        # Staged handoff with mocked Root syscalls + privilege drop + read-only pipe manifest
         root = self._short_temp()
         gate_dir = root / 'gate'
         src_dir = root / 'src'
@@ -1198,13 +1198,132 @@ class SameProcessLifecycleTests(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         args = SimpleNamespace(
             target_uid=os.getuid(), config=str(root / 'v2.json'),
-            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin=real_py,
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
         )
-        with patch.object(prep, 'open_fanotify_group', return_value=r_fan):
+        # Non-root entry must be refused before any preparation
+        with self.assertRaises(PermissionError):
+            prep.prepare_and_handoff(args, runner=_fake_runner)
+
+        fake_libc = SimpleNamespace(prctl=lambda op, a1, *a: 1 if op == prep.PR_GET_NO_NEW_PRIVS else 0)
+        fake_status = 'NoNewPrivs:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n'
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **interp_pin})), \
+             patch.object(prep, 'bind_source_gate', return_value=(SimpleNamespace(fileno=lambda: os.dup(r_fan), close=lambda: None), os.open(str(gate_dir), os.O_RDONLY), -1, (1, 2))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc):
             rc = prep.prepare_and_handoff(args, runner=_fake_runner)
         self.assertEqual(rc, 0)
         self.assertIn(seen['manifest']['fan_group'], seen['pass_fds'])
         self.assertEqual(seen['manifest']['interpreter']['sha256'], interp_pin['sha256'])
+        self.assertTrue(seen['cmd'][0].startswith('/proc/self/fd/'))
+
+    def test_root_preparer_r5_r6_security_controls_and_refusals(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_sec', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        # R6: unapproved interpreter & non-ELF refused
+        with self.assertRaises(PermissionError):
+            prep.pin_interpreter('/tmp/evil-python')
+        # R6: drop_privileges refuses non-root entry, retained caps, wrong EGID/resgid, non-empty groups
+        with self.assertRaises(PermissionError):
+            prep.drop_privileges(1000, 1000)
+        fake_libc = SimpleNamespace(prctl=lambda op, a1, *a: 1 if op == prep.PR_GET_NO_NEW_PRIVS else 0)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[27]):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[]), \
+             patch.object(prep.os, 'setresgid', lambda *a: None), \
+             patch.object(prep.os, 'getresgid', return_value=(1000, 0, 1000)):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[]), \
+             patch.object(prep.os, 'setresgid', lambda *a: None), \
+             patch.object(prep.os, 'getresgid', return_value=(1000, 1000, 1000)), \
+             patch.object(prep.os, 'setresuid', lambda *a: None), \
+             patch.object(prep.os, 'getresuid', return_value=(1000, 1000, 1000)), \
+             patch.object(prep.Path, 'read_text', return_value='NoNewPrivs:\t1\nCapInh:\t0\nCapPrm:\t0000000000000001\nCapEff:\t0\nCapAmb:\t0\n'):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        # R5: bind_source_gate uses /proc/self/fd/<node_fd> (not mutable basename) and rejects raced inode
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        gate_dir.mkdir(mode=0o700)
+        seen_chmod = []
+        orig_chmod = os.chmod
+        def _rec_chmod(p, mode):
+            seen_chmod.append(str(p))
+            return orig_chmod(p, mode)
+        with patch.object(prep.os, 'chmod', side_effect=_rec_chmod), \
+             patch.object(prep.os, 'chown', lambda *a: None):
+            sock, dfd, nfd, nid = prep.bind_source_gate(str(gate_dir), os.getuid())
+            sock.close()
+            os.close(nfd)
+            os.close(dfd)
+        self.assertEqual(len(seen_chmod), 1)
+        self.assertNotIn('source-gate.sock', seen_chmod[0])
+
+    def test_consume_handoff_fd_rejects_forged_pipe_and_non_fanotify_fd(self):
+        import json
+        from agent_hub_host.quota_dispatch_manager import consume_handoff_fd
+        r_pipe, w_pipe = os.pipe()
+        os.write(w_pipe, json.dumps({'v': 1, 'interpreter': {'fd': 3}, 'source': {'fd': 4, 'dir_fd': 5},
+                                     'client': {'fd': 6, 'dir_fd': 7}, 'prelude': {'fd': 8, 'dir_fd': 9},
+                                     'fan_group': 10, 'gate_sock_fd': 11, 'gate_dir_fd': 12}).encode())
+        os.close(w_pipe)
+        with self.assertRaises(ram.Unknown):
+            consume_handoff_fd(r_pipe, '/unused')
+
+    def test_scm_rights_source_transfer_across_source_gate_and_path_swap(self):
+        import hashlib, socket, threading
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 31 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        held_orig_fd = os.open(str(q_path), os.O_RDONLY | os.O_NOFOLLOW)
+        self.addCleanup(lambda: os.close(held_orig_fd))
+        gate_sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        gate_sock.bind(str(root / 'source-gate.sock'))
+        gate_sock.listen(1)
+        self.addCleanup(gate_sock.close)
+
+        def _server():
+            conn, _ = gate_sock.accept()
+            with conn:
+                self.assertEqual(conn.recv(256), b'held-before-quota-source')
+                # Swap path on disk before sending SCM_RIGHTS open command
+                q_path.unlink()
+                self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+                conn.sendmsg([b'open:' + b'a' * 32], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', held_orig_fd))])
+
+        t = threading.Thread(target=_server, daemon=True)
+        t.start()
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_scm', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dl_ns = str(int((time.monotonic() + 5.0) * 1e9))
+        rc = mod.main([dl_ns, q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'])
+        t.join(timeout=2.0)
+        self.assertEqual(rc, 31)
 
     def test_fanotify_reader_bad_version_header_closes_trailing_valid_fds(self):
         from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader

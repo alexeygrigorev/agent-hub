@@ -64,6 +64,8 @@ class PreparedQuotaSelection:
     poll_held: object
     cleanup_owned: object
     service_deadline: float
+    interpreter_pin: object = None
+    retained_source_fd: int | None = None
     def __post_init__(self):
         ram.require(type(self.source) is HeldSourceFD and type(self.companions) is tuple and len(self.companions)==2
             and all(type(h) is HeldSourceFD for h in self.companions)
@@ -215,6 +217,9 @@ class V4QuotaManager:
         self.owned_leases.append(lease) # worker cleanup owns it even after cancellation
         ram.require(self.stable.alive(pidfd) and self.stable.inspect_process(peer[0],cgroup)==key)
         ram.require(os.stat('/proc/self/ns/time').st_ino==os.stat('/proc/'+str(peer[0])+'/ns/time').st_ino)
+        if self.p.interpreter_pin is not None:
+            exe_stat=os.stat(f'/proc/{peer[0]}/exe')
+            ram.require((exe_stat.st_dev,exe_stat.st_ino)==(self.p.interpreter_pin['dev'],self.p.interpreter_pin['ino']))
         state=self.env.show(self.p.runner,self.p.plan,'healthy',deadline)
         ram.require(self.env.owned(state,self.p.plan,'healthy',invocation)==invocation and state['MainPID']==str(peer[0]) and self.now()<deadline)
         self.full_sources();return lease
@@ -340,7 +345,13 @@ class V4QuotaManager:
             ram.require(owner.bind_started(self.ticket,self.pending_channel));self.phase='open_send'
         elif phase=='open_send':
             raw=b'open:'+self.ticket.context.encode('ascii')
-            ram.require(self.now()<self.ticket.deadline and self.pending_channel.send(raw)==len(raw));self.phase='open_receive'
+            ram.require(self.now()<self.ticket.deadline)
+            if self.p.retained_source_fd is not None:
+                anc=[(socket.SOL_SOCKET,socket.SCM_RIGHTS,struct.pack('i',self.p.retained_source_fd))]
+                ram.require(self.pending_channel.sendmsg([raw],anc)==len(raw))
+            else:
+                ram.require(self.pending_channel.send(raw)==len(raw))
+            self.phase='open_receive'
         elif phase=='open_receive':
             raw=self.packet(self.ticket.deadline)
             if raw is None:return
@@ -694,6 +705,21 @@ class SourceGate:
             self.cleanup()
             raise
 
+    @classmethod
+    def from_inherited(cls, directory, dir_fd, listener_fd):
+        """Adopt an already-bound Root-prepared SourceGate without rebinding."""
+        from pathlib import Path
+        gate = cls.__new__(cls)
+        gate.directory = Path(directory)
+        gate.dir_fd = dir_fd
+        gate.listener = socket.socket(fileno=listener_fd)
+        ram.require(gate.listener.family == socket.AF_UNIX and gate.listener.type == socket.SOCK_SEQPACKET)
+        gate.listener.setblocking(False)
+        node = os.stat('source-gate.sock', dir_fd=dir_fd, follow_symlinks=False)
+        ram.require(stat.S_ISSOCK(node.st_mode) and node.st_uid in (0, os.getuid()) and node.st_nlink == 1)
+        gate.node_identity = (node.st_dev, node.st_ino)
+        return gate
+
     def poll_held(self):
         if self.listener is None:
             return None
@@ -726,6 +752,96 @@ class SourceGate:
             self.dir_fd = None
 
 
+def _adopt_held_source(entry):
+    ram.require(type(entry) is dict and set(entry) == {'fd', 'dir_fd', 'name', 'dev', 'ino', 'sha256'})
+    fd, dir_fd, name = entry['fd'], entry['dir_fd'], entry['name']
+    ram.require(type(fd) is int and fd > 2 and type(dir_fd) is int and dir_fd > 2
+                and type(name) is str and '/' not in name and name not in ('', '.', '..'))
+    dstat = os.fstat(dir_fd)
+    ram.require(stat.S_ISDIR(dstat.st_mode) and dstat.st_uid in (0, os.getuid()) and not (dstat.st_mode & 0o002))
+    info = os.fstat(fd)
+    nstat = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    ram.require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
+                and info.st_nlink == 1 and not (info.st_mode & 0o222)
+                and 0 < info.st_size <= 262144
+                and (info.st_dev, info.st_ino) == (entry['dev'], entry['ino'])
+                and (nstat.st_dev, nstat.st_ino) == (info.st_dev, info.st_ino))
+    raw = os.pread(fd, info.st_size + 1, 0)
+    ram.require(len(raw) == info.st_size)
+    digest = hashlib.sha256(raw).hexdigest()
+    ram.require(digest == entry['sha256'])
+    stamp = StableRuntime.source_stamp(info)
+    pin = ram.SourcePin(info.st_dev, info.st_ino, digest).checked()
+    return HeldSourceFD(fd, dir_fd, name, raw, stamp, pin)
+
+
+def consume_handoff_fd(handoff_fd, gate_directory):
+    """Consume and corroborate a Root-prepared read-only pipe manifest."""
+    ram.require(type(handoff_fd) is int and handoff_fd > 2)
+    pstat = os.fstat(handoff_fd)
+    ram.require(stat.S_ISFIFO(pstat.st_mode) and pstat.st_uid in (0, os.getuid()))
+    chunks = []
+    total = 0
+    try:
+        while total <= 65536:
+            chunk = os.read(handoff_fd, 65537 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    finally:
+        try:
+            os.close(handoff_fd)
+        except OSError:
+            pass
+    ram.require(0 < total <= 65536)
+    manifest = json.loads(b''.join(chunks).decode('utf-8'))
+    ram.require(type(manifest) is dict and manifest.get('v') == 1 and set(manifest) == {
+        'v', 'interpreter', 'source', 'client', 'prelude', 'fan_group', 'gate_sock_fd', 'gate_dir_fd',
+    })
+    fds = [
+        manifest['interpreter'].get('fd'),
+        manifest['source'].get('fd'), manifest['source'].get('dir_fd'),
+        manifest['client'].get('fd'), manifest['client'].get('dir_fd'),
+        manifest['prelude'].get('fd'), manifest['prelude'].get('dir_fd'),
+        manifest['fan_group'], manifest['gate_sock_fd'], manifest['gate_dir_fd'],
+    ]
+    ram.require(all(type(x) is int and x > 2 for x in fds) and len(set(fds)) == len(fds))
+
+    interp = manifest['interpreter']
+    ram.require(set(interp) == {'fd', 'path', 'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns', 'sha256'})
+    ist = os.fstat(interp['fd'])
+    ram.require(stat.S_ISREG(ist.st_mode) and ist.st_uid == 0 and (ist.st_mode & 0o111)
+                and (ist.st_dev, ist.st_ino) == (interp['dev'], interp['ino']) and ist.st_size == interp['size'])
+    hasher = hashlib.sha256()
+    offset = 0
+    while True:
+        buf = os.pread(interp['fd'], 65536, offset)
+        if not buf:
+            break
+        hasher.update(buf)
+        offset += len(buf)
+    ram.require(offset == ist.st_size and hasher.hexdigest() == interp['sha256'])
+
+    fan_group = manifest['fan_group']
+    ram.require(not os.get_blocking(fan_group)
+                and os.readlink(f'/proc/self/fd/{fan_group}') == 'anon_inode:[fanotify]')
+
+    quota_fd = _adopt_held_source(manifest['source'])
+    client_fd = _adopt_held_source(manifest['client'])
+    prelude_fd = _adopt_held_source(manifest['prelude'])
+    gate = SourceGate.from_inherited(gate_directory, manifest['gate_dir_fd'], manifest['gate_sock_fd'])
+    return {
+        'source': quota_fd,
+        'client': client_fd,
+        'prelude': prelude_fd,
+        'fan_group': fan_group,
+        'gate': gate,
+        'interp_fd': interp['fd'],
+        'interpreter_pin': interp,
+    }
+
+
 def prepare_selected_quota(
     *,
     source,
@@ -741,6 +857,8 @@ def prepare_selected_quota(
     observation=None,
     runner=None,
     extra_cleanup=None,
+    interpreter_pin=None,
+    retained_source_fd=None,
 ):
     """Construct PreparedQuotaSelection from already-held FDs and owned gate."""
     def _cleanup():
@@ -778,4 +896,6 @@ def prepare_selected_quota(
         poll_held=gate.poll_held,
         cleanup_owned=_cleanup,
         service_deadline=service_deadline,
+        interpreter_pin=interpreter_pin,
+        retained_source_fd=retained_source_fd,
     )
