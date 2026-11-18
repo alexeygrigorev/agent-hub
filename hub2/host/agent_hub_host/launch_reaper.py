@@ -9,8 +9,6 @@ import subprocess
 import threading
 import time
 
-from . import resource_admission
-
 ADMISSION_WINDOW_MS = 60_000
 CENSUS_RETRY_SECONDS = 5
 _OBSERVER_LOCK = threading.Lock()
@@ -167,14 +165,7 @@ def _sweep(bridge, now, inventory):
                 payload = json.loads(row['legacy_failure_json'])
                 state, key = 'launch_failed_reported', f"legacy-unobserved:{row['operation_id']}:{row['epoch']}"
             with db:
-                # Reuse only an already persisted exact-attempt absence receipt;
-                # this call neither collects native data nor changes delivery.
-                resource_admission.recover_release(db, row)
                 changed = db.execute('UPDATE launches SET state=? WHERE operation_id=? AND epoch=? AND state=?',
                                      (state, row['operation_id'], row['epoch'], row['state']))
                 if changed.rowcount:
-                    if needs_census or row['state'] == 'pending_admission':
-                        resource_admission.release(db, row, 'qualified_absence' if needs_census else 'no_dispatch')
-                    # Reporting an old legacy payload creates no new release proof;
-                    # preserve only accounting qualified by its original transition.
                     bridge.journal.enqueue(key, f"/api/sessions/{row['session_id']}/finish", payload)

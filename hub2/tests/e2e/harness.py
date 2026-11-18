@@ -30,8 +30,6 @@ PROJECT = "e2e-owner/e2e-repo"
 ACCOUNT = "e2e-codex"
 MODEL = "gpt-e2e-stub"
 MACHINE = "e2e-host"
-# Stub processes test orchestration; physical capacity is tested in host units.
-STUB_HOST_AVAILABLE_BYTES = 64 * 1024**3
 
 
 def scratch_root():
@@ -172,26 +170,6 @@ def configure_hub(server):
     return enrolled["token"]
 
 
-def host_command(config, capacity_bytes=None):
-    """Only stub e2e fixtures may opt into a deterministic physical sampler.
-
-    This bootstrap is test code, never installed or selected by production
-    configuration/environment. Default Host invocation remains byte-equivalent.
-    """
-    args = ['--config', str(config), 'serve', '--label', 'e2e']
-    if capacity_bytes is None:
-        return [sys.executable, '-m', 'agent_hub_host.cli', *args]
-    if type(capacity_bytes) is not int or not 0 <= capacity_bytes < 2**63:
-        raise ValueError('invalid synthetic physical capacity')
-    bootstrap = (
-        "import runpy,sys; from agent_hub_host import resource_admission; "
-        "capacity=int(sys.argv.pop(1)); "
-        "resource_admission.available_bytes=lambda:capacity; "
-        "runpy.run_module('agent_hub_host.cli',run_name='__main__',alter_sys=True)"
-    )
-    return [sys.executable, '-c', bootstrap, str(capacity_bytes), *args]
-
-
 class Host:
     """The real Hub2 host daemon (hub2/host) with stub `a`/`codex` first on PATH."""
 
@@ -243,7 +221,7 @@ class Host:
     def start(self):
         log = open(self.log_path, "ab")
         self.process = subprocess.Popen(
-            host_command(self.config, STUB_HOST_AVAILABLE_BYTES),
+            [sys.executable, "-m", "agent_hub_host.cli", "--config", str(self.config), "serve", "--label", "e2e"],
             cwd=self.root, env=self.env(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
     def alive(self):

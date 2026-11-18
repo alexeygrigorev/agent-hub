@@ -231,16 +231,5 @@ class WindowsCompanionInstallerContracts(unittest.TestCase):
         self.assertIn('no consumer activated', source)
 
 
-
-
-class WindowsPhysicalMemoryAdmissionTests(unittest.TestCase):
-    @unittest.skipUnless(os.name == 'nt', 'Windows Kernel32 read-only ABI smoke')
-    def test_global_memory_status_uses_real_physical_memory_api(self):
-        from agent_hub_host.resource_admission import windows_available
-        available=windows_available()
-        self.assertIs(type(available),int)
-        self.assertGreaterEqual(available,0)
-
-
 if __name__ == '__main__':
     unittest.main()
