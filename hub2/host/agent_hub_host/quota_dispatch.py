@@ -299,11 +299,14 @@ def run_same_process_quota(
     if identity is not None:
         kwargs['identity'] = identity
 
-    broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
+    broker = None
     launch_result = None
+    launched = False
     snapshot = None
     ticket = None
+    mgr = None
     try:
+        broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
         broker.start()
         while not state['ready'].is_set() and not broker.closed and now() < prepared.service_deadline:
             time.sleep(0.002)
@@ -316,6 +319,7 @@ def run_same_process_quota(
             offer = disp.post(prepared.source)
             ticket = offer.await_owner(now=now)
         # Selection reservation precedes launch; run original selected business ONCE.
+        launched = True
         launch_result = launcher(ticket)
         while (mgr is not None and mgr.phase not in ('done', 'failed')
                and not broker.closed and now() < prepared.service_deadline):
@@ -333,6 +337,19 @@ def run_same_process_quota(
             'phase': mgr.phase if mgr is not None else 'failed',
             'launch_result': launch_result,
             'snapshot': snapshot,
+            'complete': False,
+        }
+    except Exception:
+        if not launched:
+            launched = True
+            launch_result = launcher(None)
+        return {
+            'enabled': True,
+            'dispatched': False,
+            'reserved': False,
+            'phase': mgr.phase if mgr is not None else 'failed',
+            'launch_result': launch_result,
+            'snapshot': None,
             'complete': False,
         }
     finally:
