@@ -794,30 +794,107 @@ HUB_TERMINAL_STATES = frozenset((
 HUB_INFLIGHT_STATES = frozenset(("queued", "pending", "dispatching", "staged", "offered", "claimed", "starting", "running", "exiting", "stopping", "needs_attention"))
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
-# Fixed bridge executed through the already whole-archive-verified CLI (sealed
-# memfd, isolated interpreter). It issues exactly one authenticated GET through
-# the existing client with the effective human profile, no worker/env-token
-# fallback and no 401 refresh; the parent enforces the request deadline.
+# Fixed read-only bridge executed through the already whole-archive-verified CLI (sealed
+# memfd, isolated interpreter) for the two current physical inputs: resource settings and the
+# complete current session inventory. argv: archive mode remaining_seconds.
+# Guarantees (every refusal is a fixed exit code, never raw text):
+#   * no worker/env/URL override: the ACTUAL effective config (config.load_config, what the
+#     request path really uses) must equal the genuine human profile and be human/non-worker,
+#     re-proved before EVERY GET;
+#   * the caller's finite budget is installed as the maintained request deadline, which clips
+#     each GET and suppresses ALL 401 auth refresh; refresh and every config write are
+#     additionally trapped (hard exit) so a login/refresh/profile save can never happen;
+#   * only fixed GET routes; page/cursor/row bounds; duplicate ids, repeated or unterminated
+#     cursors and bad shapes refuse.
+# Exit codes: 3 unavailable, 4 unauthorized/not human, 5 deadline, 6 invalid/incomplete, 8 write attempt.
 ADMISSION_BRIDGE = r"""
-import json, os, sys
+import json, math, os, sys, time
 sys.path.insert(0, sys.argv[1])
-from agent_hub_host import auth, bus, config, worker_auth
-def _no_refresh(*args, **kwargs):
-    raise RuntimeError("refresh_disabled")
-auth.refresh_token = _no_refresh
+class Refuse(Exception):
+    def __init__(self, code):
+        self.code = code
+def _trap(*args, **kwargs):
+    os._exit(8)
 try:
-    if worker_auth.is_v2_worker() or any(os.environ.get(k) for k in ("HUB_CONFIG_FILE", "HUB_JOB_TOKEN", "HUB_TOKEN")):
-        raise RuntimeError("not_human")
-    human = config.load_human_config()
-    if not isinstance(human, dict) or not isinstance(human.get("access_token"), str) or not human.get("access_token"):
-        raise RuntimeError("not_human")
-    data = bus._do_request("GET", "/api/resource-settings")
-    settings = data.get("resource_settings") if isinstance(data, dict) else None
-    floor = settings.get("disk_floor_gb") if isinstance(settings, dict) else None
-    print(json.dumps({"disk_floor_gb": floor}))
+    from agent_hub_host import api, auth, config, session_control, worker_auth
+    mode = sys.argv[2]
+    budget = float(sys.argv[3])
+    if mode not in ("settings", "sessions") or not math.isfinite(budget) or not 0 < budget <= 600:
+        raise Refuse(6)
+    deadline = time.monotonic() + budget
+    for name in ("refresh_token", "login", "save_tokens"):
+        if hasattr(auth, name):
+            setattr(auth, name, _trap)
+    for name in ("save_config", "save_human_config", "save_host_config", "_save_to", "clear_human_config"):
+        if hasattr(config, name):
+            setattr(config, name, _trap)
+    session_control._request_deadline.set(deadline)
+    def proof():
+        for key in ("HUB_CONFIG_FILE", "HUB_JOB_TOKEN", "HUB_TOKEN", "HUB_WORKER_CONFIG_FILE", "HUB2_CONFIG", "HUB_ALLOW_LEGACY_ROUTES"):
+            if os.environ.get(key):
+                raise Refuse(4)
+        if worker_auth.is_v2_worker():
+            raise Refuse(4)
+        human = config.load_human_config()
+        effective = config.load_config()
+        if (not config.is_human_config(human) or effective != human or human.get("client_kind") != "human"
+                or "_hub2_worker" in effective or effective.get("worker_launch_id")):
+            raise Refuse(4)
+        base = human.get("base_url")
+        api.check_url(base)
+        for key in ("HUB_URL", "HUB_BASE_URL"):
+            override = os.environ.get(key)
+            if override and override.rstrip("/") != base.rstrip("/"):
+                raise Refuse(4)
+        return human
+    anchor = proof()
+    def get(path):
+        if time.monotonic() >= deadline:
+            raise Refuse(5)
+        if proof() != anchor:
+            raise Refuse(4)
+        try:
+            return session_control.request("GET", path)
+        except session_control.SessionHTTPError as exc:
+            raise Refuse(4 if exc.status in (401, 403) else 3)
+        except Exception:
+            raise Refuse(5 if time.monotonic() >= deadline else 3)
+    if mode == "settings":
+        data = get("/api/resource-settings")
+        settings = data.get("resource_settings") if isinstance(data, dict) else None
+        floor = settings.get("disk_floor_gb") if isinstance(settings, dict) else None
+        print(json.dumps({"disk_floor_gb": floor}))
+    else:
+        from urllib.parse import quote
+        rows, known, cursors, cursor = [], set(), set(), None
+        for _ in range(PAGES_MAX):
+            path = "/api/sessions?limit=100" + ("&cursor=" + quote(cursor, safe="") if cursor else "")
+            try:
+                entries, cursor = session_control._session_page(get(path))
+            except ValueError:
+                raise Refuse(6)
+            if len(entries) > 100:
+                raise Refuse(6)
+            for entry in entries:
+                if entry["id"] in known:
+                    raise Refuse(6)
+                known.add(entry["id"])
+                rows.append(entry)
+            if len(rows) > ROWS_MAX:
+                raise Refuse(6)
+            if not cursor:
+                break
+            if cursor in cursors:
+                raise Refuse(6)
+            cursors.add(cursor)
+        else:
+            raise Refuse(6)
+        print(json.dumps({"sessions": rows}))
+except Refuse as refused:
+    sys.exit(refused.code)
 except BaseException:
     sys.exit(3)
-"""
+""".replace("PAGES_MAX", str(ADMISSION_MAX_ROWS // 100 + 2)).replace("ROWS_MAX", str(ADMISSION_MAX_ROWS))
 
 
 def _closed_json(raw, limit):
@@ -1347,14 +1424,27 @@ class PhysicalAdmission:
             raise StageFailure("admission", "cli_artifact_unbindable")
         return self.bridge_fd
 
-    def fetch_disk_floor_gb(self, deadline):
+    def bridge_get(self, mode, deadline):
+        """Run the fixed read-only bridge with the SAME original budget; returns (rc, stdout)."""
         fd = self.bridge_artifact_fd()
+        remaining = self.admission_deadline(deadline) - time.monotonic()
+        if remaining <= 0:
+            return 124, ""
         rc, out, _ = self.run(
-            [sys.executable, "-I", "-S", "-c", ADMISSION_BRIDGE, f"/proc/self/fd/{fd}"],
+            [sys.executable, "-I", "-S", "-c", ADMISSION_BRIDGE, f"/proc/self/fd/{fd}", mode, f"{remaining:.3f}"],
             deadline=deadline, pass_fd=fd,
         )
+        return rc, out
+
+    @staticmethod
+    def bridge_reason(rc, prefix):
+        suffix = {124: "timeout", 5: "timeout", 4: "unauthorized", 6: "invalid"}.get(rc, "unavailable")
+        return prefix + "_" + suffix
+
+    def fetch_disk_floor_gb(self, deadline):
+        rc, out = self.bridge_get("settings", deadline)
         if rc != 0:
-            raise StageFailure("admission", "resource_settings_timeout" if rc == 124 else "resource_settings_unavailable")
+            raise StageFailure("admission", self.bridge_reason(rc, "resource_settings"))
         try:
             data = _closed_json(out, 4096)
         except ValueError:
@@ -1377,10 +1467,18 @@ class PhysicalAdmission:
         return rows
 
     def read_hub_rows(self, deadline):
+        """Complete current session inventory through the fixed read-only bridge (never the ordinary CLI)."""
+        rc, out = self.bridge_get("sessions", deadline)
+        if rc != 0:
+            raise StageFailure("admission", self.bridge_reason(rc, "managed_inflight"))
         try:
-            return self.list_items("admission", deadline)
-        except StageFailure:
-            raise StageFailure("admission", "managed_inflight_unavailable")
+            data = _closed_json(out, ADMISSION_JSON_MAX_BYTES)
+        except ValueError:
+            raise StageFailure("admission", "managed_inflight_invalid")
+        rows = data.get("sessions") if isinstance(data, dict) and set(data) == {"sessions"} else None
+        if not isinstance(rows, list) or len(rows) > ADMISSION_MAX_ROWS or not all(isinstance(r, dict) for r in rows):
+            raise StageFailure("admission", "managed_inflight_invalid")
+        return rows
 
     def boottime(self):
         return time.clock_gettime(time.CLOCK_BOOTTIME)
