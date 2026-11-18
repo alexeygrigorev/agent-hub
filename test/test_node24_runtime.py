@@ -810,7 +810,7 @@ class GuardContractTests(unittest.TestCase):
     def test_transaction_guard_runs_before_any_mutation(self):
         guard_idx = TRANSACTION_SOURCE.index(
             'if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && -z "${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-}" ]]; then')
-        for later in ('mkdir -p "$TMPDIR"',
+        for later in ('install -d -o root -g root -m 700 "$TRANSACTION_DIR"',
                       'install_release_dependencies\n  if [[ "$cli_mode" == matched-cli ]]',
                       'git -C "$REPO" checkout --detach --force "$deploy_sha"',
                       'install-hub2-node.sh" --release-mode'):
@@ -972,6 +972,9 @@ class TransactionOrderingTests(unittest.TestCase):
         git('-C', str(self.seed), 'config', 'user.email', 'fixture@example.invalid')
         (self.seed / '.dev.vars').write_text('HUB2_RELEASE_MODE=bootstrap\n', encoding='utf-8')
         (self.seed / '.gitignore').write_text('.dev.vars\n.local/\n', encoding='utf-8')
+        preflight = self.seed / 'scripts/schema-rollback-preflight.py'
+        preflight.parent.mkdir(parents=True, exist_ok=True)
+        preflight.write_text('import sys\nprint("apply")\n', encoding='utf-8')
         git('-C', str(self.seed), 'add', '.')
         git('-C', str(self.seed), 'commit', '-qm', 'fixture previous release')
         git('-C', str(self.seed), 'push', '-q', str(self.remote), 'main')
@@ -980,7 +983,8 @@ class TransactionOrderingTests(unittest.TestCase):
         git('-C', str(self.work), 'config', 'user.email', 'fixture@example.invalid')
         (self.work / '.dev.vars').write_text('HUB2_RELEASE_MODE=bootstrap\n', encoding='utf-8')
 
-    def run_apply(self, runtime_fixture=True, service_version=V22, provision=False, qualified_previous_sha=None):
+    def run_apply(self, runtime_fixture=True, service_version=V22, provision=False,
+                  qualified_previous_sha=None, caddy_mode='hub-only', extra_env=None):
         service_node = self.root / 'service-node'
         if runtime_fixture:
             service_node.write_text(f'#!/usr/bin/env bash\nprintf \'{service_version}\\n\'\n')
@@ -997,7 +1001,9 @@ class TransactionOrderingTests(unittest.TestCase):
         })
         if runtime_fixture:
             env['AGENT_HUB_NODE24_TEST_SERVICE_NODE'] = str(service_node)
-        args = ['apply', self.candidate, 'bootstrap', 'hub-only', 'legacy']
+        if extra_env:
+            env.update(extra_env)
+        args = ['apply', self.candidate, 'bootstrap', caddy_mode, 'legacy']
         if provision:
             args.append('provision-node24')
             args.append(qualified_previous_sha if qualified_previous_sha is not None else self.previous_sha)
@@ -1037,15 +1043,13 @@ class TransactionOrderingTests(unittest.TestCase):
             f'  printf \'%s\\n\' "competing-lock-acquired" >> "{self.log}"\n'
             f'fi\nexit 0\n')
         result = self.run_apply(runtime_fixture=False, provision=True)
-        # The fixture candidate has no schema preflight, so apply stops later.
-        self.assertNotEqual(result.returncode, 0)
         self.assertIn('running the staged candidate provisioner', result.stdout)
         log = self.log.read_text(encoding='utf-8')
         self.assertIn('provisioner invoked', log)
         self.assertNotIn('competing-lock-acquired', log,
                          'a competing lock acquisition must fail while the transaction owns custody')
-        self.assertNotIn('npm', log)
-        self.assertFalse(self.state.exists())
+        if 'npm ' in log:
+            self.assertLess(log.index('provisioner invoked'), log.index('npm '))
 
     def test_failing_staged_provisioner_is_an_honest_incident_before_any_effect(self):
         self.stage_provisioner_fixture('echo "modeled apt failure" >&2\nexit 3\n')
@@ -1124,6 +1128,129 @@ class TransactionOrderingTests(unittest.TestCase):
         self.assertNotIn('npm', log)
         self.assertFalse(self.state.exists())
 
+    def test_invalid_shared_caddy_import_refuses_before_provisioning_or_app_effects(self):
+        # R1: Read-only Caddy preconditions must refuse before provision_node24_runtime
+        # runs, so an invalid shared Caddyfile never mutates OS packages.
+        caddy_site = self.seed / 'deploy/hub.caddy'
+        caddy_site.parent.mkdir(parents=True, exist_ok=True)
+        caddy_site.write_text('hub.example.invalid {\n  reverse_proxy 127.0.0.1:8787\n}\n', encoding='utf-8')
+        subprocess.run(['git', '-C', str(self.seed), 'add', 'deploy/hub.caddy'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'commit', '-qm', 'add candidate caddy'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'push', '-q', str(self.remote), 'main'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        (self.root / 'Caddyfile').write_text(':80 {\n  respond "missing import"\n}\n', encoding='utf-8')
+        result = self.run_apply(runtime_fixture=False, provision=True, caddy_mode='full')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('shared Caddyfile must import', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_missing_candidate_caddy_refuses_before_provisioning_or_app_effects(self):
+        # R1: Missing candidate deploy/hub.caddy in full mode refuses before provisioning.
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        result = self.run_apply(runtime_fixture=False, provision=True, caddy_mode='full')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('requested revision has no deploy/hub.caddy', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_schema_rollback_refusal_has_no_provisioning_or_app_effects(self):
+        # R1: Unrollbackable candidate schema preflight refuses before provisioning.
+        (self.seed / 'scripts/schema-rollback-preflight.py').write_text(
+            'import sys\nprint("schema unsafe", file=sys.stderr)\nsys.exit(1)\n',
+            encoding='utf-8',
+        )
+        subprocess.run(['git', '-C', str(self.seed), 'add', 'scripts/schema-rollback-preflight.py'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'commit', '-qm', 'failing schema preflight'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(['git', '-C', str(self.seed), 'push', '-q', str(self.remote), 'main'],
+                       capture_output=True, text=True, check=True, timeout=30)
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('candidate cannot be safely rolled back', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_short_write_zero_progress_on_verified_copy_refuses_before_execution(self):
+        # R2: A zero-progress os.write on the private verified execution copy
+        # must refuse without executing any script or mutating app state.
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        py_hook_dir = self.root / 'pyhook-zero'
+        py_hook_dir.mkdir()
+        (py_hook_dir / 'sitecustomize.py').write_text(
+            'import os\n'
+            '_orig_open = os.open\n'
+            '_orig_write = os.write\n'
+            '_target_fds = set()\n'
+            'def _hook_open(path, flags, mode=0o777, *args, **kwargs):\n'
+            '    fd = _orig_open(path, flags, mode, *args, **kwargs)\n'
+            '    if "ci-node24-verified." in str(path) and (flags & os.O_CREAT):\n'
+            '        _target_fds.add(fd)\n'
+            '    return fd\n'
+            'def _hook_write(fd, data):\n'
+            '    if fd in _target_fds:\n'
+            '        return 0\n'
+            '    return _orig_write(fd, data)\n'
+            'os.open = _hook_open\n'
+            'os.write = _hook_write\n',
+            encoding='utf-8',
+        )
+        result = self.run_apply(runtime_fixture=False, provision=True,
+                                extra_env={'PYTHONPATH': str(py_hook_dir)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('short or zero-progress write', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_truncated_verified_copy_readback_mismatch_refuses_before_execution(self):
+        # R2: Even if a partial write leaves a syntactically valid bash prefix
+        # without raising, independent readback length/digest verification must
+        # refuse before bash -n or execution.
+        self.stage_provisioner_fixture(f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\nexit 0\n')
+        py_hook_dir = self.root / 'pyhook-trunc'
+        py_hook_dir.mkdir()
+        (py_hook_dir / 'sitecustomize.py').write_text(
+            'import os\n'
+            '_orig_open = os.open\n'
+            '_orig_write = os.write\n'
+            '_target_fds = set()\n'
+            'def _hook_open(path, flags, mode=0o777, *args, **kwargs):\n'
+            '    fd = _orig_open(path, flags, mode, *args, **kwargs)\n'
+            '    if "ci-node24-verified." in str(path) and (flags & os.O_CREAT):\n'
+            '        _target_fds.add(fd)\n'
+            '    return fd\n'
+            'def _hook_write(fd, data):\n'
+            '    if fd in _target_fds:\n'
+            '        prefix = b"#!/usr/bin/env bash\\n"\n'
+            '        _orig_write(fd, prefix)\n'
+            '        return len(data)\n'
+            '    return _orig_write(fd, data)\n'
+            'os.open = _hook_open\n'
+            'os.write = _hook_write\n',
+            encoding='utf-8',
+        )
+        result = self.run_apply(runtime_fixture=False, provision=True,
+                                extra_env={'PYTHONPATH': str(py_hook_dir)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('readback length or digest mismatch', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('provisioner invoked', log)
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
     def run_current_sha(self, repo):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('AGENT_HUB_TEST_') and k != 'AGENT_HUB_DEPLOY_TEST_MODE'}
@@ -1169,13 +1296,9 @@ class TransactionOrderingTests(unittest.TestCase):
 
     def test_node24_fixture_passes_the_guard_before_later_stages(self):
         result = self.run_apply(runtime_fixture=True, service_version=V24)
-        # The fixture candidate has no schema preflight, so apply stops later, but
-        # the runtime guard must already have passed before any mutation.
-        self.assertNotEqual(result.returncode, 0)
         self.assertIn('Node24 runtime check passed', result.stdout)
         self.assertNotIn('is Node 22, not Node24', result.stderr)
-        self.assertNotIn('npm', self.log.read_text(encoding='utf-8'))
-        self.assertFalse(self.state.exists())
+        self.assertTrue(self.state.exists())
 
     def test_test_mode_without_fixture_keeps_the_guard_out_of_existing_fixtures(self):
         result = self.run_apply(runtime_fixture=False)
