@@ -128,6 +128,7 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'intake queue': 'Read of the autonomous intake queue (GET /api/intake/queue); MCP callers inspect queue health via ops_status or intake_list.',
   'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
   'machines revoke': 'Admin-only hard hide of a machine with credential kill; deliberate CLI step, not an agent tool.',
+  'host': 'Host-daemon administration (enroll, serve, heartbeat, self-update) runs on the host machine with its machine credential; not a model tool.',
   'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
   'limits disable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
   'limits enable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
