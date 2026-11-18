@@ -1064,6 +1064,148 @@ class SameProcessLifecycleTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(len(cleaned), 1)
 
+    def test_run_same_process_quota_late_collector_exception_cleans_up_once_after_owner_exit(self):
+        import threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 0.05,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        cleaned = []
+        orig_cleanup = prepared.cleanup_owned
+        object.__setattr__(prepared, 'cleanup_owned', lambda: (cleaned.append(os.fstat(q_fd.fd).st_ino), orig_cleanup())[1])
+
+        release_collector = threading.Event()
+        entered_collector = threading.Event()
+        class LateThrowCollector:
+            def __init__(self, cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+            def start(self):
+                entered_collector.set()
+                release_collector.wait(2.0)
+                raise RuntimeError('late_collector_boom')
+            def handle(self, *a):
+                pass
+            def barrier(self):
+                pass
+            def close(self):
+                pass
+
+        res = run_same_process_quota(
+            prepared, lambda t: 66, enabled=True, broker_directory=broker_dir,
+            collector_factory=LateThrowCollector, identity=lambda pid: KEY,
+        )
+        self.assertTrue(entered_collector.is_set())
+        self.assertEqual(res['launch_result'], 66)
+        self.assertFalse(res['reserved'])
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
+        self.assertEqual(cleaned, [])
+        release_collector.set()
+        deadline = time.monotonic() + 2.0
+        while not cleaned and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(cleaned), 1)
+        with self.assertRaises(OSError):
+            os.fstat(q_fd.fd)
+
+    def test_real_subprocess_prelude_retained_fd_transport_on_swapped_path(self):
+        import hashlib, subprocess, sys
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 19 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        retained_fd = os.open(str(q_path), os.O_RDONLY | os.O_NOFOLLOW)
+        self.addCleanup(lambda: os.close(retained_fd))
+        os.set_inheritable(retained_fd, True)
+        # Swap path on disk after parent selection
+        q_path.unlink()
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+        repo_root = Path(__file__).resolve().parents[3]
+        prelude = repo_root / 'scripts/hub-alert-quota-dispatch.py'
+        proc = subprocess.run(
+            [sys.executable, '-I', '-S', str(prelude), '--retained-fd', str(retained_fd),
+             '0', q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'],
+            pass_fds=(retained_fd,), capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(proc.returncode, 19)
+
+    def test_root_preparer_inert_default_off_and_handoff_privilege_drop_boundary(self):
+        import contextlib, io, json, shutil, sys
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(prep.main([]), 0)
+        self.assertEqual(json.loads(out.getvalue())['status'], 'INERT_ROOT_PREPARER')
+        with self.assertRaises(PermissionError):
+            prep.drop_privileges(0, 0)
+        # Full interpreter binary pin without 262144-byte cap
+        real_py = os.path.realpath(sys.executable)
+        interp_fd, interp_pin = prep.pin_interpreter(real_py)
+        os.close(interp_fd)
+        self.assertGreater(interp_pin['size'], 262144)
+        self.assertEqual(len(interp_pin['sha256']), 64)
+        # Staged handoff passes inherited FDs + read-only pipe manifest to runner after privilege drop
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        seen = {}
+        def _fake_runner(cmd, *, pass_fds, env, check):
+            idx = cmd.index('--handoff-fd')
+            pipe_fd = int(cmd[idx + 1])
+            seen['cmd'] = cmd
+            seen['pass_fds'] = pass_fds
+            seen['manifest'] = json.loads(os.read(pipe_fd, 65536).decode('utf-8'))
+            return SimpleNamespace(returncode=0)
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin=real_py,
+        )
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan):
+            rc = prep.prepare_and_handoff(args, runner=_fake_runner)
+        self.assertEqual(rc, 0)
+        self.assertIn(seen['manifest']['fan_group'], seen['pass_fds'])
+        self.assertEqual(seen['manifest']['interpreter']['sha256'], interp_pin['sha256'])
+
     def test_fanotify_reader_bad_version_header_closes_trailing_valid_fds(self):
         from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
         r_pipe, w_pipe = os.pipe()

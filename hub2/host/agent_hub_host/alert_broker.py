@@ -209,7 +209,7 @@ class Broker:
         self._state(collector_factory,identity,_dispatch_factory)
 
     @classmethod
-    def _selected_quota_attempt(cls,directory,selected_source,*,collector_factory,dispatch_factory,identity=process_key):
+    def _selected_quota_attempt(cls,directory,selected_source,*,collector_factory,dispatch_factory,identity=process_key,_on_owner_exit=None):
         """Root-selected held source ONLY; no config/client admission selector.
 
         The normal constructor remains full-source strict. Missing roles have
@@ -217,15 +217,16 @@ class Broker:
         """
         from .quota_dispatch_manager import HeldSourceFD,V4QuotaManager
         require(type(selected_source) is HeldSourceFD and callable(collector_factory)
-                and callable(dispatch_factory) and callable(identity))
+                and callable(dispatch_factory) and callable(identity)
+                and (_on_owner_exit is None or callable(_on_owner_exit)))
         V4QuotaManager.held_pin(selected_source,os.fstat(selected_source.fd))
         instance=cls.__new__(cls)
         instance.directory=Path(directory);instance.path=instance.directory/'observer.sock'
         instance.ram=ram.LiveRAM._selected_quota_attempt(selected_source.pin,checked)
-        instance._state(collector_factory,identity,dispatch_factory)
+        instance._state(collector_factory,identity,dispatch_factory,_on_owner_exit)
         return instance
 
-    def _state(self,collector_factory,identity,_dispatch_factory):
+    def _state(self,collector_factory,identity,_dispatch_factory,_on_owner_exit=None):
         # No independently qualified dispatcher/source-open/system/cron binding
         # exists in this increment. No hook or job is allowed to self-admit.
         self.ram.poison(ram.PRODUCERS, 'dispatch_unqualified')
@@ -243,6 +244,7 @@ class Broker:
         self.unqualified_bytes = 0
         self.unqualified_contexts = {}
         self.dispatch_factory, self.dispatch = _dispatch_factory, None
+        self._on_owner_exit = _on_owner_exit
         self.requests = 0
         self.closed = False
 
@@ -378,6 +380,9 @@ class Broker:
             self.ram.collector_lost(ram.PRODUCERS)
             if self.dispatch is not None:
                 try: self.dispatch.close()
+                except BaseException: self.ram.collector_lost(ram.PRODUCERS)
+            elif self._on_owner_exit is not None:
+                try: self._on_owner_exit()
                 except BaseException: self.ram.collector_lost(ram.PRODUCERS)
             if self.collector is not None:
                 try:

@@ -307,6 +307,7 @@ def run_same_process_quota(
     kwargs = {
         'collector_factory': collector_factory or (lambda cb: wire.Broker._collector(None, cb)),
         'dispatch_factory': _dispatch_factory,
+        '_on_owner_exit': _cleanup_once,
     }
     if identity is not None:
         kwargs['identity'] = identity
