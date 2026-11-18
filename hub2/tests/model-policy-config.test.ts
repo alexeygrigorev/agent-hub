@@ -86,7 +86,8 @@ test('Gemini 4 Hydrogen via Antigravity replaces the flash route for ordinary pi
   assert.equal(hydrogen.enabled, true);
   assert.deepEqual(hydrogen.capabilities ?? [], [], 'ordinary: not review-only');
   const ordinary = policy.candidates.filter(isOrdinaryWorkModel);
-  assert.ok(!ordinary.some(candidate => /flash/i.test(`${candidate.id} ${candidate.model}`)), 'no flash route remains in the ordinary automatic pool');
+  assert.ok(!ordinary.some(candidate => candidate.engine === 'antigravity' && /flash|argon/i.test(`${candidate.id} ${candidate.model}`)), 'no antigravity flash/argon route remains in the ordinary automatic pool');
+  assert.ok(ordinary.some(candidate => candidate.id === 'zai-glm-5-3-flash'), 'canonical zai route remains in the ordinary automatic pool');
   assert.equal(modelPolicyCandidateViolation({id: hydrogen.id, engine: 'antigravity', model: hydrogen.model, effort: 'medium', account_id: 'gemini', capabilities: []}), null);
 });
 
@@ -191,11 +192,11 @@ test('Astra policy writes require review-only capability for both id and model a
 });
 
 
-test('committed GLM uses only the canonical ZAI route and remains outside ordinary work', () => {
+test('committed GLM uses only the canonical ZAI route and remains in ordinary work', () => {
   const routes = policy.candidates.filter(candidate => candidate.engine === 'zai');
   assert.deepEqual(routes, [{id: 'zai-glm-5-3-flash', engine: 'zai', model: 'glm-5.3-flash',
     effort: 'medium', account_id: 'zai-central', weight: 1, capabilities: [], enabled: true}]);
-  assert.equal(isOrdinaryWorkModel(routes[0]), false);
+  assert.equal(isOrdinaryWorkModel(routes[0]), true);
   assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'go').map(candidate => candidate.model),
     ['opencode-go/muse-spark-1.3-contributor']);
   assert(policy.candidates.filter(candidate => /glm/i.test(candidate.model))

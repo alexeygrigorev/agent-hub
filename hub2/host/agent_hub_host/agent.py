@@ -1503,7 +1503,7 @@ class Bridge:
             command_id=command.get('id') if event.get('type')=='session.command' and isinstance(command,dict) else None
             if not isinstance(command_id,str) or not re.fullmatch('[A-Za-z0-9-]{1,80}',command_id):
                 command_id=None
-            logging.getLogger(__name__).error('Host event failed command_id=%s',command_id)
+            logging.getLogger(__name__).exception('Host event failed command_id=%s error_type=%s', command_id, type(error).__name__)
             if isinstance(error,ApiError) and error.retry_at:
                 self.budget_paused_until = max(getattr(self, 'budget_paused_until', 0), error.retry_at)
                 raise
