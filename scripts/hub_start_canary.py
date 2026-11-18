@@ -1775,6 +1775,13 @@ class Canary:
                 raise StageFailure("admission", "resident_bound_unknown")
             return cap, "young"
         identity = row.get("containment_cgroup_identity")
+        if identity is None:
+            group = relative_cgroup(row.get("workload_cgroup"))
+            if type(pid) is not int or pid <= 0 or group is None:
+                raise StageFailure("admission", "resident_identity_unknown")
+            return self.coordinator_reserve(
+                row, {"kind": "workload", "pid": pid, "group": group}, boot_id, ns_ids, boot_now, btime, deadline
+            )
         if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
             raise StageFailure("admission", "resident_identity_unknown")
         for key, name in (("cgroup_namespace_inode", "cgroup"), ("mount_namespace_inode", "mnt")):
