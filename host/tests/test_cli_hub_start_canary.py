@@ -4978,11 +4978,47 @@ class AdmissionTests(unittest.TestCase):
         # Optional slots are provider specific: Codex 5h/monthly and Claude monthly only.
         self.assertEqual(verdict("claude", {"5h": dict(null), "7d": live(60), "monthly": dict(null)}), bad)
         self.assertEqual(verdict("codex", {"7d": live(60), "weekly_opus": dict(null)}), bad)
-        # Unsupported / distinct routes are never native-eligible, even with healthy readings.
+        # Routes with no Hub native engine (copilot-only, Grok quota label) or unknown names are never
+        # native-eligible, even with healthy readings.
         full = {"5h": live(80), "7d": live(60), "monthly": live(60)}
-        for route_name in ("copilot", "zai", "gemini", "grok", "codex-orin", "mystery", "Claude", ""):
+        for route_name in ("copilot", "grok", "mystery", "Claude", "Gemini", "shared-zai", "zcodex", ""):
             with self.subTest(route_name):
                 self.assertEqual(verdict(route_name, full), bad)
+        # Hub-supported native routes qualify on healthy normal readings: Gemini (engine antigravity, quse
+        # key gemini with agy/antigravity probe aliases), ZAI (zai-central), codex-orin (distinct Codex account).
+        gem = {"5h": live(80), "7d": live(60), "monthly": dict(null)}
+        for route_name in ("gemini", "agy", "antigravity", "zai", "claude"):
+            with self.subTest("supported " + route_name):
+                self.assertIsNone(verdict(route_name, gem))
+                self.assertIsNone(verdict(route_name, {"5h": zero_use, "7d": zero_use}))
+                self.assertIsNone(verdict(route_name, {"five_hour": live(80), "weekly": live(60), "monthly": dict(null)}))
+                # a single valid window is not enough; missing/unknown either required window fails
+                self.assertEqual(verdict(route_name, {"5h": live(80)}), bad)
+                self.assertEqual(verdict(route_name, {"7d": live(60), "monthly": live(60)}), bad)
+                self.assertEqual(verdict(route_name, {"5h": dict(null), "7d": live(60), "monthly": dict(null)}), bad)
+                self.assertEqual(verdict(route_name, {"5h": live(80), "7d": dict(null), "monthly": dict(null)}), bad)
+                # optional monthly: only a fully null slot is skipped
+                self.assertEqual(verdict(route_name, dict(gem, monthly=dict(null, present=True))), bad)
+                self.assertEqual(verdict(route_name, dict(gem, monthly={"percent_remaining": None, "reset_at": reset})), bad)
+                self.assertEqual(verdict(route_name, dict(gem, monthly=dict(null, error="boom"))), bad)
+                self.assertEqual(verdict(route_name, dict(gem, monthly=dict(null, status="error"))), bad)
+                self.assertEqual(verdict(route_name, dict(gem, monthly=live(0))), bad)
+                self.assertEqual(verdict(route_name, {"5h": live(0), "7d": live(60)}), bad)
+                self.assertEqual(verdict(route_name, {"5h": live(80), "7d": {"percent_remaining": float("inf"), "reset_at": reset}}), bad)
+                self.assertEqual(verdict(route_name, {"5h": live(80), "7d": {"percent_remaining": 101, "reset_at": reset}}), bad)
+                self.assertEqual(verdict(route_name, gem, stale=True), bad)
+                self.assertEqual(verdict(route_name, gem, status="error"), bad)
+        self.assertIsNone(verdict("codex-orin", {"7d": live(60), "5h": dict(null), "monthly": dict(null)}))
+        self.assertEqual(verdict("codex-orin", {"7d": live(15)}), bad)  # strict >15 reserve applies to the distinct account
+        self.assertEqual(verdict("codex-orin", {"5h": live(80)}), bad)
+        # Mixed provider controls: any one valid supported route qualifies; invalid/unsupported ones never do.
+        def mixed(routes):
+            return mod.evaluate_quota({n: dict({"status": "ok", "observed_at": stamp, "details": {"limit_reached": False, "observed_at": stamp}}, windows=w)
+                                       for n, w in routes.items()}, require_eligible_route=True, now=now)
+        self.assertIsNone(mixed({"gemini": {"5h": live(80)}, "zai": {"5h": live(80), "7d": live(60), "monthly": dict(null)}}))
+        self.assertIsNone(mixed({"copilot": full, "agy": gem}))
+        self.assertEqual(mixed({"gemini": {"5h": live(80)}, "zai": {"7d": live(60)}, "copilot": full, "grok": full}), bad)
+        self.assertEqual(mixed({"agy": {"5h": dict(null), "7d": live(60)}, "antigravity": dict(gem, monthly=dict(null, present=True))}), bad)
         self.assertIsNone(mod.evaluate_quota({"copilot": {}, "claude": {"status": "ok", "windows": {"5h": live(80), "7d": live(60)}}}, require_eligible_route=True, now=now))
         # Explicit window status/error is refused, including on an optional null slot before the skip.
         for label, extra in (("status error", {"status": "error"}), ("status unknown", {"status": "unknown"}),
