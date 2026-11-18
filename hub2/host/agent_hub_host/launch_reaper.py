@@ -9,6 +9,8 @@ import subprocess
 import threading
 import time
 
+from . import resource_admission
+
 ADMISSION_WINDOW_MS = 60_000
 CENSUS_RETRY_SECONDS = 5
 _OBSERVER_LOCK = threading.Lock()
@@ -168,4 +170,8 @@ def _sweep(bridge, now, inventory):
                 changed = db.execute('UPDATE launches SET state=? WHERE operation_id=? AND epoch=? AND state=?',
                                      (state, row['operation_id'], row['epoch'], row['state']))
                 if changed.rowcount:
+                    # Only the evidence-qualified no-dispatch expiry releases the
+                    # exact reservation; expired/uncertain custody stays held.
+                    if state == 'stopped_before_dispatch':
+                        resource_admission.release_reservation(db, row['operation_id'], row['session_id'], row['epoch'])
                     bridge.journal.enqueue(key, f"/api/sessions/{row['session_id']}/finish", payload)

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from .client import ApiError, private_file, save_config
-from . import native_launch, launch_reaper, credential_delivery
+from . import native_launch, launch_reaper, credential_delivery, resource_admission
 from .implement_workspace import prepare_workspace, _identity_and_ref
 from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
@@ -78,6 +78,7 @@ class Journal:
             self.db.execute("ALTER TABLE launches ADD COLUMN workspace_repair_digest TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS launches_active ON launches(state,operation_id)")
         launch_reaper.initialize(self)
+        resource_admission.initialize(self)
 
     @property
     def db(self):
@@ -373,6 +374,9 @@ class Bridge:
         self.machine_id=machine_id
         self.budget_paused_until=0
         self.budget_safety_paused_until=0
+        # Production physical-RAM sampler; lifecycle fixtures inject synthetic
+        # samples here instead of reading the real host's memory.
+        self.resource_sample = None
         self._unavailable_workspace_warnings=set()
         self.executable = shutil.which(executable) or str(Path(executable).resolve(strict=True))
 
@@ -703,7 +707,7 @@ class Bridge:
             launch['operation_id']=operation
             launch['epoch']=epoch
             launch['attempt_label'] = self.attempt_label(session, operation, epoch)
-            launch['before_native_dispatch'] = lambda: self.mark_native_dispatch(operation, session, epoch)
+            launch['before_native_dispatch'] = lambda: self.mark_native_dispatch(operation, session, epoch, launch)
             launch['native_identity_observed'] = lambda native_id: self.bind_dispatched_native(operation, session, epoch, native_id)
             with db:
                 changed = db.execute(
@@ -819,14 +823,16 @@ class Bridge:
     def attempt_label(self, session, operation, epoch):
         return hashlib.sha256(canonical([self.machine_id, session, operation, epoch]).encode()).hexdigest()
 
-    def mark_native_dispatch(self, operation, session, epoch):
-        with self.journal.db as db:
-            changed = db.execute(
-                "UPDATE launches SET native_dispatch_started=1 WHERE operation_id=? AND session_id=? AND epoch=? "
-                "AND state='launching' AND native_dispatch_started=0 AND native_id IS NULL",
-                (operation, session, epoch))
-            if changed.rowcount != 1:
-                raise RuntimeError('native_dispatch_fence_conflict')
+    def mark_native_dispatch(self, operation, session, epoch, specification=None):
+        """Admission and the durable 0->1 dispatch marker commit atomically.
+
+        The physical available-RAM sample, the conservative uncovered inflight
+        reservation sum, the attempt's reservation and the original marker CAS
+        share one BEGIN IMMEDIATE transaction, so concurrent same-journal
+        launches cannot spend the same headroom. Returns the short
+        original-monotonic dispatch permit for the pre-runner freshness check."""
+        return resource_admission.admit_dispatch(
+            self, operation, session, epoch, (specification or {}).get('admission_caps'))
 
     def bind_dispatched_native(self, operation, session, epoch, native_id):
         with self.journal.db as db:
@@ -835,6 +841,9 @@ class Bridge:
                 "AND state='launching' AND native_dispatch_started=1 AND native_id IS NULL",
                 (native_id, operation, session, epoch))
             if changed.rowcount != 1:
+                raise RuntimeError('native_dispatch_fence_conflict')
+            if db.execute('UPDATE resource_reservations SET native_id=? WHERE operation_id=? AND native_id IS NULL',
+                          (native_id, operation)).rowcount != 1:
                 raise RuntimeError('native_dispatch_fence_conflict')
 
     @staticmethod
@@ -869,6 +878,9 @@ class Bridge:
                 (operation, session, epoch))
             if changed.rowcount != 1:
                 return
+            # Evidence-qualified no-dispatch settlement: release this exact
+            # attempt's reservation in the same terminal transaction.
+            resource_admission.release_reservation(db, operation, session, epoch)
             self.journal.enqueue(f"no-dispatch:{operation}:{epoch}", f"/api/sessions/{session}/finish",
                                  {"operation_id": operation, "epoch": epoch, "native_id": None,
                                   "launch_failed": True, "no_dispatch": True,
@@ -1105,6 +1117,9 @@ class Bridge:
                         continue
                 else:
                     self.journal.db.execute("UPDATE launches SET state='exited' WHERE operation_id=?", (row["operation_id"],))
+                # Whole-attempt containment-empty terminal commit: release this
+                # exact reservation together with the exit state and receipt.
+                resource_admission.release_reservation(self.journal.db, row['operation_id'], row['session_id'], row['epoch'])
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
 
@@ -1230,6 +1245,9 @@ class Bridge:
                     (row['operation_id'], row['session_id'], row['epoch']))
                 if changed.rowcount != 1:
                     raise ValueError('command_fence_conflict')
+                # Qualified no-dispatch STOP: release this exact reservation in
+                # the same terminal transaction.
+                resource_admission.release_reservation(db, row['operation_id'], row['session_id'], row['epoch'])
                 result = {'stopped': True, 'evidence': 'dispatch_fenced'}
                 self.begin_command(identity, digest)
                 self.finish_command(identity, command, result)
