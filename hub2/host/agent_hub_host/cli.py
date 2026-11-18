@@ -103,7 +103,7 @@ def main(argv=None):
             from . import alert_authority as ram
             from .quota_dispatch import configured_same_process, run_same_process_quota
             from .quota_dispatch_manager import (
-                FanotifyReader, SourceGate, close_held_source, consume_handoff_fd, hold_source_fd, prepare_selected_quota,
+                FanotifyReader, SourceGate, StableRuntime, close_held_source, consume_handoff_fd, hold_source_fd, prepare_selected_quota,
             )
             spec = configured_same_process(config.get("quota_same_process"))
             if not args.enable or spec is None:
@@ -118,6 +118,7 @@ def main(argv=None):
             gate = None
             group = None
             interp_fd = None
+            entry_fd = None
             verified_quota_raw = None
             try:
                 if args.handoff_fd is not None:
@@ -128,6 +129,7 @@ def main(argv=None):
                     gate = adopted["gate"]
                     group = adopted["fan_group"]
                     interp_fd = adopted["interp_fd"]
+                    entry_fd = adopted["entry_fd"]
                     interp_pin = adopted["interpreter_pin"]
                     py_bin = interp_pin["path"]
                 else:
@@ -149,11 +151,18 @@ def main(argv=None):
                     spec["gate_directory"], quota_path, client_path, "--", *primary_args,
                 ]
                 plan = {"units": {"healthy": spec["unit"]}, "cgroups": {"healthy": spec["cgroup"]}}
+                def _close_handoff_extras():
+                    for extra in (interp_fd, entry_fd):
+                        if extra is not None:
+                            try:
+                                os.close(extra)
+                            except OSError:
+                                pass
                 prepared = prepare_selected_quota(
                     source=quota_fd, companions=(client_fd, prelude_fd), gate=gate, group=group,
                     plan=plan, exec_argv=exec_argv, service_deadline=deadline,
                     interpreter_pin=interp_pin, retained_source_fd=quota_fd.fd,
-                    extra_cleanup=(lambda: os.close(interp_fd)) if interp_fd is not None else None,
+                    extra_cleanup=_close_handoff_extras if (interp_fd is not None or entry_fd is not None) else None,
                 )
             except (OSError, ValueError, ram.Unknown) as error:
                 if gate is not None:
@@ -162,8 +171,12 @@ def main(argv=None):
                     close_held_source(item)
                 if group is not None:
                     os.close(group)
-                if interp_fd is not None:
-                    os.close(interp_fd)
+                for extra in (interp_fd, entry_fd):
+                    if extra is not None:
+                        try:
+                            os.close(extra)
+                        except OSError:
+                            pass
                 reason = error.args[0] if isinstance(error, ram.Unknown) and error.args else type(error).__name__
                 if verified_quota_raw is None:
                     # Source pin/open itself rejected: never execute unverified/rejected quota_path.
@@ -186,7 +199,8 @@ def main(argv=None):
                 try:
                     os.set_inheritable(retained_dup, True)
                     argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(dl_ns)
-                    child_env = dict(os.environ)
+                    child_env = {k: v for k, v in os.environ.items() if not k.startswith("HUB_ALERT_")}
+                    child_env.update(StableRuntime.user_manager_env(os.getuid()))
                     child_env["HUB_ALERT_RETAINED_FD"] = str(retained_dup)
                     return subprocess.run(argv, capture_output=True, timeout=5, check=False,
                                           env=child_env, pass_fds=(retained_dup,)).returncode

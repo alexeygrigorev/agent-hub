@@ -744,6 +744,8 @@ class SameProcessLifecycleTests(unittest.TestCase):
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
                     sock.connect(str(gate_dir / 'source-gate.sock'))
                     sock.send(b'held-before-quota-source')
+                    custody = sock.recv(256)
+                    self.assertEqual(custody, b'custody')
                     cmd = sock.recv(256)
                     self.assertEqual(cmd, b'open:' + ticket.context.encode('ascii'))
                     os.write(w_fan, b'open')
@@ -1194,11 +1196,14 @@ class SameProcessLifecycleTests(unittest.TestCase):
             pipe_fd = int(cmd[idx + 1])
             seen['cmd'] = cmd
             seen['pass_fds'] = pass_fds
+            seen['env'] = env
             seen['manifest'] = json.loads(os.read(pipe_fd, 65536).decode('utf-8'))
+            os.write(seen['manifest']['ack_fd'], b'ACK\n')
             return SimpleNamespace(returncode=0)
         args = SimpleNamespace(
             target_uid=os.getuid(), config=str(root / 'v2.json'),
             source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-host.pyz',
         )
         # Non-root entry must be refused before any preparation
         with self.assertRaises(PermissionError):
@@ -1206,9 +1211,12 @@ class SameProcessLifecycleTests(unittest.TestCase):
 
         fake_libc = SimpleNamespace(prctl=lambda op, a1, *a: 1 if op == prep.PR_GET_NO_NEW_PRIVS else 0)
         fake_status = 'NoNewPrivs:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n'
+        entry_pin = {k: interp_pin[k] for k in ('dev', 'ino', 'size', 'mtime_ns', 'ctime_ns', 'sha256')}
         with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
              patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **interp_pin})), \
-             patch.object(prep, 'bind_source_gate', return_value=(SimpleNamespace(fileno=lambda: os.dup(r_fan), close=lambda: None), os.open(str(gate_dir), os.O_RDONLY), -1, (1, 2))), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **entry_pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(SimpleNamespace(fileno=lambda: os.dup(r_fan), close=lambda: None), os.open(str(gate_dir), os.O_RDONLY), os.dup(r_fan), (1, 2))), \
              patch.object(prep.os, 'getuid', return_value=0), \
              patch.object(prep.os, 'geteuid', return_value=0), \
              patch.object(prep, 'drop_privileges', lambda u, g: None), \
@@ -1217,7 +1225,11 @@ class SameProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn(seen['manifest']['fan_group'], seen['pass_fds'])
         self.assertEqual(seen['manifest']['interpreter']['sha256'], interp_pin['sha256'])
+        self.assertEqual(seen['manifest']['entry']['sha256'], entry_pin['sha256'])
         self.assertTrue(seen['cmd'][0].startswith('/proc/self/fd/'))
+        self.assertTrue(seen['cmd'][2].startswith('/proc/self/fd/'))
+        self.assertEqual(seen['env']['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+        self.assertEqual(seen['env']['DBUS_SESSION_BUS_ADDRESS'], f'unix:path=/run/user/{os.getuid()}/bus')
 
     def test_root_preparer_r5_r6_security_controls_and_refusals(self):
         repo_root = Path(__file__).resolve().parents[3]
@@ -1509,6 +1521,7 @@ class SameProcessLifecycleTests(unittest.TestCase):
              patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', _fake_poll), \
              patch('os.pidfd_open', return_value=os.dup(r_fan)), \
              patch('agent_hub_host.quota_dispatch_manager.StableRuntime.alive', lambda self, fd: alive_state['alive']), \
+             patch('agent_hub_host.quota_dispatch_manager.StableRuntime.user_manager_env', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
              patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
              patch('subprocess.run', side_effect=_fake_subprocess_run), \
              contextlib.redirect_stdout(out):
@@ -1657,3 +1670,280 @@ class SameProcessLifecycleTests(unittest.TestCase):
         rc = mod.main([dl_ns, q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'])
         t.join(timeout=2.0)
         self.assertEqual(rc, 23)
+
+    def test_r1a_consume_handoff_fd_root_provenance_bounded_read_and_controls(self):
+        import fcntl, hashlib, io, json, socket
+        from agent_hub_host.quota_dispatch_manager import consume_handoff_fd
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        p_path = self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_bytes = Path(real_py).read_bytes()
+        py_st = os.stat(real_py)
+        entry_file = root / 'entry.pyz'
+        entry_file.write_bytes(b'PK\x05\x06' + b'\x00' * 18)
+        entry_file.chmod(0o444)
+        entry_st = os.stat(entry_file)
+        entry_sha = hashlib.sha256(entry_file.read_bytes()).hexdigest()
+
+        # 1. User-owned FIFO (st_uid != 0) must be refused
+        r_user, w_user = os.pipe()
+        os.write(w_user, b'{}')
+        os.close(w_user)
+        with self.assertRaises(ram.Unknown):
+            consume_handoff_fd(r_user, str(gate_dir))
+
+        # 2. Writable FD (O_RDWR) must be refused even with st_uid == 0
+        r_rw, w_rw = os.pipe()
+        os.close(w_rw)
+        real_fstat = os.fstat
+        def _root_fstat(fd):
+            st = real_fstat(fd)
+            if fd == r_rw:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with patch('os.fstat', side_effect=_root_fstat), \
+             patch('fcntl.fcntl', return_value=os.O_RDWR):
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_rw, str(gate_dir))
+
+        # 3. Stalled writer (no EOF before deadline) must fail bounded without hanging
+        r_stall, w_stall = os.pipe()
+        os.write(w_stall, b'{"v":1')
+        self.addCleanup(lambda: os.close(w_stall))
+        def _stall_fstat(fd):
+            st = real_fstat(fd)
+            if fd == r_stall:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with patch('os.fstat', side_effect=_stall_fstat):
+            t0 = time.monotonic()
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_stall, str(gate_dir), deadline=t0 + 0.05)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+        # 4. Duplicate JSON keys must be refused
+        r_dup, w_dup = os.pipe()
+        os.write(w_dup, b'{"v":1,"v":2}')
+        os.close(w_dup)
+        with patch('os.fstat', side_effect=lambda fd: os.stat_result((real_fstat(fd).st_mode, real_fstat(fd).st_ino, real_fstat(fd).st_dev, real_fstat(fd).st_nlink, 0, 0, real_fstat(fd).st_size, 0, 0, 0)) if fd == r_dup else real_fstat(fd)):
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_dup, str(gate_dir))
+
+        # 5. Faithful positive Root-prepared handoff writes b'ACK\n' to ack_fd
+        gate_sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        gate_sock.bind(str(gate_dir / 'source-gate.sock'))
+        os.chmod(str(gate_dir / 'source-gate.sock'), 0o600)
+        gate_sock.listen(1)
+        gate_sock.setblocking(False)
+        gate_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        gate_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=gate_dir_fd)
+        node_st = os.fstat(gate_node_fd)
+        interp_fd = os.open(real_py, os.O_RDONLY)
+        entry_fd = os.open(str(entry_file), os.O_RDONLY)
+        q_fd = os.open(str(q_path), os.O_RDONLY)
+        q_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        c_fd = os.open(str(c_path), os.O_RDONLY)
+        c_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        p_fd = os.open(str(p_path), os.O_RDONLY)
+        p_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        fan_r, fan_w = os.pipe()
+        os.set_blocking(fan_r, False)
+        os.close(fan_w)
+        ack_r, ack_w = os.pipe()
+        self.addCleanup(lambda: os.close(ack_r))
+        r_ok, w_ok = os.pipe()
+        q_st = os.fstat(q_fd)
+        c_st = os.fstat(c_fd)
+        p_st = os.fstat(p_fd)
+        manifest = {
+            'v': 1,
+            'target_uid': os.getuid(),
+            'handoff_deadline_ns': time.monotonic_ns() + 5_000_000_000,
+            'ack_fd': ack_w,
+            'interpreter': {'fd': interp_fd, 'path': real_py, 'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(py_bytes).hexdigest()},
+            'entry': {'fd': entry_fd, 'path': str(entry_file), 'dev': entry_st.st_dev, 'ino': entry_st.st_ino, 'size': entry_st.st_size, 'mtime_ns': entry_st.st_mtime_ns, 'ctime_ns': entry_st.st_ctime_ns, 'sha256': entry_sha},
+            'source': {'fd': q_fd, 'dir_fd': q_dir_fd, 'name': 'hub-quota-publish.py', 'dev': q_st.st_dev, 'ino': q_st.st_ino, 'sha256': hashlib.sha256(b'print("q")\n').hexdigest()},
+            'client': {'fd': c_fd, 'dir_fd': c_dir_fd, 'name': 'hub_alert_client.py', 'dev': c_st.st_dev, 'ino': c_st.st_ino, 'sha256': hashlib.sha256(b'print("c")\n').hexdigest()},
+            'prelude': {'fd': p_fd, 'dir_fd': p_dir_fd, 'name': 'hub-alert-quota-dispatch.py', 'dev': p_st.st_dev, 'ino': p_st.st_ino, 'sha256': hashlib.sha256(b'print("p")\n').hexdigest()},
+            'fan_group': fan_r,
+            'gate_sock_fd': gate_sock.fileno(),
+            'gate_dir_fd': gate_dir_fd,
+            'gate_node_fd': gate_node_fd,
+            'gate_node': {'dev': node_st.st_dev, 'ino': node_st.st_ino},
+        }
+        os.write(w_ok, json.dumps(manifest).encode('utf-8'))
+        os.close(w_ok)
+        sdev_hex = format((os.major(q_st.st_dev) << 20) | os.minor(q_st.st_dev), 'x')
+        ino_hex = format(q_st.st_ino, 'x')
+        fake_fdinfo = f'pos:\t0\nfanotify flags:12 event-flags:88000\nfanotify ino:{ino_hex} sdev:{sdev_hex} mflags:0 mask:20 ignored_mask:0\n'
+        real_open = open
+        real_readlink = os.readlink
+        def _fstat_pos(fd):
+            st = real_fstat(fd)
+            if fd in (r_ok, entry_fd):
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        def _open_pos(file, *a, **kw):
+            if file == f'/proc/self/fdinfo/{fan_r}':
+                return io.StringIO(fake_fdinfo)
+            return real_open(file, *a, **kw)
+        with patch('os.fstat', side_effect=_fstat_pos), \
+             patch('os.readlink', side_effect=lambda p: 'anon_inode:[fanotify]' if p == f'/proc/self/fd/{fan_r}' else real_readlink(p)), \
+             patch('builtins.open', side_effect=_open_pos):
+            adopted = consume_handoff_fd(r_ok, str(gate_dir))
+        self.assertEqual(os.read(ack_r, 8), b'ACK\n')
+        adopted['gate'].cleanup()
+        for h in (adopted['source'], adopted['client'], adopted['prelude']):
+            os.close(h.fd); os.close(h.directory_fd)
+        os.close(adopted['fan_group']); os.close(adopted['interp_fd']); os.close(adopted['entry_fd'])
+
+    def test_r1b_prebind_source_swap_delivers_custody_fd_and_runs_original_once(self):
+        import hashlib, threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import SourceGate, hold_source_fd, prepare_selected_quota
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 31 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        p_path = self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        quota_fd = hold_source_fd(src_dir, 'hub-quota-publish.py')
+        client_fd = hold_source_fd(src_dir, 'hub_alert_client.py')
+        prelude_fd = hold_source_fd(src_dir, 'hub-alert-quota-dispatch.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        prepared = prepare_selected_quota(
+            source=quota_fd, companions=(client_fd, prelude_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'agent-hub-quota-monitor.service'}, 'cgroups': {'healthy': '/u'}},
+            exec_argv=lambda dl: ['/usr/bin/python3'], service_deadline=time.monotonic() + 5.0,
+            retained_source_fd=quota_fd.fd,
+        )
+
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_prebind', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        child_rc = []
+        def _fake_launch(ticket):
+            self.assertIsNotNone(ticket)
+            # Swap quota_path AFTER Root selection/reservation and BEFORE manager _bind_probe/full_sources!
+            q_path.unlink()
+            self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+            dl_ns = str(int((time.monotonic() + 5.0) * 1e9))
+            t = threading.Thread(target=lambda: child_rc.append(
+                mod.main([dl_ns, q_sha, c_sha, str(gate_dir), str(q_path), str(c_path), '--', '--check'])
+            ), daemon=True)
+            t.start()
+            return 0
+        class _SwapCollector:
+            def __init__(self, _cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+                self.epoch = 'e' * 32
+                self.fault = None
+            def start(self): pass
+            def handle(self, *_a): pass
+            def barrier(self): return {'stream_index': 2}
+            def close(self): pass
+
+        with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+            res = run_same_process_quota(
+                prepared, _fake_launch, enabled=True, broker_directory=broker_dir,
+                collector_factory=_SwapCollector, identity=lambda pid: KEY,
+            )
+        deadline = time.monotonic() + 2.0
+        while not child_rc and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(child_rc, [31])
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
+
+    def test_r1c_offline_entry_archive_launch_and_user_manager_env(self):
+        import json, socket, subprocess, sys, zipfile
+        from agent_hub_host.quota_dispatch_manager import StableRuntime
+        root = self._short_temp()
+        rt_dir = root / 'run_user_1000'
+        rt_dir.mkdir(mode=0o700)
+        bus_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bus_sock.bind(str(rt_dir / 'bus'))
+        self.addCleanup(bus_sock.close)
+        real_open = os.open
+        with patch('os.open', side_effect=lambda p, *a, **kw: real_open(str(rt_dir), *a, **kw) if p == f'/run/user/{os.getuid()}' else real_open(p, *a, **kw)):
+            uenv = StableRuntime.user_manager_env(os.getuid())
+        self.assertEqual(uenv['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+        self.assertEqual(uenv['DBUS_SESSION_BUS_ADDRESS'], f'unix:path=/run/user/{os.getuid()}/bus')
+
+        # Build offline entry zipapp of agent_hub_host and execute via python3 -I /proc/self/fd/<fd>
+        pyz = root / 'agent-hub-host.pyz'
+        pkg_dir = Path(__file__).resolve().parents[1] / 'agent_hub_host'
+        with zipfile.ZipFile(pyz, 'w') as zf:
+            zf.writestr('__main__.py', 'from agent_hub_host.cli import main\nraise SystemExit(main())\n')
+            for py_file in pkg_dir.glob('*.py'):
+                zf.write(py_file, f'agent_hub_host/{py_file.name}')
+        cfg = root / 'v2.json'
+        cfg.write_text('{"server":"http://127.0.0.1:9","token":"t","machine_id":"m","roots":[],"engines":[]}')
+        fd = os.open(str(pyz), os.O_RDONLY)
+        self.addCleanup(lambda: os.close(fd))
+        res = subprocess.run([sys.executable, '-I', f'/proc/self/fd/{fd}', '--config', str(cfg), 'quota-dispatch'], pass_fds=(fd,), capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout)['dispatched'], False)
+
+    def test_r3_settlement_ack_retains_parent_cleanup_on_failure_and_preserves_foreign_node(self):
+        import hashlib, shutil, socket
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r3', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_st = os.stat(real_py)
+        pin = {'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(Path(real_py).read_bytes()).hexdigest()}
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-host.pyz',
+        )
+        # Child fails without ACK -> parent retains custody and unlinks own socket node
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.bind(str(gate_dir / 'source-gate.sock'))
+        sock.listen(1)
+        g_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd)
+        nst = os.fstat(g_node_fd)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock, g_dir_fd, g_node_fd, (nst.st_dev, nst.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            rc = prep.prepare_and_handoff(args, runner=lambda *a, **kw: SimpleNamespace(returncode=1))
+        self.assertEqual(rc, 1)
+        self.assertFalse((gate_dir / 'source-gate.sock').exists())

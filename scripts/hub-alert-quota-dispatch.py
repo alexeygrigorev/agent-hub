@@ -158,7 +158,16 @@ def main(argv, *, retained_fd=None):
             except BlockingIOError:
                 pass
             send(channel, b'held-before-quota-source', end)
-            command, transferred_fd = recv_open(channel, end)
+            custody_cmd, transferred_fd = recv_open(channel, end)
+            if custody_cmd == b'custody':
+                command, extra_fd = recv_open(channel, end)
+                if extra_fd is not None:
+                    try:
+                        os.close(extra_fd)
+                    except OSError:
+                        pass
+            else:
+                command = custody_cmd
             if len(command) == 37 and command.startswith(b'open:'):
                 candidate = command[5:].decode('ascii')
                 if len(candidate) == 32 and all(c in '0123456789abcdef' for c in candidate):
