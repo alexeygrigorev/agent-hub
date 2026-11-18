@@ -50,6 +50,9 @@ def main(argv=None):
     updater.add_argument("--root", type=Path, default=Path.home() / ".local/share/agent-hub2")
     updater.add_argument("--no-restart", action="store_true")
     updater.add_argument("--force", action="store_true", help="Windows: reinstall even when already current")
+    quota_dispatch_cmd = commands.add_parser("quota-dispatch", help="Staged opt-in same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--enable", action="store_true", default=False,
+                                    help="Opt in to staged same-process quota dispatch (default OFF)")
     args = parser.parse_args(argv)
     if args.command == "self-update" and os.name == "nt":
         from .windows_host import windows_self_update
@@ -92,6 +95,57 @@ def main(argv=None):
             updated = configure(config, args.capability, args.workspace)
             save_config(args.config, updated)
             print(json.dumps({"configured": True, "restart_required": True}))
+            return 0
+        if args.command == "quota-dispatch":
+            from . import alert_authority as ram
+            from .quota_dispatch import configured_same_process, run_same_process_quota
+            from .quota_dispatch_manager import (
+                FanotifyReader, SourceGate, close_held_source, hold_source_fd, prepare_selected_quota,
+            )
+            spec = configured_same_process(config.get("quota_same_process"))
+            if not args.enable or spec is None:
+                print(json.dumps(run_same_process_quota(enabled=False)))
+                return 0
+            held = []
+            gate = None
+            group = None
+            try:
+                src_dir = spec["source_directory"]
+                quota_fd = hold_source_fd(src_dir, "hub-quota-publish.py")
+                held.append(quota_fd)
+                client_fd = hold_source_fd(src_dir, "hub_alert_client.py")
+                held.append(client_fd)
+                boot_fd = hold_source_fd(src_dir, "qualified-quota-bootstrap.py")
+                held.append(boot_fd)
+                gate = SourceGate(spec["gate_directory"])
+                group = FanotifyReader.open_group((quota_fd,))
+                deadline = time.monotonic() + 40.0
+                exec_argv = lambda dl_ns: [
+                    "/usr/bin/python3", "-I", "-S", str(Path(src_dir) / "qualified-quota-bootstrap.py"),
+                    "--execute-owned-fixture", str(dl_ns), quota_fd.pin.sha256, client_fd.pin.sha256,
+                ]
+                plan = {"units": {"healthy": spec["unit"]}, "cgroups": {"healthy": spec["cgroup"]}}
+                prepared = prepare_selected_quota(
+                    source=quota_fd, companions=(client_fd, boot_fd), gate=gate, group=group,
+                    plan=plan, exec_argv=exec_argv, service_deadline=deadline,
+                )
+            except (OSError, ram.Unknown) as error:
+                if gate is not None:
+                    gate.cleanup()
+                for item in held:
+                    close_held_source(item)
+                if group is not None:
+                    os.close(group)
+                reason = error.args[0] if isinstance(error, ram.Unknown) and error.args else type(error).__name__
+                print(json.dumps({"enabled": True, "dispatched": False, "error": str(reason), "complete": False}))
+                return 1
+            def _launch_unit(_ticket):
+                import subprocess
+                argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(int(deadline * 1e9))
+                return subprocess.run(argv, capture_output=True, timeout=5, check=False).returncode
+            result = run_same_process_quota(prepared, _launch_unit, enabled=True, broker_directory=spec["broker_directory"])
+            print(json.dumps({"enabled": result["enabled"], "dispatched": result["dispatched"],
+                              "reserved": result["reserved"], "phase": result["phase"], "complete": False}))
             return 0
         server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
