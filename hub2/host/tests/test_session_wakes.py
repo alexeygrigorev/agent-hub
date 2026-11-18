@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import sqlite3
@@ -14,6 +15,23 @@ from agent_hub_host import wake_send
 
 NATIVE='11111111-2222-4333-8444-555555555555'
 ENVELOPE='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+CLOSED_DIAG_VALUES=frozenset(('attempt_start','validation_refused','identity_refused','context_refused','deadline_exceeded','outcome_uncertain','receipt_unverified','mutation_committed','envelope_stored','envelope_verified','submit_attempted','submit_pending','submit_verified','done_replay','unrecognized','entry','validated','identity','context','envelope','submit','receipt','terminal','submitted_verified','refused','uncertain','submission_observed','preflight_refused','input_busy','invalid_text','dispatch_fenced','prior_dispatch_uncertain','receipt_unreadable','deadline_expired','identity_mismatch','not_idle','input_client_attached','input_not_settled','unknown_layout','unsafe_composer','readiness_changed','paste_uncertain','landing_uncertain','landing_changed','enter_uncertain','invalid_wake_command','command_id_conflict','wake_fence_conflict','headless_send_refused','wake_identity_unverified','wake_local_context_unverified','wake_deadline_exceeded','wake_outcome_uncertain','wake_receipt_unverified','duplicate_receipt_field','true','false','absent'))
+class StrictDiagTools:
+    'Closed strict-attempt diagnostic capture; every emitted value must stay in CLOSED_DIAG_VALUES.'
+    def capture(self):
+        records=[]
+        class Sink(logging.Handler):
+            def emit(self,record):records.append(record.getMessage())
+        sink=Sink();logger=logging.getLogger(wake_send.STRICT_DIAG_LOGGER)
+        logger.addHandler(sink);self.addCleanup(lambda:logger.removeHandler(sink))
+        return records
+    def events(self,records):
+        prefix='wake_strict_diag '
+        return [json.loads(message[len(prefix):]) for message in records if message.startswith(prefix)]
+    def diag(self,event,phase,**fields):
+        return {'event':event,'phase':phase,'status':fields.get('status','absent'),'reason':fields.get('reason','absent'),
+                'mutation':fields.get('mutation','absent'),'landed':fields.get('landed','absent'),
+                'submitted':fields.get('submitted','absent'),'replayed':fields.get('replayed','absent')}
 class SessionWakeTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']);self.addCleanup(self.temp.cleanup)
@@ -115,7 +133,7 @@ class SessionWakeTests(unittest.TestCase):
         self.assertEqual(sum(c[1]=='send' for c in self.calls),1)
 
 
-class StrictSessionWakeTests(unittest.TestCase):
+class StrictSessionWakeTests(StrictDiagTools, unittest.TestCase):
     invoke = SessionWakeTests.invoke
     def setUp(self):
         SessionWakeTests.setUp(self)
@@ -141,9 +159,12 @@ r={'version':1,'session_id':args[1],'operation_id':field('--idempotency-key'),'d
 fence=root/'native-fence.json'
 if fence.exists():
  r=json.loads(fence.read_text());r['replayed']=True
+ if r['status']!='submitted_verified':r['reason']='prior_dispatch_uncertain'
 elif mode=='busy':r.update(status='refused',mutation=False,landed=False,submitted=False,reason='not_idle')
+elif mode=='layout':r.update(status='refused',mutation=False,landed=False,submitted=False,reason='unknown_layout')
+elif mode=='alien':r.update(status='alien_status',mutation=False,landed=False,submitted=False,reason='alien_reason')
 else:
- if mode=='uncertain':r.update(status='uncertain',submitted=False,reason='submission_uncertain')
+ if mode=='uncertain':r.update(status='uncertain',mutation=True,landed=False,submitted=False,reason='dispatch_fenced')
  fence.write_text(json.dumps(r));(root/'effect-count').write_text('1')
 if mode=='bad:duplicate':
  print(json.dumps(r)[:-1]+',\"version\":1}');raise SystemExit(0)
@@ -240,7 +261,101 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         with self.assertRaisesRegex(ValueError,'headless_send_refused'):self.invoke()
         self.assertEqual(self.calls,[])
 
-class StrictInboxWakeTests(unittest.TestCase):
+    def test_verified_submit_diagnostic_is_closed_and_done_replay_stays_effect_free(self):
+        records=self.capture();result=self.invoke()
+        self.assertEqual(result['wake_proof']['kind'],'strict_submit_v1')
+        events=self.events(records)
+        self.assertEqual(events[0],self.diag('attempt_start',phase='entry'))
+        self.assertTrue(any(e['event']=='mutation_committed' for e in events))
+        self.assertTrue(any(e['event']=='submit_attempted' for e in events))
+        self.assertEqual(events[-1],self.diag('submit_verified',phase='terminal',status='submitted_verified',
+            reason='submission_observed',mutation='true',landed='true',submitted='true'))
+        before=len(self.calls);records=self.capture();self.assertEqual(self.invoke(),result)
+        self.assertEqual(self.events(records)[-1],self.diag('done_replay',phase='terminal'))
+        self.assertEqual(len(self.calls),before)
+    def test_pending_diagnostics_distinguish_not_idle_unknown_layout_uncertain_and_replay(self):
+        records=self.capture()
+        refusal={'phase':'receipt','status':'refused','mutation':'false','landed':'false','submitted':'false','replayed':'absent'}
+        for mode in ('busy','layout'):
+            self.mode.write_text(mode);self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+        self.mode.write_text('uncertain')
+        for replayed in ('absent','true'):
+            self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+        pending=[e for e in self.events(records) if e['event']=='submit_pending']
+        self.assertEqual(pending,[self.diag('submit_pending',reason='not_idle',**refusal),
+                                  self.diag('submit_pending',reason='unknown_layout',**refusal),
+                                  self.diag('submit_pending',status='uncertain',reason='dispatch_fenced',phase='receipt',
+                                            mutation='true',landed='false',submitted='false',replayed='absent'),
+                                  self.diag('submit_pending',status='uncertain',reason='prior_dispatch_uncertain',phase='receipt',
+                                            mutation='true',landed='false',submitted='false',replayed='true')])
+        self.assertEqual((Path(self.temp.name)/'effect-count').read_text(),'1')
+    def test_unknown_receipt_and_unknown_failure_stay_unrecognized(self):
+        records=self.capture();self.mode.write_text('alien')
+        self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+        pending=[e for e in self.events(records) if e['event']=='submit_pending']
+        self.assertEqual(pending,[self.diag('submit_pending',phase='receipt',status='unrecognized',reason='unrecognized',
+                                            mutation='false',landed='false',submitted='false')])
+        records=self.capture();runner=self.bridge.runner
+        def ambiguous(argv,**kwargs):
+            if argv[1]=='send':raise RuntimeError('synthetic_ambiguous_send')
+            return runner(argv,**kwargs)
+        self.bridge.runner=ambiguous
+        with self.assertRaisesRegex(RuntimeError,'synthetic_ambiguous_send'):self.invoke()
+        events=self.events(records)
+        self.assertEqual(events[-1],self.diag('unrecognized',phase='submit',reason='unrecognized'))
+        self.assertTrue(all(e['event']!='mutation_committed' for e in events))
+    def test_deadline_exceeded_diagnostic_is_closed(self):
+        records=self.capture();runner=self.bridge.runner
+        def late(*args,**kwargs):
+            result=runner(*args,**kwargs);self.wall_clock.return_value=2001;return result
+        self.bridge.runner=late
+        with self.assertRaisesRegex(RuntimeError,'wake_deadline_exceeded'):self.invoke()
+        deadlines=[e for e in self.events(records) if e['event']=='deadline_exceeded']
+        self.assertEqual(deadlines,[self.diag('deadline_exceeded',phase='submit',reason='wake_deadline_exceeded')])
+    def test_headless_refusal_diagnostic_is_closed(self):
+        records=self.capture()
+        self.bridge.journal.db.execute('UPDATE launches SET interactive=0');self.bridge.journal.db.commit()
+        with self.assertRaisesRegex(ValueError,'headless_send_refused'):self.invoke()
+        self.assertEqual(self.events(records)[-1],self.diag('identity_refused',phase='identity',reason='headless_send_refused'))
+        self.assertEqual(self.calls,[])
+    def test_invalid_transport_diagnostic_is_closed_validation_refusal(self):
+        records=self.capture();self.command['wake']['transport']='foreign'
+        with self.assertRaisesRegex(ValueError,'invalid_wake_command'):self.invoke()
+        self.assertEqual(self.events(records)[-1],self.diag('validation_refused',phase='entry',reason='invalid_wake_command'))
+    def test_untrusted_receipt_schema_diagnostic_is_closed_without_ack(self):
+        records=self.capture();self.mode.write_text('bad:extra')
+        with self.assertRaisesRegex(RuntimeError,'wake_receipt_unverified'):self.invoke()
+        self.assertEqual(self.events(records)[-1],self.diag('receipt_unverified',phase='submit',reason='wake_receipt_unverified'))
+        self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
+    def test_diagnostics_never_leak_raw_command_envelope_or_path_values(self):
+        records=self.capture()
+        self.command['wake']['transport']='foreign'
+        with self.assertRaises(ValueError):self.invoke()
+        self.command['wake']['transport']='strict-submit:v1'
+        self.mode.write_text('busy');self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+        self.mode.write_text('bad:extra')
+        with self.assertRaises(RuntimeError):self.invoke()
+        self.bridge.journal.db.execute('UPDATE launches SET interactive=0');self.bridge.journal.db.commit()
+        with self.assertRaises(ValueError):self.invoke()
+        forbidden=(self.command['text'],'--not-a-flag','--strict',NATIVE,ENVELOPE,self.temp.name,'foreign','untrusted','strict-submit:v1')
+        keys={'event','phase','status','reason','mutation','landed','submitted','replayed'}
+        count=0
+        for message in records:
+            self.assertTrue(message.startswith('wake_strict_diag '))
+            payload=message[len('wake_strict_diag '):];record=json.loads(payload);count+=1
+            self.assertEqual(set(record),keys)
+            for value in record.values():
+                self.assertIsInstance(value,str);self.assertIn(value,CLOSED_DIAG_VALUES)
+            for raw in forbidden:self.assertNotIn(raw,payload)
+        self.assertTrue(count>=4)
+        events={json.loads(message[len('wake_strict_diag '):])['event'] for message in records}
+        self.assertTrue({'validation_refused','submit_pending','receipt_unverified','identity_refused'}<=events)
+    def test_broken_diagnostic_sink_never_changes_outcome(self):
+        with mock.patch.object(logging.getLogger(wake_send.STRICT_DIAG_LOGGER),'info',side_effect=RuntimeError('sink_broken')):
+            self.mode.write_text('busy')
+            self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+
+class StrictInboxWakeTests(StrictDiagTools, unittest.TestCase):
     invoke = SessionWakeTests.invoke
     def setUp(self):
         SessionWakeTests.setUp(self)
@@ -320,6 +435,43 @@ class StrictInboxWakeTests(unittest.TestCase):
         self.wall_clock.return_value=1000;self.bridge.runner=runner
         with self.assertRaisesRegex(RuntimeError,'wake_outcome_uncertain'):self.invoke()
         self.assertFalse(any(c[0][0]=='send' for c in self.calls))
+
+    def test_inbox_custody_and_notice_diagnostics_are_closed(self):
+        records=self.capture();result=self.invoke()
+        events=self.events(records)
+        self.assertEqual([e['event'] for e in events],['attempt_start','mutation_committed','envelope_stored',
+            'envelope_verified','submit_attempted','envelope_verified','submit_verified'])
+        self.assertEqual(events[-1],self.diag('submit_verified',phase='terminal',status='submitted_verified',
+            reason='submission_observed',mutation='true',landed='true',submitted='true'))
+        self.assertEqual(result['wake_proof']['kind'],'strict_inbox_notice_v1')
+        row=self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()
+        self.assertEqual(row[0],'done')
+    def test_inbox_pending_journal_keeps_exact_envelope_progress_shape(self):
+        records=self.capture();self.mode.write_text('busy')
+        self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-inbox:v1'})
+        row=self.bridge.journal.db.execute('SELECT state,result FROM commands').fetchone()
+        self.assertEqual(row[0],'executing');self.assertEqual(set(json.loads(row[1])),{'inbox_envelope'})
+        self.assertEqual(set(json.loads(row[1])['inbox_envelope']),
+            {'schema_version','id','workspace','created_at','from','to','kind','body','data','delivery'})
+        pending=[e for e in self.events(records) if e['event']=='submit_pending']
+        self.assertEqual(pending,[self.diag('submit_pending',phase='receipt',status='refused',reason='not_idle',
+                                            mutation='false',landed='false',submitted='false')])
+    def test_inbox_context_unknown_creation_and_uncertain_retry_diagnostics_stay_closed(self):
+        records=self.capture()
+        self.mode.write_text('identity')
+        with self.assertRaisesRegex(RuntimeError,'wake_local_context_unverified'):self.invoke()
+        self.assertEqual(self.events(records)[-1],self.diag('context_refused',phase='context',reason='wake_local_context_unverified'))
+        self.assertEqual(self.bridge.journal.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+        self.mode.write_text('create-unknown')
+        with self.assertRaisesRegex(RuntimeError,'native_command_failed'):self.invoke()
+        self.assertTrue((Path(self.temp.name)/'envelope.json').exists())
+        events=self.events(records)
+        self.assertEqual(events[-1],self.diag('unrecognized',phase='envelope',reason='unrecognized'))
+        self.assertTrue(any(e['event']=='mutation_committed' for e in events))
+        self.mode.write_text('ok')
+        with self.assertRaisesRegex(RuntimeError,'wake_outcome_uncertain'):self.invoke()
+        self.assertEqual(self.events(records)[-1],self.diag('outcome_uncertain',phase='context',reason='wake_outcome_uncertain'))
+        self.assertEqual(len(self.creations()),1)
 
 INBOX_CLI = r'''import sys,json,hashlib,os
 from pathlib import Path

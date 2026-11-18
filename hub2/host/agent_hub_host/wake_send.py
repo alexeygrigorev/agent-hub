@@ -8,8 +8,50 @@ No PTY injection, identity override, provider action or headless resume.
 import hashlib
 import os
 import json
+import logging
 import time
 import uuid
+
+# Closed private strict-attempt diagnostics: fixed record schema, whitelisted
+# vocabulary, unknown values collapse to 'unrecognized'. Records go only to
+# the Host process log; logging never authorizes, retries or alters effects.
+STRICT_DIAG_LOGGER='agent_hub_host.wake_send.strict_diag'
+_STRICT_DIAG=logging.getLogger(STRICT_DIAG_LOGGER)
+_STRICT_DIAG.addHandler(logging.NullHandler())
+_STRICT_DIAG.setLevel(logging.INFO)
+_STRICT_DIAG_RAISED={'invalid_wake_command':'validation_refused','command_id_conflict':'validation_refused',
+    'wake_fence_conflict':'identity_refused','headless_send_refused':'identity_refused',
+    'wake_identity_unverified':'identity_refused','wake_local_context_unverified':'context_refused',
+    'wake_deadline_exceeded':'deadline_exceeded','wake_outcome_uncertain':'outcome_uncertain',
+    'wake_receipt_unverified':'receipt_unverified','duplicate_receipt_field':'receipt_unverified'}
+_STRICT_DIAG_EVENTS=frozenset(('attempt_start','validation_refused','identity_refused','context_refused',
+    'deadline_exceeded','outcome_uncertain','receipt_unverified','mutation_committed','envelope_stored',
+    'envelope_verified','submit_attempted','submit_pending','submit_verified','done_replay','unrecognized'))
+_STRICT_DIAG_PHASES=frozenset(('entry','validated','identity','context','envelope','submit','receipt','terminal'))
+_STRICT_DIAG_STATUSES=frozenset(('submitted_verified','refused','uncertain'))
+_STRICT_DIAG_REASONS=frozenset(_STRICT_DIAG_RAISED)|frozenset(('submission_observed','preflight_refused',
+    'input_busy','invalid_text','dispatch_fenced','prior_dispatch_uncertain','receipt_unreadable',
+    'deadline_expired','identity_mismatch','not_idle','input_client_attached','input_not_settled',
+    'unknown_layout','unsafe_composer','readiness_changed','paste_uncertain','landing_uncertain',
+    'landing_changed','enter_uncertain'))
+
+def _strict_diag_unit(value,whitelist):
+    if value is True:return 'true'
+    if value is False:return 'false'
+    if value is None:return 'absent'
+    return value if isinstance(value,str) and value in whitelist else 'unrecognized'
+
+def _strict_diag_record(category,phase,status=None,reason=None,mutation=None,landed=None,submitted=None,replayed=None):
+    record={'event':category if category in _STRICT_DIAG_EVENTS else 'unrecognized',
+            'phase':phase if phase in _STRICT_DIAG_PHASES else 'unrecognized',
+            'status':_strict_diag_unit(status,_STRICT_DIAG_STATUSES),
+            'reason':_strict_diag_unit(reason,_STRICT_DIAG_REASONS),
+            'mutation':_strict_diag_unit(mutation,()),'landed':_strict_diag_unit(landed,()),
+            'submitted':_strict_diag_unit(submitted,()),'replayed':_strict_diag_unit(replayed,())}
+    try:
+        _STRICT_DIAG.info('wake_strict_diag %s',json.dumps(record,sort_keys=True,separators=(',',':')))
+    except Exception:
+        pass  # A diagnostic sink failure never alters the guarded attempt.
 
 
 def execute(bridge, command, digest):
@@ -124,6 +166,19 @@ def execute(bridge, command, digest):
 
 def execute_strict(bridge, command, digest):
     """A native once-ID guards retries; no mailbox or sender impersonation."""
+    phases=['entry']
+    try:
+        return _execute_strict_locked(bridge,command,digest,phases)
+    except Exception as error:
+        reason=str(error)
+        _strict_diag_record(_STRICT_DIAG_RAISED.get(reason,'unrecognized'),phases[0],
+                            reason=reason if reason in _STRICT_DIAG_REASONS else 'unrecognized')
+        raise
+
+def _execute_strict_locked(bridge,command,digest,phases):
+    """Strict attempt body; phases[0] carries the closed diagnostic phase."""
+    def diag(category,**fields):_strict_diag_record(category,phases[0],**fields)
+    diag('attempt_start')
     inbox = command.get('wake', {}).get('transport') == 'strict-inbox:v1'
     db = bridge.journal.db
     identity = command.get('id')
@@ -143,6 +198,7 @@ def execute_strict(bridge, command, digest):
     text = command.get('text')
     if not isinstance(text,str) or not text.strip() or len(text.encode()) > 8192:
         raise ValueError('invalid_wake_command')
+    phases[0]='validated'
     start = time.monotonic()
     def remaining():
         left = min(30-(time.monotonic()-start), (binding['deadline_ms']-time.time()*1000)/1000)
@@ -165,14 +221,18 @@ def execute_strict(bridge, command, digest):
     if old and old['digest'] != digest:
         raise ValueError('command_id_conflict')
     if old and old['state'] == 'done':
+        phases[0]='terminal'
+        diag('done_replay')
         result = json.loads(old['result'])
         bridge.journal.emit('command:'+identity,'/api/sessions/'+binding['session_id']+'/commands/'+identity+'/ack',
                             {'epoch':binding['epoch'],'result':result})
         return result
+    phases[0]='identity'
     qualified()
     wire_text = text
     envelope = None
     if inbox:
+        phases[0]='context'
         # No identity/workspace override. Native also discovers ancestor IDs;
         # only its explicit silent no-identity result qualifies this route.
         if os.environ.get('APLEXER_WORKSPACE'):
@@ -208,9 +268,11 @@ def execute_strict(bridge, command, digest):
             try:return json.loads(raw,object_pairs_hook=unique)
             except (ValueError,RecursionError):raise RuntimeError('wake_receipt_unverified') from None
         if not old:
+            phases[0]='envelope'
             # A crash/unknown result beyond this committed boundary NEVER
             # creates another envelope. Availability is sacrificed to custody.
             with db: bridge.begin_command(identity,digest)
+            diag('mutation_committed')
             remaining()
             sent = bridge.native('message','send','--to',binding['tag'],'--kind','hub-wake',
                                  '--data',json.dumps(data,ensure_ascii=False,separators=(',',':')),
@@ -220,6 +282,7 @@ def execute_strict(bridge, command, digest):
             progress={'inbox_envelope':envelope}
             with db:
                 db.execute("UPDATE commands SET result=? WHERE id=? AND state='executing'",(json.dumps(progress),identity))
+            diag('envelope_stored')
         if not isinstance(progress,dict) or set(progress) != {'inbox_envelope'}:
             raise RuntimeError('wake_receipt_unverified')
         envelope = validated(progress['inbox_envelope'])
@@ -228,12 +291,17 @@ def execute_strict(bridge, command, digest):
             if validated(decode(result.stdout)) != envelope:
                 raise RuntimeError('wake_receipt_unverified')
             qualified();remaining()
+            diag('envelope_verified')
         reread()
         wire_text = 'Read inbox message '+envelope['id']
     elif not old:
+        phases[0]='submit'
         with db: bridge.begin_command(identity,digest)
+        diag('mutation_committed')
     # A repeated CLI RPC uses EXACTLY the same worker-persisted once-ID/digest/
     # original deadline. Uncertain worker fences never write a second input.
+    phases[0]='submit'
+    diag('submit_attempted')
     remaining()
     sent = bridge.native('send',binding['native_id'],'--enter','--strict',
                          '--expect-tag',binding['tag'],'--expect-workspace',binding['workspace'],
@@ -264,10 +332,14 @@ def execute_strict(bridge, command, digest):
             or receipt.get('request_sha256') != expected or type(receipt.get('deadline_ms')) is not int
             or receipt['deadline_ms'] != binding['deadline_ms']):
         raise RuntimeError('wake_receipt_unverified')
+    phases[0]='receipt'
     if (sent.returncode != 0 or receipt.get('status') != 'submitted_verified'
             or receipt.get('mutation') is not True or receipt.get('landed') is not True
             or receipt.get('submitted') is not True or receipt.get('consumed') is not None
             or receipt.get('reason') != 'submission_observed'):
+        diag('submit_pending',status=receipt.get('status'),reason=receipt.get('reason'),
+             mutation=receipt.get('mutation'),landed=receipt.get('landed'),
+             submitted=receipt.get('submitted'),replayed=receipt.get('replayed'))
         return {'wake_pending':True,'transport':binding['transport']}
     result = {'delivery':'native_acknowledged','delivered_at_ms':int(time.time()*1000),
               'wake_proof':{'kind':'strict_submit_v1','epoch':binding['epoch'],
@@ -276,5 +348,9 @@ def execute_strict(bridge, command, digest):
         reread()
         result['wake_proof'].update(kind='strict_inbox_notice_v1',
             envelope_id=envelope['id'],body_sha256=hashlib.sha256(text.encode()).hexdigest())
+    phases[0]='terminal'
+    diag('submit_verified',status=receipt.get('status'),reason=receipt.get('reason'),
+         mutation=receipt.get('mutation'),landed=receipt.get('landed'),
+         submitted=receipt.get('submitted'),replayed=receipt.get('replayed'))
     with db: bridge.finish_command(identity,command,result)
     return result
