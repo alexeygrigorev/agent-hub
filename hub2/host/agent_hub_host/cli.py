@@ -108,13 +108,10 @@ def main(argv=None):
                 print(json.dumps(run_same_process_quota(enabled=False)))
                 return 0
             src_dir = spec["source_directory"]
-            exec_argv = lambda _dl_ns: [
-                "/usr/bin/python3", "-I", "-S", str(Path(src_dir) / "hub-quota-publish.py"), "--check",
-            ]
-            def _launch_unit(ticket):
-                dl_ns = int((ticket.deadline if ticket is not None else time.monotonic()) * 1e9)
-                argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(dl_ns)
-                return subprocess.run(argv, capture_output=True, timeout=5, check=False).returncode
+            quota_path = str(Path(src_dir) / "hub-quota-publish.py")
+            client_path = str(Path(src_dir) / "hub_alert_client.py")
+            prelude_path = str(Path(src_dir) / "hub-alert-quota-dispatch.py")
+            primary_args = ["--check"]
             held = []
             gate = None
             group = None
@@ -123,14 +120,19 @@ def main(argv=None):
                 held.append(quota_fd)
                 client_fd = hold_source_fd(src_dir, "hub_alert_client.py")
                 held.append(client_fd)
-                boot_fd = hold_source_fd(src_dir, "qualified-quota-bootstrap.py")
-                held.append(boot_fd)
+                prelude_fd = hold_source_fd(src_dir, "hub-alert-quota-dispatch.py")
+                held.append(prelude_fd)
                 gate = SourceGate(spec["gate_directory"])
                 group = FanotifyReader.open_group((quota_fd,))
                 deadline = time.monotonic() + 40.0
+                exec_argv = lambda dl_ns: [
+                    "/usr/bin/python3", "-I", "-S", prelude_path,
+                    str(dl_ns), quota_fd.pin.sha256, client_fd.pin.sha256,
+                    spec["gate_directory"], quota_path, client_path, "--", *primary_args,
+                ]
                 plan = {"units": {"healthy": spec["unit"]}, "cgroups": {"healthy": spec["cgroup"]}}
                 prepared = prepare_selected_quota(
-                    source=quota_fd, companions=(client_fd, boot_fd), gate=gate, group=group,
+                    source=quota_fd, companions=(client_fd, prelude_fd), gate=gate, group=group,
                     plan=plan, exec_argv=exec_argv, service_deadline=deadline,
                 )
             except (OSError, ram.Unknown) as error:
@@ -142,10 +144,18 @@ def main(argv=None):
                     os.close(group)
                 reason = error.args[0] if isinstance(error, ram.Unknown) and error.args else type(error).__name__
                 # Fail-open once: primary business still runs once when observation preparation fails.
-                launch_rc = _launch_unit(None)
+                fallback_argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--",
+                                 "/usr/bin/python3", "-I", "-S", quota_path, *primary_args]
+                launch_rc = subprocess.run(fallback_argv, capture_output=True, timeout=5, check=False).returncode
                 print(json.dumps({"enabled": True, "dispatched": False, "fail_open_business": True,
                                   "launch_rc": launch_rc, "error": str(reason), "complete": False}))
                 return launch_rc
+
+            def _launch_unit(ticket):
+                dl_ns = int(ticket.deadline * 1e9) if ticket is not None else 0
+                argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(dl_ns)
+                return subprocess.run(argv, capture_output=True, timeout=5, check=False).returncode
+
             result = run_same_process_quota(prepared, _launch_unit, enabled=True, broker_directory=spec["broker_directory"])
             print(json.dumps({"enabled": result["enabled"], "dispatched": result["dispatched"],
                               "reserved": result["reserved"], "phase": result["phase"], "complete": False}))

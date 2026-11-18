@@ -529,7 +529,7 @@ class FanotifyObservation:
 
 
 class FanotifyReader:
-    """Non-blocking reader for an owned Linux fanotify group FD."""
+    """Bounded non-blocking reader for an owned Linux fanotify group FD."""
 
     _STRUCT = struct.Struct('<IBBHqii')
     _VERS = 3
@@ -539,6 +539,9 @@ class FanotifyReader:
     _FAN_CLOEXEC = 0x00000001
     _FAN_NONBLOCK = 0x00000002
     _FAN_MARK_ADD = 0x00000001
+    MAX_READS = 16
+    MAX_RECORDS = 64
+    BUDGET_S = 0.05
 
     @classmethod
     def open_group(cls, held_sources):
@@ -561,39 +564,68 @@ class FanotifyReader:
             os.close(group)
             raise
 
+    @classmethod
+    def _close_remaining(cls, buf, offset):
+        """Close every valid event FD in the remainder of an already-read buffer."""
+        while offset + cls._STRUCT.size <= len(buf):
+            event_len, vers, _res, meta_len, _mask, fd, _pid = cls._STRUCT.unpack_from(buf, offset)
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if vers != cls._VERS or meta_len < cls._STRUCT.size or event_len < meta_len or offset + event_len > len(buf):
+                break
+            offset += event_len
+
     def drain(self, group, observation):
         observation.records = []
         observation.unknown = False
+        deadline = time.monotonic() + self.BUDGET_S
+        reads = 0
         try:
-            while True:
+            while reads < self.MAX_READS and time.monotonic() < deadline:
                 try:
                     buf = os.read(group, 4096)
                 except BlockingIOError:
-                    break
+                    return
                 if not buf:
-                    break
+                    return
+                reads += 1
                 offset = 0
                 while offset + self._STRUCT.size <= len(buf):
                     event_len, vers, _res, meta_len, mask, fd, pid = self._STRUCT.unpack_from(buf, offset)
+                    if (vers != self._VERS or meta_len < self._STRUCT.size
+                            or event_len < meta_len or offset + event_len > len(buf)
+                            or (mask & self._FAN_Q_OVERFLOW) or fd < 0 or pid <= 0
+                            or len(observation.records) >= self.MAX_RECORDS):
+                        observation.unknown = True
+                        observation.records = []
+                        self._close_remaining(buf, offset)
+                        return
                     try:
-                        if (vers != self._VERS or meta_len < self._STRUCT.size
-                                or event_len < meta_len or offset + event_len > len(buf)
-                                or (mask & self._FAN_Q_OVERFLOW) or fd < 0 or pid <= 0):
-                            observation.unknown = True
-                            observation.records = []
-                            return
                         info = os.fstat(fd)
                         observation.records.append({
                             'pid': pid, 'dev': info.st_dev, 'ino': info.st_ino, 'mask': int(mask),
                         })
+                    except BaseException:
+                        observation.unknown = True
+                        observation.records = []
+                        self._close_remaining(buf, offset + event_len)
+                        return
                     finally:
-                        if fd >= 0:
+                        try:
                             os.close(fd)
+                        except OSError:
+                            pass
                     offset += event_len
                 if offset != len(buf):
                     observation.unknown = True
                     observation.records = []
                     return
+            # Exhausted read/time budget before EAGAIN: fail closed as unknown.
+            observation.unknown = True
+            observation.records = []
         except BaseException:
             observation.unknown = True
             observation.records = []

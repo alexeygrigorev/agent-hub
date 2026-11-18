@@ -306,30 +306,47 @@ def run_same_process_quota(
     ticket = None
     mgr = None
     try:
-        broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
-        broker.start()
-        while not state['ready'].is_set() and not broker.closed and now() < prepared.service_deadline:
-            time.sleep(0.002)
-        mgr = state['manager']
-        disp = state['dispatch']
-        while (mgr is not None and mgr.phase in ('initial_begin', 'initial_poll')
-               and not broker.closed and now() < prepared.service_deadline):
-            time.sleep(0.002)
-        if disp is not None and mgr is not None and mgr.phase == 'accept' and not broker.closed:
-            offer = disp.post(prepared.source)
-            ticket = offer.await_owner(now=now)
+        try:
+            broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
+            broker.start()
+            while not state['ready'].is_set() and not broker.closed and now() < prepared.service_deadline:
+                time.sleep(0.002)
+            mgr = state['manager']
+            disp = state['dispatch']
+            while (mgr is not None and mgr.phase in ('initial_begin', 'initial_poll')
+                   and not broker.closed and now() < prepared.service_deadline):
+                time.sleep(0.002)
+            if disp is not None and mgr is not None and mgr.phase == 'accept' and not broker.closed:
+                offer = disp.post(prepared.source)
+                ticket = offer.await_owner(now=now)
+        except Exception:
+            # Observer/broker setup failure fails open once; primary exceptions propagate.
+            launched = True
+            launch_result = launcher(None)
+            return {
+                'enabled': True,
+                'dispatched': False,
+                'reserved': False,
+                'phase': mgr.phase if mgr is not None else 'failed',
+                'launch_result': launch_result,
+                'snapshot': None,
+                'complete': False,
+            }
+
         # Selection reservation precedes launch; run original selected business ONCE.
+        # Never swallow or retry original primary exceptions.
         launched = True
         launch_result = launcher(ticket)
-        while (mgr is not None and mgr.phase not in ('done', 'failed')
-               and not broker.closed and now() < prepared.service_deadline):
-            time.sleep(0.002)
-        if not broker.closed and broker.listener is not None:
-            try:
+
+        try:
+            while (mgr is not None and mgr.phase not in ('done', 'failed')
+                   and not broker.closed and now() < prepared.service_deadline):
+                time.sleep(0.002)
+            if not broker.closed and broker.listener is not None:
                 snap_call = snapshot_fn or wire.exchange
                 snapshot = snap_call(broker.path, {'v': 1, 'op': 'snapshot', 'nonce': uuid.uuid4().hex})
-            except Exception:
-                snapshot = None
+        except Exception:
+            snapshot = None
         return {
             'enabled': True,
             'dispatched': True,
@@ -339,18 +356,10 @@ def run_same_process_quota(
             'snapshot': snapshot,
             'complete': False,
         }
-    except Exception:
-        if not launched:
-            launched = True
-            launch_result = launcher(None)
-        return {
-            'enabled': True,
-            'dispatched': False,
-            'reserved': False,
-            'phase': mgr.phase if mgr is not None else 'failed',
-            'launch_result': launch_result,
-            'snapshot': None,
-            'complete': False,
-        }
     finally:
         wire.stop_optional(broker)
+        if state['manager'] is None:
+            try:
+                prepared.cleanup_owned()
+            except Exception:
+                pass

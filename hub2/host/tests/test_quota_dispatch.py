@@ -883,6 +883,10 @@ class SameProcessLifecycleTests(unittest.TestCase):
             observation=FanotifyObservation(),
             extra_cleanup=lambda: os.close(w_fan),
         )
+        # Broker failure runs launcher(None) once AND cleans up owned gate/FDs
+        cleaned = []
+        orig_cleanup = prepared.cleanup_owned
+        object.__setattr__(prepared, 'cleanup_owned', lambda: (cleaned.append(1), orig_cleanup())[1])
         launches = []
         with patch.object(wire.Broker, '_selected_quota_attempt', side_effect=OSError('broker_init_failed')):
             res = run_same_process_quota(
@@ -890,16 +894,53 @@ class SameProcessLifecycleTests(unittest.TestCase):
                 enabled=True, broker_directory=broker_dir,
             )
         self.assertEqual(launches, [None])
+        self.assertEqual(cleaned, [1])
         self.assertEqual(res['launch_result'], 42)
         self.assertFalse(res['dispatched'])
         self.assertFalse(res['complete'])
-        # Uncertain launch exception must NEVER double-launch
-        launches2 = []
+
+    def test_run_same_process_quota_preserves_original_primary_exception_identity(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 2.0,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+
+        class SentinelPrimaryError(Exception):
+            pass
+
+        sentinel = SentinelPrimaryError('original_primary')
+        launches = []
+
         def _boom(t):
-            launches2.append(t)
-            raise RuntimeError('uncertain_launch')
-        with patch.object(wire.Broker, 'start', side_effect=None):
-            res2 = run_same_process_quota(
+            launches.append(t)
+            raise sentinel
+
+        with self.assertRaises(SentinelPrimaryError) as caught:
+            run_same_process_quota(
                 prepared, _boom, enabled=True, broker_directory=broker_dir,
                 collector_factory=lambda cb: SimpleNamespace(
                     wire=SimpleNamespace(receive=lambda *a: False), epoch='e'*32,
@@ -909,8 +950,126 @@ class SameProcessLifecycleTests(unittest.TestCase):
                 ),
                 identity=lambda pid: KEY,
             )
-        self.assertEqual(len(launches2), 1)
-        self.assertFalse(res2['dispatched'])
+        self.assertIs(caught.exception, sentinel)
+        self.assertEqual(len(launches), 1)
+
+    def test_fanotify_reader_bounded_drain_and_closes_trailing_fds_on_loss(self):
+        from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
+        r_pipe, w_pipe = os.pipe()
+        self.addCleanup(lambda: [os.close(fd) for fd in (r_pipe, w_pipe)])
+        os.set_blocking(r_pipe, False)
+        reader = FanotifyReader()
+        obs = FanotifyObservation()
+        ev1 = os.open(__file__, os.O_RDONLY)
+        ev2 = os.open(__file__, os.O_RDONLY)
+        pkt_ovf = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_Q_OVERFLOW, -1, 0)
+        pkt1 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev1, 111)
+        pkt2 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev2, 222)
+        os.write(w_pipe, pkt_ovf + pkt1 + pkt2)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+        for fd in (ev1, ev2):
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+        # Bounded by MAX_RECORDS
+        fds = [os.open(__file__, os.O_RDONLY) for _ in range(FanotifyReader.MAX_RECORDS + 2)]
+        buf = b''.join(FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, fd, 333) for fd in fds)
+        os.write(w_pipe, buf)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_cli_quota_dispatch_enabled_prelude_handshake_and_deadline_match(self):
+        import contextlib, io, json, shutil, threading
+        from agent_hub_host import cli
+        from agent_hub_host.quota_dispatch_manager import FanotifyReader
+        root = self._short_temp()
+        cfg = root / 'v2.json'
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        repo_root = Path(__file__).resolve().parents[3]
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        # Disposable synthetic quota module with standard main(argv, *, _managed_observer=None)
+        business_calls = []
+        self._write_readonly(
+            src_dir, 'hub-quota-publish.py',
+            b'def main(argv=None, *, _managed_observer=None):\n'
+            b'    if _managed_observer is not None:\n'
+            b'        _managed_observer.emit("begin")\n'
+            b'        _managed_observer.emit("decision", decision="observation", condition="quota_fresh")\n'
+            b'        _managed_observer.emit("terminal")\n'
+            b'    return 0\n',
+        )
+        cfg.write_text(json.dumps({
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+            }
+        }))
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        seen_launch = []
+
+        def _fake_systemd_run(argv, **kw):
+            if argv[0] == '/usr/bin/systemd-run':
+                seen_launch.append(argv)
+                idx = argv.index('--')
+                prelude_argv = argv[idx + 1:]
+                spec = importlib.util.spec_from_file_location('actual_prelude', prelude_argv[3])
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                # Verify expired deadline falls back unqualified once
+                orig_main = mod.run_once
+                def _run():
+                    business_calls.append(prelude_argv[4])
+                    os.write(w_fan, b'open')
+                    mod.main(prelude_argv[4:])
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                t.join(timeout=2.0)
+                return SimpleNamespace(returncode=0, stdout=b'')
+            return SimpleNamespace(returncode=0, stdout=b'')
+
+        out = io.StringIO()
+        fake_collector = lambda _self, cb: SimpleNamespace(
+            wire=SimpleNamespace(receive=lambda *a: False), epoch='e'*32,
+            fault=None, started=True, pending=None, jobs={},
+            start=lambda: {'stream_index': 1}, handle=lambda *a: None,
+            barrier=lambda: {'stream_index': 2}, close=lambda: None,
+        )
+        with patch.object(wire.Broker, '_collector', fake_collector), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}), \
+             patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
+             patch('subprocess.run', side_effect=_fake_systemd_run), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', str(cfg), 'quota-dispatch', '--enable'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen_launch), 1)
+        idx = seen_launch[0].index('--')
+        prelude_cmd = seen_launch[0][idx + 1:]
+        self.assertEqual(prelude_cmd[3], str(src_dir / 'hub-alert-quota-dispatch.py'))
+        self.assertTrue(prelude_cmd[4].isdigit() and int(prelude_cmd[4]) > 0)
+        self.assertEqual(len(business_calls), 1)
+        try:
+            os.close(w_fan)
+        except OSError:
+            pass
 
     def test_cli_quota_dispatch_enabled_prep_failure_runs_primary_once_no_fixture(self):
         import contextlib, io, json
