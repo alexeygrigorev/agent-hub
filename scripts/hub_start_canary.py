@@ -721,9 +721,32 @@ WORKSPACE_CONFIG_UID = 0
 WORKSPACE_CONFIG_TRUST_ROOT = "/"
 ADMISSION_BUDGET_S = 60.0
 ADMISSION_RAM_FLOOR_BYTES = 10 * 1024 ** 3
+# Policy CEILINGS for the new worker. The caps that count are the ones the
+# selected Host launcher will actually apply (read_launcher_caps); anything above
+# these ceilings, or unknowable, holds admission.
 NEW_WORKER_MEMORY_BYTES = 1500 * 1024 ** 2
 NEW_WORKER_PIDS = 256
+# Host launcher defaults when the selected config omits them: hub2/host/agent_hub_host/
+# native_launch.py reads config["launcher"].get("memory_mb", 1500) / .get("pids", 256)
+# and passes them as `--memory <N>M --pids <N>` to the native `a start`.
+LAUNCHER_DEFAULT_MEMORY_MB = 1500
+LAUNCHER_DEFAULT_PIDS = 256
+LAUNCHER_CONFIG_RELATIVE = ".config/agent-hub/v2.json"  # hub2 CLI --config default; the Host service passes no --config
+LAUNCHER_CONFIG_MAX_BYTES = 256 * 1024
+HOST_UNIT_CGROUP_SUFFIX = "/agent-hub2-host.service"  # deploy/agent-hub2-host.service
+# Disk, all on the actual cwd/TMP devices after the validated floor:
+#  - SPIKE: one transient write margin shared by the start itself.
+#  - WORKER_RESERVE: a planning estimate per worker that may still write on the
+#    same device, charged for the NEW worker (this task's own known growth) and for
+#    every live current worker or uncovered in-flight task there (mature RAM proof
+#    says nothing about disk). The figure and the cap borrow the maintained
+#    launcher disk gate constants (host launcher_recovery.py: next_disk_mb=512,
+#    active reserve cap 8192 MiB). That gate belongs to the quota launcher; its
+#    linkage to NativeLauncher starts is NOT proven here, so this is a bounded
+#    conservative estimate, not a measured or guaranteed growth bound.
 ADMISSION_DISK_SPIKE_BYTES = 512 * 1024 ** 2
+ADMISSION_DISK_WORKER_RESERVE_BYTES = 512 * 1024 ** 2
+ADMISSION_DISK_RESERVE_CAP_BYTES = 8192 * 1024 ** 2
 DISK_FLOOR_GB_RANGE = (1, 1048576)
 MATURE_RESIDENT_AGE_S = 180.0
 QUOTA_STALE_S = 1200.0
@@ -860,6 +883,154 @@ def read_workspace_config(path=None):
             or len(workspace) > 1024 or os.path.normpath(workspace) != workspace or workspace == "/"):
         fail("schema")
     return workspace
+
+
+def selected_launcher_config_path():
+    """The Host's selected enrollment/launcher config: the hub2 CLI default, no --config."""
+    try:
+        home = pathlib.Path.home()
+    except (RuntimeError, KeyError, OSError):
+        raise StageFailure("admission", "launcher_config_path")
+    if not home.is_absolute() or "\0" in str(home):
+        raise StageFailure("admission", "launcher_config_path")
+    return home / LAUNCHER_CONFIG_RELATIVE
+
+
+def prove_loaded_host_config(config_stat, home):
+    """Exactly one Host daemon of this user, from this home, started with no --config, after the config last changed.
+
+    Source alone cannot prove the daemon loaded the file; this narrows it: the
+    process in the Host unit's cgroup is `hub2 serve` run from this home's
+    agent-hub2 release tree without a --config override, and neither mtime nor
+    ctime of the selected config is later than that process's start. It cannot
+    see systemd drop-ins or environment, so it is evidence, not an attestation.
+    """
+    def fail(reason):
+        raise StageFailure("admission", "launcher_config_" + reason)
+    euid = os.geteuid()
+    release_tree = f"{home}/.local/share/agent-hub2/"
+    found = []
+    try:
+        names = [n for n in os.listdir(PROC_ROOT) if n.isdigit()]
+    except OSError:
+        fail("host_unproven")
+    for name in names[:200000]:
+        try:
+            if os.stat(f"{PROC_ROOT}/{name}").st_uid != euid:
+                continue
+            if not any(line.startswith("0::") and line.endswith(HOST_UNIT_CGROUP_SUFFIX)
+                       for line in read_text_limited(f"{PROC_ROOT}/{name}/cgroup").splitlines()):
+                continue
+            argv = read_text_limited(f"{PROC_ROOT}/{name}/cmdline").split("\0")
+        except (OSError, ValueError):
+            continue
+        hub2 = [i for i, a in enumerate(argv) if os.path.basename(a) == "hub2"]
+        if not hub2 or "serve" not in argv[hub2[0] + 1:]:
+            continue
+        found.append((int(name), argv, argv[hub2[0]]))
+    if len(found) != 1:
+        fail("host_unproven")
+    pid, argv, program = found[0]
+    if not program.startswith(release_tree) or any(a == "--config" or a.startswith("--config=") for a in argv):
+        fail("host_unproven")
+    def start_ticks():
+        fields = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+        return int(fields[fields.rindex(")") + 2:].split()[19])
+    try:
+        first = start_ticks()
+        # Closed selector: only the daemon's own HOME entry is extracted (RAM only, rest dropped).
+        with open(f"{PROC_ROOT}/{pid}/environ", "rb") as handle:
+            environ = handle.read(1024 * 1024 + 1)
+        if len(environ) > 1024 * 1024:
+            fail("host_unproven")
+        daemon_home = [e[5:] for e in environ.split(b"\0") if e.startswith(b"HOME=")]
+        del environ
+        if daemon_home != [os.fsencode(home)]:
+            fail("host_unproven")
+        started = time.time() - (time.clock_gettime(time.CLOCK_BOOTTIME) - first / os.sysconf("SC_CLK_TCK"))
+        if start_ticks() != first:
+            fail("host_unproven")
+    except (OSError, ValueError, IndexError):
+        fail("host_unproven")
+    # Strictly before the conservative process birth (one clock tick of slack); ambiguous boundaries refuse.
+    if max(config_stat.st_mtime_ns, config_stat.st_ctime_ns) / 1e9 >= started - 1.0 / os.sysconf("SC_CLK_TCK"):
+        fail("changed_after_host_start")
+
+
+def read_launcher_caps(path, expected_machine):
+    """(memory_bytes, pids) the selected Host launcher will apply to a new worker.
+
+    Reads the selected Host config in RAM only (it also holds the enrollment
+    token): bounded, regular, NOFOLLOW, owner-private, machine identity checked,
+    and only machine_id and launcher.memory_mb/pids are extracted; nothing else is
+    kept, logged or reported. Unreadable, unsafe, mismatched, invalid,
+    changed-since-the-Host-started, unattributable or above-ceiling values raise
+    StageFailure and never fall back to a default (the documented source defaults
+    apply only when the keys are absent).
+    """
+    def fail(reason):
+        raise StageFailure("admission", "launcher_config_" + reason)
+    path = pathlib.Path(path)
+    euid = os.geteuid()
+    chain = list(reversed([path.parent, *path.parent.parents]))
+    try:
+        for directory in chain[-3:]:  # ~, ~/.config, ~/.config/agent-hub
+            st = os.lstat(directory)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid:
+                fail("parent")
+        if os.lstat(path.parent).st_mode & 0o077:
+            fail("parent")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        fail("absent")
+    except OSError as error:
+        fail("symlink" if error.errno == errno.ELOOP else "unreadable")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail("not_regular")
+        if before.st_uid != euid or before.st_mode & 0o077 or before.st_nlink != 1:
+            fail("unsafe")
+        if before.st_size > LAUNCHER_CONFIG_MAX_BYTES:
+            fail("size")
+        raw = os.read(fd, LAUNCHER_CONFIG_MAX_BYTES + 1)
+        after = os.fstat(fd)
+        if len(raw) > LAUNCHER_CONFIG_MAX_BYTES or len(raw) != after.st_size or (
+            before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns,
+        ) != (after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns):
+            fail("unstable")
+    except OSError:
+        fail("unreadable")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        fail("json")
+    finally:
+        del raw
+    if not isinstance(data, dict):
+        fail("schema")
+    machine = data.get("machine_id")
+    launcher = data.get("launcher")
+    del data
+    if not isinstance(machine, str) or machine != expected_machine:
+        fail("machine_mismatch")
+    if launcher is None:
+        launcher = {}
+    if not isinstance(launcher, dict):
+        fail("schema")
+    memory_mb = launcher.get("memory_mb", LAUNCHER_DEFAULT_MEMORY_MB)
+    pids = launcher.get("pids", LAUNCHER_DEFAULT_PIDS)
+    del launcher
+    if type(memory_mb) is not int or type(pids) is not int or memory_mb <= 0 or pids <= 0:
+        fail("caps_invalid")
+    prove_loaded_host_config(before, path.parent.parent.parent)
+    if memory_mb * 1024 ** 2 > NEW_WORKER_MEMORY_BYTES:
+        fail("memory_cap_too_high")
+    if pids > NEW_WORKER_PIDS:
+        fail("pids_cap_too_high")
+    return memory_mb * 1024 ** 2, pids
 
 
 def parse_iso_utc(value):
@@ -1191,7 +1362,7 @@ class Canary:
             raise StageFailure("admission", reason)
 
     def read_census(self, deadline):
-        rc, out, _ = self.run([*self.a, "list", "--all", "--json"], deadline=deadline)
+        rc, out, _ = self.run([*self.a, "list", "--json"], deadline=deadline)  # current inventory; no --all history
         if rc != 0:
             raise StageFailure("admission", "native_inventory_unavailable")
         try:
@@ -1246,6 +1417,47 @@ class Canary:
             "group_anon": mem_stat["anon"], "group_current": current,
         }
 
+    def read_launcher_caps(self, deadline):
+        """Actual new-worker caps of the selected Host launcher (seam; production reads the Host config)."""
+        return read_launcher_caps(selected_launcher_config_path(), self.machine)
+
+    def row_positively_dead(self, row):
+        """True only for a current row whose worker is dead and whose containment holds nothing.
+
+        worker_alive must be False. containment_empty True is positive proof.
+        When aplexer left it NULL/absent (older terminal rows), the row must be
+        terminal and any current cgroup it names must be gone or have no members;
+        missing historical pid/cgroup metadata alone is not a live obligation.
+        A phase of exited/failed on its own, or a live/unknown worker, never counts.
+        """
+        if row.get("worker_alive") is not False:
+            return False
+        empty = row.get("containment_empty")
+        if empty is True:
+            return True
+        if empty is not None:
+            return False
+        if row.get("phase") not in ("exited", "failed") and row.get("state") not in ("exited", "failed"):
+            return False
+        for key in ("workload_cgroup", "containment_cgroup"):
+            cgroup = row.get(key)
+            if cgroup is None:
+                continue
+            if isinstance(cgroup, str) and cgroup.startswith(CGROUP_ROOT + "/"):
+                cgroup = cgroup[len(CGROUP_ROOT):]
+            if (not isinstance(cgroup, str) or not cgroup.startswith("/") or "\0" in cgroup
+                    or ".." in cgroup.split("/")):
+                return False
+            try:
+                members = read_text_limited(f"{CGROUP_ROOT}{cgroup}/cgroup.procs").split()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if members:
+                return False
+        return True
+
     def row_memory_cap(self, row):
         limits = row.get("limits")
         cap = limits.get("memory_bytes") if isinstance(limits, dict) else None
@@ -1254,18 +1466,20 @@ class Canary:
         return None
 
     def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now):
-        """Extra bytes this current native row may still claim beyond what MemAvailable already reflects."""
-        if row.get("worker_alive") is False and row.get("containment_empty") is True:
-            return 0
+        """(extra bytes, kind) this current native row may still claim beyond what MemAvailable already reflects.
+
+        kind is "dead" (positively no obligation), "mature" (identity-bound proven
+        resident) or "young" (anything else that is live or still ramping).
+        """
+        if self.row_positively_dead(row):
+            return 0, "dead"
         phase, state = row.get("phase"), row.get("state")
-        if phase in ("exited", "failed") and row.get("worker_alive") is False and row.get("containment_empty") is True:
-            return 0
         cap = self.row_memory_cap(row)
         pid = row.get("workload_pid")
         if pid is None and (phase == "starting" or state == "starting"):
             if cap is None:
                 raise StageFailure("admission", "resident_bound_unknown")
-            return cap
+            return cap, "young"
         identity = row.get("containment_cgroup_identity")
         if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
             raise StageFailure("admission", "resident_identity_unknown")
@@ -1293,13 +1507,14 @@ class Canary:
             mature_ok = pid_ok and group_ok
             anon = min(first["group_anon"], second["group_anon"])
         if age >= MATURE_RESIDENT_AGE_S and mature_ok:
-            return 0
+            return 0, "mature"
         if cap is None:
             raise StageFailure("admission", "resident_bound_unknown")
-        return max(0, cap - anon) if mature_ok else cap
+        return (max(0, cap - anon) if mature_ok else cap), "young"
 
-    def uncovered_inflight_reserve(self, hub_rows, native_ids):
-        reserve = 0
+    def uncovered_inflight_rows(self, hub_rows, native_ids):
+        """Current Hub in-flight rows on this machine with no native census row yet."""
+        rows = []
         for item in hub_rows:
             if not isinstance(item, dict):
                 raise StageFailure("admission", "managed_inflight_invalid")
@@ -1314,10 +1529,32 @@ class Canary:
             native = item.get("native_id")
             if isinstance(native, str) and native.lower() in native_ids:
                 continue
-            reserve += NEW_WORKER_MEMORY_BYTES
-        return reserve
+            rows.append(item)
+        return rows
+
+    def uncovered_inflight_reserve(self, hub_rows, native_ids):
+        return len(self.uncovered_inflight_rows(hub_rows, native_ids)) * NEW_WORKER_MEMORY_BYTES
+
+    @staticmethod
+    def growth_devices(*paths):
+        """Device ids a worker's workspace, cwd and workspace/.local/tmp write to; None if unknowable."""
+        real = [os.path.realpath(p) for p in paths if isinstance(p, str) and p.startswith("/") and "\0" not in p]
+        if not real:
+            return None
+        real.append(os.path.join(real[0], ".local", "tmp"))
+        devices = set()
+        for path in real:
+            existing = nearest_existing(path)
+            if existing is None:
+                return None
+            try:
+                devices.add(os.stat(existing).st_dev)
+            except OSError:
+                return None
+        return devices
 
     def disk_free_after_margin(self, paths):
+        """{st_dev: free bytes} for the nearest existing ancestors of paths (one entry per device)."""
         seen = {}
         for path in paths:
             existing = nearest_existing(path)
@@ -1329,7 +1566,7 @@ class Canary:
             except OSError:
                 raise StageFailure("admission", "disk_unknown")
             seen.setdefault(st.st_dev, vfs.f_bavail * vfs.f_frsize)
-        return list(seen.values())
+        return seen
 
     def admit(self, deadline=None, workspace=None, *, seam="start"):
         """Finite fresh pre-start admission. Raises StageFailure('admission', closed_reason)."""
@@ -1339,6 +1576,10 @@ class Canary:
         if (not isinstance(workspace, str) or not workspace.startswith("/") or "\0" in workspace):
             raise StageFailure("admission", "workspace_invalid")
         self.admission_time_left(deadline)
+        worker_bytes, worker_pids = self.read_launcher_caps(deadline)
+        if (type(worker_bytes) is not int or type(worker_pids) is not int or worker_bytes <= 0 or worker_pids <= 0
+                or worker_bytes > NEW_WORKER_MEMORY_BYTES or worker_pids > NEW_WORKER_PIDS):
+            raise StageFailure("admission", "launcher_config_caps_invalid")
         floor_gb = self.fetch_disk_floor_gb(deadline)
         self.admission_time_left(deadline)
         self.acquire_quota(deadline)
@@ -1358,27 +1599,46 @@ class Canary:
             if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id) or native_id.lower() in native_ids:
                 raise StageFailure("admission", "native_inventory_invalid")
             native_ids.add(native_id.lower())
-            by_pid.setdefault(row.get("workload_pid"), []).append(native_id)
-            by_group.setdefault(row.get("workload_cgroup"), []).append(native_id)
+        # Positively dead rows carry no live pid/cgroup claim: they join neither the
+        # identity-ambiguity maps nor the reserves (their stale pid/cgroup may be reused).
+        live = [row for row in census if not self.row_positively_dead(row)]
+        for row in live:
+            by_pid.setdefault(row.get("workload_pid"), []).append(row["id"])
+            by_group.setdefault(row.get("workload_cgroup"), []).append(row["id"])
         reserve = 0
-        for row in census:
+        growing = []  # (workspace, cwd) of every live current worker / uncovered task that may still write to disk
+        for row in live:
             pid, group = row.get("workload_pid"), row.get("workload_cgroup")
             shared = len(by_group.get(group, ())) > 1 and group is not None
             if pid is not None and len(by_pid.get(pid, ())) > 1:
                 raise StageFailure("admission", "resident_identity_ambiguous")
-            reserve += self.resident_reserve(row, shared, boot_id, ns_ids, boot_now)
-        reserve += self.uncovered_inflight_reserve(hub_rows, native_ids)
+            extra, _kind = self.resident_reserve(row, shared, boot_id, ns_ids, boot_now)
+            reserve += extra
+            growing.append((row.get("workspace"), row.get("cwd")))  # RAM maturity proves nothing about disk
+        uncovered = self.uncovered_inflight_rows(hub_rows, native_ids)
+        # Not-yet-native tasks may have been (or be) launched under other caps: the ceiling, never the selected value.
+        reserve += len(uncovered) * NEW_WORKER_MEMORY_BYTES
+        growing.extend((item.get("workspace"), item.get("cwd")) for item in uncovered)
         # Disk: actual resolved cwd and own TMP filesystems, one charge per device.
         resolved = os.path.realpath(workspace)
         tmp_dir = os.path.join(resolved, ".local", "tmp")
         floor_bytes = int(floor_gb * 1024 ** 3)
-        for free in self.disk_free_after_margin([resolved, tmp_dir]):
-            if free - ADMISSION_DISK_SPIKE_BYTES < floor_bytes:
+        free_by_device = self.disk_free_after_margin([resolved, tmp_dir])
+        charged = {device: 0 for device in free_by_device}
+        for paths in growing:
+            devices = self.growth_devices(*paths)
+            if devices is None:
+                raise StageFailure("admission", "disk_growth_unknown")
+            for device in devices & set(free_by_device):
+                charged[device] = min(ADMISSION_DISK_RESERVE_CAP_BYTES, charged[device] + ADMISSION_DISK_WORKER_RESERVE_BYTES)
+        for device, free in free_by_device.items():
+            # floor + start spike + this new worker's own known growth + same-device others
+            if free - ADMISSION_DISK_SPIKE_BYTES - ADMISSION_DISK_WORKER_RESERVE_BYTES - charged[device] < floor_bytes:
                 raise StageFailure("admission", "disk_below_floor")
         # Final fresh RAM sample after every slow read, before any spawn.
         self.admission_time_left(deadline)
         available = self.sample_mem_available()
-        if available - reserve - NEW_WORKER_MEMORY_BYTES < ADMISSION_RAM_FLOOR_BYTES:
+        if available - reserve - worker_bytes < ADMISSION_RAM_FLOOR_BYTES:
             raise StageFailure("admission", "memory_below_floor")
         self.admission_time_left(deadline)
 
