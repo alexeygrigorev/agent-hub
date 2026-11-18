@@ -1171,9 +1171,14 @@ class SameProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())['status'], 'INERT_ROOT_PREPARER')
         with self.assertRaises(PermissionError):
             prep.drop_privileges(0, 0)
-        # Full interpreter binary pin without 262144-byte cap
-        real_py = os.path.realpath(sys.executable)
-        interp_fd, interp_pin = prep.pin_interpreter(real_py)
+        # Full interpreter binary pin without 262144-byte cap (prefer maintained system allowlist binary)
+        approved_py = next((p for p in sorted(prep.APPROVED_INTERPRETERS) if Path(p).exists() and not Path(p).is_symlink()), None)
+        real_py = approved_py or os.path.realpath(sys.executable)
+        if approved_py is not None:
+            interp_fd, interp_pin = prep.pin_interpreter(real_py)
+        else:
+            with patch.object(prep, 'APPROVED_INTERPRETERS', frozenset({real_py})):
+                interp_fd, interp_pin = prep.pin_interpreter(real_py)
         os.close(interp_fd)
         self.assertGreater(interp_pin['size'], 262144)
         self.assertEqual(len(interp_pin['sha256']), 64)
@@ -2096,7 +2101,17 @@ class SameProcessLifecycleTests(unittest.TestCase):
         def _short_prep(*a, **kw):
             kw['service_deadline'] = time.monotonic() + 0.15
             return real_prep(*a, **kw)
-        with patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
+        def _offline_collector(_self, _cb):
+            return SimpleNamespace(
+                wire=SimpleNamespace(receive=lambda *a: False), epoch='e' * 32,
+                fault=None, started=True, pending=None, jobs={},
+                start=lambda: {'stream_index': 1}, handle=lambda *a: None,
+                barrier=lambda: {'stream_index': 2}, close=lambda: None,
+            )
+        with patch.object(wire.Broker, '_collector', _offline_collector), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}), \
+             patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
              patch.object(QuotaDispatch, 'reserve', _swap_then_reserve), \
              patch.object(qde, 'prepare_selected_quota', _short_prep), \
              patch.object(qde, '_run_verified_original_once', _track_once), \
