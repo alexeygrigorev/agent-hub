@@ -5728,7 +5728,11 @@ class AdmissionTests(unittest.TestCase):
         row = self.worker_row(1, 4400, group)
         self.coordinator_world([row], [self.current_census(1, 4400, group)], mem=64 * GIB)  # creates the synthetic namespace files
         bad_identities = {
-            "null": None, "empty": {}, "wrong boot": {"boot_id": "boot-2"}, "partial no boot": {"cgroup_namespace_inode": 1},
+            "empty": {}, "wrong boot": {"boot_id": "boot-2"}, "partial no boot": {"cgroup_namespace_inode": 1},
+            "boot null inside": {"boot_id": None}, "ns inode null inside": {"boot_id": "boot-1", "cgroup_namespace_inode": None},
+            "mnt inode null inside": {"boot_id": "boot-1", "mount_namespace_inode": None},
+            "mount id null inside": {"boot_id": "boot-1", "cgroup_mount_id": None},
+            "root null inside": {"boot_id": "boot-1", "cgroup_root_inode": None},
             "string": "boot-1", "list": [], "bool": True, "number": 5, "boot type": {"boot_id": 1},
             "ns contradicts": {"boot_id": "boot-1", "cgroup_namespace_inode": os.stat(self.tmp / "proc/self/ns/cgroup").st_ino + 1},
             "mnt contradicts": {"boot_id": "boot-1", "mount_namespace_inode": os.stat(self.tmp / "proc/self/ns/mnt").st_ino + 1},
@@ -5737,6 +5741,11 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(label):
                 census = [self.current_census(1, 4400, group, identity=identity)]
                 self.assertHold(self.coordinator_world([row], census, mem=64 * GIB), "resident_identity_unknown")
+        # REVISED (explicit semantic revision): a WHOLE-null identity used to be refused here as a contradictory
+        # object. The public SDK field is Option<CgroupIdentity> (serde default, skip-None), so whole-null is the
+        # same unrecorded absence as a missing key and takes the same strong current-kernel proof; null INSIDE a
+        # provided object (above) and every other non-object still holds.
+        self.coordinator_world([row], [self.current_census(1, 4400, group, identity=None)], mem=self.FLOOR).admit()
         # A correct current kernel proof never erases or overrides an explicit contradiction, and nothing is rewritten.
         census = [self.current_census(1, 4400, group, identity={"boot_id": "boot-2"})]
         before = json.dumps(census, sort_keys=True)
@@ -5756,6 +5765,69 @@ class AdmissionTests(unittest.TestCase):
         # Invalid PID types are never rescued by the current proof or the coordinator.
         for pid in (True, "4400", 0, -1, 4400.0):
             self.assertHold(self.coordinator_world([row], [self.current_census(1, pid, group)], mem=64 * GIB), "resident_identity_unknown")
+
+    def test_whole_null_and_missing_identity_and_group_share_one_strong_current_proof(self):
+        """Missing key and whole-null value of containment_cgroup_identity / workload_cgroup are the same unrecorded
+        absence (public SDK Option fields, serde default + skip-None) and qualify only through the full proof."""
+        group = "/user.slice/wn.scope"
+        identities = {"missing": self.ABSENT, "null": None}
+        recorded = {"recorded": True, "group null": None, "group missing": self.ABSENT}
+
+        def census(n, pid, identity, rec, **extra):
+            row = self.current_census(n, pid, group, identity=identity, **extra)
+            if rec is None:
+                row["workload_cgroup"] = None
+            elif rec is self.ABSENT:
+                del row["workload_cgroup"]
+            return row
+
+        mature = self.worker_row(1, 4950, group, max="max")
+        young = lambda **extra: self.worker_row(1, 4950, group, age=10, **extra)
+        for iname, identity in identities.items():
+            for rname, rec in recorded.items():
+                with self.subTest(identity=iname, group=rname):
+                    base = [census(1, 4950, identity, rec)]
+                    # Mature: zero extra even unbounded; one byte below the floor is a real memory hold.
+                    self.coordinator_world([mature], base, mem=self.FLOOR).admit()
+                    self.assertHold(self.coordinator_world([mature], base, mem=self.FLOOR - 1), "memory_below_floor")
+                    # Young: actual finite kernel cap charged in full; unbounded/garbage cap holds.
+                    young_base = [census(1, 4950, identity, rec, age=10)]
+                    self.coordinator_world([young(max=str(700 * MIB))], young_base, mem=self.FLOOR + 700 * MIB).admit()
+                    self.assertHold(self.coordinator_world([young(max=str(700 * MIB))], young_base, mem=self.FLOOR + 700 * MIB - 1),
+                                    "memory_below_floor")
+                    self.assertHold(self.coordinator_world([young(max="max")], young_base, mem=64 * GIB), "resident_bound_unknown")
+                    # Required proof stays: birth skew, wrong boot of a provided twin, dead worker, bad PID.
+                    self.assertHold(self.coordinator_world([mature], [census(1, 4950, identity, rec, skew=10.0)], mem=64 * GIB),
+                                    "resident_identity_unknown")
+                    self.assertHold(self.coordinator_world([mature], [census(1, 4950, identity, rec, worker_alive=False)], mem=64 * GIB),
+                                    "resident_identity_unknown")
+                    self.assertHold(self.coordinator_world([mature], [census(1, True, identity, rec)], mem=64 * GIB),
+                                    "resident_identity_unknown")
+                    self.assertHold(self.coordinator_world([dict(mature, rss_anon=0)], base, mem=64 * GIB), "resident_anonymous_unknown")
+                    self.assertHold(self.coordinator_world([mature], base, mem=64 * GIB, mutate=lambda proc, cg: [(proc / "4950/ns/mnt").unlink(), (proc / "4950/ns/mnt").write_text("")]),
+                                    "resident_identity_unknown")
+        # Shared cgroup: both forms use per-PID anon, no PID alias, and are distinct chosen PIDs.
+        shared_group = "/system.slice/wn-shared.service"
+        members = [4961, 4962, 9999]
+        pair = [self.worker_row(1, 4961, shared_group, members=members), self.worker_row(2, 4962, shared_group, members=members)]
+        both = [self.current_census(1, 4961, shared_group, identity=None), self.current_census(2, 4962, shared_group)]
+        self.coordinator_world(pair, both, mem=self.FLOOR).admit()
+        self.assertHold(self.coordinator_world([pair[0], dict(pair[1], rss_anon=0)], both, mem=64 * GIB), "resident_anonymous_unknown")
+        alias = [self.current_census(1, 4961, shared_group, identity=None), self.current_census(2, 4961, shared_group)]
+        self.assertHold(self.coordinator_world(pair, alias, mem=64 * GIB), "resident_identity_ambiguous")
+        # A provided (non-null) twin sharing the group keeps its own strict proof beside a whole-null row.
+        mixed = [self.current_census(1, 4961, shared_group, identity=None), census_row(2, 4962, shared_group)]
+        self.coordinator_world(pair, mixed, mem=self.FLOOR).admit()
+        # Final census: missing<->null is a changed observed snapshot and holds conservatively (key presence kept).
+        base_missing, base_null = self.current_census(1, 4950, group), self.current_census(1, 4950, group, identity=None)
+        for first, last in ((base_missing, base_null), (base_null, base_missing)):
+            c = self.coordinator_world([mature], [first], mem=64 * GIB)
+            seen = []
+            c.read_census = lambda d, _f=first, _l=last: seen.append(d) or ([_f] if len(seen) == 1 else [_l])
+            self.assertHold(c, "resident_fallback_changed")
+        c = self.coordinator_world([mature], [base_null], mem=self.FLOOR)
+        c.read_census = lambda d: [base_null]
+        c.admit()
 
     def test_current_proof_birth_pid_reuse_namespace_inode_and_path_changes_hold(self):
         group = "/user.slice/w4.scope"
@@ -6623,7 +6695,27 @@ class AdmissionTests(unittest.TestCase):
         self.assertHold(world(finite_proc, young_census, mem=floor + 400 * MIB - 1), "memory_below_floor")
 
         # Missing cgroup, birth mismatch, or invalid PID still hold.
-        self.assertHold(world(rows[:1], [uncontained_row(1, 7101, None)], mem=64 * GIB), "resident_identity_unknown")
+        # REVISED NEGATIVE (explicit semantic revision, see docs/HUB-START-CANARY.md): the previous assertion held
+        # a missing/None RECORDED workload_cgroup. The public SDK field is Option<String> (serde default,
+        # skip-None), so None/missing is an unrecorded optional field and the kernel group of the very same PID
+        # is derived and proven instead. The negative is kept as the real intent, an UNPROVABLE or CONTRADICTORY
+        # kernel group, and the derived None/missing recorded group is asserted as a positive just below.
+        for recorded_missing in (False, True):
+            derived = uncontained_row(1, 7101, None)  # recorded workload_cgroup None
+            if recorded_missing:
+                derived.pop("workload_cgroup")  # recorded workload_cgroup key missing
+            world(rows[:1], [derived], mem=floor).admit()
+            self.assertHold(world(rows[:1], [derived], mem=floor - 1), "memory_below_floor")
+            # The kernel group read of the same PID is denied, absent or ambiguous: nothing is derived or credited.
+            self.assertHold(world(rows[:1], [derived], mem=64 * GIB, mutate=lambda proc, cg: (proc / "7101/cgroup").unlink()),
+                            "resident_measurement_unknown")
+            self.assertHold(world(rows[:1], [derived], mem=64 * GIB,
+                                  mutate=lambda proc, cg: (proc / "7101/cgroup").write_text("0::/a.scope\n0::/b.scope\n")),
+                            "resident_identity_unknown")
+            self.assertHold(world(rows[:1], [derived], mem=64 * GIB, mutate=lambda proc, cg: (proc / "7101/cgroup").write_text("")),
+                            "resident_identity_unknown")
+        # A recorded group that contradicts the actual kernel group of the PID is a real contradiction.
+        self.assertHold(world(rows[:1], [uncontained_row(1, 7101, run_cg)], mem=64 * GIB), "resident_identity_unknown")
         self.assertHold(world(rows[:1], [uncontained_row(1, 7101, run_cg, created_at_ms=self.birth_ms(400, skew=10.0))], mem=64 * GIB),
                         "resident_identity_unknown")
         # Present non-null containment_cgroup_identity with mismatched boot_id still holds.
