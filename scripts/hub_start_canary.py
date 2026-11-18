@@ -1005,11 +1005,29 @@ def selected_launcher_config_path():
     return home / LAUNCHER_CONFIG_RELATIVE
 
 
+def host_module_serve_program(argv, release_tree):
+    """The release interpreter of `hub host serve`: argv == [<release_tree>releases/<id>/bin/python*, -I, -m, agent_hub_host.cli, serve, ...].
+
+    Exact leading tokens, not a substring search. The program is a canonical absolute lexical path of the
+    form <release_tree>releases/<id>/bin/python* (the venv interpreter may itself be a symlink to the system
+    python; it is never resolved). Returns the program or None.
+    """
+    if len(argv) < 5 or argv[1:5] != ["-I", "-m", "agent_hub_host.cli", "serve"]:
+        return None
+    program = argv[0]
+    if not program.startswith("/") or os.path.normpath(program) != program or not program.startswith(release_tree):
+        return None
+    parts = program[len(release_tree):].split("/")
+    if len(parts) != 4 or parts[0] != "releases" or not parts[1] or parts[2] != "bin" or not parts[3].startswith("python"):
+        return None
+    return program
+
+
 def prove_loaded_host_config(config_stat, home):
     """Exactly one Host daemon of this user, from this home, started with no --config, after the config last changed.
 
     Source alone cannot prove the daemon loaded the file; this narrows it: the
-    process in the Host unit's cgroup is `hub2 serve` run from this home's
+    process in the Host unit's cgroup is `hub2 serve` (or the release interpreter `-I -m agent_hub_host.cli serve` of `hub host serve`) run from this home's
     agent-hub2 release tree without a --config override, and neither mtime nor
     ctime of the selected config is later than that process's start. It cannot
     see systemd drop-ins or environment, so it is evidence, not an attestation.
@@ -1034,9 +1052,10 @@ def prove_loaded_host_config(config_stat, home):
         except (OSError, ValueError):
             continue
         hub2 = [i for i, a in enumerate(argv) if os.path.basename(a) == "hub2"]
-        if not hub2 or "serve" not in argv[hub2[0] + 1:]:
-            continue
-        found.append((int(name), argv, argv[hub2[0]]))
+        if hub2 and "serve" in argv[hub2[0] + 1:]:
+            found.append((int(name), argv, argv[hub2[0]]))
+        elif host_module_serve_program(argv, release_tree):
+            found.append((int(name), argv, argv[0]))
     if len(found) != 1:
         fail("host_unproven")
     pid, argv, program = found[0]
@@ -1654,6 +1673,7 @@ class PhysicalAdmission:
             groups = [line[3:] for line in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines() if line.startswith("0::")]
             ns_stats = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}") for name in ("cgroup", "mnt")}
             namespaces = {name: st.st_ino for name, st in ns_stats.items()}
+            self_stats = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
             if groups != [group] and provided is not None:
                 raise StageFailure("admission", "resident_measurement_unknown")  # the provided pid is not in its recorded cgroup
             if groups != [group] or namespaces != ns_ids:
@@ -1694,6 +1714,14 @@ class PhysicalAdmission:
             after = os.fstat(fd)
             on_path = os.stat(f"{CGROUP_ROOT}{group}")
             members_again = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            # The namespace tuple was read before the memory reads: re-read the chosen PID's AND this process's
+            # cgroup/mnt namespaces (dev, inode) at the end; initial chosen, initial/current self and the provided
+            # coordinates must all be one and the same, so a switch during the memory reads cannot pass stale.
+            final_ns = {who: {name: os.stat(f"{PROC_ROOT}/{path}/ns/{name}") for name in ("cgroup", "mnt")} for who, path in (("pid", pid), ("self", "self"))}
+            ident = lambda st: (st.st_dev, st.st_ino)
+            for name in ("cgroup", "mnt"):
+                if len({ident(ns_stats[name]), ident(self_stats[name]), ident(final_ns["pid"][name]), ident(final_ns["self"][name])}) != 1:
+                    raise StageFailure("admission", "resident_identity_unstable")
             if provided is not None:
                 root_after, mount_after, root_path_after = os.fstat(root_fd), read_fd_mount_id(root_fd), os.stat(CGROUP_ROOT)
                 if ((root_after.st_dev, root_after.st_ino, mount_after) != (root.st_dev, root.st_ino, mount_id)
