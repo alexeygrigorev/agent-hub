@@ -4799,6 +4799,94 @@ class AdmissionTests(unittest.TestCase):
                 mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
         self.assertEqual(caught.exception.reason, "launcher_config_changed_after_host_start")
 
+    def test_launcher_caps_recognise_the_release_interpreter_host_serve_and_still_the_legacy_hub2_serve(self):
+        """Additive: `hub host serve` execs <home>/.local/share/agent-hub2/releases/<id>/bin/python -I -m agent_hub_host.cli serve ..."""
+        mod = self.mod()
+        home, path = self.home_with_config(launcher={"memory_mb": 1000})
+        py = lambda rel="releases/x/bin/python": str(home / ".local/share/agent-hub2" / rel)
+        module = lambda *rest, prog=None: [prog or py(), "-I", "-m", "agent_hub_host.cli", *rest]
+
+        def run(argv, **kw):
+            proc = self.host_process(home, argv=argv, **kw)
+            with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+                return mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+
+        def hold(argv, reason="launcher_config_host_unproven", **kw):
+            with self.assertRaises(mod.StageFailure) as caught:
+                run(argv, **kw)
+            self.assertEqual((caught.exception.stage, caught.exception.reason), ("admission", reason))
+
+        # The release interpreter may be a venv symlink to the system python: only the lexical argv path is judged.
+        release = home / ".local/share/agent-hub2/releases/x/bin"
+        release.mkdir(parents=True)
+        (release / "python").symlink_to(sys.executable)
+        for argv in (module("serve", "--aplexer", "/bin/a"), module("serve"), module("serve", prog=py("releases/abc123/bin/python3.12"))):
+            with self.subTest(argv):
+                self.assertEqual(run(argv), (1000 * MIB, 256))
+        # Legacy shape (current real unit: hub2 serve) is untouched.
+        legacy = [py("releases/x/bin/python"), py("current/bin/hub2"), "serve", "--aplexer", "/bin/a"]
+        self.assertEqual(run(legacy), (1000 * MIB, 256))
+        # Closed negatives of the new shape.
+        bad = {
+            "missing -I": [py(), "-m", "agent_hub_host.cli", "serve"],
+            "missing -m": [py(), "-I", "agent_hub_host.cli", "serve"],
+            "wrong module": [py(), "-I", "-m", "agent_hub_host.other", "serve"],
+            "module substring": [py(), "-I", "-m", "agent_hub_host.cli.x", "serve"],
+            "-c spoof": [py(), "-I", "-c", "import agent_hub_host.cli", "-m", "agent_hub_host.cli", "serve"],
+            "late -m": [py(), "-I", "-X", "dev", "-m", "agent_hub_host.cli", "serve"],
+            "module as a later arg": [py(), "-I", "-c", "pass", "-m", "agent_hub_host.cli", "serve"],
+            "wrong command": module("status"),
+            "serve only later": module("status", "serve"),
+            "outside home": module(prog="/elsewhere/agent-hub2/releases/x/bin/python"),
+            "outside the release tree": module(prog=py("bin/python")),
+            "not under releases": module(prog=py("current/bin/python")),
+            "release dir only": module(prog=py("releases/x/python")),
+            "extra path depth": module(prog=py("releases/x/y/bin/python")),
+            "dot-dot escape": module(prog=py("releases/x/../../../../../elsewhere/bin/python")),
+            "non-python program": module(prog=py("releases/x/bin/bash")),
+            "relative program": ["python", "-I", "-m", "agent_hub_host.cli", "serve"],
+            "config before module": [py(), "--config", "/other.json", "-I", "-m", "agent_hub_host.cli", "serve"],
+            "config after module": module("--config", "/other.json", "serve"),
+            "config= after serve": module("serve", "--config=/other.json"),
+            "config after serve": module("serve", "--config", "/other.json"),
+        }
+        for label, argv in bad.items():
+            with self.subTest(label):
+                hold(argv)
+        # Mismatched daemon HOME / cgroup, config newer than the daemon, caps above the ceiling: same guards for the new shape.
+        hold(module("serve"), home_env="/home/someone-else")
+        hold(module("serve"), cgroup="some-other.service")
+        proc = self.host_process(home, argv=module("serve"))
+        time.sleep(0.05)
+        path.chmod(0o600)  # config touched after the daemon started
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+        self.assertEqual(caught.exception.reason, "launcher_config_changed_after_host_start")
+        # Two daemons (new+new, new+legacy) are ambiguous; a decoy that is not a recognised daemon is ignored.
+        for second in (module("serve"), legacy):
+            with self.subTest("ambiguous with " + second[1]):
+                proc = self.host_process(home, argv=module("serve"))
+                shutil.rmtree(proc / "8802", ignore_errors=True)
+                shutil.copytree(proc / "8801", proc / "8802")
+                (proc / "8802/cmdline").write_text("\0".join(second) + "\0")
+                with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+                    with self.assertRaises(mod.StageFailure) as caught:
+                        mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+                self.assertEqual(caught.exception.reason, "launcher_config_host_unproven")
+        proc = self.host_process(home, argv=module("serve"))
+        shutil.rmtree(proc / "8802", ignore_errors=True)
+        shutil.copytree(proc / "8801", proc / "8802")
+        (proc / "8802/cmdline").write_text("\0".join(module("status")) + "\0")
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            self.assertEqual(mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1"), (1000 * MIB, 256))
+        home2, _ = self.home_with_config(launcher={"memory_mb": 1501})
+        proc = self.host_process(home2, argv=[str(home2 / ".local/share/agent-hub2/releases/x/bin/python"), "-I", "-m", "agent_hub_host.cli", "serve"])
+        with mock.patch.dict(os.environ, {"HOME": str(home2)}), mock.patch.object(mod, "PROC_ROOT", str(proc)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_launcher_caps(mod.selected_launcher_config_path(), "HOST-1")
+        self.assertEqual(caught.exception.reason, "launcher_config_memory_cap_too_high")
+
     def test_admission_uses_actual_launcher_memory_and_holds_on_unreadable_or_oversized_config(self):
         mod = self.mod()
         home, _ = self.home_with_config(launcher={"memory_mb": 1000})
@@ -6051,6 +6139,63 @@ class AdmissionTests(unittest.TestCase):
         calls = self.hook_sampler(c, 99, lambda: None)
         c.admit()  # control: the same world with no change passes with exactly first, second and final samples
         self.assertEqual(len(calls), 3)
+
+    def _replace_ns(self, who, name):
+        """Switch a synthetic namespace to a NEW object (new inode): the chosen pid's link or this process's own."""
+        path = self.tmp / "proc" / who / "ns" / name
+        fresh = self.tmp / f"fresh-ns-{who.replace('/', '_')}-{name}-{len(list(self.tmp.glob('fresh-ns-*')))}"
+        fresh.write_text("")
+        os.replace(fresh, path)
+
+    def _own_chosen_ns(self, pid):
+        """Make the chosen pid's namespaces the SAME objects as this process's (hard links), so self can change alone."""
+        for name in ("cgroup", "mnt"):
+            link = self.tmp / "proc" / str(pid) / "ns" / name
+            link.unlink()
+            os.link(self.tmp / "proc/self/ns" / name, link)
+
+    def test_namespace_switch_during_the_final_memory_reads_holds_for_every_chosen_pid_kind(self):
+        """R1: the namespace tuple was read before the memory reads; a switch DURING the final sample (PID start, group,
+        mount root, scope fd and membership all stable) must not pass as the stale tuple. nth=3 is the final sample."""
+        group = self.PGROUP
+        worlds = {
+            "provided": lambda: self.provided_world([self.worker_row(1, 4560, group)], [census_row(1, 4560, group)], mem=self.FLOOR),
+            "coordinator": lambda: self.coordinator_world([self.worker_row(1, 4561, group)],
+                                                          [self.coordinator_census(1, 4561, group, workload_pid=6999999)], mem=self.FLOOR),
+            "current workload": lambda: self.coordinator_world([self.worker_row(1, 4562, group)],
+                                                               [self.current_census(1, 4562, group)], mem=self.FLOOR),
+        }
+        pids = {"provided": 4560, "coordinator": 4561, "current workload": 4562}
+        for kind, world in worlds.items():
+            c = world()
+            c.admit()  # control: nothing changes, the very same world passes
+            for name in ("cgroup", "mnt"):
+                with self.subTest(f"{kind}: chosen {name} namespace switches during the final memory read"):
+                    c = world()
+                    self.churn_after_first_group_read(lambda: self._replace_ns(str(pids[kind]), name), nth=3)
+                    self.assertHold(c, "resident_identity_unstable")
+                with self.subTest(f"{kind}: self {name} namespace switches during the final memory read"):
+                    c = world()
+                    self._own_chosen_ns(pids[kind])
+                    if kind == "provided":
+                        c.read_census = lambda d, _c=[census_row(1, 4560, group, containment_cgroup_identity=self.provided_identity())]: _c
+                    self.churn_after_first_group_read(lambda: self._replace_ns("self", name), nth=3)
+                    self.assertHold(c, "resident_identity_unstable")
+                with self.subTest(f"{kind}: chosen {name} namespace becomes unreadable during the final memory read"):
+                    c = world()
+                    self.churn_after_first_group_read(lambda: (self.tmp / "proc" / str(pids[kind]) / "ns" / name).unlink(), nth=3)
+                    self.assertHold(c, "resident_measurement_unknown")
+                with self.subTest(f"{kind}: self {name} namespace becomes unreadable during the final memory read"):
+                    c = world()
+                    self._own_chosen_ns(pids[kind])
+                    self.churn_after_first_group_read(lambda: (self.tmp / "proc/self/ns" / name).unlink(), nth=3)
+                    self.assertHold(c, "resident_measurement_unknown")
+        # A switch during a FIRST or SECOND sample is caught the same way (the rest of the proof is unchanged).
+        for nth in (1, 2):
+            with self.subTest(f"provided: chosen mnt switches during sample {nth}"):
+                c = worlds["provided"]()
+                self.churn_after_first_group_read(lambda: self._replace_ns("4560", "mnt"), nth=nth)
+                self.assertHold(c, "resident_identity_unstable")
 
     def _shift_start(self, pid, delta):
         path = self.tmp / "proc" / str(pid) / "stat"
