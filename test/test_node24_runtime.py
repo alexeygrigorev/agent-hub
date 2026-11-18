@@ -218,6 +218,18 @@ file="$1"
 hash="$(grep -m1 "sha256-fixture:" "$file" 2>/dev/null | sed 's/.*sha256-fixture:[[:space:]]*//')"
 [[ -n "$hash" ]] || exit 3
 printf '%s  %s\\n' "$hash" "$file"
+count_file="{self.root}/.sha256sum-calls"
+calls=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s\\n' "$calls" > "$count_file"
+# Model a cache mutation exactly after one verification passed: the next
+# consumer sees the archive swapped (HASH_LATE_HASH set) or evicted (empty).
+if [[ -n "${{HASH_SWAP_AFTER_CALL:-}}" && "$calls" == "${{HASH_SWAP_AFTER_CALL:-}}" ]]; then
+  if [[ -n "${{HASH_LATE_HASH:-}}" ]]; then
+    printf 'sha256-fixture: %s\\n' "${{HASH_LATE_HASH:-}}" > "$file"
+  else
+    rm -f -- "$file"
+  fi
+fi
 ''')
 
     def env(self, **extra):
@@ -275,7 +287,7 @@ printf '%s  %s\\n' "$hash" "$file"
 
     def plain_install_calls(self):
         """apt-get install invocations that were not the bounded --download-only."""
-        return [c for c in self.commands() if ' install nodejs=' in c and '--download-only' not in c]
+        return [c for c in self.commands() if ' install ' in c and '--download-only' not in c]
 
 
 class ProvisionerTestCase(unittest.TestCase):
@@ -340,21 +352,27 @@ class ProvisionerFlowTests(ProvisionerTestCase):
             'apt-get',        # apt-get update before candidate binding
             'apt-cache',      # origin/version binding before download
             'apt-get',        # bounded download-only of the pinned artifact
-            'sha256sum',      # artifact hash before installation
-            'apt-get',        # the single bounded install
+            'sha256sum',      # artifact hash at download verification
+            'sha256sum',      # artifact hash re-bound at consumption
+            'apt-get',        # the single bounded install of the verified file
             'dpkg-query',     # postcheck: ownership
             'dpkg-query',     # postcheck: version
             'node',           # postcheck: PATH build toolchain major 24
         ])
         logged = '\n'.join(self.sandbox.commands())
         self.assertIn('apt-get update', logged)
-        self.assertIn(f'apt-get -y --no-install-recommends install nodejs={PIN_VERSION}', logged)
+        archive = self.sandbox.apt_archives / f'nodejs_{PIN_VERSION}_amd64.deb'
+        # The install consumes the exact verified local artifact: no version
+        # operand apt could re-resolve or re-download, only the verified file.
+        self.assertIn(f'apt-get -y --no-install-recommends install {archive}', logged)
+        for line in self.sandbox.plain_install_calls():
+            self.assertIn(str(archive), line)
+            self.assertNotIn('nodejs=', line)
+        self.assertTrue(archive.exists())
+        self.assertIn(PIN_FINGERPRINT, self.sandbox.keyring.read_text(encoding='utf-8'))
         expected_line = (f'deb [arch=amd64 signed-by={self.sandbox.keyring}] '
                          f'{PIN_REPO} nodistro main')
         self.assertEqual(self.sandbox.sources.read_text(encoding='utf-8'), expected_line + '\n')
-        self.assertIn(PIN_FINGERPRINT, self.sandbox.keyring.read_text(encoding='utf-8'))
-        archive = self.sandbox.apt_archives / f'nodejs_{PIN_VERSION}_amd64.deb'
-        self.assertTrue(archive.exists())
         # The install converged the modeled runtime and package identity to 24.
         self.assertEqual(self.sandbox.node_version_file.read_text().strip(), V24)
         self.assertEqual(self.sandbox.dpkg_version_file.read_text().strip(), PIN_VERSION)
@@ -385,13 +403,6 @@ class ProvisionerFlowTests(ProvisionerTestCase):
         self.assertIn('already bound', result.stdout)
         self.assertEqual(self.sandbox.sources.read_text(encoding='utf-8'),
                          f'deb [arch=amd64 signed-by={self.sandbox.keyring}] {PIN_REPO} nodistro main\n')
-
-    def test_drifted_keyring_is_replaced_by_the_validated_download(self):
-        self.sandbox.keyring.write_text('gpg-fixture-primary-fingerprint: DEAD\n', encoding='utf-8')
-        result = self.sandbox.run_provisioner()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(PIN_FINGERPRINT, self.sandbox.keyring.read_text(encoding='utf-8'))
-        self.assertNotIn('DEAD', self.sandbox.keyring.read_text(encoding='utf-8'))
 
 
 class ProvisionerRefusalTests(ProvisionerTestCase):
@@ -450,6 +461,55 @@ class ProvisionerRefusalTests(ProvisionerTestCase):
         prefixes = self.sandbox.command_prefixes()
         self.assertNotIn('apt-get', prefixes)
 
+    def test_foreign_existing_keyring_is_preserved_and_refused(self):
+        # R2 negative control: foreign key material keeps its identity and
+        # bytes, and no package or application effect follows the refusal.
+        foreign = 'gpg-fixture-primary-fingerprint: DEAD\nplus more foreign bytes\n'
+        self.sandbox.keyring.write_text(foreign, encoding='utf-8')
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'refusing to overwrite an existing keyring')
+        self.assertEqual(self.sandbox.keyring.read_text(encoding='utf-8'), foreign,
+                         'the existing keyring must be preserved byte for byte')
+        prefixes = self.sandbox.command_prefixes()
+        self.assertNotIn('apt-get', prefixes)
+        self.assertNotIn('apt-cache', prefixes)
+        self.assertFalse(self.sandbox.sources.exists())
+        self.assertFalse((self.sandbox.apt_archives / f'nodejs_{PIN_VERSION}_amd64.deb').exists())
+
+    def test_symlinked_keyring_refuses_instead_of_writing_through_the_link(self):
+        target = self.sandbox.root / 'keyrings/foreign-target.gpg'
+        target.write_text('gpg-fixture-primary-fingerprint: DEAD\n', encoding='utf-8')
+        self.sandbox.keyring.symlink_to(target)
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'refusing to overwrite an existing keyring')
+        self.assertTrue(self.sandbox.keyring.is_symlink())
+        self.assertEqual(target.read_text(encoding='utf-8'), 'gpg-fixture-primary-fingerprint: DEAD\n')
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_dangling_keyring_symlink_refuses(self):
+        self.sandbox.keyring.symlink_to(self.sandbox.root / 'keyrings/never-created.gpg')
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'refusing to overwrite an existing keyring')
+        self.assertTrue(self.sandbox.keyring.is_symlink())
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_non_regular_keyring_entry_refuses(self):
+        self.sandbox.keyring.unlink(missing_ok=True)
+        self.sandbox.keyring.mkdir()
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'refusing to overwrite an existing keyring')
+        self.assertTrue(self.sandbox.keyring.is_dir())
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_symlinked_apt_source_refuses_instead_of_writing_through_the_link(self):
+        target = self.sandbox.sources.parent / 'foreign.list'
+        target.write_text('deb https://example.invalid/node nodistro main\n', encoding='utf-8')
+        self.sandbox.sources.symlink_to(target)
+        result = self.sandbox.run_provisioner()
+        self.assertRefused(result, 'refusing to overwrite a foreign or mutated apt source')
+        self.assertTrue(self.sandbox.sources.is_symlink())
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
     def test_candidate_from_foreign_origin_refuses_before_download(self):
         result = subprocess.run(['/bin/bash', str(PROVISIONER)], cwd=str(self.sandbox.root),
                                 env=self.sandbox.env(APT_POLICY_TEXT=self.sandbox.policy_text(origin_line=False)),
@@ -473,6 +533,24 @@ class ProvisionerRefusalTests(ProvisionerTestCase):
         self.assertRefused(result, 'hash mismatch')
         self.assertIn('--download-only', '\n'.join(self.sandbox.commands()))
         self.assertEqual(self.sandbox.plain_install_calls(), [])
+
+    def test_archive_swapped_after_verification_refuses_at_consumption(self):
+        # R3 negative control: the cached archive is replaced after the
+        # download-time hash passed; the consumption-time re-bind must catch
+        # it and no unverified selected archive may be installed.
+        result = subprocess.run(['/bin/bash', str(PROVISIONER)], cwd=str(self.sandbox.root),
+                                env=self.sandbox.env(HASH_SWAP_AFTER_CALL='1', HASH_LATE_HASH='f' * 64),
+                                capture_output=True, text=True, timeout=30)
+        self.assertRefused(result, 'changed between verification and consumption')
+        self.assertEqual(len(self.sandbox.plain_install_calls()), 0)
+
+    def test_archive_evicted_after_verification_refuses_before_install(self):
+        # Synthetic cache removal between verification and consumption.
+        result = subprocess.run(['/bin/bash', str(PROVISIONER)], cwd=str(self.sandbox.root),
+                                env=self.sandbox.env(HASH_SWAP_AFTER_CALL='1'),
+                                capture_output=True, text=True, timeout=30)
+        self.assertRefused(result, 'the verified Node24 archive is missing')
+        self.assertEqual(len(self.sandbox.plain_install_calls()), 0)
 
     def test_newer_installed_node24_refuses_an_implicit_downgrade(self):
         newer = '24.99.0-1nodesource1'
@@ -547,16 +625,73 @@ class ProvisionerFailureReceiptTests(ProvisionerTestCase):
         result = self.sandbox.run_provisioner()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_inherited_custody_under_a_real_lock_owner_provisions(self):
+        # The deploy transaction invokes the provisioner inside its own held
+        # lock; custody is proven, not trusted, so the flow proceeds.
+        lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
+        with open(lock_path, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.sandbox.run_provisioner(
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('runtime ready for the deploy transaction', result.stdout)
+        self.assertIn('apt-get', self.sandbox.command_prefixes())
+
+    def test_inherited_custody_without_a_real_lock_owner_refuses(self):
+        # An environment flag alone proves nothing: with no owner holding the
+        # lock, an independent acquisition succeeds and the run must refuse.
+        lock_path = self.sandbox.repo / '.local/tmp/.deploy-transaction.lock'
+        lock_path.write_text('', encoding='utf-8')
+        result = self.sandbox.run_provisioner(
+            AGENT_HUB_NODE24_LOCK_INHERITED=str(lock_path))
+        self.assertRefused(result, 'deploy-lock custody was not inherited')
+        prefixes = self.sandbox.command_prefixes()
+        self.assertNotIn('apt-get', prefixes)
+        self.assertNotIn('curl', prefixes)
+        self.assertFalse(self.sandbox.sources.exists())
+
+    def test_foreign_inherited_lock_path_refuses(self):
+        other = self.sandbox.root / 'elsewhere.lock'
+        with open(other, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.sandbox.run_provisioner(
+                AGENT_HUB_NODE24_LOCK_INHERITED=str(other))
+        self.assertRefused(result, 'foreign lock custody path')
+        self.assertNotIn('apt-get', self.sandbox.command_prefixes())
+
     def test_provisioner_takes_the_same_single_owner_lock_as_the_transaction(self):
-        self.assertIn('.deploy-transaction.lock', PROVISIONER_SOURCE)
+        # R1: ONE existing deploy-lock owner spans package provisioning and the
+        # application transaction. The transaction derives the staged
+        # provisioner path from the validated deploy SHA and invokes it inside
+        # its held fd9 lock; the provisioner never opens a nested flock in
+        # that mode and never trusts a skip-lock flag — custody is proven by a
+        # failing independent acquisition of the same lock file.
         self.assertIn('flock -n 9', PROVISIONER_SOURCE)
+        self.assertIn('.deploy-transaction.lock', PROVISIONER_SOURCE)
         self.assertIn('.deploy-transaction.lock', TRANSACTION_SOURCE)
-        # Never nested: the transaction must not invoke the provisioner; the
-        # only allowed mentions are the guard's guidance messages.
-        self.assertIsNone(
-            re.search(r'(?m)^.*(run_root |sudo |exec 9>>.*\|\| ).*provision-node24', TRANSACTION_SOURCE),
-            'the transaction must never invoke deploy/vm/provision-node24.sh itself')
-        self.assertNotRegex(TRANSACTION_SOURCE, r'(?m)^\s*(run_root\s+)?(sudo\s+)?bash\s+"\$?[A-Za-z_].*provision-node24')
+        self.assertIn('AGENT_HUB_NODE24_LOCK_INHERITED', PROVISIONER_SOURCE)
+        self.assertIn('deploy-lock custody was not inherited', PROVISIONER_SOURCE)
+        self.assertIn('provision_node24_runtime', TRANSACTION_SOURCE)
+        self.assertIn('ci-node24-provision-$1/provision-node24.sh', TRANSACTION_SOURCE)
+        # No skip-lock escape hatch exists anywhere in the feature.
+        for source in (PROVISIONER_SOURCE, TRANSACTION_SOURCE, INSTALLER_SOURCE):
+            self.assertNotRegex(source, r'SKIP_LOCK|SKIPLOCK|LOCK_SKIP|NO_LOCK')
+        # The invocation happens inside apply, before the candidate checkout,
+        # npm dependency mutation, transaction state and unit writes.
+        apply_body = function_body(TRANSACTION_SOURCE, 'apply_release')
+        invoke_idx = apply_body.index('provision_node24_runtime "$deploy_sha"')
+        for later in ('git -C "$REPO" checkout --detach --force "$deploy_sha"',
+                      'install_release_dependencies',
+                      'install-hub2-node.sh" --release-mode',
+                      'install -d -o root -g root -m 700 "$TRANSACTION_DIR"'):
+            self.assertLess(invoke_idx, apply_body.index(later),
+                            f'provisioning must precede: {later}')
+        # The provisioner's inherited mode proves custody instead of trusting
+        # the environment: an independent acquisition must fail for it to run.
+        custody = function_body(PROVISIONER_SOURCE, 'main')
+        self.assertIn('if flock -n "$DEPLOY_LOCK" true; then', custody)
+        self.assertLess(custody.index('deploy-lock custody was not inherited'),
+                        custody.index('PROVISION_WORK="$(mktemp'))
 
 
 class GuardContractTests(unittest.TestCase):
@@ -741,7 +876,7 @@ class TransactionOrderingTests(unittest.TestCase):
         git('-C', str(self.work), 'config', 'user.email', 'fixture@example.invalid')
         (self.work / '.dev.vars').write_text('HUB2_RELEASE_MODE=bootstrap\n', encoding='utf-8')
 
-    def run_apply(self, runtime_fixture=True, service_version=V22):
+    def run_apply(self, runtime_fixture=True, service_version=V22, provision=False):
         service_node = self.root / 'service-node'
         if runtime_fixture:
             service_node.write_text(f'#!/usr/bin/env bash\nprintf \'{service_version}\\n\'\n')
@@ -758,8 +893,111 @@ class TransactionOrderingTests(unittest.TestCase):
         })
         if runtime_fixture:
             env['AGENT_HUB_NODE24_TEST_SERVICE_NODE'] = str(service_node)
-        return subprocess.run(['/bin/bash', str(TRANSACTION), 'apply', self.candidate, 'bootstrap', 'hub-only'],
+        args = ['apply', self.candidate, 'bootstrap', 'hub-only', 'legacy']
+        if provision:
+            args.append('provision-node24')
+        return subprocess.run(['/bin/bash', str(TRANSACTION), *args],
                               cwd=str(self.root), env=env, capture_output=True, text=True, timeout=120)
+
+    def stage_provisioner_fixture(self, body):
+        """Stages a candidate provisioner fixture at the transaction-derived path."""
+        staged = self.work / '.local/tmp' / f'ci-node24-provision-{self.candidate}' / 'provision-node24.sh'
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(f'#!/usr/bin/env bash\n{body}\n', encoding='utf-8')
+        staged.chmod(0o750)
+        return staged
+
+    def test_staged_provisioner_runs_inside_the_deploy_lock_before_app_effects(self):
+        # R1 interleaving control, exercised against the real transaction:
+        # while the transaction invokes the staged provisioner, a competing
+        # non-blocking acquisition of the same deploy lock must fail, and the
+        # invocation must precede any npm or transaction-state effect.
+        lock_path = self.work / '.local/tmp/.deploy-transaction.lock'
+        self.stage_provisioner_fixture(
+            f'printf \'%s\\n\' "provisioner invoked" >> "{self.log}"\n'
+            f'if flock -n "{lock_path}" true; then\n'
+            f'  printf \'%s\\n\' "competing-lock-acquired" >> "{self.log}"\n'
+            f'fi\nexit 0\n')
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        # The fixture candidate has no schema preflight, so apply stops later.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('running the staged candidate provisioner', result.stdout)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertIn('provisioner invoked', log)
+        self.assertNotIn('competing-lock-acquired', log,
+                         'a competing lock acquisition must fail while the transaction owns custody')
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_failing_staged_provisioner_is_an_honest_incident_before_any_effect(self):
+        self.stage_provisioner_fixture('echo "modeled apt failure" >&2\nexit 3\n')
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Node24 runtime provisioning failed inside the deploy transaction', result.stderr)
+        self.assertIn('no automatic OS rollback exists', result.stderr)
+        log = self.log.read_text(encoding='utf-8')
+        self.assertNotIn('npm', log)
+        self.assertFalse(self.state.exists())
+
+    def test_missing_staged_provisioner_refuses_before_any_effect(self):
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing or not a regular file', result.stderr)
+        self.assertNotIn('npm', self.log.read_text(encoding='utf-8'))
+        self.assertFalse(self.state.exists())
+
+    def test_symlinked_staged_provisioner_refuses(self):
+        target = self.work / '.local/tmp' / 'evil-provisioner.sh'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8')
+        staged = self.work / '.local/tmp' / f'ci-node24-provision-{self.candidate}' / 'provision-node24.sh'
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.symlink_to(target)
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('missing or not a regular file', result.stderr)
+        self.assertNotIn('npm', self.log.read_text(encoding='utf-8'))
+        self.assertFalse(self.state.exists())
+
+    def test_group_writable_staged_provisioner_refuses(self):
+        self.stage_provisioner_fixture('exit 0\n').chmod(0o770)
+        result = self.run_apply(runtime_fixture=False, provision=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('group/other writable', result.stderr)
+        self.assertFalse(self.state.exists())
+
+    def run_current_sha(self, repo):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith('AGENT_HUB_TEST_') and k != 'AGENT_HUB_DEPLOY_TEST_MODE'}
+        env.update({
+            'AGENT_HUB_DEPLOY_TEST_MODE': '1',
+            'AGENT_HUB_TEST_REPO': str(repo),
+            'AGENT_HUB_TEST_TRANSACTION_DIR': str(self.state),
+            'AGENT_HUB_TEST_CADDY_CONFIG': str(self.root / 'Caddyfile'),
+            'AGENT_HUB_TEST_CADDY_SITE': str(self.root / 'sites/hub.caddy'),
+        })
+        return subprocess.run(['/bin/bash', str(TRANSACTION), 'current-sha'],
+                              cwd=str(self.root), env=env, capture_output=True, text=True, timeout=30)
+
+    def test_current_sha_reports_the_deployed_identity_without_the_deploy_lock(self):
+        result = self.run_current_sha(self.work)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), self.candidate)
+        # Read-only under contention: a held deploy lock does not block it.
+        lock_path = self.work / '.local/tmp/.deploy-transaction.lock'
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.run_current_sha(self.work)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), self.candidate)
+
+    def test_current_sha_reports_none_without_a_deployed_checkout(self):
+        empty = self.root / 'no-repo'
+        empty.mkdir()
+        result = self.run_current_sha(empty)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), 'none')
 
     def test_node22_fixture_refuses_before_npm_or_transaction_state(self):
         result = self.run_apply(runtime_fixture=True, service_version=V22)
@@ -806,16 +1044,68 @@ class WorkflowIntegrationTests(unittest.TestCase):
     DEPLOY = DEPLOY_WORKFLOW.read_text(encoding='utf-8')
     ROLLBACK = ROLLBACK_WORKFLOW.read_text(encoding='utf-8')
 
-    def test_ci_provisions_node24_over_ssh_before_the_transaction_step(self):
-        provision_idx = self.DEPLOY.index('- name: Provision the required Node24 VM runtime')
+    def deploy_job(self):
+        start = self.DEPLOY.index('\n  deploy:')
+        end = self.DEPLOY.index('\n  rollback_pending:', start)
+        return self.DEPLOY[start:end]
+
+    def test_ci_stages_the_provisioner_and_provisions_inside_the_transaction_step(self):
+        # R1: no separate provisioning SSH stage whose lock ownership would
+        # end before the app transaction starts. The deploy step stages the
+        # exact candidate provisioner bytes to a SHA-bound path over normal CI
+        # SSH, then ONE transaction invocation applies them under a single
+        # deploy-lock owner.
         deploy_idx = self.DEPLOY.index('- name: Deploy validated revision through the fixed VM transaction script')
-        self.assertLess(provision_idx, deploy_idx)
-        provision_step = self.DEPLOY[provision_idx:deploy_idx]
-        self.assertIn('< deploy/vm/provision-node24.sh', provision_step)
-        self.assertIn('ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"', provision_step)
-        self.assertNotIn('deploy-release-transaction.sh', provision_step)
-        # No nested lock ownership: the transaction is not modified to provision.
-        self.assertNotIn('Provision the required Node24', self.DEPLOY[deploy_idx:])
+        step = self.DEPLOY[deploy_idx:self.DEPLOY.index('- name: Read Hub API health', deploy_idx)]
+        self.assertNotIn('- name: Provision the required Node24 VM runtime', self.DEPLOY)
+        self.assertIn('tar -C deploy/vm -cf - provision-node24.sh | ssh', step)
+        self.assertIn('ci-node24-provision-', step)
+        staging_idx = step.index('tar -C deploy/vm -cf - provision-node24.sh')
+        invoke_idx = step.index('bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode"')
+        self.assertLess(staging_idx, invoke_idx, 'staging must precede the transaction invocation')
+        self.assertIn('provision-node24 \\\n            < deploy/vm/deploy-release-transaction.sh', step)
+        # The provisioner bytes are never executed directly over SSH: the
+        # transaction is the only runner of the staged script on the VM.
+        self.assertNotIn('< deploy/vm/provision-node24.sh', self.DEPLOY)
+        self.assertNotIn('bash -s -- < deploy/vm/provision-node24.sh', step)
+
+    def test_single_deploy_lock_owner_spans_provisioning_and_application(self):
+        # The transaction invocation carries the literal token and the
+        # transaction derives the staged path from the validated deploy SHA.
+        self.assertIn('needs: [test, hub2, distribution]', self.DEPLOY,
+                      'the deploy gate must stay exactly on the release contract')
+        self.assertNotIn('previous-release-compatibility]', self.DEPLOY)
+        self.assertIn('provision_node24_runtime "$deploy_sha"', TRANSACTION_SOURCE)
+        self.assertIn('ci-node24-provision-$1/provision-node24.sh', TRANSACTION_SOURCE)
+
+    def test_forward_previous_release_compatibility_proves_the_deployed_source(self):
+        # Qualification control, inside the gated deploy job: the normal
+        # forward workflow rebuilds and starts the exact release the VM
+        # reports as deployed, on the same Node24 the rollback path would
+        # keep — never a fake OS rollback.
+        job = self.deploy_job()
+        self.assertIn("grep -Eq '^v24\\.'", job)
+        self.assertIn('node-version: 24', job)
+        self.assertIn('fetch-depth: 0', job)
+        self.assertIn('bash -s -- current-sha < deploy/vm/deploy-release-transaction.sh', job)
+        self.assertIn('git checkout --detach --force "$PREVIOUS_SHA"', job)
+        self.assertIn('npm ci', job)
+        self.assertIn('npm run build', job)
+        self.assertIn('No deployed release on the VM yet', job)
+        # The compatibility checkout must restore the candidate bytes before
+        # any later stage transports provisioner or release artifacts.
+        self.assertIn('git checkout --detach --force "$DEPLOY_SHA"', job)
+        # Rollout is gated on the proof: the compat steps run before the
+        # deploy step, ahead of even the 25-minute Python wait.
+        rebuild_idx = job.index('- name: Rebuild and start the exact deployed previous release on Node24')
+        wait_idx = job.index('- name: Require green Python host tests for this main commit')
+        deploy_step_idx = job.index('- name: Deploy validated revision through the fixed VM transaction script')
+        self.assertLess(rebuild_idx, wait_idx)
+        self.assertLess(rebuild_idx, deploy_step_idx)
+        # Exactly one deploy-key install stays in the workflow (deploy job):
+        # the release contract pins the private-key handling count.
+        self.assertEqual(self.DEPLOY.count('printf \'%s\\n\' "$VM_DEPLOY_KEY"'), 2)
+        self.assertEqual(self.DEPLOY.count("ssh-keygen -y -P '' -f"), 2)
 
     def test_distribution_and_rollback_lanes_agree_on_node24(self):
         for workflow, name in ((self.DEPLOY, 'deploy.yml'), (self.ROLLBACK, 'rollback.yml')):

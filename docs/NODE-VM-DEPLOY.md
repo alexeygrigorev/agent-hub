@@ -80,10 +80,22 @@ by the deploy guards (see below).
 ## Node runtime provisioning (Node24, CI-owned)
 
 The VM service unit selects the absolute `/usr/bin/node`. Production requires
-major 24 there, and production CI owns that upgrade: `deploy.yml` streams
-`deploy/vm/provision-node24.sh` to the VM over the normal deploy-key SSH path
-as its own step, BEFORE the deployment transaction mutates source, npm
-dependencies, configuration or systemd units. The provisioner:
+major 24 there, and production CI owns that upgrade. There is one deploy-lock
+owner for the whole mutation window: the deploy job stages the exact candidate
+`deploy/vm/provision-node24.sh` bytes to a SHA-bound path under
+`/opt/agent-hub/.local/tmp` over the normal deploy-key SSH (never a remote
+curl setup script), then invokes the transaction once with the trailing
+`provision-node24` token. The transaction derives the staged path from the
+validated deploy SHA alone, re-validates the staged bytes (regular file, not a
+symlink, invoking-user owned, not group/other writable, size-bounded, parses)
+and runs them INSIDE its existing `.deploy-transaction.lock`, after all
+application preconditions and before any checkout, npm dependency,
+transaction-state, configuration or systemd-unit mutation. A competing
+transaction therefore cannot acquire the lock between package verification and
+the application stage: custody is continuous, never nested, and never trusted
+from an environment flag — the provisioner proves inheritance by an
+independent non-blocking acquisition of the same lock file that must fail.
+The provisioner:
 
 - supports exactly Ubuntu 24.04 (`noble`) and Debian 12 (`bookworm`) on
   `amd64`/`arm64`, read from `/etc/os-release` and `dpkg`, and refuses any
@@ -92,26 +104,40 @@ dependencies, configuration or systemd units. The provisioner:
   `https://deb.nodesource.com/node_24.x` (`nodistro`/`main`), the approved
   signing key (`https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key`,
   pinned primary fingerprint) and the exact `nodejs` package version with its
-  per-architecture SHA-256 (verified against the downloaded archive before
-  installation);
+  per-architecture SHA-256;
 - is idempotent: when `/usr/bin/node` already reports major 24 and the exact
   pinned, package-owned identity, it verifies and no-ops; otherwise it
-  validates the downloaded key, installs/keeps the keyring and apt source
-  (never overwriting a foreign or mutated apt source), refreshes the package
-  index, binds the candidate version to the approved origin, then performs
-  exactly one bounded package install and re-verifies `/usr/bin/node`;
+  validates the downloaded key and installs/keeps the keyring and apt source
+  at their dedicated owned paths. An existing keyring or apt source that is
+  foreign, mutated, a symlink or otherwise non-regular is preserved byte for
+  byte and refused — never overwritten (operator reconciliation required);
+- refreshes the signed package index, binds the candidate version to the
+  approved origin, downloads the artifact, re-checks its SHA-256 at
+  consumption and installs exactly that verified local file in one bounded
+  `apt-get install` — the selected package is never re-resolved or
+  re-downloaded from another byte source, while dependency resolution stays
+  with the signed nodistro index — then re-verifies `/usr/bin/node`;
 - never runs a general OS upgrade, never pipes a remote script into a shell,
   never downgrades an installed package, and refuses on any mismatch
-  (fingerprint, origin, version, hash, ownership) before installing;
-- serializes with the deploy transaction through the same non-blocking
-  `.deploy-transaction.lock` (single owner, never nested).
+  (fingerprint, origin, version, hash, ownership) before installing.
 
 Both the direct installer (`install-hub2-node.sh`) and the transaction
-(`deploy-release-transaction.sh`, before any checkout/npm/state mutation) fail
-closed when the selected service runtime or the npm build toolchain is not
-Node 24. Because the provision step precedes the transaction in the same CI
-run, the guard pair upgrades the VM from Node 22 to Node 24 in the first
-deploy of this feature instead of blocking it.
+(`deploy-release-transaction.sh`, after the in-lock provisioning phase and
+before any checkout/npm/state mutation) fail closed when the selected service
+runtime or the npm build toolchain is not Node 24. Because the provisioning
+phase precedes the application stages inside the same locked transaction, the
+guard pair upgrades the VM from Node 22 to Node 24 in the first deploy of this
+feature instead of blocking it.
+
+The forward workflow also proves rollback compatibility before rollout: early
+in the gated `deploy` job — before the transaction and ahead of the Python
+host-test wait — it reads the actual deployed release identity from the VM
+through the transaction's read-only `current-sha` operation (no deploy lock;
+`none` before the first release), checks out exactly that revision on the
+runner and rebuilds its dependencies and boots its clean start under Node 24
+(`npm ci` + `npm run build`), then restores the candidate checkout. A failing
+compatibility proof fails the deploy job before rollout. This is a
+source/runtime compatibility proof only — never an OS rollback.
 
 ## Runtime failure and rollback semantics
 
@@ -122,13 +148,16 @@ installed Node runtime. A provisioned Node 24 therefore survives application
 rollbacks (the restored release rebuilds and runs on 24), and a Node runtime
 failure is never repaired — or claimed repaired — by an application rollback.
 
-Provisioning failures are contained in their own CI step before any candidate
-transaction starts: a failed key download, key/fingerprint mismatch, foreign
-apt source, index refresh failure, origin/version/hash mismatch or failed
-install exits nonzero with a receipt, and no application code, npm state,
-configuration or unit was touched. Recovery is package-manager custody
-(inspect `apt-get`/`dpkg` state on the VM as the operator); there is no
-automatic retry, no blind downgrade to Node 22 and no repeated install.
+Runtime provisioning failures are honest incidents inside the locked apply,
+before any application mutation: a failed key download, key/fingerprint
+mismatch, existing foreign keyring or apt source, index refresh failure,
+origin/version/hash mismatch, a cache archive that changed or vanished between
+verification and consumption, or a failed install exits nonzero with a
+receipt while no application code, npm state, configuration or unit was
+touched and no transaction state exists. There is no automatic retry, no
+automatic OS rollback, no blind downgrade to Node 22 and no repeated install;
+recovery is package-manager custody (inspect `apt-get`/`dpkg` state on the VM
+as the operator).
 
 ## Rollout steps (per revision)
 
@@ -136,9 +165,11 @@ automatic retry, no blind downgrade to Node 22 and no repeated install.
 2. CI deploy (manual dispatch, `dry_run=false`) or on the VM:
    `cd /opt/agent-hub && git fetch && git checkout --detach origin/main &&
    npm ci --omit=dev && sudo bash deploy/vm/install-hub2-node.sh`.
-   The CI path provisions Node24 over SSH before the transaction; a manual
-   rollout must reach the same state first
-   (`sudo bash deploy/vm/provision-node24.sh` on the VM), because both the
+   The CI path provisions Node24 inside the transaction's deploy lock (the
+   staged provisioner runs before any application mutation); a manual rollout
+   must reach the same state first
+   (`sudo bash deploy/vm/provision-node24.sh` on the VM — the standalone
+   provisioner takes the same transaction lock itself), because both the
    installer and the transaction refuse to run against a non-Node24 service
    runtime.
 3. `systemctl status agent-hub-hub2` + `curl -s http://127.0.0.1:8787/health`.

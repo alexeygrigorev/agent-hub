@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Maintained Node24 runtime provisioning for the Hub2 VM.
-# Invoked through the normal production CI SSH path (deploy.yml) BEFORE the
-# deployment transaction mutates source, npm dependencies, configuration or
-# systemd units. This is a maintained deployment-custody action, never a
-# manual operational prerequisite and never a curl-piped upstream script:
-# the only downloaded bytes are the approved NodeSource signing key, and the
-# package artifact is fetched, hash-verified and installed by apt itself
-# against the signed nodistro index. The script never runs a general OS
-# upgrade, never overwrites a foreign apt source or keyring and never
-# downgrades an installed package.
+# CI stages these exact bytes over normal SSH and the deployment transaction
+# invokes them INSIDE its own single deploy lock, before any source, npm,
+# configuration or systemd-unit mutation; the standalone mode keeps the same
+# lock discipline for direct invocation. This is a maintained
+# deployment-custody action, never a manual operational prerequisite and
+# never a curl-piped upstream script: the only downloaded bytes are the
+# approved NodeSource signing key, and the package artifact is fetched,
+# hash-verified and installed by apt itself against the signed nodistro
+# index. The script never runs a general OS upgrade, never overwrites a
+# foreign apt source or keyring and never downgrades an installed package.
 #
 # Pure stubbed-command tests: test/test_node24_runtime.py. Production paths
 # are fixed below; tests may relocate ONLY the absolute paths through the
@@ -42,6 +43,7 @@ APT_ARCHIVE_DIR="${AGENT_HUB_NODE24_TEST_APT_CACHE:-/var/cache/apt/archives}"
 REPO="${AGENT_HUB_NODE24_TEST_REPO:-/opt/agent-hub}"
 
 PROVISION_WORK=""
+ARTIFACT_PATH=""
 cleanup_work() {
   if [[ -n "$PROVISION_WORK" ]]; then
     rm -rf -- "$PROVISION_WORK"
@@ -177,11 +179,17 @@ validate_downloaded_key() {
 }
 
 install_keyring() {
-  if [[ -f "$KEYRING" ]]; then
-    if key_material_matches_binding "$KEYRING"; then
+  # The keyring is dedicated, explicitly owned material. Anything already
+  # present — foreign key bytes, a mutated copy, a symlink or any other
+  # non-regular entry — is preserved byte for byte and refused; only a truly
+  # absent path receives the validated download. -L must lead -e: a dangling
+  # symlink would otherwise fall through to a write through the link.
+  if [[ -L "$KEYRING" || -e "$KEYRING" ]]; then
+    if [[ -f "$KEYRING" && ! -L "$KEYRING" ]] && key_material_matches_binding "$KEYRING"; then
       printf 'Node24 provision: approved keyring already installed at %s.\n' "$KEYRING"
       return 0
     fi
+    fail "$KEYRING already exists with foreign, mutated or non-regular key material; refusing to overwrite an existing keyring (operator reconciliation required)"
   fi
   run_root install -m 644 "$PROVISION_WORK/repo.gpg" "$KEYRING" \
     || fail "could not install the validated NodeSource keyring at $KEYRING"
@@ -197,7 +205,9 @@ expected_sources_line() {
 install_sources_entry() {
   local expected current
   expected="$(expected_sources_line)"
-  if [[ -e "$SOURCES_FILE" ]]; then
+  # Same custody rule as the keyring: a symlink or any non-regular entry is
+  # preserved and refused, never written through.
+  if [[ -L "$SOURCES_FILE" || -e "$SOURCES_FILE" ]]; then
     current="$(cat "$SOURCES_FILE")" \
       || fail "cannot read the existing NodeSource apt source at $SOURCES_FILE"
     if [[ "$current" == "$expected" ]]; then
@@ -236,22 +246,37 @@ download_and_verify_artifact() {
   run_root env DEBIAN_FRONTEND=noninteractive timeout 300 \
     apt-get -y --no-install-recommends --download-only install "$NODE_PACKAGE=$NODE_PACKAGE_VERSION" \
     || fail "apt download of $NODE_PACKAGE=$NODE_PACKAGE_VERSION failed; no package was installed"
-  local archive expected actual
-  archive="$APT_ARCHIVE_DIR/${NODE_PACKAGE}_${NODE_PACKAGE_VERSION}_${PLATFORM_ARCH}.deb"
-  [[ -f "$archive" ]] || fail "apt did not retain the downloaded archive at $archive; refusing to install an unverifiable artifact"
-  expected="$(selected_artifact_sha256)"
-  actual="$(sha256sum "$archive")" || fail "could not hash the downloaded Node24 archive"
-  actual="${actual%% *}"
-  [[ "$actual" == "$expected" ]] \
-    || fail "downloaded Node24 archive hash mismatch: bound $expected, downloaded $actual; refusing to install the artifact"
+  ARTIFACT_PATH="$APT_ARCHIVE_DIR/${NODE_PACKAGE}_${NODE_PACKAGE_VERSION}_${PLATFORM_ARCH}.deb"
+  [[ -f "$ARTIFACT_PATH" ]] \
+    || fail "apt did not retain the downloaded archive at $ARTIFACT_PATH; refusing to install an unverifiable artifact"
+  verify_artifact_hash "$ARTIFACT_PATH" \
+    || fail "downloaded Node24 archive hash mismatch: bound $(selected_artifact_sha256), downloaded artifact at $ARTIFACT_PATH does not match; refusing to install the artifact"
 }
 
-install_pinned_package() {
-  # Exactly one bounded install attempt; failures are receipts, never retries
-  # and never a blind downgrade.
+# The bound SHA-256 of the selected artifact, checked against the file that is
+# actually about to be consumed.
+verify_artifact_hash() {
+  local expected actual
+  expected="$(selected_artifact_sha256)"
+  actual="$(sha256sum "$1")" || fail "could not hash the Node24 archive at $1"
+  actual="${actual%% *}"
+  [[ "$actual" == "$expected" ]]
+}
+
+install_verified_artifact() {
+  # Consume the exact verified local artifact: the operand handed to apt is
+  # the archive file itself, so the selected package can never be re-resolved
+  # or re-downloaded from a different byte source. The hash is re-checked at
+  # consumption, immediately before the single bounded install; dependency
+  # resolution still comes from the signed nodistro index. Failures are
+  # receipts, never retries and never a blind downgrade.
+  [[ -n "$ARTIFACT_PATH" && -f "$ARTIFACT_PATH" ]] \
+    || fail "the verified Node24 archive is missing at $ARTIFACT_PATH; refusing to install a substitute"
+  verify_artifact_hash "$ARTIFACT_PATH" \
+    || fail "the Node24 archive at $ARTIFACT_PATH changed between verification and consumption; refusing to install an unverified artifact"
   run_root env DEBIAN_FRONTEND=noninteractive timeout 600 \
-    apt-get -y --no-install-recommends install "$NODE_PACKAGE=$NODE_PACKAGE_VERSION" \
-    || fail "apt install of $NODE_PACKAGE=$NODE_PACKAGE_VERSION failed; package manager owns recovery, application rollback does not restore the OS runtime"
+    apt-get -y --no-install-recommends install "$ARTIFACT_PATH" \
+    || fail "apt install of the verified Node24 artifact failed; package manager owns recovery, application rollback does not restore the OS runtime"
 }
 
 verify_provisioned_runtime() {
@@ -284,13 +309,26 @@ main() {
   fi
   refuse_broken_identity
 
-  # Mutation phase. Single-owner serialization with the deploy transaction:
-  # the same non-blocking lock the transaction scripts hold, acquired only
-  # here (never nested) and released when this step exits.
+  # Mutation phase under the single deploy-lock owner. Standalone runs acquire
+  # the same non-blocking transaction lock here. When the deploy transaction
+  # invokes this script inside its already-held lock, custody is never trusted
+  # from the environment: it is proven by an independent non-blocking
+  # acquisition of the same lock file, which must fail while another owner —
+  # the invoking transaction — holds it. This proves a competing transaction
+  # cannot acquire the lock between package verification and the app stage.
+  DEPLOY_LOCK="$REPO/.local/tmp/.deploy-transaction.lock"
   mkdir -p "$REPO/.local/tmp"
   chmod 750 "$REPO/.local/tmp"
-  exec 9>>"$REPO/.local/tmp/.deploy-transaction.lock"
-  flock -n 9 || fail "another Hub2 deploy transaction operation is running; provisioning Node24 concurrently is not allowed"
+  if [[ -n "${AGENT_HUB_NODE24_LOCK_INHERITED:-}" ]]; then
+    [[ "$AGENT_HUB_NODE24_LOCK_INHERITED" == "$DEPLOY_LOCK" ]] \
+      || fail "provisioner was invoked with a foreign lock custody path: $AGENT_HUB_NODE24_LOCK_INHERITED"
+    if flock -n "$DEPLOY_LOCK" true; then
+      fail "deploy-lock custody was not inherited: no owner holds $DEPLOY_LOCK; refusing to mutate packages without the single deploy-lock owner"
+    fi
+  else
+    exec 9>>"$DEPLOY_LOCK"
+    flock -n 9 || fail "another Hub2 deploy transaction operation is running; provisioning Node24 concurrently is not allowed"
+  fi
 
   PROVISION_WORK="$(mktemp -d "$REPO/.local/tmp/provision-node24.XXXXXXXX")"
 
@@ -302,7 +340,7 @@ main() {
   refresh_package_index
   verify_candidate_origin
   download_and_verify_artifact
-  install_pinned_package
+  install_verified_artifact
   verify_provisioned_runtime
 
   printf 'Node24 provision: %s is Node %s, owned by %s=%s from %s (%s nodistro %s); runtime ready for the deploy transaction.\n' \

@@ -127,9 +127,73 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The rollback-compatibility control checks out the exact deployed
+          # previous release, which a shallow clone of the candidate cannot
+          # reach.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install VM deploy key
+        env:
+          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
+          umask 077
+          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
+          unset VM_DEPLOY_KEY
+          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
+            echo "VM deploy key is not a valid unencrypted private key" >&2
+            exit 1
+          fi
+      # Forward Node24 compatibility control for the application rollback path:
+      # rollback keeps the OS runtime and restores the previous release source,
+      # so the exact release the VM reports as deployed must rebuild its native
+      # dependencies and start under Node24 before a new deploy rolls out. A
+      # source/runtime compatibility proof only — never an OS rollback.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: |
+          node --version | grep -Eq '^v24\.' \
+            || { echo "::error::rollback compatibility must run on Node24; setup-node drifted" >&2; exit 1; }
+          npm --version
+      - name: Read the deployed previous release identity from the VM
+        id: previous_release
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          deployed="$(ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- current-sha < deploy/vm/deploy-release-transaction.sh)"
+          [[ "$deployed" =~ ^(none|[0-9a-f]{40})$ ]] \
+            || { echo "VM reported an invalid deployed release identity: $deployed" >&2; exit 2; }
+          echo "sha=$deployed" >> "$GITHUB_OUTPUT"
+      - name: Rebuild and start the exact deployed previous release on Node24
+        env:
+          PREVIOUS_SHA: ${{ steps.previous_release.outputs.sha }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PREVIOUS_SHA" == "none" ]]; then
+            echo "No deployed release on the VM yet; nothing to prove rollback compatibility against."
+            exit 0
+          fi
+          [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid previous release identity" >&2; exit 2; }
+          git checkout --detach --force "$PREVIOUS_SHA"
+          node --version | grep -Eq '^v24\.'
+          npm ci
+          # Typecheck plus the Node clean-start boot of the checked-out source.
+          npm run build
+          # Return to the candidate so later stages transport its exact bytes.
+          git checkout --detach --force "$DEPLOY_SHA"
       - name: Require green Python host tests for this main commit
         if: github.event_name == 'push'
         # Fixed 25-minute observation deadline: Python job's 20 minutes + 5 queue.
@@ -277,20 +341,6 @@ jobs:
             --verify-dir "$bundle_dir" \
             --manifest-sha256 "$manifest_sha256"
           printf 'bundle_dir=%s\nmanifest_sha256=%s\n' "$bundle_dir" "$manifest_sha256" >> "$GITHUB_OUTPUT"
-      - name: Install VM deploy key
-        env:
-          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
-          umask 077
-          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
-          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
-          unset VM_DEPLOY_KEY
-          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
-            echo "VM deploy key is not a valid unencrypted private key" >&2
-            exit 1
-          fi
       - name: Stage verified matched CLI release bundle on VM
         if: (inputs.release_mode || 'active') == 'active'
         env:
@@ -307,21 +357,6 @@ jobs:
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             "$SSH_TARGET" \
             "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
-      - name: Provision the required Node24 VM runtime
-        env:
-          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
-        run: |
-          set -euo pipefail
-          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
-          # Streams the reviewed provisioner bytes itself (never a remote curl
-          # setup script) through the normal CI SSH path. Runs BEFORE the
-          # deployment transaction so the runtime exists before npm/source/
-          # config/unit mutation; a provisioning failure is handled entirely
-          # inside this step and never reaches the transaction.
-          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
-            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
-            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- < deploy/vm/provision-node24.sh
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
@@ -337,7 +372,9 @@ jobs:
             active) cli_mode_args=(matched-cli) ;;
             bootstrap)
               [[ "$CONFIRM_BOOTSTRAP" == "DISABLE-HUB-DISPATCH" ]] \
-                || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; } ;;
+                || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; }
+              # Explicit so the trailing provision-node24 token stays positional.
+              cli_mode_args=(legacy) ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
           esac
           case "$HUB_ONLY" in
@@ -347,10 +384,23 @@ jobs:
           esac
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
           test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          # Stage the exact candidate provisioner bytes over normal CI SSH to a
+          # SHA-bound path (never a remote curl setup script). The transaction
+          # invoked below then derives that path from the same validated SHA.
+          tar -C deploy/vm -cf - provision-node24.sh | ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" \
+            "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; chmod 750 \"\$stage_dir/provision-node24.sh\"; test \"\$(stat -c %s \"\$stage_dir/provision-node24.sh\")\" -le 262144; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
+          # ONE SSH transaction invocation owns the existing deploy lock across
+          # runtime provisioning and all application effects: the transaction
+          # runs the staged provisioner inside its own held lock before any
+          # npm/source/config/unit mutation, so a competing transaction cannot
+          # interleave between package verification and the app stage.
           ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" provision-node24 \
             < deploy/vm/deploy-release-transaction.sh
       - name: Read Hub API health on the configured client URL
         env:
