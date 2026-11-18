@@ -53,6 +53,8 @@ def main(argv=None):
     quota_dispatch_cmd = commands.add_parser("quota-dispatch", help="Staged opt-in same-process quota dispatch (default OFF)")
     quota_dispatch_cmd.add_argument("--enable", action="store_true", default=False,
                                     help="Opt in to staged same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--handoff-fd", type=int, default=None,
+                                    help="Inherited Root-prepared descriptor manifest pipe FD")
     args = parser.parse_args(argv)
     if args.command == "self-update" and os.name == "nt":
         from .windows_host import windows_self_update
@@ -162,8 +164,16 @@ def main(argv=None):
 
             def _launch_unit(ticket):
                 dl_ns = int(ticket.deadline * 1e9) if ticket is not None else 0
-                argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(dl_ns)
-                return subprocess.run(argv, capture_output=True, timeout=5, check=False).returncode
+                retained_dup = os.dup(quota_fd.fd)
+                try:
+                    os.set_inheritable(retained_dup, True)
+                    argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--"] + exec_argv(dl_ns)
+                    child_env = dict(os.environ)
+                    child_env["HUB_ALERT_RETAINED_FD"] = str(retained_dup)
+                    return subprocess.run(argv, capture_output=True, timeout=5, check=False,
+                                          env=child_env, pass_fds=(retained_dup,)).returncode
+                finally:
+                    os.close(retained_dup)
 
             result = run_same_process_quota(prepared, _launch_unit, enabled=True, broker_directory=spec["broker_directory"])
             print(json.dumps({"enabled": result["enabled"], "dispatched": result["dispatched"],

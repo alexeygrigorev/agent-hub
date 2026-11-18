@@ -92,6 +92,19 @@ def run_once(selected, argv, observer):
 
 
 def main(argv, *, retained_fd=None):
+    if len(argv) >= 2 and argv[0] == '--retained-fd':
+        try:
+            parsed_fd = int(argv[1])
+        except ValueError as err:
+            raise ValueError('invalid_retained_fd') from err
+        if retained_fd is None:
+            retained_fd = parsed_fd
+        argv = argv[2:]
+    elif retained_fd is None and 'HUB_ALERT_RETAINED_FD' in os.environ:
+        try:
+            retained_fd = int(os.environ['HUB_ALERT_RETAINED_FD'])
+        except ValueError:
+            retained_fd = None
     if len(argv) < 7 or argv[6] != '--':
         raise ValueError('invalid_prelude_args')
     deadline_ns, quota_sha, client_sha, gate_dir, quota_path, client_path = argv[:6]
