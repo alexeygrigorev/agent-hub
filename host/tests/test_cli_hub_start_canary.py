@@ -3955,6 +3955,159 @@ class AdmissionTests(unittest.TestCase):
             canary.admit(**kwargs)
         self.assertEqual((caught.exception.stage, caught.exception.reason), ("admission", reason))
 
+    def diagnostic_hold(self, canary, reason):
+        mod = self.mod()
+        with self.assertRaises(mod.StageFailure) as caught:
+            canary.admit()
+        result = {"ok": False, "stage": caught.exception.stage, "reason": caught.exception.reason}
+        mod.add_admission_diagnostic(result, caught.exception)
+        self.assertEqual((result["ok"], result["stage"], result["reason"]), (False, "admission", reason))
+        return result["admission_diagnostic"]
+
+    def test_bound_failure_diagnostics_distinguish_real_admission_branches(self):
+        group = "/user.slice/private-resident.scope"
+        coordinator = self.coordinator_world(
+            [self.worker_row(1, 7100, group, age=179, max="max")],
+            [self.coordinator_census(1, 7100, group, age=179)], mem=64 * GIB)
+        detail = self.diagnostic_hold(coordinator, "resident_bound_unknown")
+        self.assertEqual(detail, {"category": "coordinator_kernel_cap", "target_kind": "coordinator",
+                                 "age_class": "young", "state_class": "running", "phase_class": "running",
+                                 "cap_status": "unavailable"})
+        provided = self.residency(
+            [dict(pid=4243, cgroup=group, age=10, anon=200 * MIB, current=300 * MIB, rss_anon=200 * MIB)],
+            [census_row(2, 4243, group, limits={})], mem=64 * GIB)
+        self.assertEqual(self.diagnostic_hold(provided, "resident_bound_unknown"),
+                         {"category": "provided_recorded_cap", "cap_status": "unavailable", "age_class": "young"})
+        starting = self.residency([], [census_row(3, None, None, phase="starting", state="starting",
+                                                worker_alive=None, limits={})], mem=64 * GIB)
+        self.assertEqual(self.diagnostic_hold(starting, "resident_bound_unknown"),
+                         {"category": "starting_recorded_cap", "cap_status": "unavailable"})
+        self.assertNotIn(group, json.dumps(detail))
+        self.assertNotIn("7100", json.dumps(detail))
+
+    def test_bound_diagnostics_preserve_maturity_and_distinguish_changed_kernel_cap(self):
+        group = "/user.slice/diagnostic.scope"
+        mature = self.worker_row(1, 7100, group, age=181, max="max")
+        census = self.coordinator_census(1, 7100, group, age=181, workload_pid=6999999)
+        self.coordinator_world([mature], [census], mem=self.FLOOR).admit()
+        self.assertHold(self.coordinator_world([mature], [census], mem=self.FLOOR - 1), "memory_below_floor")
+        uncertain = self.coordinator_world([mature], [dict(census, state="starting")], mem=64 * GIB)
+        detail = self.diagnostic_hold(uncertain, "resident_bound_unknown")
+        self.assertEqual((detail["age_class"], detail["state_class"]), ("mature", "other"))
+        young = self.worker_row(1, 7100, group, age=10, max=str(800 * MIB))
+        c = self.coordinator_world([young], [self.coordinator_census(1, 7100, group, age=10)], mem=64 * GIB)
+        self.hook_sampler(c, 1, lambda: (self.tmp / "cgroup/user.slice/diagnostic.scope/memory.max").write_text(str(900 * MIB)))
+        self.assertEqual(self.diagnostic_hold(c, "resident_bound_unknown")["cap_status"], "changed")
+
+    def test_final_census_diagnostics_keep_original_deadline_and_refusal(self):
+        group = "/user.slice/diagnostic.scope"
+        row = self.worker_row(1, 7100, group)
+        original = self.coordinator_census(1, 7100, group)
+        for final, category in (([original, dict(original)], "census_invalid"),
+                                ([dict(original, state="stopping")], "census_changed")):
+            with self.subTest(category=category):
+                c = self.coordinator_world([row], [original], mem=64 * GIB)
+                deadlines = []
+                c.read_census = lambda deadline: deadlines.append(deadline) or ([original] if len(deadlines) == 1 else final)
+                self.assertEqual(self.diagnostic_hold(c, "resident_fallback_changed"), {"category": category})
+                self.assertEqual(len(deadlines), 2)
+                self.assertEqual(deadlines[0], deadlines[1])
+
+    def test_chosen_cap_and_identity_diagnostics_do_not_credit_changed_residents(self):
+        group = "/user.slice/diagnostic.scope"
+        for mutation, category in ((lambda: (self.tmp / "cgroup/user.slice/diagnostic.scope/memory.max").write_text(str(900 * MIB)),
+                                    "chosen_cap_changed"),
+                                   (lambda: self._shift_start(7100, 1),
+                                    "chosen_identity_changed")):
+            with self.subTest(category=category):
+                c = self.coordinator_world([self.worker_row(1, 7100, group, age=10, max=str(800 * MIB))],
+                                           [self.current_census(1, 7100, group, age=10)], mem=64 * GIB)
+                self.hook_sampler(c, 2, mutation)
+                self.assertEqual(self.diagnostic_hold(c, "resident_fallback_changed"), {"category": category})
+
+    def test_reappeared_workload_diagnostic_does_not_retarget_or_resample(self):
+        group = "/user.slice/diagnostic.scope"
+        row = self.coordinator_census(1, 7100, group, workload_pid=6999999)
+        c = self.coordinator_world([self.worker_row(1, 7100, group)], [row], mem=64 * GIB)
+        deadlines = []
+
+        def census(deadline):
+            deadlines.append(deadline)
+            if len(deadlines) == 2:
+                other = self.tmp / "proc/6999999"
+                other.mkdir()
+                (other / "stat").write_text("6999999 (w) S " + " ".join(["0"] * 30) + "\n")
+            return [row]
+
+        c.read_census = census
+        self.assertEqual(self.diagnostic_hold(c, "resident_fallback_changed"), {"category": "workload_reappeared"})
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines[0], deadlines[1])
+
+    def test_inflight_diagnostic_preserves_final_managed_projection_check(self):
+        group = "/user.slice/diagnostic.scope"
+        c = self.coordinator_world([self.worker_row(1, 7100, group)],
+                                   [self.current_census(1, 7100, group)], mem=64 * GIB)
+        deadlines = []
+        new = {"id": "bbbbbbbb-0000-4000-8000-000000000001", "state": "starting", "machine_id": "HOST-1",
+               "native_id": None, "workspace": str(self.tmp)}
+        c.read_hub_rows = lambda deadline: deadlines.append(deadline) or ([] if len(deadlines) == 1 else [new])
+        self.assertEqual(self.diagnostic_hold(c, "resident_fallback_changed"), {"category": "inflight_changed"})
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines[0], deadlines[1])
+
+    def test_diagnostics_reach_the_physical_preview_without_new_measurements(self):
+        mod = self.mod()
+        group = "/user.slice/diagnostic.scope"
+        c = self.coordinator_world([self.worker_row(1, 7100, group, age=10, max="max")],
+                                   [self.coordinator_census(1, 7100, group, age=10)], mem=64 * GIB)
+        c.run = mock.Mock(side_effect=AssertionError("no CLI or native command permitted"))
+        with mock.patch.object(mod, "read_workspace_config", return_value=c.workspace):
+            result = mod.physical_admission_check(c)
+        self.assertEqual((result["ok"], result["reason"], result["full_admission"], result["quota_checked"]),
+                         (False, "resident_bound_unknown", False, False))
+        self.assertEqual(result["admission_diagnostic"]["category"], "coordinator_kernel_cap")
+        c.run.assert_not_called()
+
+    def test_diagnostics_are_closed_and_cannot_replace_or_reclassify_failures(self):
+        mod = self.mod()
+        valid = {"category": "starting_recorded_cap", "cap_status": "unavailable"}
+        for detail in ({**valid, "pid": 4242}, {**valid, "path": "/secret"}, {**valid, "cap_status": "/secret"},
+                       {"category": "untrusted\ntext"}, [valid], {}, {**valid, "age_class": True}):
+            with self.subTest(detail=detail):
+                result = {"ok": False, "reason": "resident_bound_unknown"}
+                mod.add_admission_diagnostic(result, mod.StageFailure("admission", result["reason"], admission_diagnostic=detail))
+                self.assertEqual(result, {"ok": False, "reason": "resident_bound_unknown",
+                                          "admission_diagnostic": {"category": "unavailable"}})
+        result = {"ok": False, "reason": "resident_bound_unknown"}
+        with mock.patch.object(mod, "ADMISSION_DIAGNOSTIC_VALUES", None):
+            mod.add_admission_diagnostic(result, mod.StageFailure("admission", result["reason"], admission_diagnostic=valid))
+        self.assertEqual((result["ok"], result["reason"], result["admission_diagnostic"]),
+                         (False, "resident_bound_unknown", {"category": "unavailable"}))
+        for stage, reason in (("running", "hub_cli_exit_1"), ("admission", "memory_below_floor")):
+            result = {"ok": False, "stage": stage, "reason": reason}
+            mod.add_admission_diagnostic(result, mod.StageFailure(stage, reason, admission_diagnostic=valid))
+            self.assertNotIn("admission_diagnostic", result)
+        result = {}
+        mod.add_admission_diagnostic(result, mod.StageFailure("admission", "resident_bound_unknown"))
+        self.assertEqual(result, {})
+
+    def test_execute_keeps_the_original_admission_failure_and_closed_diagnostic(self):
+        group = "/user.slice/diagnostic.scope"
+        c = self.coordinator_world([self.worker_row(1, 7100, group, age=10, max="max")],
+                                   [self.coordinator_census(1, 7100, group, age=10)], mem=64 * GIB)
+        for name in ("verify_helper_digest", "resolve_workspace", "acquire_deploy_gate_lock",
+                     "verify_candidate_host_release", "reconcile_prior_pending", "check_health"):
+            setattr(c, name, lambda: None)
+        c.start = c.admit  # Reach the real failure decision without a native launch or CLI artifact.
+        c.run = mock.Mock(side_effect=AssertionError("no CLI or native command permitted"))
+        result = c.execute()
+        self.assertEqual((result["ok"], result["stage"], result["reason"], result["cleanup"]),
+                         (False, "admission", "resident_bound_unknown", "not_needed"))
+        self.assertEqual(result["admission_diagnostic"]["category"], "coordinator_kernel_cap")
+        self.assertIsNone(result["session_id"])
+        c.run.assert_not_called()
+
     # ---- root workspace config -------------------------------------------------
 
     def test_root_config_overrides_hostile_environment_and_is_used_for_start(self):
