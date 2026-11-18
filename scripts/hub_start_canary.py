@@ -751,19 +751,38 @@ DISK_FLOOR_GB_RANGE = (1, 1048576)
 MATURE_RESIDENT_AGE_S = 180.0
 QUOTA_STALE_S = 1200.0
 CODEX_QUOTA_RESERVE_PERCENT = 15.0
-# Finite supported quse routes with their required window groups (any alias satisfies a group) and
-# the source-proven optional null plan slots. Data semantics only, from the maintained
-# agent-quota-launcher launcher/provider_admission.py REQUIRED_WINDOWS/ABSENT_OPTIONAL (quse key `go`
-# is the launcher's opencode) and quse usage.py (Claude monthly is a canonical null slot; Go monthly
-# is a real window). Any other route (copilot, zai, gemini, grok, codex-orin, unknown names) has no
-# maintained required-window metadata here, so it can never make a native canary eligible. This is
-# data validation only: the launcher's executor lifecycle and its Codex execution prohibition are
-# not imported; the protected Codex wrapper and the 15% reserve stay authoritative for Codex.
+# Supported quse routes with their required window groups (any alias satisfies a group) and the
+# source-proven optional null plan slots. Data semantics only. Window shapes come from quse
+# usage.py `windows()` (5h/7d/monthly canonical slots; null slots are plan windows the provider
+# does not have): Claude and Gemini (underlying buckets in gemini_quota.py; a missing 5h/7d
+# bucket is an unknown REQUIRED window, not an unsupported provider) and ZAI carry 5h+7d with a
+# null monthly; Go has a real monthly window; Codex requires weekly. Provider support follows
+# the Hub's actual native routes (hub2 native_launch.py: claude, codex, go/opencode, zai via
+# zcodex, antigravity via agy; model-policy.ts: engine zai only on account zai-central, Gemini
+# engine antigravity on account gemini), NOT the presence of agent-quota-launcher
+# provider_admission.py REQUIRED_WINDOWS, which only supplies Claude/Codex/Go data semantics.
+# Aliases: quse key `gemini` (canonical) with probe aliases `agy`/`antigravity`; `codex-orin` is
+# the second Codex ACCOUNT reported under its own wire key and keeps the Codex requirements
+# and strict >15 reserve. Not eligible: copilot (no native route), Grok (quota-only label in
+# worker.ts; no native engine in PROVIDER_CAPABILITIES/LOCAL_ROUTES/CENTRAL_ROUTES, so a
+# Grok-only reading must not qualify a native start; data schema 7d+monthly/optional 5h and the
+# entitlement/5% controls are intentionally not wired until a Hub route exists) and unknown names.
+# This is data validation only: the launcher's executor lifecycle and its independent Codex
+# execution prohibition are not imported; the protected Codex wrapper stays authoritative.
+_FIVE_H_7D = (("5h", "five_hour"), ("7d", "weekly", "seven_day"))
+_CODEX_POLICY = {"required": (("7d", "weekly"),), "optional": frozenset(("5h", "monthly"))}
+_GEMINI_POLICY = {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))}
 QUOTA_ROUTE_POLICY = {
-    "claude": {"required": (("5h", "five_hour"), ("7d", "weekly", "seven_day")), "optional": frozenset(("monthly",))},
+    "claude": {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))},
     "go": {"required": (("5h", "rolling"), ("7d", "weekly"), ("monthly",)), "optional": frozenset()},
-    "codex": {"required": (("7d", "weekly"),), "optional": frozenset(("5h", "monthly"))},
+    "codex": _CODEX_POLICY,
+    "codex-orin": _CODEX_POLICY,
+    "zai": {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))},
+    "gemini": _GEMINI_POLICY,
+    "agy": _GEMINI_POLICY,
+    "antigravity": _GEMINI_POLICY,
 }
+CODEX_RESERVE_ROUTES = frozenset(("codex", "codex-orin"))
 ADMISSION_JSON_MAX_BYTES = 16 * 1024 * 1024
 ADMISSION_MAX_ROWS = 5000
 PROC_ROOT = "/proc"
@@ -1121,7 +1140,7 @@ def quota_route_usable(name, route, now):
         lowest = percent if lowest is None else min(lowest, percent)
     if any(not available.intersection(group) for group in policy["required"]):
         return False
-    reserve = CODEX_QUOTA_RESERVE_PERCENT if name == "codex" else 0.0
+    reserve = CODEX_QUOTA_RESERVE_PERCENT if name in CODEX_RESERVE_ROUTES else 0.0
     return lowest is not None and lowest > reserve
 
 
