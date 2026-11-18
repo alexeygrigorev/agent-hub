@@ -4358,6 +4358,7 @@ class AdmissionTests(unittest.TestCase):
             z.writestr("agent_hub_host/bus.py", body)
         return buf.getvalue()
 
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
     def test_bridge_reads_disk_floor_through_sealed_cli_with_human_only_and_no_refresh(self):
         mod = self.mod()
         marker = self.tmp / "refreshed.flag"
@@ -4392,6 +4393,7 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaises(mod.StageFailure):
                 c.fetch_disk_floor_gb(time.monotonic() + 20)
 
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
     def test_periodic_cli_must_be_a_bindable_owned_zipapp(self):
         mod = self.mod()
         c = mod.Canary("shell", "periodic")
