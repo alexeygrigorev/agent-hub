@@ -816,10 +816,14 @@ class SourceGate:
 
 
 def _adopt_held_source(entry):
-    ram.require(type(entry) is dict and set(entry) == {'fd', 'dir_fd', 'name', 'dev', 'ino', 'sha256'})
+    ram.require(type(entry) is dict and set(entry) == {'fd', 'dir_fd', 'name', 'dev', 'ino', 'mtime_ns', 'ctime_ns', 'sha256'})
     fd, dir_fd, name = entry['fd'], entry['dir_fd'], entry['name']
     ram.require(type(fd) is int and fd > 2 and type(dir_fd) is int and dir_fd > 2
-                and type(name) is str and '/' not in name and name not in ('', '.', '..'))
+                and type(name) is str and '/' not in name and name not in ('', '.', '..')
+                and type(entry['dev']) is int and type(entry['ino']) is int
+                and type(entry['mtime_ns']) is int and type(entry['ctime_ns']) is int
+                and type(entry['sha256']) is str and len(entry['sha256']) == 64)
+    ram.require((fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY)
     dstat = os.fstat(dir_fd)
     ram.require(stat.S_ISDIR(dstat.st_mode) and dstat.st_uid in (0, os.getuid()) and not (dstat.st_mode & 0o002))
     info = os.fstat(fd)
@@ -828,7 +832,9 @@ def _adopt_held_source(entry):
                 and info.st_nlink == 1 and not (info.st_mode & 0o222)
                 and 0 < info.st_size <= 262144
                 and (info.st_dev, info.st_ino) == (entry['dev'], entry['ino'])
-                and (nstat.st_dev, nstat.st_ino) == (info.st_dev, info.st_ino))
+                and (info.st_mtime_ns, info.st_ctime_ns) == (entry['mtime_ns'], entry['ctime_ns'])
+                and (nstat.st_dev, nstat.st_ino) == (info.st_dev, info.st_ino)
+                and (nstat.st_mtime_ns, nstat.st_ctime_ns) == (info.st_mtime_ns, info.st_ctime_ns))
     raw = os.pread(fd, info.st_size + 1, 0)
     ram.require(len(raw) == info.st_size)
     digest = hashlib.sha256(raw).hexdigest()
@@ -849,6 +855,7 @@ def _verify_pinned_root_file(entry, *, require_exec):
                 and not (ist.st_mode & 0o022)
                 and (not require_exec or bool(ist.st_mode & 0o111))
                 and (ist.st_dev, ist.st_ino) == (entry['dev'], entry['ino'])
+                and (ist.st_mtime_ns, ist.st_ctime_ns) == (entry['mtime_ns'], entry['ctime_ns'])
                 and ist.st_size == entry['size'] and 0 < ist.st_size <= 16 * 1024 * 1024)
     if require_exec:
         ram.require(os.pread(fd, 4, 0) == b'\x7fELF')
@@ -934,7 +941,7 @@ def _read_handoff_manifest(handoff_fd, *, deadline=None):
         parse_constant=lambda _: ram.require(False),
     )
     ram.require(type(manifest) is dict and type(manifest.get('v')) is int and manifest['v'] == 1 and set(manifest) == {
-        'v', 'target_uid', 'handoff_deadline_ns', 'ack_fd',
+        'v', 'target_uid', 'handoff_deadline_ns', 'ack_fd', 'plan',
         'interpreter', 'entry', 'source', 'client', 'prelude',
         'fan_group', 'gate_sock_fd', 'gate_dir_fd', 'gate_node_fd', 'gate_node',
     })
@@ -950,6 +957,14 @@ def consume_handoff_fd(handoff_fd, gate_directory, *, deadline=None):
     try:
         ram.require(type(manifest['target_uid']) is int and manifest['target_uid'] == os.getuid() and manifest['target_uid'] > 0)
         ram.require(type(manifest['handoff_deadline_ns']) is int and time.monotonic_ns() < manifest['handoff_deadline_ns'])
+        plan = manifest['plan']
+        ram.require(type(plan) is dict and set(plan) == {'source_directory', 'gate_directory', 'unit', 'cgroup', 'primary_args'}
+                    and type(plan['source_directory']) is str and plan['source_directory'].startswith('/')
+                    and type(plan['gate_directory']) is str and plan['gate_directory'] == str(gate_directory)
+                    and type(plan['unit']) is str and plan['unit'].endswith('.service') and '/' not in plan['unit']
+                    and type(plan['cgroup']) is str and plan['cgroup'].startswith('/')
+                    and type(plan['primary_args']) is list and len(plan['primary_args']) > 0
+                    and all(type(a) is str for a in plan['primary_args']))
         for section in ('interpreter', 'entry', 'source', 'client', 'prelude'):
             ram.require(type(manifest[section]) is dict)
         fds = [
@@ -991,6 +1006,7 @@ def consume_handoff_fd(handoff_fd, gate_directory, *, deadline=None):
             'interpreter_pin': interp,
             'entry_fd': entry['fd'],
             'entry_pin': entry,
+            'plan': plan,
         }
     except BaseException:
         if gate_owned and gate is not None:
