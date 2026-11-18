@@ -789,9 +789,9 @@ PROC_ROOT = "/proc"
 CGROUP_ROOT = "/sys/fs/cgroup"
 # Hub session states with no live physical obligation vs. states that reserve capacity.
 HUB_TERMINAL_STATES = frozenset((
-    "failed", "stopped", "cancelled", "closed", "aborted", "lost", "completed", "completed-awaiting-review", "exited", "archived",
+    "failed", "stopped", "cancelled", "closed", "aborted", "lost", "completed", "completed-awaiting-review", "exited", "archived", "expired",
 ))
-HUB_INFLIGHT_STATES = frozenset(("queued", "pending", "dispatching", "starting", "running", "exiting", "stopping", "needs_attention"))
+HUB_INFLIGHT_STATES = frozenset(("queued", "pending", "dispatching", "staged", "offered", "claimed", "starting", "running", "exiting", "stopping", "needs_attention"))
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 # Fixed bridge executed through the already whole-archive-verified CLI (sealed
