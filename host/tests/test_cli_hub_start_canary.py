@@ -299,7 +299,7 @@ def _install_test_collectors():
         return floor
     def acquire_quota(self, deadline):
         log("quota")
-        raw = cfg().get("quota", {"codex": {"status": "ok", "details": {"limit_reached": False}, "windows": {"5h": {"percent_remaining": 80, "present": True}}}})
+        raw = cfg().get("quota", {"codex": {"status": "ok", "details": {"limit_reached": False}, "windows": {"7d": {"percent_remaining": 80, "present": True}}}})
         reason = evaluate_quota(raw, require_eligible_route=(self.mode == "full"))
         if reason:
             raise StageFailure("admission", reason)
@@ -4506,6 +4506,23 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(label):
                 c, _ = run([changed])
                 self.assertHold(c, "resident_fallback_changed")
+        # The final snapshot must itself be unique/valid: a duplicate or malformed id is ambiguous, not "equal".
+        upper = dict(base, id=base["id"].upper())
+        bad_finals = {
+            "identical duplicate row": [base, dict(base)],
+            "duplicate differing only in case": [base, upper],
+            "lowercase-id collision with changed row": [base, dict(base, tag="task-x")],
+            "invalid id": [dict(base, id="not-a-uuid")],
+            "non-string id": [dict(base, id=7)],
+            "missing id": [{k: v for k, v in base.items() if k != "id"}],
+        }
+        for label, final in bad_finals.items():
+            with self.subTest(label):
+                c, seen = run(final)
+                self.assertHold(c, "resident_fallback_changed")
+                self.assertEqual(len(seen), 2)  # no extra poll, no deadline renewal
+        c, _ = run([base])
+        c.admit()  # control: a unique equal final snapshot still passes
         with self.subTest("row vanished / extra row"):
             c, _ = run([])
             self.assertHold(c, "resident_fallback_changed")
@@ -4861,7 +4878,11 @@ class AdmissionTests(unittest.TestCase):
     def test_quota_acceptance_and_privacy(self):
         mod = self.mod()
         now = datetime_now()
-        good = {"status": "ok", "details": {"limit_reached": False}, "windows": {"w": {"percent_remaining": 40, "present": True}}}
+        def wins(pct, **extra):
+            # genuinely required Claude windows (5h + 7d), so each negative case keeps its own purpose
+            return {"5h": dict({"percent_remaining": pct, "present": True}, **extra), "7d": {"percent_remaining": 40, "present": True}}
+
+        good = {"status": "ok", "details": {"limit_reached": False}, "windows": wins(40)}
         self.assertIsNone(mod.evaluate_quota({"claude": good}, require_eligible_route=True, now=now))
         cases = {
             "limit": dict(good, details={"limit_reached": True}),
@@ -4869,16 +4890,16 @@ class AdmissionTests(unittest.TestCase):
             "error": dict(good, error="boom"),
             "old": dict(good, observed_at="2000-01-01T00:00:00Z"),
             "future": dict(good, observed_at="2999-01-01T00:00:00Z"),
-            "bool_pct": dict(good, windows={"w": {"percent_remaining": True}}),
-            "nan_pct": dict(good, windows={"w": {"percent_remaining": float("nan")}}),
+            "bool_pct": dict(good, windows=wins(True)),
+            "nan_pct": dict(good, windows=wins(float("nan"))),
             "no_windows": dict(good, windows={}),
-            "exhausted": dict(good, windows={"w": {"percent_remaining": 0, "present": True}}),
+            "exhausted": dict(good, windows=wins(0)),
             "status_unknown": dict(good, status="unknown"),
         }
         for label, route in cases.items():
             with self.subTest(label):
                 self.assertEqual(mod.evaluate_quota({"claude": route}, require_eligible_route=True, now=now), "quota_no_eligible_route")
-        reserve = dict(good, windows={"w": {"percent_remaining": 15, "present": True}})
+        reserve = dict(good, windows={"5h": {"percent_remaining": 15, "present": True}, "7d": {"percent_remaining": 15, "present": True}})
         self.assertEqual(mod.evaluate_quota({"codex": reserve}, require_eligible_route=True, now=now), "quota_no_eligible_route")
         self.assertIsNone(mod.evaluate_quota({"claude": reserve}, require_eligible_route=True, now=now))
         self.assertEqual(mod.evaluate_quota([], require_eligible_route=False, now=now), "quota_unparseable")
@@ -4908,20 +4929,82 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(verdict("claude", {"5h": live(80), "7d": dict(null), "monthly": dict(null)}), bad)
         self.assertEqual(verdict("codex", {"5h": live(80), "7d": dict(null)}), bad)
         self.assertEqual(verdict("go", {"5h": live(80), "7d": live(60), "monthly": dict(null)}), bad)  # not optional for this provider
-        self.assertEqual(verdict("claude", {"5h": live(80), "weekly_opus": dict(null)}), bad)  # unlisted window
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null, present=True)}), bad)
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null, error="boom")}), bad)
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": {"percent_remaining": None, "reset_at": reset}}), bad)
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": {"percent_remaining": 50, "reset_at": None, "present": "yes"}}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "weekly_opus": dict(null)}), bad)  # unlisted window
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null, present=True)}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null, error="boom")}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": {"percent_remaining": None, "reset_at": reset}}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": {"percent_remaining": 50, "reset_at": None, "present": "yes"}}), bad)
         self.assertEqual(verdict("claude", {"monthly": dict(null)}), bad)  # nothing usable left
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": live(0)}), bad)  # present optional window is still checked
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": live(0)}), bad)  # present optional window is still checked
         self.assertEqual(verdict("claude", {"5h": live(0), "7d": live(60), "monthly": dict(null)}), bad)  # exhausted
         self.assertEqual(verdict("codex", {"7d": live(15), "5h": dict(null)}), bad)  # Codex reserve
         self.assertIsNone(verdict("codex", {"7d": live(16), "5h": dict(null)}))
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, stale=True), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null)}, stale=True), bad)
         old = (now - __import__("datetime").timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, observed_at=old, details={"limit_reached": False, "observed_at": old}), bad)
-        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": dict(null)}, details={"limit_reached": True, "observed_at": stamp}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null)}, observed_at=old, details={"limit_reached": False, "observed_at": old}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null)}, details={"limit_reached": True, "observed_at": stamp}), bad)
+
+    def test_required_window_presence_supported_routes_and_window_status(self):
+        mod = self.mod()
+        now = datetime_now()
+        stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        reset = "2999-01-01T00:00:00Z"
+        null = {"percent_remaining": None, "reset_at": None}
+        live = lambda pct, **extra: dict({"percent_remaining": pct, "reset_at": reset}, **extra)
+        zero_use = {"percent_remaining": 100, "reset_at": None}  # fresh valid zero-use reading: no future-reset prerequisite
+        bad = "quota_no_eligible_route"
+
+        def verdict(name, windows, **extra):
+            route = dict({"status": "ok", "observed_at": stamp, "details": {"limit_reached": False, "observed_at": stamp}, "windows": windows}, **extra)
+            return mod.evaluate_quota({name: route}, require_eligible_route=True, now=now)
+
+        # Missing required windows: one valid positive reading is not enough.
+        self.assertEqual(verdict("claude", {"5h": live(80)}), bad)
+        self.assertEqual(verdict("claude", {"7d": live(80)}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "monthly": live(80)}), bad)
+        self.assertEqual(verdict("codex", {"5h": live(80), "monthly": live(80)}), bad)  # weekly required
+        self.assertEqual(verdict("go", {"5h": live(80), "7d": live(60)}), bad)  # monthly is real and required
+        self.assertEqual(verdict("go", {"7d": live(60), "monthly": live(60)}), bad)
+        # Documented aliases satisfy a group; supported routes with every required window pass.
+        self.assertIsNone(verdict("claude", {"five_hour": live(80), "seven_day": live(60), "monthly": dict(null)}))
+        self.assertIsNone(verdict("claude", {"5h": live(80), "weekly": live(60)}))
+        self.assertIsNone(verdict("codex", {"weekly": live(60)}))
+        self.assertIsNone(verdict("codex", {"7d": zero_use, "5h": dict(null), "monthly": dict(null)}))
+        self.assertIsNone(verdict("claude", {"5h": zero_use, "7d": zero_use, "monthly": dict(null)}))
+        # Real Go shape: short + weekly + REAL monthly (never dropped as optional).
+        self.assertIsNone(verdict("go", {"5h": live(80), "7d": live(60), "monthly": live(30)}))
+        self.assertIsNone(verdict("go", {"rolling": live(80), "weekly": live(60), "monthly": live(30)}))
+        self.assertEqual(verdict("go", {"5h": live(80), "7d": live(60), "monthly": live(0)}), bad)
+        # Optional slots are provider specific: Codex 5h/monthly and Claude monthly only.
+        self.assertEqual(verdict("claude", {"5h": dict(null), "7d": live(60), "monthly": dict(null)}), bad)
+        self.assertEqual(verdict("codex", {"7d": live(60), "weekly_opus": dict(null)}), bad)
+        # Unsupported / distinct routes are never native-eligible, even with healthy readings.
+        full = {"5h": live(80), "7d": live(60), "monthly": live(60)}
+        for route_name in ("copilot", "zai", "gemini", "grok", "codex-orin", "mystery", "Claude", ""):
+            with self.subTest(route_name):
+                self.assertEqual(verdict(route_name, full), bad)
+        self.assertIsNone(mod.evaluate_quota({"copilot": {}, "claude": {"status": "ok", "windows": {"5h": live(80), "7d": live(60)}}}, require_eligible_route=True, now=now))
+        # Explicit window status/error is refused, including on an optional null slot before the skip.
+        for label, extra in (("status error", {"status": "error"}), ("status unknown", {"status": "unknown"}),
+                             ("error text", {"error": "boom"}), ("stale", {"stale": True}),
+                             ("limit_reached", {"limit_reached": True}), ("infinite", {"infinite": True})):
+            with self.subTest("optional null " + label):
+                self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null, **extra)}), bad)
+                self.assertEqual(verdict("codex", {"7d": live(60), "5h": dict(null, **extra)}), bad)
+            with self.subTest("required positive " + label):
+                self.assertEqual(verdict("claude", {"5h": live(80, **extra), "7d": live(60)}), bad)
+                self.assertEqual(verdict("go", {"5h": live(80), "7d": live(60), "monthly": live(30, **extra)}), bad)
+        self.assertIsNone(verdict("claude", {"5h": live(80, status="ok"), "7d": live(60), "monthly": dict(null, status="ok")}))
+        # Null/partial/reset-only/present flags on a required or optional slot never read as absent.
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": dict(null, present=True)}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": {"percent_remaining": None, "reset_at": reset}}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": dict(null, present="false")}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "monthly": live(60, present=False)}), bad)
+        # Every extra window is validated too.
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "extra": live(50, status="error")}), bad)
+        self.assertEqual(verdict("claude", {"5h": live(80), "7d": live(60), "extra": dict(null)}), bad)
+        self.assertEqual(verdict("codex", {"7d": live(16)}), None)
+        self.assertEqual(verdict("codex", {"7d": live(15)}), bad)
 
     def test_quota_failure_is_closed_and_raw_output_never_leaks(self):
         secret = "SECRET-ACCOUNT-xyz"
