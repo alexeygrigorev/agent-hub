@@ -5,6 +5,7 @@ There is NO config/JSON factory or privileged setup/elevation here. Source FD,
 bootstrap/client/interpreter selection and original manager connection are held
 by the dispatcher, never supplied by a hook or a historical receipt.
 """
+import ctypes
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ import select
 import socket
 import stat
 import struct
+import subprocess
 import time
 import queue
 import threading
@@ -413,3 +415,334 @@ class V4QuotaManager:
             if first is not None:raise first
     def close(self):
         self.closed=True;self.barriers.close();self.probe.close()
+
+
+class SubprocessRunner:
+    """Bounded subprocess runner without shell; strips observer env."""
+
+    def run(self, argv, timeout):
+        ram.require(type(argv) in (list, tuple) and len(argv) > 0 and all(type(a) is str for a in argv))
+        ram.require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 15)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('HUB_ALERT_')}
+        result = subprocess.run(list(argv), capture_output=True, timeout=timeout, check=False, env=env)
+        return result.returncode, result.stdout
+
+
+class StableRuntime:
+    """OS/source/process verification helpers for V4QuotaManager."""
+
+    def __init__(self, *, uid=None):
+        self.UID = os.getuid() if uid is None else uid
+
+    @staticmethod
+    def source_stamp(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def checked_source(self, fd, directory_fd, name, raw, stamp):
+        a = os.fstat(fd)
+        b = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        ram.require(stat.S_ISREG(a.st_mode) and a.st_uid in (0, self.UID)
+                    and not (a.st_mode & 0o022) and a.st_nlink == 1)
+        ram.require(self.source_stamp(a) == stamp == self.source_stamp(b))
+        actual = os.pread(fd, len(raw) + 1, 0)
+        ram.require(actual == raw)
+
+    @staticmethod
+    def inspect_exec(raw, expected_exec):
+        ram.require(type(raw) is bytes and 0 < len(raw) <= 8192 and type(expected_exec) is str and len(expected_exec) > 0)
+        text = raw.decode('utf-8', 'strict').strip()
+        ram.require('\n' not in text and text.startswith('ExecStart='))
+        body = text[len('ExecStart='):].strip()
+        if body.startswith('{') and 'argv[]=' in body:
+            part = body.split('argv[]=', 1)[1]
+            actual_exec = part.split(' ; ', 1)[0].strip()
+        else:
+            actual_exec = body
+        ram.require(actual_exec == expected_exec)
+
+    @staticmethod
+    def inspect_process(pid, cgroup):
+        ram.require(type(pid) is int and pid > 0 and type(cgroup) is str and cgroup.startswith('/'))
+        with open(f'/proc/{pid}/stat', 'rb') as f:
+            raw = f.read(8193)
+        ram.require(len(raw) <= 8192)
+        birth = int(raw[raw.rindex(b')') + 2:].split()[19])
+        with open('/proc/sys/kernel/random/boot_id', 'r', encoding='ascii') as f:
+            boot_id = f.read(64).strip()
+        with open(f'/proc/{pid}/cgroup', 'r', encoding='utf-8') as f:
+            cgroups = f.read(4097)
+        ram.require(len(cgroups) <= 4096)
+        ram.require(any(line.split(':', 2)[-1] == cgroup for line in cgroups.splitlines() if ':' in line))
+        ram.ProcessKey(pid, birth, boot_id).checked()
+        return (pid, birth, boot_id)
+
+    @staticmethod
+    def alive(pidfd):
+        ram.require(type(pidfd) is int and pidfd >= 0)
+        ready, _, _ = select.select([pidfd], [], [], 0)
+        return not ready
+
+
+class UserManagerEnvironment:
+    """USER-systemd manager state/ownership queries via SubprocessRunner."""
+
+    def __init__(self, *, now=time.monotonic):
+        self.now = now
+
+    def remaining(self, deadline, cap=1.0):
+        left = deadline - self.now()
+        ram.require(left > 0)
+        return min(cap, left)
+
+    def show(self, runner, plan, role, deadline):
+        unit = plan['units'][role]
+        rc, raw = runner.run(
+            ['/usr/bin/systemctl', '--user', 'show', unit,
+             '--property=MainPID,ControlGroup,InvocationID,ActiveState,SubState'],
+            self.remaining(deadline, 1.0),
+        )
+        ram.require(rc == 0 and 0 < len(raw) <= 4096)
+        values = {}
+        for line in raw.decode('utf-8', 'strict').splitlines():
+            ram.require('=' in line)
+            key, val = line.split('=', 1)
+            values[key] = val
+        ram.require({'MainPID', 'ControlGroup', 'InvocationID'} <= set(values))
+        return values
+
+    @staticmethod
+    def owned(state, plan, role, invocation=None):
+        ram.require(type(state) is dict)
+        inv = state.get('InvocationID', '')
+        ram.require(ram.identity(inv) and state.get('ControlGroup') == plan['cgroups'][role])
+        if invocation is not None:
+            ram.require(inv == invocation)
+        return inv
+
+
+class FanotifyObservation:
+    """Mutable observation buffer drained on the owner thread."""
+
+    def __init__(self):
+        self.records = []
+        self.unknown = False
+
+
+class FanotifyReader:
+    """Non-blocking reader for an owned Linux fanotify group FD."""
+
+    _STRUCT = struct.Struct('<IBBHqii')
+    _VERS = 3
+    _FAN_NOFD = -1
+    _FAN_Q_OVERFLOW = 0x00004000
+    _FAN_OPEN = 0x00000020
+    _FAN_CLOEXEC = 0x00000001
+    _FAN_NONBLOCK = 0x00000002
+    _FAN_MARK_ADD = 0x00000001
+
+    @classmethod
+    def open_group(cls, held_sources):
+        """Attempt to initialize a real fanotify group; fails closed on EPERM."""
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        libc.fanotify_init.restype = ctypes.c_int
+        libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.c_char_p]
+        libc.fanotify_mark.restype = ctypes.c_int
+        group = libc.fanotify_init(cls._FAN_CLOEXEC | cls._FAN_NONBLOCK, os.O_RDONLY | os.O_CLOEXEC)
+        if group < 0:
+            raise ram.Unknown('fanotify_unavailable')
+        try:
+            for held in held_sources:
+                rc = libc.fanotify_mark(group, cls._FAN_MARK_ADD, cls._FAN_OPEN, held.directory_fd, held.name.encode())
+                if rc < 0:
+                    raise ram.Unknown('fanotify_mark_failed')
+            return group
+        except BaseException:
+            os.close(group)
+            raise
+
+    def drain(self, group, observation):
+        observation.records = []
+        observation.unknown = False
+        try:
+            while True:
+                try:
+                    buf = os.read(group, 4096)
+                except BlockingIOError:
+                    break
+                if not buf:
+                    break
+                offset = 0
+                while offset + self._STRUCT.size <= len(buf):
+                    event_len, vers, _res, meta_len, mask, fd, pid = self._STRUCT.unpack_from(buf, offset)
+                    try:
+                        if (vers != self._VERS or meta_len < self._STRUCT.size
+                                or event_len < meta_len or offset + event_len > len(buf)
+                                or (mask & self._FAN_Q_OVERFLOW) or fd < 0 or pid <= 0):
+                            observation.unknown = True
+                            observation.records = []
+                            return
+                        info = os.fstat(fd)
+                        observation.records.append({
+                            'pid': pid, 'dev': info.st_dev, 'ino': info.st_ino, 'mask': int(mask),
+                        })
+                    finally:
+                        if fd >= 0:
+                            os.close(fd)
+                    offset += event_len
+                if offset != len(buf):
+                    observation.unknown = True
+                    observation.records = []
+                    return
+        except BaseException:
+            observation.unknown = True
+            observation.records = []
+
+
+def hold_source_fd(directory, name, *, expected_sha256=None):
+    """Open and pin a selected immutable source file via dir_fd + O_NOFOLLOW."""
+    ram.require(type(name) is str and '/' not in name and name not in ('', '.', '..'))
+    uid = os.getuid()
+    dir_fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = -1
+    try:
+        dstat = os.fstat(dir_fd)
+        ram.require(stat.S_ISDIR(dstat.st_mode) and dstat.st_uid in (0, uid) and not (dstat.st_mode & 0o002))
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        info = os.fstat(fd)
+        ram.require(stat.S_ISREG(info.st_mode) and info.st_uid in (0, uid)
+                    and info.st_nlink == 1 and not (info.st_mode & 0o222)
+                    and 0 < info.st_size <= 262144)
+        raw = os.pread(fd, info.st_size + 1, 0)
+        ram.require(len(raw) == info.st_size)
+        digest = hashlib.sha256(raw).hexdigest()
+        if expected_sha256 is not None:
+            ram.require(digest == expected_sha256)
+        stamp = StableRuntime.source_stamp(info)
+        pin = ram.SourcePin(info.st_dev, info.st_ino, digest).checked()
+        return HeldSourceFD(fd, dir_fd, name, raw, stamp, pin)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+        raise
+
+
+def close_held_source(held):
+    """Close held file and directory descriptors safely."""
+    for fd in (held.fd, held.directory_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+class SourceGate:
+    """Private owned AF_UNIX SEQPACKET listener for source-gate.sock."""
+
+    def __init__(self, directory):
+        from pathlib import Path
+        from .alert_broker import private_directory
+        self.directory = Path(directory)
+        self.dir_fd = private_directory(self.directory)
+        self.listener = None
+        self.node_identity = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.listener = sock
+            sock.bind(f'/proc/self/fd/{self.dir_fd}/source-gate.sock')
+            node = os.stat('source-gate.sock', dir_fd=self.dir_fd, follow_symlinks=False)
+            ram.require(stat.S_ISSOCK(node.st_mode) and node.st_uid == os.getuid() and node.st_nlink == 1)
+            self.node_identity = (node.st_dev, node.st_ino)
+            os.chmod(f'/proc/self/fd/{self.dir_fd}/source-gate.sock', 0o600)
+            sock.setblocking(False)
+            sock.listen(1)
+        except BaseException:
+            self.cleanup()
+            raise
+
+    def poll_held(self):
+        if self.listener is None:
+            return None
+        try:
+            conn, _ = self.listener.accept()
+            return conn
+        except BlockingIOError:
+            return None
+
+    def cleanup(self):
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+            self.listener = None
+        if self.node_identity is not None and self.dir_fd is not None:
+            try:
+                node = os.stat('source-gate.sock', dir_fd=self.dir_fd, follow_symlinks=False)
+                if (node.st_dev, node.st_ino) == self.node_identity:
+                    os.unlink('source-gate.sock', dir_fd=self.dir_fd)
+            except OSError:
+                pass
+            self.node_identity = None
+        if self.dir_fd is not None:
+            try:
+                os.close(self.dir_fd)
+            except OSError:
+                pass
+            self.dir_fd = None
+
+
+def prepare_selected_quota(
+    *,
+    source,
+    companions,
+    gate,
+    group,
+    plan,
+    exec_argv,
+    service_deadline,
+    stable=None,
+    manager_environment=None,
+    fan=None,
+    observation=None,
+    runner=None,
+    extra_cleanup=None,
+):
+    """Construct PreparedQuotaSelection from already-held FDs and owned gate."""
+    def _cleanup():
+        first = None
+        if extra_cleanup is not None:
+            try:
+                extra_cleanup()
+            except BaseException as err:
+                first = err
+        try:
+            gate.cleanup()
+        except BaseException as err:
+            if first is None:
+                first = err
+        for held in (source,) + tuple(companions):
+            close_held_source(held)
+        try:
+            os.close(group)
+        except OSError:
+            pass
+        if first is not None:
+            raise first
+
+    return PreparedQuotaSelection(
+        stable=stable or StableRuntime(),
+        manager_environment=manager_environment or UserManagerEnvironment(),
+        fan=fan or FanotifyReader(),
+        group=group,
+        observation=observation or FanotifyObservation(),
+        source=source,
+        companions=tuple(companions),
+        runner=runner or SubprocessRunner(),
+        plan=plan,
+        exec_argv=exec_argv,
+        poll_held=gate.poll_held,
+        cleanup_owned=_cleanup,
+        service_deadline=service_deadline,
+    )

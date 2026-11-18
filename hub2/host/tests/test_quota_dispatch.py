@@ -1,6 +1,9 @@
 """Pure owner-state controls. Fake manager handles are NOT runtime admission."""
 import importlib.util
+import os
 from pathlib import Path
+import struct
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -532,3 +535,321 @@ class ProducerTerminalProtocolTests(unittest.TestCase):
         self.channel.recvmsg=lambda *args:(b'',[],socket.MSG_CTRUNC,None)
         self.manager.step(self.owner);self.assertEqual(self.manager.phase,'failed')
         self.assertEqual(self.source_calls,1);self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+
+
+class SameProcessLifecycleTests(unittest.TestCase):
+    """End-to-end same-process boundary, OS-adapter, and failure-seam tests."""
+
+    def _short_temp(self):
+        import tempfile
+        base = os.environ.get('RUNNER_TEMP')
+        if not base:
+            xdg = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+            if os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+                base = xdg
+        td = tempfile.TemporaryDirectory(prefix='qd-', dir=base)
+        self.addCleanup(td.cleanup)
+        return Path(td.name)
+
+    def _write_readonly(self, directory, name, content):
+        path = directory / name
+        path.write_bytes(content)
+        path.chmod(0o400)
+        return path
+
+    def test_opt_in_default_off_has_zero_io(self):
+        from agent_hub_host.quota_dispatch import configured_same_process, run_same_process_quota
+        with patch('socket.socket', side_effect=AssertionError('socket forbidden')), \
+             patch('subprocess.run', side_effect=AssertionError('subprocess forbidden')):
+            res = run_same_process_quota({'proof': True}, lambda t: 0)
+            self.assertEqual(res, {'enabled': False, 'dispatched': False, 'authority': 'NONE', 'complete': False})
+            self.assertIsNone(configured_same_process(None))
+            self.assertIsNone(configured_same_process({'v': 1, 'enabled': False}))
+
+    def test_cli_quota_dispatch_default_off_exits_zero_without_io(self):
+        import contextlib, io, json
+        from agent_hub_host import cli
+        out = io.StringIO()
+        with patch('socket.socket', side_effect=AssertionError('socket forbidden')), \
+             patch('subprocess.run', side_effect=AssertionError('subprocess forbidden')), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', '/nonexistent/v2.json', 'quota-dispatch'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {'enabled': False, 'dispatched': False, 'authority': 'NONE', 'complete': False})
+
+    def test_negative_client_self_admission_and_proof_dict_rejected(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        with self.assertRaises(ram.Unknown):
+            run_same_process_quota({'proof': True}, lambda t: 0, enabled=True, broker_directory='/unused')
+
+    def test_hold_source_fd_and_changed_source_refused(self):
+        from agent_hub_host.quota_dispatch_manager import StableRuntime, close_held_source, hold_source_fd
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        target = self._write_readonly(src_dir, 'quota.py', b'print("ok")\n')
+        held = hold_source_fd(src_dir, 'quota.py')
+        self.addCleanup(close_held_source, held)
+        stable = StableRuntime()
+        stable.checked_source(held.fd, held.directory_fd, held.name, held.raw, held.stamp)
+        target.chmod(0o600)
+        target.write_bytes(b'print("tampered")\n')
+        target.chmod(0o400)
+        with self.assertRaises(ram.Unknown):
+            stable.checked_source(held.fd, held.directory_fd, held.name, held.raw, held.stamp)
+
+    def test_stable_inspect_exec_and_process_and_user_manager_env(self):
+        from agent_hub_host.quota_dispatch_manager import StableRuntime, UserManagerEnvironment
+        stable = StableRuntime()
+        stable.inspect_exec(
+            b'ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /opt/b.py 1 2 3 ; ignore_errors=no }\n',
+            '/usr/bin/python3 /opt/b.py 1 2 3',
+        )
+        with self.assertRaises(ram.Unknown):
+            stable.inspect_exec(b'ExecStart=/usr/bin/false\n', '/usr/bin/python3 /opt/b.py 1 2 3')
+        pid = os.getpid()
+        cgroup = next(
+            line.split(':', 2)[-1]
+            for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+            if ':' in line
+        )
+        key = stable.inspect_process(pid, cgroup)
+        self.assertEqual(key[0], pid)
+        with self.assertRaises(ram.Unknown):
+            stable.inspect_process(pid, '/wrong/cgroup.slice')
+        plan = {'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': cgroup}}
+        runner = SimpleNamespace(run=lambda argv, timeout: (
+            0, f'MainPID={pid}\nControlGroup={cgroup}\nInvocationID={"a"*32}\n'.encode()
+        ))
+        env = UserManagerEnvironment()
+        state = env.show(runner, plan, 'healthy', env.now() + 5)
+        self.assertEqual(env.owned(state, plan, 'healthy'), 'a' * 32)
+        with self.assertRaises(ram.Unknown):
+            env.owned(state, plan, 'healthy', 'b' * 32)
+
+    def test_fanotify_reader_ordinary_read_and_overflow_loss(self):
+        import struct
+        from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
+        r_pipe, w_pipe = os.pipe()
+        self.addCleanup(lambda: [os.close(fd) for fd in (r_pipe, w_pipe) if fd is not None])
+        os.set_blocking(r_pipe, False)
+        reader = FanotifyReader()
+        obs = FanotifyObservation()
+        ev_fd = os.open(__file__, os.O_RDONLY)
+        pkt = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev_fd, 99999)
+        os.write(w_pipe, pkt)
+        reader.drain(r_pipe, obs)
+        self.assertFalse(obs.unknown)
+        self.assertEqual(len(obs.records), 1)
+        self.assertEqual(obs.records[0]['pid'], 99999)
+        # Overflow sets unknown=True cleanly
+        pkt_ovf = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_Q_OVERFLOW, -1, 0)
+        os.write(w_pipe, pkt_ovf)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+
+    def test_same_process_full_lifecycle_reservation_precedes_launch_and_negative_public_hook(self):
+        import json, socket, threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, close_held_source, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        obs = FanotifyObservation()
+
+        class FakeFan:
+            def drain(self, group, o):
+                o.records = []
+                o.unknown = False
+                try:
+                    raw = os.read(group, 64)
+                    if raw == b'open':
+                        o.records = [{'pid': os.getpid(), 'dev': q_fd.pin.dev, 'ino': q_fd.pin.ino, 'mask': 0x20}]
+                except BlockingIOError:
+                    pass
+
+        class FakeCollector:
+            def __init__(self, cb):
+                self.cb = cb
+                self.wire = SimpleNamespace(receive=lambda *a: False, send=lambda *a: 1)
+                self.epoch = 'e' * 32
+                self.fault = None
+                self.manager = ':1.9'
+                self.jobs = {}
+                self.started = True
+                self.pending = None
+            def start(self):
+                self.cb({'member': 'JobNew', 'job_id': 1, 'unit': 'u.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': self.epoch})
+                return {'stream_index': 1}
+            def handle(self, *a):
+                pass
+            def receipt(self, idx):
+                return {'stream_index': idx}
+            def barrier(self):
+                return {'stream_index': 10}
+            def close(self):
+                pass
+
+        alive_flag = {'alive': True}
+        stable = SimpleNamespace(
+            UID=os.getuid(),
+            source_stamp=lambda info: q_fd.stamp if info.st_ino == q_fd.pin.ino else (c_fd.stamp if info.st_ino == c_fd.pin.ino else b_fd.stamp),
+            checked_source=lambda *a: None,
+            inspect_exec=lambda *a: None,
+            inspect_process=lambda pid, cg: (os.getpid(), 77, '11111111-2222-4333-8444-555555555555'),
+            alive=lambda pidfd: alive_flag['alive'],
+        )
+        env = SimpleNamespace(
+            remaining=lambda d, c=1: 1.0,
+            show=lambda r, p, role, d: {'MainPID': str(os.getpid()) if alive_flag['alive'] else '0', 'ControlGroup': '/u.slice', 'InvocationID': 'a' * 32},
+            owned=lambda s, p, role, inv=None: 'a' * 32,
+        )
+        runner = SimpleNamespace(run=lambda argv, t: (0, b'ExecMainCode=1\nExecMainStatus=0\n' if 'ExecMainCode' in argv[-1] else b'ExecStart=/usr/bin/python3\n'))
+        plan = {'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}}
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan=plan, exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 5.0,
+            stable=stable, manager_environment=env, fan=FakeFan(), observation=obs, runner=runner,
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+
+        order = []
+        child_err = []
+
+        def _fake_launch(ticket):
+            order.append(('launch', ticket is not None))
+            self.assertIsNotNone(ticket)
+            self.assertTrue(ram.identity(ticket.context))
+
+            def _child():
+                sock = None
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    sock.connect(str(gate_dir / 'source-gate.sock'))
+                    sock.send(b'held-before-quota-source')
+                    cmd = sock.recv(256)
+                    self.assertEqual(cmd, b'open:' + ticket.context.encode('ascii'))
+                    os.write(w_fan, b'open')
+                    sock.send(b'quota-source-opened')
+                    rel = sock.recv(256)
+                    self.assertEqual(rel, b'qualified-run')
+                    # Negative client self-admission on public observer.sock must be refused!
+                    pub = wire.exchange(broker_dir / 'observer.sock', {
+                        'v': 1, 'op': 'hook', 'frame': {
+                            'v': 1, 'invocation_id': ticket.context, 'parent_id': None,
+                            'role': 'quota_monitor', 'phase': 'begin', 'seq': 0,
+                            'decision': None, 'condition': None, 'flags': {},
+                            'recipient_class': 'none', 'observer_ok': True,
+                        },
+                    })
+                    self.assertIs(pub['ok'], False)
+                    alive_flag['alive'] = False
+                except BaseException as exc:
+                    child_err.append(exc)
+                finally:
+                    if sock is not None:
+                        sock.close()
+
+            t = threading.Thread(target=_child, daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+            return 0
+
+        class InlineBarrierCollector(FakeCollector):
+            pass
+
+        with patch('os.pidfd_open', return_value=os.dup(r_fan)):
+            # Drive OrderedBarrier + events minimally by patching OrderedBarrier.begin/poll on this test
+            with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+                 patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+                res = run_same_process_quota(
+                    prepared, _fake_launch, enabled=True, broker_directory=broker_dir,
+                    collector_factory=InlineBarrierCollector,
+                    identity=lambda pid: KEY,
+                )
+        self.assertEqual(child_err, [])
+        self.assertEqual(order, [('launch', True)])
+        self.assertTrue(res['enabled'])
+        self.assertTrue(res['dispatched'])
+        self.assertTrue(res['reserved'])
+        self.assertFalse(res['complete'])
+        # Because public_hook was attempted, sticky failure is preserved!
+        self.assertEqual(res['phase'], 'failed')
+
+    def test_early_crash_and_dropped_hook_preserve_once_only_business_and_sticky_fault(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+
+        class FakeCollector:
+            def __init__(self, cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+                self.epoch = 'e' * 32
+                self.fault = None
+                self.started = True
+                self.pending = None
+                self.jobs = {}
+            def start(self):
+                self.cb({'member': 'JobNew', 'job_id': 1, 'unit': 'u.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': self.epoch})
+                return {'stream_index': 1}
+            def handle(self, *a):
+                pass
+            def barrier(self):
+                return {'stream_index': 2}
+            def close(self):
+                pass
+
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 0.25,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        launches = []
+        with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+            res = run_same_process_quota(
+                prepared, lambda ticket: launches.append(ticket) or 73,
+                enabled=True, broker_directory=broker_dir,
+                collector_factory=FakeCollector, identity=lambda pid: KEY,
+            )
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(res['launch_result'], 73)
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
