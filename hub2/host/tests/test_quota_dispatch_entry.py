@@ -73,6 +73,24 @@ class QuotaDispatchEntryTests(unittest.TestCase):
         payload = json.loads(run_res.stdout)
         self.assertEqual(payload, {"enabled": False, "dispatched": False, "authority": "NONE", "complete": False})
 
+        # Also verify primary-prelude subcommand in the built archive runs offline via python3 -I /proc/self/fd/<fd>
+        src_dir = root / "src"
+        src_dir.mkdir(mode=0o700)
+        q_file = src_dir / "hub-quota-publish.py"
+        q_file.write_bytes(b"import sys\ndef main(argv=None, *, _managed_observer=None):\n    return 37 if argv == ['--check', '--health-timeout', '8'] and _managed_observer is None else 99\n")
+        q_file.chmod(0o444)
+        c_file = src_dir / "hub_alert_client.py"
+        c_file.write_bytes(b"pass\n")
+        c_file.chmod(0o444)
+        q_sha = hashlib.sha256(q_file.read_bytes()).hexdigest()
+        c_sha = hashlib.sha256(c_file.read_bytes()).hexdigest()
+        prelude_res = subprocess.run(
+            [sys.executable, "-I", f"/proc/self/fd/{fd}", "primary-prelude",
+             "0", q_sha, c_sha, str(root), str(q_file), str(c_file), "--", "--check", "--health-timeout", "8"],
+            pass_fds=(fd,), capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(prelude_res.returncode, 37, prelude_res.stderr)
+
     def test_user_manager_env_offline_validation(self):
         root = self._short_temp()
         rt = root / "rt"

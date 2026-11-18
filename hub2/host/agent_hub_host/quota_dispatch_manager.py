@@ -66,6 +66,7 @@ class PreparedQuotaSelection:
     cleanup_owned: object
     service_deadline: float
     interpreter_pin: object = None
+    entry_pin: object = None
     retained_source_fd: int | None = None
     def __post_init__(self):
         ram.require(type(self.source) is HeldSourceFD and type(self.companions) is tuple and len(self.companions)==2
@@ -205,6 +206,8 @@ class V4QuotaManager:
         for held in (self.source,)+self.p.companions:
             self.stable.checked_source(held.fd,held.directory_fd,held.name,held.raw,held.stamp)
             self.held_pin(held,os.fstat(held.fd))
+        if getattr(self.p, 'entry_pin', None) is not None:
+            self.stable.verify_root_owned_file(self.p.entry_pin['path'], self.p.entry_pin)
     def _bind_probe(self, source, channel, deadline):
         self.full_sources();peer=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
         ram.require(peer[1]==self.stable.UID and self.now()<deadline)
@@ -478,6 +481,43 @@ class StableRuntime:
             'XDG_RUNTIME_DIR': runtime_dir,
             'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime_dir}/bus',
         }
+
+    @staticmethod
+    def verify_root_owned_file(path_str, expected_pin):
+        from pathlib import Path
+        p = Path(path_str) if type(path_str) is str else None
+        ram.require(p is not None and p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'))
+        dir_fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fd = -1
+        try:
+            dinfo = os.fstat(dir_fd)
+            ram.require(dinfo.st_uid == 0 and not (dinfo.st_mode & 0o022))
+            for part in p.parent.parts[1:]:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+                os.close(dir_fd)
+                dir_fd = nxt
+                dinfo = os.fstat(dir_fd)
+                ram.require(dinfo.st_uid == 0 and not (dinfo.st_mode & 0o022))
+            fd = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+            ist = os.fstat(fd)
+            ram.require(stat.S_ISREG(ist.st_mode) and ist.st_uid == 0 and ist.st_nlink == 1
+                        and not (ist.st_mode & 0o022)
+                        and (ist.st_dev, ist.st_ino) == (expected_pin['dev'], expected_pin['ino'])
+                        and (ist.st_mtime_ns, ist.st_ctime_ns) == (expected_pin['mtime_ns'], expected_pin['ctime_ns'])
+                        and ist.st_size == expected_pin['size'] and 0 < ist.st_size <= 16 * 1024 * 1024)
+            hasher = hashlib.sha256()
+            offset = 0
+            while True:
+                buf = os.pread(fd, 65536, offset)
+                if not buf:
+                    break
+                hasher.update(buf)
+                offset += len(buf)
+            ram.require(offset == ist.st_size and hasher.hexdigest() == expected_pin['sha256'])
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            os.close(dir_fd)
 
     @staticmethod
     def source_stamp(info):
@@ -980,6 +1020,7 @@ def consume_handoff_fd(handoff_fd, gate_directory, *, deadline=None):
 
         interp = _verify_pinned_root_file(manifest['interpreter'], require_exec=True)
         entry = _verify_pinned_root_file(manifest['entry'], require_exec=False)
+        StableRuntime.verify_root_owned_file(entry['path'], entry)
         quota_fd = _adopt_held_source(manifest['source'])
         client_fd = _adopt_held_source(manifest['client'])
         prelude_fd = _adopt_held_source(manifest['prelude'])
@@ -1039,6 +1080,7 @@ def prepare_selected_quota(
     runner=None,
     extra_cleanup=None,
     interpreter_pin=None,
+    entry_pin=None,
     retained_source_fd=None,
 ):
     """Construct PreparedQuotaSelection from already-held FDs and owned gate."""
@@ -1078,5 +1120,6 @@ def prepare_selected_quota(
         cleanup_owned=_cleanup,
         service_deadline=service_deadline,
         interpreter_pin=interpreter_pin,
+        entry_pin=entry_pin,
         retained_source_fd=retained_source_fd,
     )

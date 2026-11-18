@@ -39,21 +39,25 @@ PR_CAP_AMBIENT = 47
 PR_CAP_AMBIENT_CLEAR_ALL = 4
 
 
-def _walk_dir(path_str, target_uid, *, require_mode=None):
+def _walk_dir(path_str, target_uid, *, require_mode=None, root_only=False):
     path = Path(path_str)
     if not path.is_absolute() or '..' in path.parts:
         raise PermissionError('invalid_directory')
+    allowed_uids = (0,) if root_only else (0, target_uid)
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
+        root_info = os.fstat(fd)
+        if root_info.st_uid != 0 or (root_info.st_mode & 0o022):
+            raise PermissionError('untrusted_root_directory')
         for part in path.parts[1:]:
             nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
             os.close(fd)
             fd = nxt
             info = os.fstat(fd)
-            if info.st_uid not in (0, target_uid) or (info.st_mode & 0o002):
+            if info.st_uid not in allowed_uids or (info.st_mode & (0o022 if root_only else 0o002)):
                 raise PermissionError('untrusted_directory')
         info = os.fstat(fd)
-        if require_mode is not None and (info.st_uid not in (0, target_uid) or stat.S_IMODE(info.st_mode) != require_mode):
+        if require_mode is not None and (info.st_uid not in allowed_uids or stat.S_IMODE(info.st_mode) != require_mode):
             raise PermissionError('untrusted_private_directory')
         return fd
     except BaseException:
@@ -98,11 +102,14 @@ def pin_interpreter(python_bin):
 
 
 def pin_entry_archive(entry_path):
-    """Open and pin a Root-owned non-writable maintained Host entry archive."""
-    if not entry_path or not Path(entry_path).is_absolute() or '..' in Path(entry_path).parts:
+    """Open and pin a Root-owned non-writable maintained Host entry archive under Root-owned parents."""
+    p = Path(entry_path) if entry_path else None
+    if p is None or not p.is_absolute() or '..' in p.parts or p.name in ('', '.', '..'):
         raise PermissionError('invalid_entry_archive')
-    fd = os.open(entry_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    dir_fd = _walk_dir(str(p.parent), 0, root_only=True)
+    fd = -1
     try:
+        fd = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
                 or info.st_nlink != 1 or (info.st_mode & 0o022)
@@ -127,8 +134,11 @@ def pin_entry_archive(entry_path):
             'sha256': hasher.hexdigest(),
         }
     except BaseException:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
         raise
+    finally:
+        os.close(dir_fd)
 
 
 def validate_user_runtime(target_uid):
@@ -280,24 +290,63 @@ def drop_privileges(target_uid, target_gid):
     _verify_proc_dropped()
 
 
+MAX_CONFIG_BYTES = 65536
+
+
+def _read_bounded_config(config_path, target_uid):
+    p = Path(config_path)
+    if not p.is_absolute() or '..' in p.parts or p.name in ('', '.', '..'):
+        raise PermissionError('invalid_config_path')
+    dir_fd = _walk_dir(str(p.parent), target_uid)
+    fd = -1
+    try:
+        try:
+            fd = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return None
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, target_uid)
+                or st.st_nlink != 1 or (st.st_mode & 0o002)
+                or not 0 < st.st_size <= MAX_CONFIG_BYTES):
+            raise PermissionError('untrusted_config_file')
+        raw = os.pread(fd, st.st_size + 1, 0)
+        if len(raw) != st.st_size:
+            raise PermissionError('config_size_mismatch')
+        st2 = os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
+        if (st2.st_dev, st2.st_ino, st2.st_size, st2.st_mtime_ns) != (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns):
+            raise PermissionError('config_replaced')
+        cfg = json.loads(raw.decode('utf-8'), parse_constant=lambda _: (_ for _ in ()).throw(ValueError('invalid_json_constant')))
+        if not isinstance(cfg, dict):
+            raise ValueError('invalid_config_schema')
+        return cfg
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+
+
 def _sealed_plan(args, target_uid):
     unit = getattr(args, 'unit', None)
     cgroup = getattr(args, 'cgroup', None)
     primary_args = getattr(args, 'primary_args', None)
-    cfg_path = Path(args.config)
-    if (unit is None or cgroup is None or primary_args is None) and cfg_path.is_file():
-        try:
-            cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
-            qsp = cfg.get('quota_same_process') if isinstance(cfg, dict) else None
-            if isinstance(qsp, dict):
-                if unit is None and isinstance(qsp.get('unit'), str):
-                    unit = qsp['unit']
-                if cgroup is None and isinstance(qsp.get('cgroup'), str):
-                    cgroup = qsp['cgroup']
-                if primary_args is None and isinstance(qsp.get('primary_args'), list):
-                    primary_args = list(qsp['primary_args'])
-        except (OSError, json.JSONDecodeError):
-            pass
+    if unit is None or cgroup is None or primary_args is None:
+        cfg = _read_bounded_config(args.config, target_uid)
+        if cfg is not None and 'quota_same_process' in cfg:
+            qsp = cfg['quota_same_process']
+            if not isinstance(qsp, dict):
+                raise ValueError('invalid_quota_same_process_schema')
+            if unit is None and 'unit' in qsp:
+                if not isinstance(qsp['unit'], str):
+                    raise ValueError('invalid_sealed_unit')
+                unit = qsp['unit']
+            if cgroup is None and 'cgroup' in qsp:
+                if not isinstance(qsp['cgroup'], str):
+                    raise ValueError('invalid_sealed_cgroup')
+                cgroup = qsp['cgroup']
+            if primary_args is None and 'primary_args' in qsp:
+                if not isinstance(qsp['primary_args'], list) or not all(isinstance(a, str) for a in qsp['primary_args']):
+                    raise ValueError('invalid_sealed_primary_args')
+                primary_args = list(qsp['primary_args'])
     if unit is None:
         unit = 'agent-hub-quota-monitor.service'
     if cgroup is None:
@@ -437,6 +486,9 @@ def main(argv=None):
     parser.add_argument('--gate-dir', required=True)
     parser.add_argument('--python-bin', default='/usr/bin/python3')
     parser.add_argument('--entry-archive', default=DEFAULT_ENTRY_ARCHIVE)
+    parser.add_argument('--unit', default=None)
+    parser.add_argument('--cgroup', default=None)
+    parser.add_argument('--primary-arg', dest='primary_args', action='append', default=None)
     args = parser.parse_args(argv)
     return prepare_and_handoff(args)
 
