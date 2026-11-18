@@ -6,6 +6,7 @@ bootstrap/client/interpreter selection and original manager connection are held
 by the dispatcher, never supplied by a hook or a historical receipt.
 """
 import ctypes
+import fcntl
 import hashlib
 import json
 import math
@@ -20,7 +21,7 @@ import time
 import queue
 import threading
 from . import alert_authority as ram
-from .alert_broker import decode, FRAME
+from .alert_broker import decode, FRAME, unique
 
 
 # Pinned quota_monitor main: begin + <=2 health decisions (normal then error)
@@ -333,6 +334,13 @@ class V4QuotaManager:
             raw=self.packet(self.ticket.deadline)
             if raw is None:return
             ram.require(raw==b'held-before-quota-source')
+            peer=struct.unpack('3i',self.pending_channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+            ram.require(peer[1]==self.stable.UID and self.now()<self.ticket.deadline)
+            if self.p.retained_source_fd is not None:
+                anc=[(socket.SOL_SOCKET,socket.SCM_RIGHTS,struct.pack('i',self.p.retained_source_fd))]
+                ram.require(self.pending_channel.sendmsg([b'custody'],anc)==len(b'custody'))
+            else:
+                ram.require(self.pending_channel.send(b'custody')==len(b'custody'))
             self.start_probe('bind',lambda:self._bind_probe(self.source,self.pending_channel,self.ticket.deadline),self.ticket.deadline)
             self.phase='bind_poll'
         elif phase=='bind_poll':
@@ -346,11 +354,7 @@ class V4QuotaManager:
         elif phase=='open_send':
             raw=b'open:'+self.ticket.context.encode('ascii')
             ram.require(self.now()<self.ticket.deadline)
-            if self.p.retained_source_fd is not None:
-                anc=[(socket.SOL_SOCKET,socket.SCM_RIGHTS,struct.pack('i',self.p.retained_source_fd))]
-                ram.require(self.pending_channel.sendmsg([raw],anc)==len(raw))
-            else:
-                ram.require(self.pending_channel.send(raw)==len(raw))
+            ram.require(self.pending_channel.send(raw)==len(raw))
             self.phase='open_receive'
         elif phase=='open_receive':
             raw=self.packet(self.ticket.deadline)
@@ -429,12 +433,25 @@ class V4QuotaManager:
 
 
 class SubprocessRunner:
-    """Bounded subprocess runner without shell; strips observer env."""
+    """Bounded subprocess runner without shell; strips observer env and binds USER manager runtime."""
+
+    def __init__(self, *, uid=None, validate_user_env=True):
+        self.uid = uid
+        self.validate_user_env = validate_user_env
 
     def run(self, argv, timeout):
         ram.require(type(argv) in (list, tuple) and len(argv) > 0 and all(type(a) is str for a in argv))
         ram.require(type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 15)
         env = {k: v for k, v in os.environ.items() if not k.startswith('HUB_ALERT_')}
+        if argv[0] in ('/usr/bin/systemctl', '/usr/bin/systemd-run') and '--user' in argv:
+            uid = os.getuid() if self.uid is None else self.uid
+            ram.require(type(uid) is int and uid > 0)
+            if self.validate_user_env:
+                env.update(StableRuntime.user_manager_env(uid))
+            else:
+                runtime_dir = f'/run/user/{uid}'
+                env['XDG_RUNTIME_DIR'] = runtime_dir
+                env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={runtime_dir}/bus'
         result = subprocess.run(list(argv), capture_output=True, timeout=timeout, check=False, env=env)
         return result.returncode, result.stdout
 
@@ -444,6 +461,23 @@ class StableRuntime:
 
     def __init__(self, *, uid=None):
         self.UID = os.getuid() if uid is None else uid
+
+    @staticmethod
+    def user_manager_env(uid):
+        ram.require(type(uid) is int and uid > 0)
+        runtime_dir = f'/run/user/{uid}'
+        rt_fd = os.open(runtime_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            rt_stat = os.fstat(rt_fd)
+            ram.require(stat.S_ISDIR(rt_stat.st_mode) and rt_stat.st_uid == uid and stat.S_IMODE(rt_stat.st_mode) == 0o700)
+            bus_stat = os.stat('bus', dir_fd=rt_fd, follow_symlinks=False)
+            ram.require(stat.S_ISSOCK(bus_stat.st_mode) and bus_stat.st_uid == uid)
+        finally:
+            os.close(rt_fd)
+        return {
+            'XDG_RUNTIME_DIR': runtime_dir,
+            'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime_dir}/bus',
+        }
 
     @staticmethod
     def source_stamp(info):
@@ -690,6 +724,7 @@ class SourceGate:
         self.directory = Path(directory)
         self.dir_fd = private_directory(self.directory)
         self.listener = None
+        self.node_fd = None
         self.node_identity = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -706,19 +741,41 @@ class SourceGate:
             raise
 
     @classmethod
-    def from_inherited(cls, directory, dir_fd, listener_fd):
-        """Adopt an already-bound Root-prepared SourceGate without rebinding."""
+    def from_inherited(cls, directory, dir_fd, listener_fd, node_fd, node_identity):
+        """Adopt an already-bound Root-prepared SourceGate using Root-pinned node FD/identity."""
         from pathlib import Path
+        ram.require(type(dir_fd) is int and dir_fd > 2
+                    and type(listener_fd) is int and listener_fd > 2
+                    and type(node_fd) is int and node_fd > 2
+                    and len({dir_fd, listener_fd, node_fd}) == 3
+                    and type(node_identity) is dict and set(node_identity) == {'dev', 'ino'}
+                    and type(node_identity['dev']) is int and type(node_identity['ino']) is int)
+        dstat = os.fstat(dir_fd)
+        ram.require(stat.S_ISDIR(dstat.st_mode) and dstat.st_uid in (0, os.getuid())
+                    and stat.S_IMODE(dstat.st_mode) == 0o700)
+        nstat = os.fstat(node_fd)
+        ram.require(stat.S_ISSOCK(nstat.st_mode) and nstat.st_uid == os.getuid()
+                    and nstat.st_nlink == 1 and stat.S_IMODE(nstat.st_mode) == 0o600
+                    and (nstat.st_dev, nstat.st_ino) == (node_identity['dev'], node_identity['ino']))
+        cur = os.stat('source-gate.sock', dir_fd=dir_fd, follow_symlinks=False)
+        ram.require((cur.st_dev, cur.st_ino) == (nstat.st_dev, nstat.st_ino))
+
         gate = cls.__new__(cls)
         gate.directory = Path(directory)
         gate.dir_fd = dir_fd
+        gate.node_fd = node_fd
+        gate.node_identity = (nstat.st_dev, nstat.st_ino)
         gate.listener = socket.socket(fileno=listener_fd)
-        ram.require(gate.listener.family == socket.AF_UNIX and gate.listener.type == socket.SOCK_SEQPACKET)
-        gate.listener.setblocking(False)
-        node = os.stat('source-gate.sock', dir_fd=dir_fd, follow_symlinks=False)
-        ram.require(stat.S_ISSOCK(node.st_mode) and node.st_uid in (0, os.getuid()) and node.st_nlink == 1)
-        gate.node_identity = (node.st_dev, node.st_ino)
-        return gate
+        try:
+            ram.require(gate.listener.family == socket.AF_UNIX and gate.listener.type == socket.SOCK_SEQPACKET
+                        and gate.listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1)
+            sockname = gate.listener.getsockname()
+            ram.require(type(sockname) is str and sockname.endswith('/source-gate.sock'))
+            gate.listener.setblocking(False)
+            return gate
+        except BaseException:
+            gate.listener.detach()
+            raise
 
     def poll_held(self):
         if self.listener is None:
@@ -744,6 +801,12 @@ class SourceGate:
             except OSError:
                 pass
             self.node_identity = None
+        if self.node_fd is not None:
+            try:
+                os.close(self.node_fd)
+            except OSError:
+                pass
+            self.node_fd = None
         if self.dir_fd is not None:
             try:
                 os.close(self.dir_fd)
@@ -775,16 +838,80 @@ def _adopt_held_source(entry):
     return HeldSourceFD(fd, dir_fd, name, raw, stamp, pin)
 
 
-def consume_handoff_fd(handoff_fd, gate_directory):
-    """Consume and corroborate a Root-prepared read-only pipe manifest."""
+def _verify_pinned_root_file(entry, *, require_exec):
+    ram.require(type(entry) is dict and set(entry) == {'fd', 'path', 'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns', 'sha256'})
+    fd = entry['fd']
+    ram.require(type(fd) is int and fd > 2 and type(entry['path']) is str and entry['path'].startswith('/')
+                and type(entry['dev']) is int and type(entry['ino']) is int
+                and type(entry['size']) is int and type(entry['sha256']) is str and len(entry['sha256']) == 64)
+    ist = os.fstat(fd)
+    ram.require(stat.S_ISREG(ist.st_mode) and ist.st_uid == 0 and ist.st_nlink == 1
+                and not (ist.st_mode & 0o022)
+                and (not require_exec or bool(ist.st_mode & 0o111))
+                and (ist.st_dev, ist.st_ino) == (entry['dev'], entry['ino'])
+                and ist.st_size == entry['size'] and 0 < ist.st_size <= 16 * 1024 * 1024)
+    if require_exec:
+        ram.require(os.pread(fd, 4, 0) == b'\x7fELF')
+    hasher = hashlib.sha256()
+    offset = 0
+    while True:
+        buf = os.pread(fd, 65536, offset)
+        if not buf:
+            break
+        hasher.update(buf)
+        offset += len(buf)
+    ram.require(offset == ist.st_size and hasher.hexdigest() == entry['sha256'])
+    return entry
+
+
+def _verify_fanotify_fd(fan_group, expected_dev, expected_ino):
+    ram.require(not os.get_blocking(fan_group)
+                and os.readlink(f'/proc/self/fd/{fan_group}') == 'anon_inode:[fanotify]')
+    with open(f'/proc/self/fdinfo/{fan_group}', 'r', encoding='ascii') as f:
+        info_text = f.read(8193)
+    ram.require(len(info_text) <= 8192)
+    lines = info_text.splitlines()
+    ram.require(any(line.startswith('fanotify flags:') for line in lines))
+    expected_ino_hex = format(expected_ino, 'x')
+    expected_sdev_hex = format((os.major(expected_dev) << 20) | os.minor(expected_dev), 'x')
+    matched = False
+    for line in lines:
+        if not line.startswith('fanotify ino:'):
+            continue
+        parts = {}
+        for token in line[len('fanotify '):].split():
+            if ':' in token:
+                k, v = token.split(':', 1)
+                parts[k] = v
+        if (parts.get('ino', '').lower() == expected_ino_hex
+                and parts.get('sdev', '').lower() == expected_sdev_hex
+                and 'mask' in parts):
+            mask = int(parts['mask'], 16)
+            if (mask & 0x20) == 0x20:
+                matched = True
+                break
+    ram.require(matched)
+
+
+def _read_handoff_manifest(handoff_fd, *, deadline=None):
     ram.require(type(handoff_fd) is int and handoff_fd > 2)
     pstat = os.fstat(handoff_fd)
-    ram.require(stat.S_ISFIFO(pstat.st_mode) and pstat.st_uid in (0, os.getuid()))
+    ram.require(stat.S_ISFIFO(pstat.st_mode) and pstat.st_uid == 0)
+    ram.require((fcntl.fcntl(handoff_fd, fcntl.F_GETFL) & os.O_ACCMODE) == os.O_RDONLY)
+    os.set_blocking(handoff_fd, False)
+    end = time.monotonic() + 5.0 if deadline is None else min(deadline, time.monotonic() + 5.0)
     chunks = []
     total = 0
     try:
         while total <= 65536:
-            chunk = os.read(handoff_fd, 65537 - total)
+            remaining = end - time.monotonic()
+            ram.require(remaining > 0)
+            ready = select.select([handoff_fd], [], [], remaining)
+            ram.require(bool(ready[0]))
+            try:
+                chunk = os.read(handoff_fd, 65537 - total)
+            except BlockingIOError:
+                continue
             if not chunk:
                 break
             chunks.append(chunk)
@@ -795,51 +922,89 @@ def consume_handoff_fd(handoff_fd, gate_directory):
         except OSError:
             pass
     ram.require(0 < total <= 65536)
-    manifest = json.loads(b''.join(chunks).decode('utf-8'))
-    ram.require(type(manifest) is dict and manifest.get('v') == 1 and set(manifest) == {
-        'v', 'interpreter', 'source', 'client', 'prelude', 'fan_group', 'gate_sock_fd', 'gate_dir_fd',
+    def _unique_pairs(pairs):
+        out = {}
+        for k, v in pairs:
+            ram.require(k not in out)
+            out[k] = v
+        return out
+    manifest = json.loads(
+        b''.join(chunks).decode('utf-8'),
+        object_pairs_hook=_unique_pairs,
+        parse_constant=lambda _: ram.require(False),
+    )
+    ram.require(type(manifest) is dict and type(manifest.get('v')) is int and manifest['v'] == 1 and set(manifest) == {
+        'v', 'target_uid', 'handoff_deadline_ns', 'ack_fd',
+        'interpreter', 'entry', 'source', 'client', 'prelude',
+        'fan_group', 'gate_sock_fd', 'gate_dir_fd', 'gate_node_fd', 'gate_node',
     })
-    fds = [
-        manifest['interpreter'].get('fd'),
-        manifest['source'].get('fd'), manifest['source'].get('dir_fd'),
-        manifest['client'].get('fd'), manifest['client'].get('dir_fd'),
-        manifest['prelude'].get('fd'), manifest['prelude'].get('dir_fd'),
-        manifest['fan_group'], manifest['gate_sock_fd'], manifest['gate_dir_fd'],
-    ]
-    ram.require(all(type(x) is int and x > 2 for x in fds) and len(set(fds)) == len(fds))
+    return manifest
 
-    interp = manifest['interpreter']
-    ram.require(set(interp) == {'fd', 'path', 'dev', 'ino', 'size', 'mtime_ns', 'ctime_ns', 'sha256'})
-    ist = os.fstat(interp['fd'])
-    ram.require(stat.S_ISREG(ist.st_mode) and ist.st_uid == 0 and (ist.st_mode & 0o111)
-                and (ist.st_dev, ist.st_ino) == (interp['dev'], interp['ino']) and ist.st_size == interp['size'])
-    hasher = hashlib.sha256()
-    offset = 0
-    while True:
-        buf = os.pread(interp['fd'], 65536, offset)
-        if not buf:
-            break
-        hasher.update(buf)
-        offset += len(buf)
-    ram.require(offset == ist.st_size and hasher.hexdigest() == interp['sha256'])
 
-    fan_group = manifest['fan_group']
-    ram.require(not os.get_blocking(fan_group)
-                and os.readlink(f'/proc/self/fd/{fan_group}') == 'anon_inode:[fanotify]')
+def consume_handoff_fd(handoff_fd, gate_directory, *, deadline=None):
+    """Consume and corroborate a Root-prepared read-only pipe manifest."""
+    manifest = _read_handoff_manifest(handoff_fd, deadline=deadline)
+    fds = []
+    gate = None
+    gate_owned = False
+    try:
+        ram.require(type(manifest['target_uid']) is int and manifest['target_uid'] == os.getuid() and manifest['target_uid'] > 0)
+        ram.require(type(manifest['handoff_deadline_ns']) is int and time.monotonic_ns() < manifest['handoff_deadline_ns'])
+        for section in ('interpreter', 'entry', 'source', 'client', 'prelude'):
+            ram.require(type(manifest[section]) is dict)
+        fds = [
+            manifest['interpreter'].get('fd'),
+            manifest['entry'].get('fd'),
+            manifest['source'].get('fd'), manifest['source'].get('dir_fd'),
+            manifest['client'].get('fd'), manifest['client'].get('dir_fd'),
+            manifest['prelude'].get('fd'), manifest['prelude'].get('dir_fd'),
+            manifest['fan_group'], manifest['gate_sock_fd'], manifest['gate_dir_fd'],
+            manifest['gate_node_fd'], manifest['ack_fd'],
+        ]
+        ram.require(all(type(x) is int and x > 2 for x in fds) and len(set(fds)) == len(fds))
 
-    quota_fd = _adopt_held_source(manifest['source'])
-    client_fd = _adopt_held_source(manifest['client'])
-    prelude_fd = _adopt_held_source(manifest['prelude'])
-    gate = SourceGate.from_inherited(gate_directory, manifest['gate_dir_fd'], manifest['gate_sock_fd'])
-    return {
-        'source': quota_fd,
-        'client': client_fd,
-        'prelude': prelude_fd,
-        'fan_group': fan_group,
-        'gate': gate,
-        'interp_fd': interp['fd'],
-        'interpreter_pin': interp,
-    }
+        interp = _verify_pinned_root_file(manifest['interpreter'], require_exec=True)
+        entry = _verify_pinned_root_file(manifest['entry'], require_exec=False)
+        quota_fd = _adopt_held_source(manifest['source'])
+        client_fd = _adopt_held_source(manifest['client'])
+        prelude_fd = _adopt_held_source(manifest['prelude'])
+        fan_group = manifest['fan_group']
+        _verify_fanotify_fd(fan_group, quota_fd.pin.dev, quota_fd.pin.ino)
+        gate = SourceGate.from_inherited(
+            gate_directory,
+            manifest['gate_dir_fd'],
+            manifest['gate_sock_fd'],
+            manifest['gate_node_fd'],
+            manifest['gate_node'],
+        )
+        gate_owned = True
+        ack_fd = manifest['ack_fd']
+        ram.require(os.write(ack_fd, b'ACK\n') == 4)
+        os.close(ack_fd)
+        return {
+            'source': quota_fd,
+            'client': client_fd,
+            'prelude': prelude_fd,
+            'fan_group': fan_group,
+            'gate': gate,
+            'interp_fd': interp['fd'],
+            'interpreter_pin': interp,
+            'entry_fd': entry['fd'],
+            'entry_pin': entry,
+        }
+    except BaseException:
+        if gate_owned and gate is not None:
+            gate.cleanup()
+            skip = {manifest['gate_sock_fd'], manifest['gate_dir_fd'], manifest['gate_node_fd']}
+        else:
+            skip = set()
+        for fd in fds:
+            if type(fd) is int and fd > 2 and fd not in skip:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        raise
 
 
 def prepare_selected_quota(

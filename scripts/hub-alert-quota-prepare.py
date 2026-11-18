@@ -17,12 +17,16 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 
 FAN_CLOEXEC = 0x00000001
 FAN_NONBLOCK = 0x00000002
 FAN_MARK_ADD = 0x00000001
 FAN_OPEN = 0x00000020
 MAX_SOURCE_BYTES = 262144
+MAX_ENTRY_BYTES = 16 * 1024 * 1024
+DEFAULT_ENTRY_ARCHIVE = '/usr/local/lib/agent-hub/agent-hub-host.pyz'
+HANDOFF_DEADLINE_NS = 5_000_000_000
 APPROVED_INTERPRETERS = frozenset({
     '/usr/bin/python3',
     '/usr/bin/python3.12',
@@ -91,6 +95,59 @@ def pin_interpreter(python_bin):
     except BaseException:
         os.close(fd)
         raise
+
+
+def pin_entry_archive(entry_path):
+    """Open and pin a Root-owned non-writable maintained Host entry archive."""
+    if not entry_path or not Path(entry_path).is_absolute() or '..' in Path(entry_path).parts:
+        raise PermissionError('invalid_entry_archive')
+    fd = os.open(entry_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or info.st_nlink != 1 or (info.st_mode & 0o022)
+                or not 0 < info.st_size <= MAX_ENTRY_BYTES):
+            raise PermissionError('untrusted_entry_archive')
+        hasher = hashlib.sha256()
+        total = 0
+        offset = 0
+        while True:
+            chunk = os.pread(fd, 65536, offset)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            total += len(chunk)
+            offset += len(chunk)
+        if total != info.st_size:
+            raise PermissionError('entry_archive_size_mismatch')
+        return fd, {
+            'path': entry_path,
+            'dev': info.st_dev, 'ino': info.st_ino, 'size': info.st_size,
+            'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns,
+            'sha256': hasher.hexdigest(),
+        }
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def validate_user_runtime(target_uid):
+    """Validate and derive target USER manager XDG_RUNTIME_DIR and D-Bus address."""
+    runtime_dir = f'/run/user/{target_uid}'
+    rt_fd = _walk_dir(runtime_dir, target_uid, require_mode=0o700)
+    try:
+        rt_stat = os.fstat(rt_fd)
+        if rt_stat.st_uid != target_uid:
+            raise PermissionError('untrusted_user_runtime')
+        bus_stat = os.stat('bus', dir_fd=rt_fd, follow_symlinks=False)
+        if not stat.S_ISSOCK(bus_stat.st_mode) or bus_stat.st_uid != target_uid:
+            raise PermissionError('untrusted_user_bus')
+        return {
+            'XDG_RUNTIME_DIR': runtime_dir,
+            'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime_dir}/bus',
+        }
+    finally:
+        os.close(rt_fd)
 
 
 def pin_source(dir_path, name, target_uid):
@@ -236,10 +293,13 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
     gate_node_fd = -1
     gate_node_identity = None
     pipe_r = pipe_w = -1
+    ack_r = ack_w = -1
     handed_off = False
     try:
         interp_fd, interp_pin = pin_interpreter(args.python_bin)
         owned_fds.append(interp_fd)
+        entry_fd, entry_pin = pin_entry_archive(args.entry_archive)
+        owned_fds.append(entry_fd)
         q_fd, q_dir_fd, q_pin = pin_source(args.source_dir, 'hub-quota-publish.py', target_uid)
         owned_fds.extend((q_fd, q_dir_fd))
         c_fd, c_dir_fd, c_pin = pin_source(args.source_dir, 'hub_alert_client.py', target_uid)
@@ -251,41 +311,58 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
         owned_fds.append(fan_group)
         gate_sock, gate_dir_fd, gate_node_fd, gate_node_identity = bind_source_gate(args.gate_dir, target_uid)
         owned_fds.append(gate_dir_fd)
+        user_env = validate_user_runtime(target_uid)
 
         pipe_r, pipe_w = os.pipe()
+        ack_r, ack_w = os.pipe()
         manifest = json.dumps({
             'v': 1,
+            'target_uid': target_uid,
+            'handoff_deadline_ns': time.monotonic_ns() + HANDOFF_DEADLINE_NS,
+            'ack_fd': ack_w,
             'interpreter': {'fd': interp_fd, **interp_pin},
+            'entry': {'fd': entry_fd, **entry_pin},
             'source': {'fd': q_fd, 'dir_fd': q_dir_fd, **q_pin},
             'client': {'fd': c_fd, 'dir_fd': c_dir_fd, **c_pin},
             'prelude': {'fd': p_fd, 'dir_fd': p_dir_fd, **p_pin},
             'fan_group': fan_group,
             'gate_sock_fd': gate_sock.fileno(),
             'gate_dir_fd': gate_dir_fd,
+            'gate_node_fd': gate_node_fd,
+            'gate_node': {'dev': gate_node_identity[0], 'ino': gate_node_identity[1]},
         }, separators=(',', ':')).encode('utf-8')
         os.write(pipe_w, manifest)
         os.close(pipe_w)
         pipe_w = -1
 
-        handoff_fds = owned_fds + [gate_sock.fileno(), pipe_r]
+        handoff_fds = owned_fds + [gate_sock.fileno(), gate_node_fd, pipe_r, ack_w]
         for fd in handoff_fds:
             os.set_inheritable(fd, True)
 
         drop_privileges(target_uid, target_gid)
 
         cmd = [
-            f'/proc/self/fd/{interp_fd}', '-I', '-m', 'agent_hub_host.cli',
+            f'/proc/self/fd/{interp_fd}', '-I', f'/proc/self/fd/{entry_fd}',
             '--config', args.config, 'quota-dispatch', '--enable', '--handoff-fd', str(pipe_r),
         ]
-        env = {'PATH': '/usr/bin:/bin', 'HOME': entry.pw_dir}
-        handed_off = True
+        env = {'PATH': '/usr/bin:/bin', 'HOME': entry.pw_dir, **user_env}
         res = runner(cmd, pass_fds=tuple(handoff_fds), env=env, check=False)
+        os.close(ack_w)
+        ack_w = -1
+        os.set_blocking(ack_r, False)
+        try:
+            ack_data = os.read(ack_r, 8)
+        except OSError:
+            ack_data = b''
+        handed_off = ack_data == b'ACK\n'
         return res.returncode
     finally:
-        if pipe_w >= 0:
-            os.close(pipe_w)
-        if pipe_r >= 0:
-            os.close(pipe_r)
+        for fd in (pipe_w, pipe_r, ack_w, ack_r):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         if gate_sock is not None:
             gate_sock.close()
         if not handed_off and gate_node_identity is not None and gate_dir_fd >= 0:
@@ -296,7 +373,10 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
             except OSError:
                 pass
         if gate_node_fd >= 0:
-            os.close(gate_node_fd)
+            try:
+                os.close(gate_node_fd)
+            except OSError:
+                pass
         for fd in owned_fds:
             try:
                 os.close(fd)
@@ -315,6 +395,7 @@ def main(argv=None):
     parser.add_argument('--source-dir', required=True)
     parser.add_argument('--gate-dir', required=True)
     parser.add_argument('--python-bin', default='/usr/bin/python3')
+    parser.add_argument('--entry-archive', default=DEFAULT_ENTRY_ARCHIVE)
     args = parser.parse_args(argv)
     return prepare_and_handoff(args)
 
