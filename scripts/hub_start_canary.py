@@ -96,9 +96,44 @@ HOST_UPDATER_TRIGGER_ARGV = (
 
 
 class StageFailure(Exception):
-    def __init__(self, stage, reason):
+    def __init__(self, stage, reason, *, admission_diagnostic=None):
         super().__init__(f"{stage}: {reason}")
         self.stage, self.reason = stage, reason
+        self.admission_diagnostic = admission_diagnostic
+
+
+ADMISSION_DIAGNOSTIC_VALUES = {
+    "category": frozenset(("coordinator_kernel_cap", "starting_recorded_cap", "provided_recorded_cap",
+                           "census_invalid", "census_changed", "inflight_changed", "workload_reappeared",
+                           "chosen_identity_changed", "chosen_cap_changed")),
+    "cap_status": frozenset(("unavailable", "changed")),
+    "age_class": frozenset(("young", "mature")),
+    "target_kind": frozenset(("coordinator", "workload_current")),
+    "state_class": frozenset(("running", "other")),
+    "phase_class": frozenset(("running", "other")),
+}
+
+
+def add_admission_diagnostic(result, failure):
+    """Publish closed categories only; diagnostic failure never replaces the original refusal.
+
+    No new measurements, file writes or admission decisions happen here. In particular,
+    an unavailable cap does not identify RAM exhaustion or an unbounded kernel limit.
+    """
+    try:
+        if failure.stage != "admission" or failure.reason not in ("resident_bound_unknown", "resident_fallback_changed"):
+            return
+        detail = failure.admission_diagnostic
+        if detail is None:
+            return  # Preserve the verdict shape of existing callers without diagnostic evidence.
+        if (type(detail) is not dict or "category" not in detail
+                or any(type(key) is not str or key not in ADMISSION_DIAGNOSTIC_VALUES
+                       or type(value) is not str or value not in ADMISSION_DIAGNOSTIC_VALUES[key]
+                       for key, value in detail.items())):
+            raise ValueError("closed diagnostic required")
+        result["admission_diagnostic"] = dict(detail)
+    except Exception:
+        result["admission_diagnostic"] = {"category": "unavailable"}
 
 
 class CanaryTerminated(BaseException):
@@ -1899,7 +1934,13 @@ class PhysicalAdmission:
         if age >= MATURE_RESIDENT_AGE_S and row.get("state") == "running" and row.get("phase") == "running":
             return 0, "mature"
         if first["cap"] is None or first["cap"] != second["cap"]:
-            raise StageFailure("admission", "resident_bound_unknown")
+            raise StageFailure("admission", "resident_bound_unknown", admission_diagnostic={
+                "category": "coordinator_kernel_cap", "target_kind": target.get("kind"),
+                "age_class": "mature" if age >= MATURE_RESIDENT_AGE_S else "young",
+                "state_class": "running" if row.get("state") == "running" else "other",
+                "phase_class": "running" if row.get("phase") == "running" else "other",
+                "cap_status": "unavailable" if first["cap"] is None else "changed",
+            })
         target["cap"] = first["cap"]
         return first["cap"], "young"
 
@@ -1922,15 +1963,18 @@ class PhysicalAdmission:
         try:
             changed = census_signature(final) != census_signature(census)
         except ValueError:
-            raise StageFailure("admission", "resident_fallback_changed")  # duplicate/invalid final id: ambiguous snapshot
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "census_invalid"})
         if changed:
-            raise StageFailure("admission", "resident_fallback_changed")
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "census_changed"})
         if hub_rows is not None and any(target["kind"] == "workload_current" or target.get("proof") == "provided" for _row, target in derived):
             self.admission_time_left(deadline)
             freeze = lambda rows: sorted(json.dumps([r.get(k) for k in ("id", "native_id", "workspace", "cwd", "host", "machine_id", "machine")], default=str)
                                          for r in self.uncovered_inflight_rows(rows, native_ids))
             if freeze(self.read_hub_rows(deadline)) != freeze(hub_rows):
-                raise StageFailure("admission", "resident_fallback_changed")
+                raise StageFailure("admission", "resident_fallback_changed",
+                                   admission_diagnostic={"category": "inflight_changed"})
         final_rows = {r["id"].lower(): r for r in final}
         delta = 0
         for row, target in derived:
@@ -1940,13 +1984,17 @@ class PhysicalAdmission:
                 continue
             if target["kind"] == "coordinator":
                 if row.get("workload_pid") is not None and not self.workload_pid_absent(row["workload_pid"]):
-                    raise StageFailure("admission", "resident_fallback_changed")
+                    raise StageFailure("admission", "resident_fallback_changed",
+                                       admission_diagnostic={"category": "workload_reappeared"})
                 if self.sample_coordinator(target, boot_id, ns_ids)["identity"] != target["identity"]:
-                    raise StageFailure("admission", "resident_fallback_changed")
+                    raise StageFailure("admission", "resident_fallback_changed",
+                                       admission_diagnostic={"category": "chosen_identity_changed"})
                 continue
             sample = self.sample_coordinator(target, boot_id, ns_ids)
             if sample["identity"] != target["identity"] or (target["cap"] is not None and sample["cap"] != target["cap"]):
-                raise StageFailure("admission", "resident_fallback_changed")
+                raise StageFailure("admission", "resident_fallback_changed", admission_diagnostic={
+                    "category": "chosen_identity_changed" if sample["identity"] != target["identity"] else "chosen_cap_changed",
+                })
         return delta
 
     def revalidate_provided(self, final_row, target, boot_id, ns_ids):
@@ -1964,7 +2012,8 @@ class PhysicalAdmission:
         target["provided"] = provided
         sample = self.sample_coordinator(target, boot_id, ns_ids)
         if sample["identity"] != target["identity"]:
-            raise StageFailure("admission", "resident_fallback_changed")
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "chosen_identity_changed"})
         if not target["credited"]:
             return 0  # no credit was taken (whole recorded cap reserved): nothing a later sample can lower
         group_ok = 0 < sample["group_anon"] <= sample["group_current"]
@@ -1993,7 +2042,8 @@ class PhysicalAdmission:
         pid = row.get("workload_pid")
         if pid is None and (phase == "starting" or state == "starting"):
             if cap is None:
-                raise StageFailure("admission", "resident_bound_unknown")
+                raise StageFailure("admission", "resident_bound_unknown",
+                                   admission_diagnostic={"category": "starting_recorded_cap", "cap_status": "unavailable"})
             return cap, "young"
         identity = row.get("containment_cgroup_identity")
         if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
@@ -2033,7 +2083,10 @@ class PhysicalAdmission:
             anon = min(first["group_anon"], second["group_anon"])
         mature = age >= MATURE_RESIDENT_AGE_S and mature_ok
         if not mature and cap is None:
-            raise StageFailure("admission", "resident_bound_unknown")
+            raise StageFailure("admission", "resident_bound_unknown", admission_diagnostic={
+                "category": "provided_recorded_cap", "cap_status": "unavailable",
+                "age_class": "mature" if age >= MATURE_RESIDENT_AGE_S else "young",
+            })
         extra = 0 if mature else (max(0, cap - anon) if mature_ok else cap)
         target.update(proof="provided", identity=first["identity"], credited=mature_ok, mature=mature, shared=shared,
                       anon=anon, recorded_cap=cap, extra=extra)
@@ -2306,6 +2359,7 @@ def physical_admission_check(admission=None):
         result["disk_floor_gb"] = floor_gb
     except StageFailure as failure:
         result["reason"] = failure.reason if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", str(failure.reason)) else "physical_check_failed"
+        add_admission_diagnostic(result, failure)
     except Exception:  # closed output only: never a raw exception text
         result["reason"] = "physical_check_internal_error"
     return result
@@ -3603,6 +3657,7 @@ class Canary(PhysicalAdmission):
             result.update(ok=True)
         except StageFailure as failure:
             result.update(stage=failure.stage, reason=failure.reason)
+            add_admission_diagnostic(result, failure)
         except CanaryTerminated as terminated:
             stage = self.current_stage if self.current_stage in STAGES else ("start" if not self.session else "stop")
             result.update(stage=stage, reason=f"terminated_{terminated.sig_name.lower()}")
