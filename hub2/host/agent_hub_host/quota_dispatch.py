@@ -219,3 +219,173 @@ class QuotaDispatch:
             except BaseException as error:
                 if first is None: first = error
         if first is not None: raise first
+
+
+def configured_same_process(value):
+    """Strict opt-in config validator for same-process quota dispatch (default OFF)."""
+    from pathlib import Path
+    import os
+    try:
+        allowed_keys = {
+            'v', 'enabled', 'broker_directory', 'gate_directory',
+            'source_directory', 'unit', 'cgroup',
+        }
+        ram.require(type(value) is dict and allowed_keys <= set(value) <= (allowed_keys | {'primary_args'}))
+        ram.require(type(value['v']) is int and value['v'] == 1 and value['enabled'] is True)
+        for key in ('broker_directory', 'gate_directory', 'source_directory'):
+            directory = value[key]
+            ram.require(type(directory) is str and directory.startswith('/')
+                        and '\x00' not in directory and '..' not in Path(directory).parts
+                        and len(os.fsencode(directory)) <= 80)
+        unit = value['unit']
+        cgroup = value['cgroup']
+        ram.require(type(unit) is str and unit.endswith('.service') and '/' not in unit and len(unit) <= 128)
+        ram.require(type(cgroup) is str and cgroup.startswith('/') and '\x00' not in cgroup and len(cgroup) <= 256)
+        if 'primary_args' in value:
+            pargs = value['primary_args']
+            ram.require(type(pargs) is list and 1 <= len(pargs) <= 32
+                        and all(type(a) is str and '\x00' not in a and len(a) <= 256 for a in pargs))
+        return dict(value)
+    except Exception:
+        return None
+
+
+def run_same_process_quota(
+    prepared=None,
+    launcher=None,
+    *,
+    enabled=False,
+    broker_directory=None,
+    collector_factory=None,
+    identity=None,
+    now=time.monotonic,
+    probe_factory=None,
+    snapshot_fn=None,
+):
+    """Opt-in, default-OFF same-process quota dispatch lifecycle caller.
+
+    Selection reservation precedes launch. Original selected business runs
+    once even if reservation/broker fails. Never claims complete=True.
+    """
+    if not enabled:
+        return {'enabled': False, 'dispatched': False, 'authority': 'NONE', 'complete': False}
+
+    from . import alert_broker as wire
+    from .quota_dispatch_manager import PreparedQuotaSelection, SerialProbe, V4QuotaManager
+
+    ram.require(type(prepared) is PreparedQuotaSelection and callable(launcher))
+    ram.require(broker_directory is not None)
+
+    state = {'dispatch': None, 'manager': None, 'ready': threading.Event(), 'error': None}
+    cleanup_lock = threading.Lock()
+    cleaned = {'done': False}
+
+    def _cleanup_once():
+        with cleanup_lock:
+            if cleaned['done']:
+                return
+            cleaned['done'] = True
+        prepared.cleanup_owned()
+
+    def _dispatch_factory(broker):
+        if broker.stop_event.is_set():
+            _cleanup_once()
+            raise ram.Unknown('broker_stopped')
+        try:
+            mgr = V4QuotaManager(
+                prepared,
+                broker.collector,
+                broker.events,
+                now=now,
+                probe_factory=probe_factory or SerialProbe,
+            )
+            disp = QuotaDispatch(broker, mgr, now=now)
+            state['manager'] = mgr
+            state['dispatch'] = disp
+            return disp
+        except BaseException as err:
+            state['error'] = err
+            raise
+        finally:
+            state['ready'].set()
+
+    kwargs = {
+        'collector_factory': collector_factory or (lambda cb: wire.Broker._collector(None, cb)),
+        'dispatch_factory': _dispatch_factory,
+        '_on_owner_exit': _cleanup_once,
+    }
+    if identity is not None:
+        kwargs['identity'] = identity
+
+    broker = None
+    launch_result = None
+    snapshot = None
+    ticket = None
+    mgr = None
+    primary_error = None
+    try:
+        try:
+            broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
+            broker.start()
+            while not state['ready'].is_set() and not broker.closed and now() < prepared.service_deadline:
+                time.sleep(0.002)
+            mgr = state['manager']
+            disp = state['dispatch']
+            while (mgr is not None and mgr.phase in ('initial_begin', 'initial_poll')
+                   and not broker.closed and now() < prepared.service_deadline):
+                time.sleep(0.002)
+            if disp is not None and mgr is not None and mgr.phase == 'accept' and not broker.closed:
+                offer = disp.post(prepared.source)
+                ticket = offer.await_owner(now=now)
+        except Exception:
+            # Observer/broker setup failure fails open once; primary exceptions propagate.
+            try:
+                launch_result = launcher(None)
+            except BaseException as err:
+                primary_error = err
+                raise
+            return {
+                'enabled': True,
+                'dispatched': False,
+                'reserved': False,
+                'phase': mgr.phase if mgr is not None else 'failed',
+                'launch_result': launch_result,
+                'snapshot': None,
+                'complete': False,
+            }
+
+        # Selection reservation precedes launch; run original selected business ONCE.
+        # Never swallow or retry original primary exceptions.
+        try:
+            launch_result = launcher(ticket)
+        except BaseException as err:
+            primary_error = err
+            raise
+
+        try:
+            while (mgr is not None and mgr.phase not in ('done', 'failed')
+                   and not broker.closed and now() < prepared.service_deadline):
+                time.sleep(0.002)
+            if not broker.closed and broker.listener is not None:
+                snap_call = snapshot_fn or wire.exchange
+                snapshot = snap_call(broker.path, {'v': 1, 'op': 'snapshot', 'nonce': uuid.uuid4().hex})
+        except Exception:
+            snapshot = None
+        return {
+            'enabled': True,
+            'dispatched': True,
+            'reserved': ticket is not None,
+            'phase': mgr.phase if mgr is not None else 'failed',
+            'launch_result': launch_result,
+            'snapshot': snapshot,
+            'complete': False,
+        }
+    finally:
+        try:
+            wire.stop_optional(broker)
+            owner_gone = broker is None or broker.thread is None or not broker.thread.is_alive()
+            if state['manager'] is None and owner_gone:
+                _cleanup_once()
+        except BaseException:
+            if primary_error is None:
+                raise

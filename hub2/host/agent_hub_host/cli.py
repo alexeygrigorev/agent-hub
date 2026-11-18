@@ -50,6 +50,11 @@ def main(argv=None):
     updater.add_argument("--root", type=Path, default=Path.home() / ".local/share/agent-hub2")
     updater.add_argument("--no-restart", action="store_true")
     updater.add_argument("--force", action="store_true", help="Windows: reinstall even when already current")
+    quota_dispatch_cmd = commands.add_parser("quota-dispatch", help="Staged opt-in same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--enable", action="store_true", default=False,
+                                    help="Opt in to staged same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--handoff-fd", type=int, default=None,
+                                    help="Inherited Root-prepared descriptor manifest pipe FD")
     args = parser.parse_args(argv)
     if args.command == "self-update" and os.name == "nt":
         from .windows_host import windows_self_update
@@ -93,6 +98,9 @@ def main(argv=None):
             save_config(args.config, updated)
             print(json.dumps({"configured": True, "restart_required": True}))
             return 0
+        if args.command == "quota-dispatch":
+            from .quota_dispatch_entry import run_quota_dispatch_cli
+            return run_quota_dispatch_cli(args, config)
         server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
         if args.command not in ('auth', 'heartbeat') and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:

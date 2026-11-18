@@ -1,6 +1,9 @@
 """Pure owner-state controls. Fake manager handles are NOT runtime admission."""
 import importlib.util
+import os
 from pathlib import Path
+import struct
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -532,3 +535,1715 @@ class ProducerTerminalProtocolTests(unittest.TestCase):
         self.channel.recvmsg=lambda *args:(b'',[],socket.MSG_CTRUNC,None)
         self.manager.step(self.owner);self.assertEqual(self.manager.phase,'failed')
         self.assertEqual(self.source_calls,1);self.assertEqual(self.owner.ram.counts['quota_stale']['finished'],0)
+
+
+class SameProcessLifecycleTests(unittest.TestCase):
+    """End-to-end same-process boundary, OS-adapter, and failure-seam tests."""
+
+    def _short_temp(self):
+        import tempfile
+        base = os.environ.get('RUNNER_TEMP')
+        if not base:
+            xdg = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+            if os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+                base = xdg
+        td = tempfile.TemporaryDirectory(prefix='qd-', dir=base)
+        self.addCleanup(td.cleanup)
+        return Path(td.name)
+
+    def _write_readonly(self, directory, name, content):
+        path = directory / name
+        path.write_bytes(content)
+        path.chmod(0o400)
+        return path
+
+    def test_opt_in_default_off_has_zero_io(self):
+        from agent_hub_host.quota_dispatch import configured_same_process, run_same_process_quota
+        with patch('socket.socket', side_effect=AssertionError('socket forbidden')), \
+             patch('subprocess.run', side_effect=AssertionError('subprocess forbidden')):
+            res = run_same_process_quota({'proof': True}, lambda t: 0)
+            self.assertEqual(res, {'enabled': False, 'dispatched': False, 'authority': 'NONE', 'complete': False})
+            self.assertIsNone(configured_same_process(None))
+            self.assertIsNone(configured_same_process({'v': 1, 'enabled': False}))
+
+    def test_cli_quota_dispatch_default_off_exits_zero_without_io(self):
+        import contextlib, io, json
+        from agent_hub_host import cli
+        out = io.StringIO()
+        with patch('socket.socket', side_effect=AssertionError('socket forbidden')), \
+             patch('subprocess.run', side_effect=AssertionError('subprocess forbidden')), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', '/nonexistent/v2.json', 'quota-dispatch'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue()), {'enabled': False, 'dispatched': False, 'authority': 'NONE', 'complete': False})
+
+    def test_negative_client_self_admission_and_proof_dict_rejected(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        with self.assertRaises(ram.Unknown):
+            run_same_process_quota({'proof': True}, lambda t: 0, enabled=True, broker_directory='/unused')
+
+    def test_hold_source_fd_and_changed_source_refused(self):
+        from agent_hub_host.quota_dispatch_manager import StableRuntime, close_held_source, hold_source_fd
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        target = self._write_readonly(src_dir, 'quota.py', b'print("ok")\n')
+        held = hold_source_fd(src_dir, 'quota.py')
+        self.addCleanup(close_held_source, held)
+        stable = StableRuntime()
+        stable.checked_source(held.fd, held.directory_fd, held.name, held.raw, held.stamp)
+        target.chmod(0o600)
+        target.write_bytes(b'print("tampered")\n')
+        target.chmod(0o400)
+        with self.assertRaises(ram.Unknown):
+            stable.checked_source(held.fd, held.directory_fd, held.name, held.raw, held.stamp)
+
+    def test_stable_inspect_exec_and_process_and_user_manager_env(self):
+        from agent_hub_host.quota_dispatch_manager import StableRuntime, UserManagerEnvironment
+        stable = StableRuntime()
+        stable.inspect_exec(
+            b'ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /opt/b.py 1 2 3 ; ignore_errors=no }\n',
+            '/usr/bin/python3 /opt/b.py 1 2 3',
+        )
+        with self.assertRaises(ram.Unknown):
+            stable.inspect_exec(b'ExecStart=/usr/bin/false\n', '/usr/bin/python3 /opt/b.py 1 2 3')
+        pid = os.getpid()
+        cgroup = next(
+            line.split(':', 2)[-1]
+            for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+            if ':' in line
+        )
+        key = stable.inspect_process(pid, cgroup)
+        self.assertEqual(key[0], pid)
+        with self.assertRaises(ram.Unknown):
+            stable.inspect_process(pid, '/wrong/cgroup.slice')
+        plan = {'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': cgroup}}
+        runner = SimpleNamespace(run=lambda argv, timeout: (
+            0, f'MainPID={pid}\nControlGroup={cgroup}\nInvocationID={"a"*32}\n'.encode()
+        ))
+        env = UserManagerEnvironment()
+        state = env.show(runner, plan, 'healthy', env.now() + 5)
+        self.assertEqual(env.owned(state, plan, 'healthy'), 'a' * 32)
+        with self.assertRaises(ram.Unknown):
+            env.owned(state, plan, 'healthy', 'b' * 32)
+
+    def test_fanotify_reader_ordinary_read_and_overflow_loss(self):
+        import struct
+        from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
+        r_pipe, w_pipe = os.pipe()
+        self.addCleanup(lambda: [os.close(fd) for fd in (r_pipe, w_pipe) if fd is not None])
+        os.set_blocking(r_pipe, False)
+        reader = FanotifyReader()
+        obs = FanotifyObservation()
+        ev_fd = os.open(__file__, os.O_RDONLY)
+        pkt = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev_fd, 99999)
+        os.write(w_pipe, pkt)
+        reader.drain(r_pipe, obs)
+        self.assertFalse(obs.unknown)
+        self.assertEqual(len(obs.records), 1)
+        self.assertEqual(obs.records[0]['pid'], 99999)
+        # Overflow sets unknown=True cleanly
+        pkt_ovf = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_Q_OVERFLOW, -1, 0)
+        os.write(w_pipe, pkt_ovf)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+
+    def test_same_process_full_lifecycle_reservation_precedes_launch_and_negative_public_hook(self):
+        import json, socket, threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, close_held_source, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        obs = FanotifyObservation()
+
+        class FakeFan:
+            def drain(self, group, o):
+                o.records = []
+                o.unknown = False
+                try:
+                    raw = os.read(group, 64)
+                    if raw == b'open':
+                        o.records = [{'pid': os.getpid(), 'dev': q_fd.pin.dev, 'ino': q_fd.pin.ino, 'mask': 0x20}]
+                except BlockingIOError:
+                    pass
+
+        class FakeCollector:
+            def __init__(self, cb):
+                self.cb = cb
+                self.wire = SimpleNamespace(receive=lambda *a: False, send=lambda *a: 1)
+                self.epoch = 'e' * 32
+                self.fault = None
+                self.manager = ':1.9'
+                self.jobs = {}
+                self.started = True
+                self.pending = None
+            def start(self):
+                self.cb({'member': 'JobNew', 'job_id': 1, 'unit': 'u.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': self.epoch})
+                return {'stream_index': 1}
+            def handle(self, *a):
+                pass
+            def receipt(self, idx):
+                return {'stream_index': idx}
+            def barrier(self):
+                return {'stream_index': 10}
+            def close(self):
+                pass
+
+        alive_flag = {'alive': True}
+        stable = SimpleNamespace(
+            UID=os.getuid(),
+            source_stamp=lambda info: q_fd.stamp if info.st_ino == q_fd.pin.ino else (c_fd.stamp if info.st_ino == c_fd.pin.ino else b_fd.stamp),
+            checked_source=lambda *a: None,
+            inspect_exec=lambda *a: None,
+            inspect_process=lambda pid, cg: (os.getpid(), 77, '11111111-2222-4333-8444-555555555555'),
+            alive=lambda pidfd: alive_flag['alive'],
+        )
+        env = SimpleNamespace(
+            remaining=lambda d, c=1: 1.0,
+            show=lambda r, p, role, d: {'MainPID': str(os.getpid()) if alive_flag['alive'] else '0', 'ControlGroup': '/u.slice', 'InvocationID': 'a' * 32},
+            owned=lambda s, p, role, inv=None: 'a' * 32,
+        )
+        runner = SimpleNamespace(run=lambda argv, t: (0, b'ExecMainCode=1\nExecMainStatus=0\n' if 'ExecMainCode' in argv[-1] else b'ExecStart=/usr/bin/python3\n'))
+        plan = {'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}}
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan=plan, exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 5.0,
+            stable=stable, manager_environment=env, fan=FakeFan(), observation=obs, runner=runner,
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+
+        order = []
+        child_err = []
+
+        def _fake_launch(ticket):
+            order.append(('launch', ticket is not None))
+            self.assertIsNotNone(ticket)
+            self.assertTrue(ram.identity(ticket.context))
+
+            def _child():
+                sock = None
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    sock.connect(str(gate_dir / 'source-gate.sock'))
+                    sock.send(b'held-before-quota-source')
+                    custody = sock.recv(256)
+                    self.assertEqual(custody, b'custody')
+                    cmd = sock.recv(256)
+                    self.assertEqual(cmd, b'open:' + ticket.context.encode('ascii'))
+                    os.write(w_fan, b'open')
+                    sock.send(b'quota-source-opened')
+                    rel = sock.recv(256)
+                    self.assertEqual(rel, b'qualified-run')
+                    # Negative client self-admission on public observer.sock must be refused!
+                    pub = wire.exchange(broker_dir / 'observer.sock', {
+                        'v': 1, 'op': 'hook', 'frame': {
+                            'v': 1, 'invocation_id': ticket.context, 'parent_id': None,
+                            'role': 'quota_monitor', 'phase': 'begin', 'seq': 0,
+                            'decision': None, 'condition': None, 'flags': {},
+                            'recipient_class': 'none', 'observer_ok': True,
+                        },
+                    })
+                    self.assertIs(pub['ok'], False)
+                    alive_flag['alive'] = False
+                except BaseException as exc:
+                    child_err.append(exc)
+                finally:
+                    if sock is not None:
+                        sock.close()
+
+            t = threading.Thread(target=_child, daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+            return 0
+
+        class InlineBarrierCollector(FakeCollector):
+            pass
+
+        with patch('os.pidfd_open', return_value=os.dup(r_fan)):
+            # Drive OrderedBarrier + events minimally by patching OrderedBarrier.begin/poll on this test
+            with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+                 patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+                res = run_same_process_quota(
+                    prepared, _fake_launch, enabled=True, broker_directory=broker_dir,
+                    collector_factory=InlineBarrierCollector,
+                    identity=lambda pid: KEY,
+                )
+        self.assertEqual(child_err, [])
+        self.assertEqual(order, [('launch', True)])
+        self.assertTrue(res['enabled'])
+        self.assertTrue(res['dispatched'])
+        self.assertTrue(res['reserved'])
+        self.assertFalse(res['complete'])
+        # Because public_hook was attempted, sticky failure is preserved!
+        self.assertEqual(res['phase'], 'failed')
+
+    def test_early_crash_and_dropped_hook_preserve_once_only_business_and_sticky_fault(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+
+        class FakeCollector:
+            def __init__(self, cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+                self.epoch = 'e' * 32
+                self.fault = None
+                self.started = True
+                self.pending = None
+                self.jobs = {}
+            def start(self):
+                self.cb({'member': 'JobNew', 'job_id': 1, 'unit': 'u.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': self.epoch})
+                return {'stream_index': 1}
+            def handle(self, *a):
+                pass
+            def barrier(self):
+                return {'stream_index': 2}
+            def close(self):
+                pass
+
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 0.25,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        launches = []
+        with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+            res = run_same_process_quota(
+                prepared, lambda ticket: launches.append(ticket) or 73,
+                enabled=True, broker_directory=broker_dir,
+                collector_factory=FakeCollector, identity=lambda pid: KEY,
+            )
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(res['launch_result'], 73)
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
+
+    def test_run_same_process_quota_broker_failure_runs_launcher_once_and_no_double_launch(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 2.0,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        # Broker failure runs launcher(None) once AND cleans up owned gate/FDs
+        cleaned = []
+        orig_cleanup = prepared.cleanup_owned
+        object.__setattr__(prepared, 'cleanup_owned', lambda: (cleaned.append(1), orig_cleanup())[1])
+        launches = []
+        with patch.object(wire.Broker, '_selected_quota_attempt', side_effect=OSError('broker_init_failed')):
+            res = run_same_process_quota(
+                prepared, lambda t: launches.append(t) or 42,
+                enabled=True, broker_directory=broker_dir,
+            )
+        self.assertEqual(launches, [None])
+        self.assertEqual(cleaned, [1])
+        self.assertEqual(res['launch_result'], 42)
+        self.assertFalse(res['dispatched'])
+        self.assertFalse(res['complete'])
+
+    def test_run_same_process_quota_preserves_original_primary_exception_identity(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 2.0,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+
+        class SentinelPrimaryError(Exception):
+            pass
+
+        sentinel = SentinelPrimaryError('original_primary')
+        launches = []
+
+        def _boom(t):
+            launches.append(t)
+            raise sentinel
+
+        with self.assertRaises(SentinelPrimaryError) as caught:
+            run_same_process_quota(
+                prepared, _boom, enabled=True, broker_directory=broker_dir,
+                collector_factory=lambda cb: SimpleNamespace(
+                    wire=SimpleNamespace(receive=lambda *a: False), epoch='e'*32,
+                    fault=None, started=True, pending=None, jobs={},
+                    start=lambda: {'stream_index': 1}, handle=lambda *a: None,
+                    barrier=lambda: {'stream_index': 2}, close=lambda: None,
+                ),
+                identity=lambda pid: KEY,
+            )
+        self.assertIs(caught.exception, sentinel)
+        self.assertEqual(len(launches), 1)
+
+    def test_run_same_process_quota_cleanup_base_exception_never_masks_primary_sentinel(self):
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 2.0,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        orig_cleanup = prepared.cleanup_owned
+        def _bad_cleanup():
+            orig_cleanup()
+            raise KeyboardInterrupt('cleanup_interrupt')
+        object.__setattr__(prepared, 'cleanup_owned', _bad_cleanup)
+
+        class SentinelPrimaryError(Exception):
+            pass
+
+        sentinel = SentinelPrimaryError('must_propagate')
+        with patch.object(wire.Broker, '_selected_quota_attempt', side_effect=OSError('broker_fail')):
+            with self.assertRaises(SentinelPrimaryError) as caught:
+                run_same_process_quota(
+                    prepared, lambda t: (_ for _ in ()).throw(sentinel),
+                    enabled=True, broker_directory=broker_dir,
+                )
+        self.assertIs(caught.exception, sentinel)
+
+    def test_run_same_process_quota_paused_collector_never_prematurely_closes_borrowed_fds(self):
+        import threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 0.05,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        cleaned = []
+        orig_cleanup = prepared.cleanup_owned
+        object.__setattr__(prepared, 'cleanup_owned', lambda: (cleaned.append(os.fstat(q_fd.fd).st_ino), orig_cleanup())[1])
+
+        release_collector = threading.Event()
+        entered_collector = threading.Event()
+        class SlowCollector:
+            def __init__(self, cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+            def start(self):
+                entered_collector.set()
+                release_collector.wait(2.0)
+                return {'stream_index': 1}
+            def handle(self, *a):
+                pass
+            def barrier(self):
+                pass
+            def close(self):
+                pass
+
+        res = run_same_process_quota(
+            prepared, lambda t: 55, enabled=True, broker_directory=broker_dir,
+            collector_factory=SlowCollector, identity=lambda pid: KEY,
+        )
+        self.assertTrue(entered_collector.is_set())
+        self.assertEqual(res['launch_result'], 55)
+        # Owner thread is still alive past 0.2s close join -> must NOT have prematurely closed borrowed FDs
+        self.assertEqual(cleaned, [])
+        release_collector.set()
+        deadline = time.monotonic() + 2.0
+        while not cleaned and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(cleaned), 1)
+
+    def test_run_same_process_quota_late_collector_exception_cleans_up_once_after_owner_exit(self):
+        import threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import (
+            FanotifyObservation, SourceGate, hold_source_fd, prepare_selected_quota,
+        )
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'quota.py', b'print("q")\n')
+        self._write_readonly(src_dir, 'client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'boot.py', b'print("b")\n')
+        q_fd = hold_source_fd(src_dir, 'quota.py')
+        c_fd = hold_source_fd(src_dir, 'client.py')
+        b_fd = hold_source_fd(src_dir, 'boot.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        prepared = prepare_selected_quota(
+            source=q_fd, companions=(c_fd, b_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'u.service'}, 'cgroups': {'healthy': '/u.slice'}},
+            exec_argv=lambda ns: ['/usr/bin/python3'],
+            service_deadline=time.monotonic() + 0.05,
+            fan=SimpleNamespace(drain=lambda g, o: None),
+            observation=FanotifyObservation(),
+            extra_cleanup=lambda: os.close(w_fan),
+        )
+        cleaned = []
+        orig_cleanup = prepared.cleanup_owned
+        object.__setattr__(prepared, 'cleanup_owned', lambda: (cleaned.append(os.fstat(q_fd.fd).st_ino), orig_cleanup())[1])
+
+        release_collector = threading.Event()
+        entered_collector = threading.Event()
+        class LateThrowCollector:
+            def __init__(self, cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+            def start(self):
+                entered_collector.set()
+                release_collector.wait(2.0)
+                raise RuntimeError('late_collector_boom')
+            def handle(self, *a):
+                pass
+            def barrier(self):
+                pass
+            def close(self):
+                pass
+
+        res = run_same_process_quota(
+            prepared, lambda t: 66, enabled=True, broker_directory=broker_dir,
+            collector_factory=LateThrowCollector, identity=lambda pid: KEY,
+        )
+        self.assertTrue(entered_collector.is_set())
+        self.assertEqual(res['launch_result'], 66)
+        self.assertFalse(res['reserved'])
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
+        self.assertEqual(cleaned, [])
+        release_collector.set()
+        deadline = time.monotonic() + 2.0
+        while not cleaned and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(cleaned), 1)
+        with self.assertRaises(OSError):
+            os.fstat(q_fd.fd)
+
+    def test_real_subprocess_prelude_retained_fd_transport_on_swapped_path(self):
+        import hashlib, subprocess, sys
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 19 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        retained_fd = os.open(str(q_path), os.O_RDONLY | os.O_NOFOLLOW)
+        self.addCleanup(lambda: os.close(retained_fd))
+        os.set_inheritable(retained_fd, True)
+        # Swap path on disk after parent selection
+        q_path.unlink()
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+        repo_root = Path(__file__).resolve().parents[3]
+        prelude = repo_root / 'scripts/hub-alert-quota-dispatch.py'
+        proc = subprocess.run(
+            [sys.executable, '-I', '-S', str(prelude), '--retained-fd', str(retained_fd),
+             '0', q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'],
+            pass_fds=(retained_fd,), capture_output=True, timeout=5, check=False,
+        )
+        self.assertEqual(proc.returncode, 19)
+
+    def test_root_preparer_inert_default_off_and_handoff_privilege_drop_boundary(self):
+        import contextlib, io, json, shutil, stat, sys
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(prep.main([]), 0)
+        self.assertEqual(json.loads(out.getvalue())['status'], 'INERT_ROOT_PREPARER')
+        with self.assertRaises(PermissionError):
+            prep.drop_privileges(0, 0)
+        # Full interpreter binary pin without 262144-byte cap (prefer maintained trusted system binary)
+        root = self._short_temp()
+        def _trusted_system_py(path_str):
+            p = Path(path_str)
+            if not p.exists() or p.is_symlink():
+                return False
+            st = os.stat(path_str)
+            return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and not (st.st_mode & 0o022) and bool(st.st_mode & 0o111)
+        # Always test unapproved, non-root untrusted, and >262144-byte ELF witness boundary
+        witness = root / 'witness-python'
+        witness.write_bytes(b'\x7fELF' + b'\x00' * 300000)
+        witness.chmod(0o555)
+        with self.assertRaises(PermissionError):
+            prep.pin_interpreter(str(witness))
+        with patch.object(prep, 'APPROVED_INTERPRETERS', frozenset({str(witness)})):
+            with self.assertRaises(PermissionError):
+                prep.pin_interpreter(str(witness))  # non-root owner must be refused as untrusted_interpreter
+            real_fstat = os.fstat
+            def _root_elf_fstat(fd):
+                st = real_fstat(fd)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            with patch('os.fstat', side_effect=_root_elf_fstat):
+                w_fd, w_pin = prep.pin_interpreter(str(witness))
+                os.close(w_fd)
+                self.assertGreater(w_pin['size'], 262144)
+                self.assertEqual(len(w_pin['sha256']), 64)
+
+        approved_py = next((p for p in sorted(prep.APPROVED_INTERPRETERS) if _trusted_system_py(p)), None)
+        if approved_py is not None:
+            real_py = approved_py
+            interp_fd, interp_pin = prep.pin_interpreter(real_py)
+            os.close(interp_fd)
+            self.assertGreater(interp_pin['size'], 262144)
+            self.assertEqual(len(interp_pin['sha256']), 64)
+        else:
+            real_py = str(witness)
+            interp_pin = w_pin
+        # Staged handoff with mocked Root syscalls + privilege drop + read-only pipe manifest
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        seen = {}
+        def _fake_runner(cmd, *, pass_fds, env, check):
+            idx = cmd.index('--handoff-fd')
+            pipe_fd = int(cmd[idx + 1])
+            seen['cmd'] = cmd
+            seen['pass_fds'] = pass_fds
+            seen['env'] = env
+            seen['manifest'] = json.loads(os.read(pipe_fd, 65536).decode('utf-8'))
+            os.write(seen['manifest']['ack_fd'], b'ACK\n')
+            return SimpleNamespace(returncode=0)
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-host.pyz',
+        )
+        # Non-root entry must be refused before any preparation
+        with self.assertRaises(PermissionError):
+            prep.prepare_and_handoff(args, runner=_fake_runner)
+
+        fake_libc = SimpleNamespace(prctl=lambda op, a1, *a: 1 if op == prep.PR_GET_NO_NEW_PRIVS else 0)
+        fake_status = 'NoNewPrivs:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n'
+        entry_pin = {k: interp_pin[k] for k in ('dev', 'ino', 'size', 'mtime_ns', 'ctime_ns', 'sha256')}
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **interp_pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **entry_pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(SimpleNamespace(fileno=lambda: os.dup(r_fan), close=lambda: None), os.open(str(gate_dir), os.O_RDONLY), os.dup(r_fan), (1, 2))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc):
+            rc = prep.prepare_and_handoff(args, runner=_fake_runner)
+        self.assertEqual(rc, 0)
+        self.assertIn(seen['manifest']['fan_group'], seen['pass_fds'])
+        self.assertEqual(seen['manifest']['interpreter']['sha256'], interp_pin['sha256'])
+        self.assertEqual(seen['manifest']['entry']['sha256'], entry_pin['sha256'])
+        self.assertTrue(seen['cmd'][0].startswith('/proc/self/fd/'))
+        self.assertTrue(seen['cmd'][2].startswith('/proc/self/fd/'))
+        self.assertEqual(seen['env']['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+        self.assertEqual(seen['env']['DBUS_SESSION_BUS_ADDRESS'], f'unix:path=/run/user/{os.getuid()}/bus')
+
+    def test_root_preparer_r5_r6_security_controls_and_refusals(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_sec', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        # R6: unapproved interpreter & non-ELF refused
+        with self.assertRaises(PermissionError):
+            prep.pin_interpreter('/tmp/evil-python')
+        # R6: drop_privileges refuses non-root entry, retained caps, wrong EGID/resgid, non-empty groups
+        with self.assertRaises(PermissionError):
+            prep.drop_privileges(1000, 1000)
+        fake_libc = SimpleNamespace(prctl=lambda op, a1, *a: 1 if op == prep.PR_GET_NO_NEW_PRIVS else 0)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[27]):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[]), \
+             patch.object(prep.os, 'setresgid', lambda *a: None), \
+             patch.object(prep.os, 'getresgid', return_value=(1000, 0, 1000)):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        with patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep.ctypes, 'CDLL', return_value=fake_libc), \
+             patch.object(prep.os, 'setgroups', lambda g: None), \
+             patch.object(prep.os, 'getgroups', return_value=[]), \
+             patch.object(prep.os, 'setresgid', lambda *a: None), \
+             patch.object(prep.os, 'getresgid', return_value=(1000, 1000, 1000)), \
+             patch.object(prep.os, 'setresuid', lambda *a: None), \
+             patch.object(prep.os, 'getresuid', return_value=(1000, 1000, 1000)), \
+             patch.object(prep.Path, 'read_text', return_value='NoNewPrivs:\t1\nCapInh:\t0\nCapPrm:\t0000000000000001\nCapEff:\t0\nCapAmb:\t0\n'):
+            with self.assertRaises(PermissionError):
+                prep.drop_privileges(1000, 1000)
+        # R5: bind_source_gate uses /proc/self/fd/<node_fd> (not mutable basename) and rejects raced inode
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        gate_dir.mkdir(mode=0o700)
+        seen_chmod = []
+        orig_chmod = os.chmod
+        def _rec_chmod(p, mode):
+            seen_chmod.append(str(p))
+            return orig_chmod(p, mode)
+        with patch.object(prep.os, 'chmod', side_effect=_rec_chmod), \
+             patch.object(prep.os, 'chown', lambda *a: None):
+            sock, dfd, nfd, nid = prep.bind_source_gate(str(gate_dir), os.getuid())
+            sock.close()
+            os.close(nfd)
+            os.close(dfd)
+        self.assertEqual(len(seen_chmod), 1)
+        self.assertNotIn('source-gate.sock', seen_chmod[0])
+
+    def test_consume_handoff_fd_rejects_forged_pipe_and_non_fanotify_fd(self):
+        import json
+        from agent_hub_host.quota_dispatch_manager import consume_handoff_fd
+        r_pipe, w_pipe = os.pipe()
+        os.write(w_pipe, json.dumps({'v': 1, 'interpreter': {'fd': 3}, 'source': {'fd': 4, 'dir_fd': 5},
+                                     'client': {'fd': 6, 'dir_fd': 7}, 'prelude': {'fd': 8, 'dir_fd': 9},
+                                     'fan_group': 10, 'gate_sock_fd': 11, 'gate_dir_fd': 12}).encode())
+        os.close(w_pipe)
+        with self.assertRaises(ram.Unknown):
+            consume_handoff_fd(r_pipe, '/unused')
+
+    def test_scm_rights_source_transfer_across_source_gate_and_path_swap(self):
+        import hashlib, socket, threading
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 31 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        held_orig_fd = os.open(str(q_path), os.O_RDONLY | os.O_NOFOLLOW)
+        self.addCleanup(lambda: os.close(held_orig_fd))
+        gate_sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        gate_sock.bind(str(root / 'source-gate.sock'))
+        gate_sock.listen(1)
+        self.addCleanup(gate_sock.close)
+
+        def _server():
+            conn, _ = gate_sock.accept()
+            with conn:
+                self.assertEqual(conn.recv(256), b'held-before-quota-source')
+                # Swap path on disk before sending SCM_RIGHTS open command
+                q_path.unlink()
+                self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+                conn.sendmsg([b'open:' + b'a' * 32], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', held_orig_fd))])
+
+        t = threading.Thread(target=_server, daemon=True)
+        t.start()
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_scm', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dl_ns = str(int((time.monotonic() + 5.0) * 1e9))
+        rc = mod.main([dl_ns, q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'])
+        t.join(timeout=2.0)
+        self.assertEqual(rc, 31)
+
+    def test_fanotify_reader_bad_version_header_closes_trailing_valid_fds(self):
+        from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
+        r_pipe, w_pipe = os.pipe()
+        self.addCleanup(lambda: [os.close(fd) for fd in (r_pipe, w_pipe)])
+        os.set_blocking(r_pipe, False)
+        reader = FanotifyReader()
+        obs = FanotifyObservation()
+        ev1 = os.open(__file__, os.O_RDONLY)
+        ev2 = os.open(__file__, os.O_RDONLY)
+        pkt_bad_vers = FanotifyReader._STRUCT.pack(24, 99, 0, 24, FanotifyReader._FAN_OPEN, -1, 111)
+        pkt1 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev1, 222)
+        pkt2 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev2, 333)
+        os.write(w_pipe, pkt_bad_vers + pkt1 + pkt2)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+        for fd in (ev1, ev2):
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_fanotify_reader_bounded_drain_and_closes_trailing_fds_on_loss(self):
+        from agent_hub_host.quota_dispatch_manager import FanotifyObservation, FanotifyReader
+        r_pipe, w_pipe = os.pipe()
+        self.addCleanup(lambda: [os.close(fd) for fd in (r_pipe, w_pipe)])
+        os.set_blocking(r_pipe, False)
+        reader = FanotifyReader()
+        obs = FanotifyObservation()
+        ev1 = os.open(__file__, os.O_RDONLY)
+        ev2 = os.open(__file__, os.O_RDONLY)
+        pkt_ovf = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_Q_OVERFLOW, -1, 0)
+        pkt1 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev1, 111)
+        pkt2 = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev2, 222)
+        os.write(w_pipe, pkt_ovf + pkt1 + pkt2)
+        reader.drain(r_pipe, obs)
+        self.assertTrue(obs.unknown)
+        self.assertEqual(obs.records, [])
+        for fd in (ev1, ev2):
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+        # Bounded by MAX_RECORDS (fresh observation)
+        obs2 = FanotifyObservation()
+        fds = [os.open(__file__, os.O_RDONLY) for _ in range(FanotifyReader.MAX_RECORDS + 2)]
+        buf = b''.join(FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, fd, 333) for fd in fds)
+        os.write(w_pipe, buf)
+        reader.drain(r_pipe, obs2)
+        self.assertTrue(obs2.unknown)
+        self.assertEqual(obs2.records, [])
+        for fd in fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+    def test_cli_quota_dispatch_enabled_prelude_handshake_and_deadline_match(self):
+        import contextlib, io, json, shutil, threading
+        from agent_hub_host import cli
+        from agent_hub_host.quota_dispatch_manager import FanotifyReader
+        root = self._short_temp()
+        cfg = root / 'v2.json'
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        repo_root = Path(__file__).resolve().parents[3]
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        observer_seen = []
+        self._write_readonly(
+            src_dir, 'hub-quota-publish.py',
+            b'def main(argv=None, *, _managed_observer=None):\n'
+            b'    import builtins\n'
+            b'    builtins._test_observer_seen.append(_managed_observer is not None)\n'
+            b'    if _managed_observer is not None:\n'
+            b'        assert _managed_observer.emit("begin") is True\n'
+            b'        assert _managed_observer.emit("decision", decision="observation", condition="quota_fresh") is True\n'
+            b'        assert _managed_observer.emit("terminal") is True\n'
+            b'    return 0\n',
+        )
+        pid = os.getpid()
+        cgroup = next(
+            line.split(':', 2)[-1]
+            for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+            if ':' in line
+        )
+        cfg.write_text(json.dumps({
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': cgroup,
+            }
+        }))
+        r_fan, w_fan = os.pipe()
+        os.set_blocking(r_fan, False)
+        seen_launch = []
+        alive_state = {'alive': True}
+        q_path_str = str(src_dir / 'hub-quota-publish.py')
+
+        def _fake_subprocess_run(argv, **kw):
+            if argv[0] == '/usr/bin/systemd-run':
+                seen_launch.append(argv)
+                idx = argv.index('--')
+                prelude_argv = argv[idx + 1:]
+                spec = importlib.util.spec_from_file_location('actual_prelude', prelude_argv[3])
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                orig_acquired = mod.acquired
+                def _acquired_with_fanotify(p, d):
+                    raw = orig_acquired(p, d)
+                    if p == q_path_str:
+                        ev_fd = os.open(q_path_str, os.O_RDONLY)
+                        pkt = FanotifyReader._STRUCT.pack(24, 3, 0, 24, FanotifyReader._FAN_OPEN, ev_fd, pid)
+                        os.write(w_fan, pkt)
+                    return raw
+                mod.acquired = _acquired_with_fanotify
+                def _run():
+                    try:
+                        mod.main(prelude_argv[4:])
+                    finally:
+                        alive_state['alive'] = False
+                t = threading.Thread(target=_run, daemon=True)
+                t.start()
+                t.join(timeout=2.0)
+                return SimpleNamespace(returncode=0, stdout=b'')
+            if '--property=ExecStart' in argv:
+                prelude_cmd = seen_launch[-1][seen_launch[-1].index('--') + 1:]
+                return SimpleNamespace(returncode=0, stdout=('ExecStart=' + ' '.join(prelude_cmd) + '\n').encode())
+            if '--property=ExecMainCode' in argv:
+                return SimpleNamespace(returncode=0, stdout=b'ExecMainCode=1\nExecMainStatus=0\n')
+            main_pid = str(pid) if alive_state['alive'] else '0'
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f'MainPID={main_pid}\nControlGroup={cgroup}\nInvocationID={"a"*32}\n'.encode(),
+            )
+
+        out = io.StringIO()
+        events_cb = {}
+        def _fake_collector(_self, cb):
+            events_cb['cb'] = cb
+            return SimpleNamespace(
+                wire=SimpleNamespace(receive=lambda *a: False), epoch='e'*32,
+                fault=None, started=True, pending=None, jobs={},
+                start=lambda: (cb({'member': 'JobNew', 'job_id': 1, 'unit': 'agent-hub-quota-monitor.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': 'e'*32}), {'stream_index': 1})[1],
+                handle=lambda *a: None,
+                barrier=lambda: {'stream_index': 2}, close=lambda: None,
+            )
+
+        import builtins, select
+        builtins._test_observer_seen = observer_seen
+        self.addCleanup(lambda: delattr(builtins, '_test_observer_seen'))
+        real_select = select.select
+        def _fast_select(r, w, x, timeout=None):
+            if timeout == 0.01:
+                timeout = 0.001
+            return real_select(r, w, x, timeout)
+
+        def _fake_poll(self_b):
+            if not alive_state['alive']:
+                if not any(e.get('member') == 'JobRemoved' for e in events_cb['list']):
+                    events_cb['cb']({'member': 'JobRemoved', 'job_id': 1, 'unit': 'agent-hub-quota-monitor.service', 'result': 'done', 'stream_index': 5, 'manager_serial': 11, 'epoch': 'e'*32})
+                return {'stream_index': 6}
+            return {'stream_index': 2}
+
+        def _fake_collector2(_self, cb):
+            events_cb['cb'] = lambda ev: (events_cb['list'].append(ev), cb(ev))[1]
+            events_cb['list'] = []
+            return SimpleNamespace(
+                wire=SimpleNamespace(receive=lambda *a: False), epoch='e'*32,
+                fault=None, started=True, pending=None, jobs={},
+                start=lambda: (events_cb['cb']({'member': 'JobNew', 'job_id': 1, 'unit': 'agent-hub-quota-monitor.service', 'result': None, 'stream_index': 3, 'manager_serial': 10, 'epoch': 'e'*32}), {'stream_index': 1})[1],
+                handle=lambda *a: None,
+                barrier=lambda: {'stream_index': 2}, close=lambda: None,
+            )
+
+        with patch.object(wire.Broker, '_collector', _fake_collector2), \
+             patch('select.select', _fast_select), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', _fake_poll), \
+             patch('os.pidfd_open', return_value=os.dup(r_fan)), \
+             patch('agent_hub_host.quota_dispatch_manager.StableRuntime.alive', lambda self, fd: alive_state['alive']), \
+             patch('agent_hub_host.quota_dispatch_manager.StableRuntime.user_manager_env', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
+             patch('subprocess.run', side_effect=_fake_subprocess_run), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', str(cfg), 'quota-dispatch', '--enable'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(seen_launch), 1)
+        prelude_cmd = seen_launch[0][seen_launch[0].index('--') + 1:]
+        self.assertEqual(prelude_cmd[3], str(src_dir / 'hub-alert-quota-dispatch.py'))
+        self.assertTrue(prelude_cmd[4].isdigit() and int(prelude_cmd[4]) > 0)
+        self.assertEqual(observer_seen, [True])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload['dispatched'])
+        self.assertTrue(payload['reserved'])
+        self.assertEqual(payload['phase'], 'done')
+        self.assertFalse(payload['complete'])
+        try:
+            os.close(w_fan)
+        except OSError:
+            pass
+
+    def test_cli_quota_dispatch_enabled_prep_failure_runs_verified_retained_original(self):
+        import contextlib, io, json
+        from agent_hub_host import cli
+        from agent_hub_host.quota_dispatch_manager import FanotifyReader
+        root = self._short_temp()
+        cfg = root / 'v2.json'
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        self._write_readonly(
+            src_dir, 'hub-quota-publish.py',
+            b'def main(argv=None, *, _managed_observer=None):\n'
+            b'    return 0 if _managed_observer is None else 9\n',
+        )
+        self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        cfg.write_text(json.dumps({
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+            }
+        }))
+        out = io.StringIO()
+        with patch.object(FanotifyReader, 'open_group', side_effect=ram.Unknown('fanotify_unavailable')), \
+             patch('subprocess.run', side_effect=AssertionError('must not invoke subprocess')), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', str(cfg), 'quota-dispatch', '--enable'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload['fail_open_business'])
+        self.assertFalse(payload['dispatched'])
+        self.assertFalse(payload['complete'])
+
+    def test_cli_quota_dispatch_source_pin_rejection_never_executes_rejected_path(self):
+        import contextlib, io, json
+        from agent_hub_host import cli
+        root = self._short_temp()
+        cfg = root / 'v2.json'
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        bad = src_dir / 'hub-quota-publish.py'
+        bad.write_bytes(b'raise AssertionError("rejected_path_executed")\n')
+        bad.chmod(0o644)  # writable -> rejected by hold_source_fd
+        cfg.write_text(json.dumps({
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+            }
+        }))
+        out = io.StringIO()
+        with patch('subprocess.run', side_effect=AssertionError('must not invoke subprocess')), \
+             contextlib.redirect_stdout(out):
+            rc = cli.main(['--config', str(cfg), 'quota-dispatch', '--enable'])
+        self.assertEqual(rc, 1)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload['source_rejected'])
+        self.assertFalse(payload['dispatched'])
+
+    def test_prelude_retained_fd_fallback_on_swapped_path_never_evaluates_replacement(self):
+        import hashlib
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 17 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        retained_fd = os.open(str(q_path), os.O_RDONLY | os.O_NOFOLLOW)
+        self.addCleanup(lambda: os.close(retained_fd))
+        # Swap path on disk with hostile replacement
+        q_path.unlink()
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_swap', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rc = mod.main(['0', q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'], retained_fd=retained_fd)
+        self.assertEqual(rc, 17)
+
+    def test_prelude_helper_client_failure_still_runs_primary_once_and_closes_channel(self):
+        import hashlib, socket, threading
+        root = self._short_temp()
+        src_dir = root / 'src'
+        src_dir.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 23 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'raise RuntimeError("broken_client")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'raise RuntimeError("broken_client")\n').hexdigest()
+        gate_sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        gate_sock.bind(str(root / 'source-gate.sock'))
+        gate_sock.listen(1)
+        self.addCleanup(gate_sock.close)
+
+        def _server():
+            conn, _ = gate_sock.accept()
+            with conn:
+                self.assertEqual(conn.recv(256), b'held-before-quota-source')
+                conn.send(b'open:' + b'a' * 32)
+                self.assertEqual(conn.recv(256), b'quota-source-opened')
+                conn.send(b'qualified-run')
+                # Prelude must close channel when helper fails
+                self.assertEqual(conn.recv(256), b'')
+
+        t = threading.Thread(target=_server, daemon=True)
+        t.start()
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_helper', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dl_ns = str(int((time.monotonic() + 5.0) * 1e9))
+        rc = mod.main([dl_ns, q_sha, c_sha, str(root), str(q_path), str(c_path), '--', '--check'])
+        t.join(timeout=2.0)
+        self.assertEqual(rc, 23)
+
+    def test_r1a_consume_handoff_fd_root_provenance_bounded_read_and_controls(self):
+        import fcntl, hashlib, io, json, socket
+        from agent_hub_host.quota_dispatch_manager import consume_handoff_fd
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        p_path = self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_bytes = Path(real_py).read_bytes()
+        py_st = os.stat(real_py)
+        entry_file = root / 'entry.pyz'
+        entry_file.write_bytes(b'PK\x05\x06' + b'\x00' * 18)
+        entry_file.chmod(0o444)
+        entry_st = os.stat(entry_file)
+        entry_sha = hashlib.sha256(entry_file.read_bytes()).hexdigest()
+
+        # 1. User-owned FIFO (st_uid != 0) must be refused
+        r_user, w_user = os.pipe()
+        os.write(w_user, b'{}')
+        os.close(w_user)
+        with self.assertRaises(ram.Unknown):
+            consume_handoff_fd(r_user, str(gate_dir))
+
+        # 2. Writable FD (O_RDWR) must be refused even with st_uid == 0
+        r_rw, w_rw = os.pipe()
+        os.close(w_rw)
+        real_fstat = os.fstat
+        def _root_fstat(fd):
+            st = real_fstat(fd)
+            if fd == r_rw:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with patch('os.fstat', side_effect=_root_fstat), \
+             patch('fcntl.fcntl', return_value=os.O_RDWR):
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_rw, str(gate_dir))
+
+        # 3. Stalled writer (no EOF before deadline) must fail bounded without hanging
+        r_stall, w_stall = os.pipe()
+        os.write(w_stall, b'{"v":1')
+        self.addCleanup(lambda: os.close(w_stall))
+        def _stall_fstat(fd):
+            st = real_fstat(fd)
+            if fd == r_stall:
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        with patch('os.fstat', side_effect=_stall_fstat):
+            t0 = time.monotonic()
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_stall, str(gate_dir), deadline=t0 + 0.05)
+            self.assertLess(time.monotonic() - t0, 0.5)
+
+        # 4. Duplicate JSON keys must be refused
+        r_dup, w_dup = os.pipe()
+        os.write(w_dup, b'{"v":1,"v":2}')
+        os.close(w_dup)
+        with patch('os.fstat', side_effect=lambda fd: os.stat_result((real_fstat(fd).st_mode, real_fstat(fd).st_ino, real_fstat(fd).st_dev, real_fstat(fd).st_nlink, 0, 0, real_fstat(fd).st_size, 0, 0, 0)) if fd == r_dup else real_fstat(fd)):
+            with self.assertRaises(ram.Unknown):
+                consume_handoff_fd(r_dup, str(gate_dir))
+
+        # 5. Faithful positive Root-prepared handoff writes b'ACK\n' to ack_fd
+        gate_sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        gate_sock.bind(str(gate_dir / 'source-gate.sock'))
+        os.chmod(str(gate_dir / 'source-gate.sock'), 0o600)
+        gate_sock.listen(1)
+        gate_sock.setblocking(False)
+        gate_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        gate_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=gate_dir_fd)
+        node_st = os.fstat(gate_node_fd)
+        interp_fd = os.open(real_py, os.O_RDONLY)
+        entry_fd = os.open(str(entry_file), os.O_RDONLY)
+        entry_st_raw = os.fstat(entry_fd)
+        entry_st = os.stat_result((entry_st_raw.st_mode, entry_st_raw.st_ino, entry_st_raw.st_dev, entry_st_raw.st_nlink, 0, 0, entry_st_raw.st_size, entry_st_raw.st_atime, entry_st_raw.st_mtime, entry_st_raw.st_ctime))
+        q_fd = os.open(str(q_path), os.O_RDONLY)
+        q_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        c_fd = os.open(str(c_path), os.O_RDONLY)
+        c_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        p_fd = os.open(str(p_path), os.O_RDONLY)
+        p_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        fan_r, fan_w = os.pipe()
+        os.set_blocking(fan_r, False)
+        os.close(fan_w)
+        ack_r, ack_w = os.pipe()
+        self.addCleanup(lambda: os.close(ack_r))
+        r_ok, w_ok = os.pipe()
+        q_st = os.fstat(q_fd)
+        c_st = os.fstat(c_fd)
+        p_st = os.fstat(p_fd)
+        manifest = {
+            'v': 1,
+            'target_uid': os.getuid(),
+            'handoff_deadline_ns': time.monotonic_ns() + 5_000_000_000,
+            'ack_fd': ack_w,
+            'plan': {
+                'source_directory': str(src_dir),
+                'gate_directory': str(gate_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check'],
+            },
+            'interpreter': {'fd': interp_fd, 'path': real_py, 'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(py_bytes).hexdigest()},
+            'entry': {'fd': entry_fd, 'path': str(entry_file), 'dev': entry_st.st_dev, 'ino': entry_st.st_ino, 'size': entry_st.st_size, 'mtime_ns': entry_st.st_mtime_ns, 'ctime_ns': entry_st.st_ctime_ns, 'sha256': entry_sha},
+            'source': {'fd': q_fd, 'dir_fd': q_dir_fd, 'name': 'hub-quota-publish.py', 'dev': q_st.st_dev, 'ino': q_st.st_ino, 'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("q")\n').hexdigest()},
+            'client': {'fd': c_fd, 'dir_fd': c_dir_fd, 'name': 'hub_alert_client.py', 'dev': c_st.st_dev, 'ino': c_st.st_ino, 'mtime_ns': c_st.st_mtime_ns, 'ctime_ns': c_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("c")\n').hexdigest()},
+            'prelude': {'fd': p_fd, 'dir_fd': p_dir_fd, 'name': 'hub-alert-quota-dispatch.py', 'dev': p_st.st_dev, 'ino': p_st.st_ino, 'mtime_ns': p_st.st_mtime_ns, 'ctime_ns': p_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("p")\n').hexdigest()},
+            'fan_group': fan_r,
+            'gate_sock_fd': gate_sock.fileno(),
+            'gate_dir_fd': gate_dir_fd,
+            'gate_node_fd': gate_node_fd,
+            'gate_node': {'dev': node_st.st_dev, 'ino': node_st.st_ino},
+        }
+        os.write(w_ok, json.dumps(manifest).encode('utf-8'))
+        os.close(w_ok)
+        sdev_hex = format((os.major(q_st.st_dev) << 20) | os.minor(q_st.st_dev), 'x')
+        ino_hex = format(q_st.st_ino, 'x')
+        fake_fdinfo = f'pos:\t0\nfanotify flags:12 event-flags:88000\nfanotify ino:{ino_hex} sdev:{sdev_hex} mflags:0 mask:20 ignored_mask:0\n'
+        real_open = open
+        real_readlink = os.readlink
+        def _fstat_pos(fd):
+            st = real_fstat(fd)
+            if fd in (r_ok, entry_fd):
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            return st
+        def _open_pos(file, *a, **kw):
+            if file == f'/proc/self/fdinfo/{fan_r}':
+                return io.StringIO(fake_fdinfo)
+            return real_open(file, *a, **kw)
+        with patch('os.fstat', side_effect=_fstat_pos), \
+             patch('os.readlink', side_effect=lambda p: 'anon_inode:[fanotify]' if p == f'/proc/self/fd/{fan_r}' else real_readlink(p)), \
+             patch('builtins.open', side_effect=_open_pos), \
+             patch('agent_hub_host.quota_dispatch_manager.StableRuntime.verify_root_owned_file', lambda p, pin: None):
+            adopted = consume_handoff_fd(r_ok, str(gate_dir))
+        self.assertEqual(os.read(ack_r, 8), b'ACK\n')
+        adopted['gate'].cleanup()
+        for h in (adopted['source'], adopted['client'], adopted['prelude']):
+            os.close(h.fd); os.close(h.directory_fd)
+        os.close(adopted['fan_group']); os.close(adopted['interp_fd']); os.close(adopted['entry_fd'])
+
+    def test_r1b_prebind_source_swap_delivers_custody_fd_and_runs_original_once(self):
+        import hashlib, threading
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        from agent_hub_host.quota_dispatch_manager import SourceGate, hold_source_fd, prepare_selected_quota
+        root = self._short_temp()
+        broker_dir = root / 'broker'
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        for d in (broker_dir, gate_dir, src_dir):
+            d.mkdir(mode=0o700)
+        orig_bytes = b'def main(argv=None, *, _managed_observer=None):\n    return 31 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        c_path = self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        p_path = self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        q_sha = hashlib.sha256(orig_bytes).hexdigest()
+        c_sha = hashlib.sha256(b'print("c")\n').hexdigest()
+        quota_fd = hold_source_fd(src_dir, 'hub-quota-publish.py')
+        client_fd = hold_source_fd(src_dir, 'hub_alert_client.py')
+        prelude_fd = hold_source_fd(src_dir, 'hub-alert-quota-dispatch.py')
+        gate = SourceGate(gate_dir)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        prepared = prepare_selected_quota(
+            source=quota_fd, companions=(client_fd, prelude_fd), gate=gate, group=r_fan,
+            plan={'units': {'healthy': 'agent-hub-quota-monitor.service'}, 'cgroups': {'healthy': '/u'}},
+            exec_argv=lambda dl: ['/usr/bin/python3'], service_deadline=time.monotonic() + 5.0,
+            retained_source_fd=quota_fd.fd,
+        )
+
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('actual_prelude_prebind', repo_root / 'scripts/hub-alert-quota-dispatch.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        child_rc = []
+        def _fake_launch(ticket):
+            self.assertIsNotNone(ticket)
+            # Swap quota_path AFTER Root selection/reservation and BEFORE manager _bind_probe/full_sources!
+            q_path.unlink()
+            self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+            dl_ns = str(int((time.monotonic() + 5.0) * 1e9))
+            t = threading.Thread(target=lambda: child_rc.append(
+                mod.main([dl_ns, q_sha, c_sha, str(gate_dir), str(q_path), str(c_path), '--', '--check'])
+            ), daemon=True)
+            t.start()
+            return 0
+        class _SwapCollector:
+            def __init__(self, _cb):
+                self.wire = SimpleNamespace(receive=lambda *a: False)
+                self.epoch = 'e' * 32
+                self.fault = None
+            def start(self): pass
+            def handle(self, *_a): pass
+            def barrier(self): return {'stream_index': 2}
+            def close(self): pass
+
+        with patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}):
+            res = run_same_process_quota(
+                prepared, _fake_launch, enabled=True, broker_directory=broker_dir,
+                collector_factory=_SwapCollector, identity=lambda pid: KEY,
+            )
+        deadline = time.monotonic() + 2.0
+        while not child_rc and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(child_rc, [31])
+        self.assertEqual(res['phase'], 'failed')
+        self.assertFalse(res['complete'])
+
+    def test_r1c_offline_entry_archive_launch_and_user_manager_env(self):
+        import json, socket, subprocess, sys, zipfile
+        from agent_hub_host.quota_dispatch_manager import StableRuntime
+        root = self._short_temp()
+        rt_dir = root / 'run_user_1000'
+        rt_dir.mkdir(mode=0o700)
+        bus_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bus_sock.bind(str(rt_dir / 'bus'))
+        self.addCleanup(bus_sock.close)
+        real_open = os.open
+        with patch('os.open', side_effect=lambda p, *a, **kw: real_open(str(rt_dir), *a, **kw) if p == f'/run/user/{os.getuid()}' else real_open(p, *a, **kw)):
+            uenv = StableRuntime.user_manager_env(os.getuid())
+        self.assertEqual(uenv['XDG_RUNTIME_DIR'], f'/run/user/{os.getuid()}')
+        self.assertEqual(uenv['DBUS_SESSION_BUS_ADDRESS'], f'unix:path=/run/user/{os.getuid()}/bus')
+
+        # Build offline entry zipapp of agent_hub_host and execute via python3 -I /proc/self/fd/<fd>
+        pyz = root / 'agent-hub-host.pyz'
+        pkg_dir = Path(__file__).resolve().parents[1] / 'agent_hub_host'
+        with zipfile.ZipFile(pyz, 'w') as zf:
+            zf.writestr('__main__.py', 'from agent_hub_host.cli import main\nraise SystemExit(main())\n')
+            for py_file in pkg_dir.glob('*.py'):
+                zf.write(py_file, f'agent_hub_host/{py_file.name}')
+        cfg = root / 'v2.json'
+        cfg.write_text('{"server":"http://127.0.0.1:9","token":"t","machine_id":"m","roots":[],"engines":[]}')
+        fd = os.open(str(pyz), os.O_RDONLY)
+        self.addCleanup(lambda: os.close(fd))
+        res = subprocess.run([sys.executable, '-I', f'/proc/self/fd/{fd}', '--config', str(cfg), 'quota-dispatch'], pass_fds=(fd,), capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(res.stdout)['dispatched'], False)
+
+    def test_r3_settlement_ack_retains_parent_cleanup_on_failure_and_preserves_foreign_node(self):
+        import hashlib, shutil, socket
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch import run_same_process_quota
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r3', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_st = os.stat(real_py)
+        pin = {'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(Path(real_py).read_bytes()).hexdigest()}
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-host.pyz',
+        )
+        # Child fails without ACK -> parent retains custody and unlinks own socket node
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.bind(str(gate_dir / 'source-gate.sock'))
+        sock.listen(1)
+        g_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd)
+        nst = os.fstat(g_node_fd)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock, g_dir_fd, g_node_fd, (nst.st_dev, nst.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            rc = prep.prepare_and_handoff(args, runner=lambda *a, **kw: SimpleNamespace(returncode=1))
+        self.assertEqual(rc, 1)
+        self.assertFalse((gate_dir / 'source-gate.sock').exists())
+
+    def test_r1_sealed_plan_drift_and_source_fd_access_mode_refused(self):
+        import contextlib, fcntl, hashlib, io, json
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch_entry import run_quota_dispatch_cli
+        from agent_hub_host.quota_dispatch_manager import _adopt_held_source
+        root = self._short_temp()
+        src_dir = root / 'src'
+        alt_dir = root / 'alt'
+        gate_dir = root / 'gate'
+        broker_dir = root / 'broker'
+        for d in (src_dir, alt_dir, gate_dir, broker_dir):
+            d.mkdir(mode=0o700)
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', b'def main(*a, **kw):\n    return 0\n')
+        q_fd = os.open(str(q_path), os.O_RDONLY)
+        dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(lambda: (os.close(q_fd), os.close(dir_fd)))
+        q_st = os.fstat(q_fd)
+        entry = {
+            'fd': q_fd, 'dir_fd': dir_fd, 'name': 'hub-quota-publish.py',
+            'dev': q_st.st_dev, 'ino': q_st.st_ino,
+            'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns,
+            'sha256': hashlib.sha256(q_path.read_bytes()).hexdigest(),
+        }
+        # O_RDWR source FD must be refused by _adopt_held_source
+        with patch('fcntl.fcntl', return_value=os.O_RDWR):
+            with self.assertRaises(ram.Unknown):
+                _adopt_held_source(entry)
+        # mtime_ns mismatch must be refused
+        bad_mtime = dict(entry, mtime_ns=entry['mtime_ns'] + 1)
+        with self.assertRaises(ram.Unknown):
+            _adopt_held_source(bad_mtime)
+
+        # Post-drop config drift (both directory and primary_args) must use Root-sealed path & args on fallback!
+        self._write_readonly(alt_dir, 'hub-alert-quota-dispatch.py', b'raise AssertionError("evil_prelude")\n')
+        adopted = {
+            'source': SimpleNamespace(raw=b'CALLS=[]\ndef main(argv=None, *, _managed_observer=None):\n    return 41 if argv == ["--check"] and _managed_observer is None else 99\n', fd=q_fd, pin=SimpleNamespace(sha256='a'*64)),
+            'client': SimpleNamespace(pin=SimpleNamespace(sha256='b'*64)),
+            'prelude': SimpleNamespace(),
+            'fan_group': None,
+            'gate': SimpleNamespace(cleanup=lambda: None),
+            'interp_fd': None,
+            'entry_fd': None,
+            'interpreter_pin': {'path': '/usr/bin/python3'},
+            'entry_pin': {'path': '/usr/local/lib/agent-hub/agent-hub-quota-dispatcher.pyz'},
+            'plan': {
+                'source_directory': str(src_dir),
+                'gate_directory': str(gate_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check'],
+            },
+        }
+        cfg = {
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(alt_dir),  # Drifted from Root-sealed src_dir!
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--evil-arg'],  # Drifted primary_args!
+            }
+        }
+        out = io.StringIO()
+        import agent_hub_host.quota_dispatch_entry as qde
+        seen_fallback = []
+        real_once = qde._run_verified_original_once
+        def _cap_once(raw, qp, pa):
+            seen_fallback.append((qp, list(pa)))
+            return real_once(raw, qp, pa)
+        with patch('agent_hub_host.quota_dispatch_entry.consume_handoff_fd', return_value=adopted), \
+             patch('agent_hub_host.quota_dispatch_entry.close_held_source', lambda h: None), \
+             patch.object(qde, '_run_verified_original_once', _cap_once), \
+             patch('subprocess.run', side_effect=AssertionError('must not launch on plan drift')), \
+             contextlib.redirect_stdout(out):
+            rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=99), cfg)
+        self.assertEqual(rc, 41)
+        self.assertEqual(seen_fallback, [(str(src_dir / 'hub-quota-publish.py'), ['--check'])])
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload['fail_open_business'])
+        self.assertFalse(payload['dispatched'])
+
+        # verify_root_owned_file must refuse non-Root-owned path/parent!
+        from agent_hub_host.quota_dispatch_manager import StableRuntime
+        with self.assertRaises(ram.Unknown):
+            StableRuntime.verify_root_owned_file(str(q_path), {'dev': q_st.st_dev, 'ino': q_st.st_ino, 'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns, 'size': q_st.st_size, 'sha256': entry['sha256']})
+
+    def test_r3_pre_reservation_swap_executes_verified_original_once_without_systemd(self):
+        import contextlib, io, json
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch_entry import run_quota_dispatch_cli
+        from agent_hub_host.quota_dispatch_manager import FanotifyReader
+        root = self._short_temp()
+        src_dir = root / 'src'
+        gate_dir = root / 'gate'
+        broker_dir = root / 'broker'
+        for d in (src_dir, gate_dir, broker_dir):
+            d.mkdir(mode=0o700)
+        orig_bytes = b'CALLS = []\ndef main(argv=None, *, _managed_observer=None):\n    CALLS.append((argv, _managed_observer))\n    return 53 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        cfg = {
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'],
+            }
+        }
+        # Swap quota_path right before reserve() runs in run_same_process_quota -> ticket is None!
+        from agent_hub_host.quota_dispatch import QuotaDispatch
+        real_reserve = QuotaDispatch.reserve
+        swapped = {'done': False, 'deadline': None}
+        def _swap_then_reserve(self_owner, source, deadline):
+            q_path.unlink()
+            self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+            swapped['done'] = True
+            swapped['deadline'] = deadline
+            return real_reserve(self_owner, source, deadline)
+
+        out = io.StringIO()
+        calls = []
+        import agent_hub_host.quota_dispatch_entry as qde
+        real_once = qde._run_verified_original_once
+        def _track_once(raw, qpath, pargs):
+            rc_inner = real_once(raw, qpath, pargs)
+            calls.append((qpath, pargs, rc_inner))
+            return rc_inner
+        real_prep = qde.prepare_selected_quota
+        def _short_prep(*a, **kw):
+            kw['service_deadline'] = time.monotonic() + 0.15
+            return real_prep(*a, **kw)
+        def _offline_collector(_self, _cb):
+            return SimpleNamespace(
+                wire=SimpleNamespace(receive=lambda *a: False), epoch='e' * 32,
+                fault=None, started=True, pending=None, jobs={},
+                start=lambda: {'stream_index': 1}, handle=lambda *a: None,
+                barrier=lambda: {'stream_index': 2}, close=lambda: None,
+            )
+        with patch.object(wire.Broker, '_collector', _offline_collector), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.begin', lambda self, d: None), \
+             patch('agent_hub_host.quota_dispatch_manager.OrderedBarrier.poll', lambda self: {'stream_index': 2}), \
+             patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
+             patch.object(QuotaDispatch, 'reserve', _swap_then_reserve), \
+             patch.object(qde, 'prepare_selected_quota', _short_prep), \
+             patch.object(qde, '_run_verified_original_once', _track_once), \
+             patch('subprocess.run', side_effect=AssertionError('must not call systemd-run on ticket=None')), \
+             contextlib.redirect_stdout(out):
+            rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=None), cfg)
+        self.assertEqual(rc, 0)
+        self.assertTrue(swapped['done'])
+        self.assertIsInstance(swapped['deadline'], float)
+        self.assertEqual(calls, [(str(q_path), ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'], 53)])
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload['reserved'])
+        self.assertNotEqual(payload['phase'], 'done')
+
+    def test_r2_root_sealed_plan_rejects_symlink_oversize_and_malformed_config(self):
+        from types import SimpleNamespace
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r2_cfg', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        real_cfg = root / 'real.json'
+        real_cfg.write_text('{"quota_same_process":{"unit":"u.service","cgroup":"/u"}}')
+        sym_cfg = root / 'sym.json'
+        sym_cfg.symlink_to(real_cfg)
+        with self.assertRaises((OSError, PermissionError)):
+            prep._read_bounded_config(str(sym_cfg), os.getuid())
+        big_cfg = root / 'big.json'
+        big_cfg.write_bytes(b' ' * 70000)
+        with self.assertRaises(PermissionError):
+            prep._read_bounded_config(str(big_cfg), os.getuid())
+        bad_cfg = root / 'bad.json'
+        bad_cfg.write_text('{"quota_same_process": "not-a-dict"}')
+        with self.assertRaises(ValueError):
+            prep._sealed_plan(SimpleNamespace(config=str(bad_cfg), source_dir=str(root), gate_dir=str(root)), os.getuid())
+
+    def test_r4_ack_then_child_crash_reconciles_owned_node_and_preserves_foreign(self):
+        import hashlib, json, shutil, socket
+        from types import SimpleNamespace
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r4_ack', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_st = os.stat(real_py)
+        pin = {'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(Path(real_py).read_bytes()).hexdigest()}
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-quota-dispatcher.pyz',
+        )
+        # Case 1: Child sends ACK then crashes before cleanup -> parent reconciles own node
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.bind(str(gate_dir / 'source-gate.sock'))
+        sock.listen(1)
+        g_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd)
+        nst = os.fstat(g_node_fd)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        def _ack_then_crash(cmd, *, pass_fds, env, check):
+            pipe_fd = int(cmd[cmd.index('--handoff-fd') + 1])
+            m = json.loads(os.read(pipe_fd, 65536).decode('utf-8'))
+            os.write(m['ack_fd'], b'ACK\n')
+            return SimpleNamespace(returncode=139)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock, g_dir_fd, g_node_fd, (nst.st_dev, nst.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            rc = prep.prepare_and_handoff(args, runner=_ack_then_crash)
+        self.assertEqual(rc, 139)
+        self.assertFalse((gate_dir / 'source-gate.sock').exists())
+
+        # Case 2: Foreign node swapped onto source-gate.sock -> parent preserves foreign node
+        sock2 = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock2.bind(str(gate_dir / 'source-gate.sock'))
+        sock2.listen(1)
+        g_dir_fd2 = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd2 = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd2)
+        nst2 = os.fstat(g_node_fd2)
+        r_fan2, w_fan2 = os.pipe()
+        os.close(w_fan2)
+        def _swap_foreign(*_a, **_kw):
+            (gate_dir / 'source-gate.sock').unlink()
+            (gate_dir / 'source-gate.sock').write_text('foreign')
+            return SimpleNamespace(returncode=1)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan2), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock2, g_dir_fd2, g_node_fd2, (nst2.st_dev, nst2.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            prep.prepare_and_handoff(args, runner=_swap_foreign)
+        self.assertEqual((gate_dir / 'source-gate.sock').read_text(), 'foreign')
