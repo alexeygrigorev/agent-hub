@@ -1160,7 +1160,7 @@ class SameProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 19)
 
     def test_root_preparer_inert_default_off_and_handoff_privilege_drop_boundary(self):
-        import contextlib, io, json, shutil, sys
+        import contextlib, io, json, shutil, stat, sys
         repo_root = Path(__file__).resolve().parents[3]
         spec = importlib.util.spec_from_file_location('root_preparer', repo_root / 'scripts/hub-alert-quota-prepare.py')
         prep = importlib.util.module_from_spec(spec)
@@ -1171,19 +1171,44 @@ class SameProcessLifecycleTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())['status'], 'INERT_ROOT_PREPARER')
         with self.assertRaises(PermissionError):
             prep.drop_privileges(0, 0)
-        # Full interpreter binary pin without 262144-byte cap (prefer maintained system allowlist binary)
-        approved_py = next((p for p in sorted(prep.APPROVED_INTERPRETERS) if Path(p).exists() and not Path(p).is_symlink()), None)
-        real_py = approved_py or os.path.realpath(sys.executable)
-        if approved_py is not None:
-            interp_fd, interp_pin = prep.pin_interpreter(real_py)
-        else:
-            with patch.object(prep, 'APPROVED_INTERPRETERS', frozenset({real_py})):
-                interp_fd, interp_pin = prep.pin_interpreter(real_py)
-        os.close(interp_fd)
-        self.assertGreater(interp_pin['size'], 262144)
-        self.assertEqual(len(interp_pin['sha256']), 64)
-        # Staged handoff with mocked Root syscalls + privilege drop + read-only pipe manifest
+        # Full interpreter binary pin without 262144-byte cap (prefer maintained trusted system binary)
         root = self._short_temp()
+        def _trusted_system_py(path_str):
+            p = Path(path_str)
+            if not p.exists() or p.is_symlink():
+                return False
+            st = os.stat(path_str)
+            return stat.S_ISREG(st.st_mode) and st.st_uid == 0 and st.st_nlink == 1 and not (st.st_mode & 0o022) and bool(st.st_mode & 0o111)
+        # Always test unapproved, non-root untrusted, and >262144-byte ELF witness boundary
+        witness = root / 'witness-python'
+        witness.write_bytes(b'\x7fELF' + b'\x00' * 300000)
+        witness.chmod(0o555)
+        with self.assertRaises(PermissionError):
+            prep.pin_interpreter(str(witness))
+        with patch.object(prep, 'APPROVED_INTERPRETERS', frozenset({str(witness)})):
+            with self.assertRaises(PermissionError):
+                prep.pin_interpreter(str(witness))  # non-root owner must be refused as untrusted_interpreter
+            real_fstat = os.fstat
+            def _root_elf_fstat(fd):
+                st = real_fstat(fd)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+            with patch('os.fstat', side_effect=_root_elf_fstat):
+                w_fd, w_pin = prep.pin_interpreter(str(witness))
+                os.close(w_fd)
+                self.assertGreater(w_pin['size'], 262144)
+                self.assertEqual(len(w_pin['sha256']), 64)
+
+        approved_py = next((p for p in sorted(prep.APPROVED_INTERPRETERS) if _trusted_system_py(p)), None)
+        if approved_py is not None:
+            real_py = approved_py
+            interp_fd, interp_pin = prep.pin_interpreter(real_py)
+            os.close(interp_fd)
+            self.assertGreater(interp_pin['size'], 262144)
+            self.assertEqual(len(interp_pin['sha256']), 64)
+        else:
+            real_py = str(witness)
+            interp_pin = w_pin
+        # Staged handoff with mocked Root syscalls + privilege drop + read-only pipe manifest
         gate_dir = root / 'gate'
         src_dir = root / 'src'
         gate_dir.mkdir(mode=0o700)
