@@ -5805,7 +5805,7 @@ class AdmissionTests(unittest.TestCase):
                                     "resident_identity_unknown")
                     self.assertHold(self.coordinator_world([dict(mature, rss_anon=0)], base, mem=64 * GIB), "resident_anonymous_unknown")
                     self.assertHold(self.coordinator_world([mature], base, mem=64 * GIB, mutate=lambda proc, cg: [(proc / "4950/ns/mnt").unlink(), (proc / "4950/ns/mnt").write_text("")]),
-                                    "resident_identity_unknown")
+                                    "resident_measurement_unknown")  # mnt-only difference needs a kernel-root view; this world has none
         # Shared cgroup: both forms use per-PID anon, no PID alias, and are distinct chosen PIDs.
         shared_group = "/system.slice/wn-shared.service"
         members = [4961, 4962, 9999]
@@ -6011,7 +6011,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertHold(c, "resident_fallback_changed")
         c = self.coordinator_world([row], [base], mem=64 * GIB)
         self.hook_sampler(c, 2, lambda: [(self.tmp / "proc/4800/ns/mnt").unlink(), (self.tmp / "proc/4800/ns/mnt").write_text("")])
-        self.assertHold(c, "resident_identity_unknown")
+        self.assertHold(c, "resident_measurement_unknown")  # mnt-only difference needs a kernel-root view; this world has none
 
     def test_current_proof_keeps_original_deadline_and_closes_every_cgroup_fd(self):
         mod = self.mod()
@@ -6200,7 +6200,7 @@ class AdmissionTests(unittest.TestCase):
             "zombie": (1, lambda: stat_path(4530).write_text(stat_text(4530, "Z")), "resident_identity_unknown"),
             "dead": (2, lambda: stat_path(4530).write_text(stat_text(4530, "X")), "resident_identity_unknown"),
             "cgroup namespace replaced": (1, lambda: [(self.tmp / "proc/4530/ns/cgroup").unlink(), (self.tmp / "proc/4530/ns/cgroup").write_text("")], "resident_identity_unknown"),
-            "mount namespace replaced before final": (2, lambda: [(self.tmp / "proc/4530/ns/mnt").unlink(), (self.tmp / "proc/4530/ns/mnt").write_text("")], "resident_identity_unknown"),
+            "mount namespace replaced before final": (2, lambda: [(self.tmp / "proc/4530/ns/mnt").unlink(), (self.tmp / "proc/4530/ns/mnt").write_text("")], "resident_measurement_unknown"),  # no kernel-root view in this world
         }
         for label, (index, change, reason) in changes.items():
             with self.subTest(label):
@@ -6721,6 +6721,390 @@ class AdmissionTests(unittest.TestCase):
         # Present non-null containment_cgroup_identity with mismatched boot_id still holds.
         self.assertHold(world(rows[:1], [census_row(1, 7101, session_cg, boot_id="old-boot")], mem=64 * GIB),
                         "resident_identity_unknown")
+
+    # ---- differing mount namespace: the target's own kernel view of the SAME cgroup objects ----------------------------
+
+    TARGET_MOUNT_ID = 91
+    VIEW_PIDS = {"provided": 4570, "coordinator": 4571, "current": 4572, "null": 4573}
+    HOLDS = {"resident_identity_unstable", "resident_identity_unknown", "resident_measurement_unknown", "resident_fallback_changed"}
+
+    def view_world(self, kind, *, differing=True, mem=64 * GIB, age=400, **rowkw):
+        """(canary, census) whose chosen process has its own mount namespace plus a kernel root view of the cgroup tree.
+
+        The synthetic cgroup root is relocated to <kroot>/sys/fs/cgroup (the old path stays a symlink for the helpers), the
+        chosen pid gets a distinct mnt namespace object and a proc/<pid>/root link onto <kroot>; fdinfo is modelled so only
+        a fd opened through that view may be asked for the TARGET mount id (the observer clone has another one)."""
+        mod, pid, group = self.mod(), self.VIEW_PIDS[kind], self.PGROUP
+        shutil.rmtree(self.tmp / "kroot", ignore_errors=True)
+        row = self.worker_row(1, pid, group, age=age, **rowkw)
+        census = {
+            "provided": lambda: [census_row(1, pid, group)],
+            "coordinator": lambda: [self.coordinator_census(1, pid, group, age=age, workload_pid=6999999)],
+            "current": lambda: [self.current_census(1, pid, group, age=age)],
+            "null": lambda: [self.current_census(1, pid, group, age=age, identity=None, recorded=False)],
+        }[kind]()
+        c = self.provided_world([row], census, mem=mem)
+        self.view_opens, self.target_fds = [], set()
+        real_open_root, real_close = getattr(mod, "open_target_cgroup_root", None), os.close  # the exact 52 source has none
+
+        def open_root(pid_fd):
+            fd = real_open_root(pid_fd)
+            self.view_opens.append(fd)
+            self.target_fds.add(fd)
+            return fd
+
+        def closing(fd):
+            self.target_fds.discard(fd)
+            return real_close(fd)
+
+        patchers = [mock.patch.object(os, "close", closing)]
+        if real_open_root is not None:
+            patchers.append(mock.patch.object(mod, "open_target_cgroup_root", open_root))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if differing:
+            kroot = self.tmp / "kroot"
+            (kroot / "sys/fs").mkdir(parents=True)
+            os.rename(self.tmp / "cgroup", kroot / "sys/fs/cgroup")
+            os.symlink(kroot / "sys/fs/cgroup", self.tmp / "cgroup")
+            patcher = mock.patch.object(mod, "CGROUP_ROOT", str(kroot / "sys/fs/cgroup"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+            (self.tmp / "proc" / str(pid) / "root").symlink_to(kroot)
+            (self.tmp / "target-mnt").write_text("")
+            link = self.tmp / "proc" / str(pid) / "ns" / "mnt"
+            link.unlink()
+            link.symlink_to(self.tmp / "target-mnt")
+            self.target_mount_id = self.TARGET_MOUNT_ID
+
+            def fdinfo(fd):
+                if fd not in self.target_fds:
+                    raise OSError(errno.EBADF, "a differing view only reads the mount id of its own target root fd")
+                return self.target_mount_id
+
+            patcher = mock.patch.object(mod, "read_fd_mount_id", fdinfo)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if kind == "provided":
+            census[0]["containment_cgroup_identity"] = self.view_identity(pid, differing)
+        return c, census
+
+    def view_identity(self, pid, differing=True, **override):
+        if not differing:
+            return self.provided_identity(**override)
+        target_mnt = os.stat(self.tmp / "proc" / str(pid) / "ns" / "mnt")
+        return self.provided_identity(mount_namespace_device=target_mnt.st_dev, mount_namespace_inode=target_mnt.st_ino,
+                                      cgroup_mount_id=self.TARGET_MOUNT_ID, **override)
+
+    def assertHeld(self, canary, reason=None):
+        with self.assertRaises(self.mod().StageFailure) as caught:
+            canary.admit()
+        self.assertEqual(caught.exception.stage, "admission")
+        if reason is None:
+            self.assertIn(caught.exception.reason, self.HOLDS)
+        else:
+            self.assertEqual(caught.exception.reason, reason)
+
+    def test_differing_mount_namespace_passes_only_through_the_positive_target_view_for_every_kind(self):
+        """Causal control. The exact 52 sampler required the chosen pid's mnt namespace to equal the observer's and held
+        every kind of this world at resident_identity_unknown. The corrected sampler passes it, but only while the target's
+        own kernel root view names the very same cgroup root and scope; remove that view and the same world holds."""
+        for kind in self.VIEW_PIDS:
+            with self.subTest(kind):
+                c, _census = self.view_world(kind)
+                c.admit()
+                self.assertTrue(self.view_opens, "the differing branch opened the target kernel root view")
+                root_link = self.tmp / "proc" / str(self.VIEW_PIDS[kind]) / "root"
+                root_link.rename(root_link.with_name("root.off"))
+                self.assertHeld(c, "resident_measurement_unknown")  # no view: never an equality waiver
+                root_link.with_name("root.off").rename(root_link)
+                c.admit()
+
+    def test_same_mount_namespace_never_opens_the_target_view(self):
+        for kind in self.VIEW_PIDS:
+            with self.subTest(kind):
+                c, _census = self.view_world(kind, differing=False)
+                c.admit()
+                self.assertEqual(self.view_opens, [])
+
+    def test_differing_view_keeps_same_cgroup_namespace_mandatory(self):
+        for kind in self.VIEW_PIDS:
+            with self.subTest(kind):
+                c, _census = self.view_world(kind)
+                self._replace_ns(str(self.VIEW_PIDS[kind]), "cgroup")
+                self.assertHeld(c, "resident_identity_unknown")
+
+    def test_differing_view_static_negative_controls_hold(self):
+        def root_missing(pid):
+            (self.tmp / "proc" / str(pid) / "root").unlink()
+
+        def root_not_directory(pid):
+            link = self.tmp / "proc" / str(pid) / "root"
+            link.unlink()
+            (self.tmp / "plain-file").write_text("")
+            link.symlink_to(self.tmp / "plain-file")
+
+        def symlinked_component(pid):
+            (self.tmp / "kroot/sys").rename(self.tmp / "kroot/sys.real")
+            (self.tmp / "kroot/sys").symlink_to(self.tmp / "kroot/sys.real")
+
+        def other_root(pid, with_group):
+            other = self.tmp / "kroot2"
+            (other / "sys/fs/cgroup").mkdir(parents=True)
+            if with_group:
+                shutil.copytree(self.tmp / "kroot/sys/fs/cgroup", other / "sys/fs/cgroup", symlinks=True, dirs_exist_ok=True)
+            link = self.tmp / "proc" / str(pid) / "root"
+            link.unlink()
+            link.symlink_to(other)
+
+        def subtree_root(pid):
+            # The target's "cgroup root" is really a subtree of the observer's tree: never the same kernel object.
+            sub = self.tmp / "kroot2"
+            (sub / "sys/fs").mkdir(parents=True)
+            os.symlink(self.tmp / "kroot/sys/fs/cgroup/user.slice", sub / "sys/fs/cgroup")
+            link = self.tmp / "proc" / str(pid) / "root"
+            link.unlink()
+            link.symlink_to(sub)
+
+        cases = {
+            "target root link missing": (root_missing, "resident_measurement_unknown"),
+            "target root is not a directory": (root_not_directory, "resident_measurement_unknown"),
+            "ordinary component is a symlink": (symlinked_component, "resident_measurement_unknown"),
+            "target cgroup root is another empty filesystem": (lambda pid: other_root(pid, False), "resident_identity_unknown"),
+            "target cgroup root is another copy of the tree": (lambda pid: other_root(pid, True), "resident_identity_unknown"),
+            "target cgroup root is a symlinked subtree": (subtree_root, "resident_measurement_unknown"),
+        }
+        for kind in self.VIEW_PIDS:
+            for label, (mutate, reason) in cases.items():
+                with self.subTest(f"{kind}: {label}"):
+                    shutil.rmtree(self.tmp / "kroot2", ignore_errors=True)
+                    c, _census = self.view_world(kind)
+                    mutate(self.VIEW_PIDS[kind])
+                    self.assertHeld(c, reason)
+        for kind in self.VIEW_PIDS:
+            mod = self.mod()
+            for label, error in (("fdinfo unreadable", OSError(errno.EIO, "fdinfo")), ("fdinfo malformed", ValueError("mnt_id"))):
+                with self.subTest(f"{kind}: {label}"):
+                    c, _census = self.view_world(kind)
+                    with mock.patch.object(mod, "read_fd_mount_id", side_effect=error):
+                        self.assertHeld(c, "resident_measurement_unknown")
+            with self.subTest(f"{kind}: target scope is another object"):
+                c, _census = self.view_world(kind)
+                real = mod.open_cgroup_dir
+
+                def wrong_scope(group, root_fd=None):
+                    if root_fd in self.target_fds:
+                        return real("/user.slice", root_fd)
+                    return real(group, root_fd)
+
+                with mock.patch.object(mod, "open_cgroup_dir", wrong_scope):
+                    self.assertHeld(c, "resident_identity_unknown")
+
+    def _view_churn(self, kind, change, nth):
+        c, _census = self.view_world(kind)
+        self.churn_after_first_group_read(lambda: change(self.VIEW_PIDS[kind]), nth=nth)
+        return c
+
+    def test_differing_view_changes_during_any_sample_hold(self):
+        def swap_target_root(pid):
+            other = self.tmp / "kroot2"
+            shutil.copytree(self.tmp / "kroot", other, symlinks=True)
+            link = self.tmp / "proc" / str(pid) / "root"
+            link.unlink()
+            link.symlink_to(other)
+
+        def replace_procdir(pid):
+            path = self.tmp / "proc" / str(pid)
+            old = self.tmp / "proc" / f"{pid}.old"
+            path.rename(old)
+            shutil.copytree(old, path, symlinks=True)
+
+        def swap_scope(pid):
+            scope = self.tmp / "kroot/sys/fs/cgroup/user.slice/prov.scope"
+            scope.rename(scope.with_name("prov.old"))
+            shutil.copytree(scope.with_name("prov.old"), scope)
+
+        def mount_instance(pid):
+            self.target_mount_id += 1
+
+        cases = {
+            "target mnt namespace switches": (lambda pid: self._replace_ns(str(pid), "mnt"), "resident_identity_unstable"),
+            "target cgroup namespace switches": (lambda pid: self._replace_ns(str(pid), "cgroup"), "resident_identity_unstable"),
+            "observer mnt namespace switches": (lambda pid: self._replace_ns("self", "mnt"), "resident_identity_unstable"),
+            "observer cgroup namespace switches": (lambda pid: self._replace_ns("self", "cgroup"), "resident_identity_unstable"),
+            "target mount instance changes with the same inode": (mount_instance, "resident_identity_unstable"),
+            "target root view is replaced": (swap_target_root, "resident_identity_unstable"),
+            "scope is replaced": (swap_scope, "resident_identity_unstable"),
+            "process directory is replaced": (replace_procdir, "resident_identity_unstable"),
+            "pid start time changes (reuse)": (lambda pid: self._shift_start(pid, 1), "resident_identity_unstable"),
+            "pid exits": (lambda pid: shutil.rmtree(self.tmp / "proc" / str(pid)), "resident_measurement_unknown"),
+            "pid leaves its cgroup membership": (lambda pid: self.procs(self.PGROUP, [4999]), None),  # per-kind code, unchanged from 52
+            "pid becomes a zombie": (lambda pid: (self.tmp / "proc" / str(pid) / "stat").write_text(
+                (self.tmp / "proc" / str(pid) / "stat").read_text().replace(" S ", " Z ", 1)), "resident_identity_unstable"),
+            "target root view disappears": (lambda pid: (self.tmp / "proc" / str(pid) / "root").unlink(), "resident_measurement_unknown"),
+        }
+        for kind in self.VIEW_PIDS:
+            for nth in (1, 3):
+                for label, (change, reason) in cases.items():
+                    with self.subTest(f"{kind}: sample {nth}: {label}"):
+                        shutil.rmtree(self.tmp / "kroot2", ignore_errors=True)
+                        self.assertHeld(self._view_churn(kind, change, nth),
+                                        reason or ("resident_measurement_unknown" if kind == "provided" else "resident_identity_unknown"))
+
+    def _shift_dev(self, match, start):
+        """From the start-th matching stat on, report a different st_dev (an inode-identical but device-different object)."""
+        real, seen = os.stat, []
+
+        def stat(path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            if match(str(path), kwargs.get("dir_fd")):
+                seen.append(1)
+                if len(seen) >= start:
+                    values = list(result)
+                    values[2] += 1
+                    return os.stat_result(values)
+            return result
+
+        patcher = mock.patch.object(os, "stat", stat)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_differing_view_device_only_namespace_changes_hold(self):
+        for kind in self.VIEW_PIDS:
+            for start in (2, 3):
+                with self.subTest(f"{kind}: target mnt device changes from its read {start} on"):
+                    c, _census = self.view_world(kind)
+                    self._shift_dev(lambda path, dir_fd: dir_fd is not None and path == "ns/mnt", start - 1)
+                    self.assertHeld(c, "resident_identity_unstable")
+        for kind in self.VIEW_PIDS:
+            with self.subTest(f"{kind}: observer mnt device changes at the end of a sample"):
+                c, _census = self.view_world(kind)
+                self._shift_dev(lambda path, dir_fd: path.endswith("proc/self/ns/mnt"), 2)
+                self.assertHeld(c, "resident_identity_unstable")
+
+    def test_differing_view_provided_coordinates_bind_the_target_objects(self):
+        """PROVIDED coordinates describe the TARGET mount namespace and cgroup mount root, never the observer's clone."""
+        pid, group = self.VIEW_PIDS["provided"], self.PGROUP
+        c, census = self.view_world("provided")
+        full = census[0]["containment_cgroup_identity"]
+        self.assertNotEqual(full["cgroup_mount_id"], self.MOUNT_ID)
+        scope = os.stat(self.tmp / "cgroup" / group.lstrip("/"))
+        observer_mnt = os.stat(self.tmp / "proc/self/ns/mnt")
+
+        def admit(identity):
+            c, census = self.view_world("provided")
+            census[0]["containment_cgroup_identity"] = identity
+            return c
+
+        admit(full).admit()
+        admit({"boot_id": "boot-1"}).admit()
+        for key in self.mod().PROVIDED_COORDINATES:
+            with self.subTest("alone passes: " + key):
+                admit({"boot_id": "boot-1", key: full[key]}).admit()
+            for label, value in {"+1": full[key] + 1, "bool": True, "float": float(full[key]), "string": str(full[key]), "null": None,
+                                 "zero": 0, "negative": -full[key]}.items():
+                with self.subTest(f"{key}: {label}"):
+                    self.assertHeld(admit({"boot_id": "boot-1", key: value}), "resident_identity_unknown")
+        for label, override in {
+            "observer clone mount id": {"cgroup_mount_id": self.MOUNT_ID},
+            "observer mnt namespace inode": {"mount_namespace_inode": observer_mnt.st_ino},
+            "scope inode as root inode": {"cgroup_root_inode": scope.st_ino},
+            "wrong root device": {"cgroup_root_device": full["cgroup_root_device"] + 1},
+        }.items():
+            with self.subTest(label):
+                self.assertHeld(admit(dict(full, **override)), "resident_identity_unknown")
+        # A final-only change of a present coordinate (e.g. to the observer's clone id) is a changed census, never credit.
+        c, census = self.view_world("provided")
+        seen = []
+        c.read_census = lambda d: seen.append(1) or ([census_row(1, pid, group, containment_cgroup_identity=full)] if len(seen) == 1 else
+                                                   [census_row(1, pid, group, containment_cgroup_identity=dict(full, cgroup_mount_id=self.MOUNT_ID))])
+        self.assertHeld(c, "resident_fallback_changed")
+
+    def test_differing_view_whole_null_and_missing_identity_keep_the_current_proof_semantics(self):
+        for kind in ("current", "null"):
+            with self.subTest(kind):
+                c, census = self.view_world(kind)
+                c.admit()
+        # A missing key becoming a whole-null value (or provided) between censuses is a changed census.
+        c, census = self.view_world("current")
+        seen = []
+        c.read_census = lambda d: seen.append(1) or ([dict(census[0])] if len(seen) < 2 else [dict(census[0], containment_cgroup_identity=None)])
+        self.assertHeld(c, "resident_fallback_changed")
+
+    def test_differing_view_keeps_age_cap_reserve_and_member_churn_contracts(self):
+        group = self.PGROUP
+        # Mature: no extra even unbounded; one byte below the floor is a real memory hold.
+        for kind in self.VIEW_PIDS:
+            with self.subTest(f"{kind}: mature"):
+                c, _census = self.view_world(kind, max="max", mem=self.FLOOR)
+                c.admit()
+                self.assertHeld(self.view_world(kind, max="max", mem=self.FLOOR - 1)[0], "memory_below_floor")
+        # Young: actual finite kernel cap for derived kinds; the recorded cap for provided ones.
+        for kind in ("coordinator", "current", "null"):
+            with self.subTest(f"{kind}: young cap"):
+                self.view_world(kind, age=10, max=str(700 * MIB), mem=self.FLOOR + 700 * MIB)[0].admit()
+                self.assertHeld(self.view_world(kind, age=10, max=str(700 * MIB), mem=self.FLOOR + 700 * MIB - 1)[0], "memory_below_floor")
+                self.assertHeld(self.view_world(kind, age=10, max="max", mem=64 * GIB)[0], "resident_bound_unknown")
+        # Unrelated members joining/leaving never matter; the chosen pid leaving does.
+        pid = self.VIEW_PIDS["provided"]
+        c, _census = self.view_world("provided", members=[pid])
+        self.churn_after_first_group_read(lambda: self.procs(group, [pid, 4999]))
+        c.admit()
+
+    def test_differing_view_provided_r2_reserve_increases_once_and_never_decreases(self):
+        pid = self.VIEW_PIDS["provided"]
+        young = dict(age=10, anon=300 * MIB, rss=300 * MIB, current=400 * MIB, members=[pid])
+        need = self.FLOOR + 1200 * MIB  # cap 1500 - credited 300
+        group = self.PGROUP
+        for label, final_anon, expected in (("anon falls to 100", 100 * MIB, 1400 * MIB), ("anon rises to 600", 600 * MIB, 1200 * MIB)):
+            for mem, hold in ((self.FLOOR + expected, False), (self.FLOOR + expected - 1, True)):
+                with self.subTest(f"{label}: mem={mem - self.FLOOR}"):
+                    c, _census = self.view_world("provided", mem=mem, **young)
+                    self.hook_sampler(c, 2, lambda: self.set_anon(pid, group, rss=final_anon, group_anon=final_anon))
+                    if hold:
+                        self.assertHeld(c, "memory_below_floor")
+                    else:
+                        c.admit()
+
+    def test_differing_view_closes_every_fd_on_every_branch(self):
+        opened, real_open = [], os.open
+
+        def tracking(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        cases = {
+            "success": lambda pid: None,
+            "view missing": lambda pid: (self.tmp / "proc" / str(pid) / "root").unlink(),
+            "other root": lambda pid: self._other_root(pid),
+            "memory.stat malformed": lambda pid: (self.tmp / "cgroup/user.slice/prov.scope/memory.stat").write_text("file 1\n"),
+        }
+        for kind in self.VIEW_PIDS:
+            for label, mutate in cases.items():
+                with self.subTest(f"{kind}: {label}"):
+                    shutil.rmtree(self.tmp / "kroot2", ignore_errors=True)
+                    c, _census = self.view_world(kind)
+                    mutate(self.VIEW_PIDS[kind])
+                    del opened[:]
+                    with mock.patch.object(os, "open", tracking):
+                        try:
+                            c.admit()
+                        except self.mod().StageFailure:
+                            pass
+                    self.assertTrue(opened)
+                    for fd in opened:
+                        if fd in self.target_fds or True:
+                            with self.assertRaises(OSError):
+                                os.fstat(fd)
+
+    def _other_root(self, pid):
+        other = self.tmp / "kroot2"
+        (other / "sys/fs/cgroup").mkdir(parents=True)
+        link = self.tmp / "proc" / str(pid) / "root"
+        link.unlink()
+        link.symlink_to(other)
 
 
 def datetime_now():
