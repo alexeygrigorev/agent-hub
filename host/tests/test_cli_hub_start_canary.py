@@ -3861,6 +3861,11 @@ def synthetic_proc(root, *, boot_id="boot-1", rows=()):
         (proc / str(pid) / "stat").write_text(f"{pid} (worker x) S " + " ".join(["0"] * 18 + [str(ticks)] + ["0"] * 10) + "\n")
         (proc / str(pid) / "cgroup").write_text(f"0::{row['cgroup']}\n")
         (proc / str(pid) / "status").write_text(f"Name:\tw\nRssAnon:\t{row['rss_anon'] // 1024} kB\n")
+        (proc / str(pid) / "ns").mkdir(exist_ok=True)  # genuine per-process namespace links onto the synthetic self namespaces
+        for name in ("cgroup", "mnt"):
+            link = proc / str(pid) / "ns" / name
+            if not os.path.lexists(link):
+                link.symlink_to(proc / "self" / "ns" / name)
         group = cg / row["cgroup"].lstrip("/")
         group.mkdir(parents=True, exist_ok=True)
         (group / "cgroup.procs").write_text("\n".join(str(m) for m in row.get("members", [pid])) + "\n")
@@ -3892,6 +3897,16 @@ class AdmissionTests(unittest.TestCase):
     copy_sha256 = CanaryTest.copy_sha256
 
     def mod(self):
+        override = os.environ.get("HUB_CANARY_SOURCE_UNDER_TEST")  # diagnostics only: run these controls against another source file
+        if override:
+            import importlib.util
+            loaded = sys.modules.get("hub_start_canary_under_test")
+            if loaded is None or getattr(loaded, "__file__", None) != override:
+                spec = importlib.util.spec_from_file_location("hub_start_canary_under_test", override)
+                loaded = importlib.util.module_from_spec(spec)
+                sys.modules["hub_start_canary_under_test"] = loaded
+                spec.loader.exec_module(loaded)
+            return loaded
         sys.path.insert(0, str(ROOT))
         from scripts import hub_start_canary as mod
         return mod
@@ -4116,7 +4131,26 @@ class AdmissionTests(unittest.TestCase):
         stack = mock.patch.multiple(mod, PROC_ROOT=str(proc), CGROUP_ROOT=str(cg))
         stack.start()
         self.addCleanup(stack.stop)
+        self.patch_root_mount_id()
         return c
+
+    MOUNT_ID = 77
+
+    def patch_root_mount_id(self):
+        """Synthetic /proc cannot name the fd a sampler will open, so the fdinfo read of the HELD cgroup-root fd is
+        modelled: it still insists the fd really is the held cgroup root directory, then yields self.mount_id."""
+        mod = self.mod()
+        self.mount_id = self.MOUNT_ID
+        os.makedirs(mod.CGROUP_ROOT, exist_ok=True)
+
+        def read_fd_mount_id(fd):
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EBADF, "fd is not a directory")
+            return self.mount_id
+
+        patcher = mock.patch.object(mod, "read_fd_mount_id", read_fd_mount_id, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_mature_resident_reserves_nothing_even_with_unbounded_memory_max(self):
         row = dict(pid=4242, cgroup="/user.slice/w1.scope", age=400, anon=300 * MIB, current=400 * MIB, rss_anon=300 * MIB)
@@ -4546,13 +4580,21 @@ class AdmissionTests(unittest.TestCase):
 
         c.read_census = appear
         self.assertHold(c, "resident_fallback_changed")
-        # Non-fallback admissions never take the extra census read.
-        plain = [census_row(1, 7200, "/user.slice/wl.scope")]
+        # Admissions with no measured kernel target (a starting row and a dead row) never take the extra census read.
+        plain = [census_row(1, None, "/user.slice/wl.scope", phase="starting", state="starting"),
+                 census_row(2, 7300, "/user.slice/gone.scope", worker_alive=False, containment_empty=True)]
         seen = []
         c = self.coordinator_world([self.worker_row(1, 7200, "/user.slice/wl.scope")], plain, mem=64 * GIB)
         c.read_census = lambda d: seen.append(d) or plain
         c.admit()
         self.assertEqual(len(seen), 1)
+        # A measured provided-identity workload is now finally revalidated too: exactly one extra read, no poll.
+        provided = [census_row(1, 7200, "/user.slice/wl.scope")]
+        seen = []
+        c = self.coordinator_world([self.worker_row(1, 7200, "/user.slice/wl.scope")], provided, mem=64 * GIB)
+        c.read_census = lambda d: seen.append(d) or provided
+        c.admit()
+        self.assertEqual(len(seen), 2)
 
     def test_fallback_keeps_original_deadline_and_replay_seam_hold(self):
         group = "/user.slice/coord.scope"
@@ -5852,6 +5894,451 @@ class AdmissionTests(unittest.TestCase):
         for fd in opened:
             with self.assertRaises(OSError):
                 os.fstat(fd)
+
+    # ---- provided-identity workloads: stable CHOSEN identity, not the cgroup's whole member set --------------------
+
+    PGROUP = "/user.slice/prov.scope"
+
+    def provided_identity(self, **override):
+        """A complete provided SDK containment identity for the synthetic kernel (call after a world exists)."""
+        ns_cgroup, ns_mnt = os.stat(self.tmp / "proc/self/ns/cgroup"), os.stat(self.tmp / "proc/self/ns/mnt")
+        root = os.stat(self.tmp / "cgroup")
+        identity = {
+            "boot_id": "boot-1", "cgroup_namespace_device": ns_cgroup.st_dev, "cgroup_namespace_inode": ns_cgroup.st_ino,
+            "mount_namespace_device": ns_mnt.st_dev, "mount_namespace_inode": ns_mnt.st_ino,
+            "cgroup_mount_id": self.MOUNT_ID, "cgroup_root_device": root.st_dev, "cgroup_root_inode": root.st_ino,
+        }
+        identity.update(override)
+        return {k: v for k, v in identity.items() if v is not self.ABSENT}
+
+    def provided_world(self, rows, census, **kwargs):
+        for path in [self.tmp / "proc", self.tmp / "cgroup", *self.tmp.glob("cgroup.old*")]:  # every world starts from pristine synthetic kernel state
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.exists():
+                shutil.rmtree(path)
+        return self.coordinator_world(rows, census, **kwargs)
+
+    def churn_after_first_group_read(self, change, nth=1):
+        """Run `change` right after the nth memory.stat read of a sample. Both the old pathname sampler and the
+        new held-fd sampler read memory.stat once per sample, so this fires at the same place in either source."""
+        mod, count = self.mod(), []
+        real_text, real_at = mod.read_text_limited, mod.read_at_limited
+
+        def bump():
+            count.append(1)
+            if len(count) == nth:
+                change()
+
+        def text(path, limit=65536):
+            out = real_text(path, limit)
+            if str(path).endswith("/memory.stat"):
+                bump()
+            return out
+
+        def at(dir_fd, name, limit=65536):
+            out = real_at(dir_fd, name, limit)
+            if name == "memory.stat":
+                bump()
+            return out
+
+        for name, fn in (("read_text_limited", text), ("read_at_limited", at)):
+            patcher = mock.patch.object(mod, name, fn)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def procs(self, group, members):
+        (self.tmp / "cgroup" / group.lstrip("/") / "cgroup.procs").write_text("".join(f"{m}\n" for m in members))
+
+    def set_anon(self, pid, group, *, rss=None, group_anon=None):
+        if rss is not None:
+            (self.tmp / "proc" / str(pid) / "status").write_text(f"Name:\tw\nRssAnon:\t{rss // 1024} kB\n")
+        if group_anon is not None:
+            (self.tmp / "cgroup" / group.lstrip("/") / "memory.stat").write_text(f"anon {group_anon}\nfile 4096\n")
+            (self.tmp / "cgroup" / group.lstrip("/") / "memory.current").write_text(f"{max(group_anon, 1500 * MIB)}\n")
+
+    def test_provided_other_member_joining_or_leaving_keeps_the_chosen_pid_proof_stable(self):
+        """F1 red/green: another member of the chosen workload's cgroup (a tool child) joins or leaves between samples.
+
+        The exact old source compared the cgroup's WHOLE member set across the two samples and raised
+        resident_identity_unstable although the chosen PID stayed present, unchanged and its own scope; the corrected
+        source proves the chosen identity and ignores unrelated members."""
+        group = self.PGROUP
+        for label, initial, changed in (("join", [4500], [4500, 4999]), ("leave", [4500, 4999], [4500]),
+                                        ("join and leave", [4500, 4998], [4500, 4999])):
+            with self.subTest(label):
+                row = self.worker_row(1, 4500, group, members=initial)
+                census = [census_row(1, 4500, group)]
+                c = self.provided_world([row], census, mem=self.FLOOR)
+                self.churn_after_first_group_read(lambda: self.procs(group, changed))
+                c.admit()
+        # A young provided row keeps the old cap-minus-anon arithmetic under the same churn (and boundary).
+        young = self.worker_row(1, 4501, group, age=10, anon=300 * MIB, rss=300 * MIB, current=400 * MIB, members=[4501])
+        census = [census_row(1, 4501, group)]
+        need = self.FLOOR + 1200 * MIB
+        for mem, hold in ((need, False), (need - 1, True)):
+            c = self.provided_world([young], census, mem=mem)
+            self.churn_after_first_group_read(lambda: self.procs(group, [4501, 4999]))
+            if hold:
+                self.assertHold(c, "memory_below_floor")
+            else:
+                c.admit()
+
+    def test_provided_shared_and_unshared_credit_ignore_unrelated_member_churn(self):
+        group = self.PGROUP
+        # Shared scope: each row is credited only with its OWN pid's anonymous memory, whoever else joins.
+        rows = [self.worker_row(1, 4510, group, age=10, rss=900 * MIB, anon=1500 * MIB, current=1600 * MIB, members=[4510, 4511]),
+                self.worker_row(2, 4511, group, age=10, rss=200 * MIB, anon=1500 * MIB, current=1600 * MIB, members=[4510, 4511])]
+        census = [census_row(1, 4510, group), census_row(2, 4511, group)]
+        need = self.FLOOR + (600 + 1300) * MIB
+        c = self.provided_world(rows, census, mem=need)
+        self.churn_after_first_group_read(lambda: self.procs(group, [4510, 4511, 4999]))
+        c.admit()
+        c = self.provided_world(rows, census, mem=need - 1)
+        self.churn_after_first_group_read(lambda: self.procs(group, [4510, 4511, 4999]))
+        self.assertHold(c, "memory_below_floor")
+        # A sibling's positive anonymous memory cannot stand in for a chosen pid that has none (whole cap is kept).
+        zero = [dict(rows[0], rss_anon=0), rows[1]]
+        c = self.provided_world(zero, census, mem=self.FLOOR + (1500 + 1300) * MIB)
+        self.churn_after_first_group_read(lambda: self.procs(group, [4510, 4511, 4999]))
+        c.admit()
+        c = self.provided_world(zero, census, mem=self.FLOOR + (1500 + 1300) * MIB - 1)
+        self.assertHold(c, "memory_below_floor")
+        # Unshared scope: the validated group anonymous memory is the credit.
+        solo = self.worker_row(1, 4520, "/user.slice/solo.scope", age=10, rss=100 * MIB, anon=700 * MIB, current=800 * MIB)
+        solo_census = [census_row(1, 4520, "/user.slice/solo.scope")]
+        c = self.provided_world([solo], solo_census, mem=self.FLOOR + 800 * MIB)
+        self.churn_after_first_group_read(lambda: self.procs("/user.slice/solo.scope", [4520, 4999]))
+        c.admit()
+        self.assertHold(self.provided_world([solo], solo_census, mem=self.FLOOR + 800 * MIB - 1), "memory_below_floor")
+        # Two census rows on the same PID are still ambiguous; distinct PIDs in one scope are not duplicates.
+        dup = [census_row(1, 4510, group), census_row(2, 4510, group)]
+        self.assertHold(self.provided_world(rows, dup, mem=64 * GIB), "resident_identity_ambiguous")
+
+    def test_provided_chosen_pid_must_stay_present_and_identical_in_every_sample(self):
+        group = self.PGROUP
+        stat_path = lambda pid: self.tmp / "proc" / str(pid) / "stat"
+        row = self.worker_row(1, 4530, group, members=[4530, 4531])
+        census = [census_row(1, 4530, group)]
+
+        def world():
+            return self.provided_world([row], census, mem=64 * GIB)
+
+        # The chosen pid is not a member at all although the member SET is perfectly stable: no other pid is substituted.
+        absent = dict(row, members=[4531, 4532])
+        self.assertHold(self.provided_world([absent], census, mem=64 * GIB), "resident_measurement_unknown")
+        replaced = dict(row, pid=4531, members=[4530, 4531])
+        self.assertHold(self.provided_world([dict(replaced, pid=4533)], [census_row(1, 4533, group)], mem=64 * GIB), "resident_measurement_unknown")
+        stat_text = lambda pid, state="S", ticks=None: stat_path(pid).read_text().replace(" S ", f" {state} ", 1)
+        changes = {
+            "leaves membership before sample 2": (1, lambda: self.procs(group, [4531]), "resident_measurement_unknown"),
+            "leaves membership before the final sample": (2, lambda: self.procs(group, [4531]), "resident_measurement_unknown"),
+            "disappears before the final sample": (2, lambda: shutil.rmtree(self.tmp / "proc/4530"), "resident_measurement_unknown"),
+            "start ticks change (pid reuse) before sample 2": (1, lambda: self._shift_start(4530, 1), "resident_identity_unstable"),
+            "start ticks change before the final sample": (2, lambda: self._shift_start(4530, 1), "resident_fallback_changed"),
+            "moves to another cgroup": (1, lambda: (self.tmp / "proc/4530/cgroup").write_text("0::/user.slice/elsewhere.scope\n"), "resident_measurement_unknown"),
+            "zombie": (1, lambda: stat_path(4530).write_text(stat_text(4530, "Z")), "resident_identity_unknown"),
+            "dead": (2, lambda: stat_path(4530).write_text(stat_text(4530, "X")), "resident_identity_unknown"),
+            "cgroup namespace replaced": (1, lambda: [(self.tmp / "proc/4530/ns/cgroup").unlink(), (self.tmp / "proc/4530/ns/cgroup").write_text("")], "resident_identity_unknown"),
+            "mount namespace replaced before final": (2, lambda: [(self.tmp / "proc/4530/ns/mnt").unlink(), (self.tmp / "proc/4530/ns/mnt").write_text("")], "resident_identity_unknown"),
+        }
+        for label, (index, change, reason) in changes.items():
+            with self.subTest(label):
+                c = world()
+                self.hook_sampler(c, index, change)
+                self.assertHold(c, reason)
+        c = world()
+        calls = self.hook_sampler(c, 99, lambda: None)
+        c.admit()  # control: the same world with no change passes with exactly first, second and final samples
+        self.assertEqual(len(calls), 3)
+
+    def _shift_start(self, pid, delta):
+        path = self.tmp / "proc" / str(pid) / "stat"
+        head, _, tail = path.read_text().partition(") ")
+        fields = tail.split()
+        fields[19] = str(int(fields[19]) + delta)
+        path.write_text(head + ") " + " ".join(fields) + "\n")
+
+    def test_provided_scope_root_and_namespace_binding_hold_and_close_every_fd(self):
+        mod = self.mod()
+        group = self.PGROUP
+        row = self.worker_row(1, 4540, group)
+        census = [census_row(1, 4540, group)]
+        cg, scope = self.tmp / "cgroup", self.tmp / "cgroup" / group.lstrip("/")
+
+        swaps = []
+
+        def swap_scope():  # a different directory (new inode) appears at the same pathname; the old one lives on
+            old = scope.with_name(f"prov.old{len(swaps)}")
+            swaps.append(1)
+            scope.rename(old)
+            shutil.copytree(old, scope, symlinks=True)
+
+        def swap_root():
+            old = self.tmp / f"cgroup.old{len(swaps)}"
+            swaps.append(1)
+            cg.rename(old)
+            shutil.copytree(old, cg, symlinks=True)
+
+        def symlink_scope():
+            old = scope.with_name("prov.real")
+            scope.rename(old)
+            scope.symlink_to(old)
+
+        def mount_changes():
+            self.mount_id = 99
+
+        def bad_file(name, text):
+            return lambda: (scope / name).write_text(text)
+
+        opened = []
+        real_open = os.open
+
+        def tracking(path, flags, *a, **k):
+            fd = real_open(path, flags, *a, **k)
+            if flags & os.O_DIRECTORY:
+                opened.append(fd)
+            return fd
+
+        cases = {
+            "scope inode replaced between samples": (1, swap_scope, "resident_identity_unstable"),
+            "scope inode replaced before the final sample": (2, swap_scope, "resident_fallback_changed"),
+            "cgroup root replaced between samples": (1, swap_root, "resident_identity_unstable"),
+            "cgroup root replaced before the final sample": (2, swap_root, "resident_fallback_changed"),
+            "root mount id changes between samples": (1, mount_changes, "resident_identity_unstable"),
+            "root mount id changes before the final sample": (2, mount_changes, "resident_fallback_changed"),
+            "scope becomes a symlink": (1, symlink_scope, "resident_measurement_unknown"),
+            "memory.current malformed": (1, bad_file("memory.current", "x\n"), "resident_measurement_unknown"),
+            "memory.stat without anon": (1, bad_file("memory.stat", "file 1\n"), "resident_measurement_unknown"),
+            "cgroup.procs unreadable": (1, lambda: (scope / "cgroup.procs").unlink(), "resident_measurement_unknown"),
+            "RssAnon malformed": (1, lambda: (self.tmp / "proc/4540/status").write_text("RssAnon:\t5 MB\n"), "resident_measurement_unknown"),
+            "RssAnon missing": (1, lambda: (self.tmp / "proc/4540/status").write_text("Name:\tw\n"), "resident_measurement_unknown"),
+        }
+        for label, (index, change, reason) in cases.items():
+            with self.subTest(label):
+                c = self.provided_world([row], census, mem=64 * GIB)
+                self.hook_sampler(c, index, change)
+                with mock.patch.object(os, "open", tracking):
+                    self.assertHold(c, reason)
+        # Swapped DURING a sample (after the memory reads opened the fds): the held fd no longer matches the path.
+        for label, change in (("scope", swap_scope), ("root", swap_root)):
+            with self.subTest("during sample " + label):
+                c = self.provided_world([row], census, mem=64 * GIB)
+                self.churn_after_first_group_read(change)
+                with mock.patch.object(os, "open", tracking):
+                    self.assertHold(c, "resident_identity_unstable")
+        c = self.provided_world([row], census, mem=64 * GIB)
+        with mock.patch.object(os, "open", tracking):
+            c.admit()
+        self.assertTrue(opened)
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)  # scope and mount-root fds are closed once on success and on every failure
+
+    def test_provided_present_coordinates_are_strict_and_checked_against_the_correct_kernel_object(self):
+        group = self.PGROUP
+        row = self.worker_row(1, 4550, group)
+        self.provided_world([row], [census_row(1, 4550, group)], mem=64 * GIB)  # creates the synthetic kernel objects
+        full = self.provided_identity()
+        root, scope = os.stat(self.tmp / "cgroup"), os.stat(self.tmp / "cgroup" / group.lstrip("/"))
+        self.assertNotEqual(root.st_ino, scope.st_ino)
+
+        def admit(identity, mem=self.FLOOR, **world):
+            census = [census_row(1, 4550, group, containment_cgroup_identity=identity)]
+            return self.provided_world([row], census, mem=mem, **world)
+
+        admit(full).admit()  # complete correct identity
+        admit({"boot_id": "boot-1"}).admit()  # boot-only compatible form: coordinates freshly proven, never invented
+        for key in self.mod().PROVIDED_COORDINATES:
+            partial = {k: v for k, v in full.items() if k in ("boot_id", key)}
+            with self.subTest("each present coordinate alone passes: " + key):
+                admit(partial).admit()
+            wrong = {
+                "contradiction +1": full[key] + 1, "bool": True, "float": float(full[key]), "string": str(full[key]), "null": None,
+                "zero": 0, "negative": -full[key], "list": [full[key]],
+            }
+            for label, value in wrong.items():
+                with self.subTest(f"{key}: {label}"):
+                    self.assertHold(admit(dict(partial, **{key: value})), "resident_identity_unknown")
+            with self.subTest(key + ": final-only provided mutation"):
+                census = [census_row(1, 4550, group, containment_cgroup_identity=partial)]
+                c = self.provided_world([row], census, mem=self.FLOOR)
+                seen = []
+                c.read_census = lambda d: seen.append(1) or ([census_row(1, 4550, group, containment_cgroup_identity=partial)] if len(seen) == 1
+                                                           else [census_row(1, 4550, group, containment_cgroup_identity=dict(partial, **{key: full[key] + 1}))])
+                self.assertHold(c, "resident_fallback_changed")
+        # The SDK root coordinates describe the cgroup MOUNT ROOT: the workload scope's inode is never the right object.
+        self.assertHold(admit({"boot_id": "boot-1", "cgroup_root_inode": scope.st_ino}), "resident_identity_unknown")
+        self.assertHold(admit({"boot_id": "boot-1", "cgroup_root_device": root.st_dev + 1}), "resident_identity_unknown")
+        # Unknown keys, wrong boot, empty/null/non-dict forms and the mount id of another mount hold; nothing is rewritten.
+        for label, identity in {"unknown key": dict(full, extra=1), "wrong boot": dict(full, boot_id="boot-2"), "boot type": dict(full, boot_id=1),
+                                "empty": {}, "null": None, "list": [], "string": "boot-1", "no boot": {k: v for k, v in full.items() if k != "boot_id"}}.items():
+            with self.subTest(label):
+                self.assertHold(admit(identity), "resident_identity_unknown")
+        before = json.dumps(full, sort_keys=True)
+        self.assertHold(admit(dict(full, cgroup_mount_id=full["cgroup_mount_id"] + 1)), "resident_identity_unknown")
+        self.assertEqual(json.dumps(full, sort_keys=True), before)
+        # A kernel mount id that disappears or becomes unreadable is a typed measurement hold, never a pass.
+        c = admit(full)
+        mod = self.mod()
+        with mock.patch.object(mod, "read_fd_mount_id", side_effect=OSError(errno.EIO, "fdinfo")):
+            self.assertHold(c, "resident_measurement_unknown")
+        self.assertEqual(mod.parse_fdinfo_mount_id("pos:\t0\nflags:\t02\nmnt_id:\t26\nino:\t1\n"), 26)
+        for text in ("", "mnt_id:\t0\n", "mnt_id:\tx\n", "mnt_id:\t1\nmnt_id:\t2\n", "mnt_id:\t-3\n"):
+            with self.assertRaises(ValueError):
+                mod.parse_fdinfo_mount_id(text)
+
+    def test_provided_final_anon_credit_never_lowers_a_reserve_and_adds_each_increase_once(self):
+        """R2: credit = min(first, second, final positive accounting anon); only a non-negative increase is added, once."""
+        group = self.PGROUP
+        floor = self.FLOOR
+        shared_group = "/user.slice/shared.scope"
+
+        def run(*, shared, final, mem, extra_rows=(), hub=(), mature_age=10, final_group=None):
+            if shared:
+                rows = [self.worker_row(1, 4560, shared_group, age=mature_age, rss=1000 * MIB, anon=1500 * MIB, current=1600 * MIB, members=[4560, 4561]),
+                        self.worker_row(2, 4561, shared_group, age=mature_age, rss=1000 * MIB, anon=1500 * MIB, current=1600 * MIB, members=[4560, 4561])]
+                census = [census_row(1, 4560, shared_group), census_row(2, 4561, shared_group)]
+            else:
+                rows = [self.worker_row(1, 4560, group, age=mature_age, rss=300 * MIB, anon=1000 * MIB, current=1500 * MIB)]
+                census = [census_row(1, 4560, group)]
+            c = self.provided_world(rows, census, mem=mem, hub_rows=hub)
+            order = []
+            real_mem = c.sample_mem_available
+            c.sample_mem_available = lambda: order.append("mem") or real_mem()
+
+            def change():
+                order.append("final anon")
+                if shared:
+                    self.set_anon(4560, shared_group, rss=final)
+                else:
+                    self.set_anon(4560, group, group_anon=final)
+
+            if final is not None:
+                self.hook_sampler(c, 2, change)
+            return c, order
+
+        for shared in (False, True):
+            base_extra = (500 + (500 if shared else 0)) * MIB  # cap 1500 - credited 1000 per row
+            label = "shared own pid" if shared else "unshared group"
+            # Falling anon 1000 -> 400: that row's extra grows 500 -> 1100 (delta 600), added exactly once.
+            with self.subTest(label + " boundary"):
+                stale, new = floor + base_extra, floor + base_extra + 600 * MIB
+                c, order = run(shared=shared, final=400 * MIB, mem=stale)
+                self.assertHold(c, "memory_below_floor")  # the stale initial credit alone would have passed
+                c, order = run(shared=shared, final=400 * MIB, mem=new - 1)
+                self.assertHold(c, "memory_below_floor")
+                c, order = run(shared=shared, final=400 * MIB, mem=new)
+                c.admit()
+                self.assertEqual(order, ["final anon", "mem"])  # recomputed BEFORE the final MemAvailable sample
+            with self.subTest(label + " rising final anon keeps the reserve"):
+                for final in (1000 * MIB, 1200 * MIB, 5 * GIB):
+                    c, _ = run(shared=shared, final=final, mem=floor + base_extra)
+                    c.admit()
+                    c, _ = run(shared=shared, final=final, mem=floor + base_extra - 1)
+                    self.assertHold(c, "memory_below_floor")  # never recredited below the initial reserve
+            with self.subTest(label + " unchanged anon is the plain initial reserve"):
+                c, _ = run(shared=shared, final=None, mem=floor + base_extra)
+                c.admit()
+            with self.subTest(label + " final zero or invalid anon holds"):
+                c, _ = run(shared=shared, final=0, mem=64 * GIB)
+                self.assertHold(c, "resident_anonymous_unknown")
+            with self.subTest(label + " other reserves are unchanged and the delta is applied once"):
+                inflight = [{"id": "h-new", "state": "running", "machine_id": "HOST-1", "native_id": None, "workspace": "/w", "cwd": "/w"}]
+                total = floor + base_extra + 600 * MIB + 1500 * MIB
+                c, _ = run(shared=shared, final=400 * MIB, mem=total, hub=inflight)
+                c.admit()
+                c, _ = run(shared=shared, final=400 * MIB, mem=total - 1, hub=inflight)
+                self.assertHold(c, "memory_below_floor")
+        # Unshared: a final group anon above current is invalid for credit and holds.
+        c, _ = run(shared=False, final=None, mem=64 * GIB)
+        self.hook_sampler(c, 2, lambda: (self.tmp / "cgroup" / group.lstrip("/") / "memory.stat").write_text(f"anon {2000 * MIB}\n"))
+        self.assertHold(c, "resident_anonymous_unknown")
+        # Mature rows keep the zero reserve (no invented growth bound) but still need positive final chosen anon.
+        for shared in (False, True):
+            c, _ = run(shared=shared, final=400 * MIB, mem=floor, mature_age=400)
+            c.admit()
+            c, _ = run(shared=shared, final=0, mem=floor, mature_age=400)
+            self.assertHold(c, "resident_anonymous_unknown")
+        # A row that never had credit (zero own anon: whole cap reserved) is neither lowered nor held by the final sample.
+        zero = self.worker_row(1, 4570, group, age=10, rss=0, anon=0, current=100 * MIB)
+        for final in (None, 800 * MIB):
+            c = self.provided_world([zero], [census_row(1, 4570, group)], mem=floor + 1500 * MIB)
+            if final is not None:
+                self.hook_sampler(c, 2, lambda: self.set_anon(4570, group, rss=final, group_anon=final))
+            c.admit()
+            c = self.provided_world([zero], [census_row(1, 4570, group)], mem=floor + 1500 * MIB - 1)
+            if final is not None:
+                self.hook_sampler(c, 2, lambda: self.set_anon(4570, group, rss=final, group_anon=final))
+            self.assertHold(c, "memory_below_floor")
+
+    def test_provided_final_state_changes_hold_but_unrelated_member_changes_pass(self):
+        group = self.PGROUP
+        row = self.worker_row(1, 4580, group, members=[4580, 4581])
+        base = census_row(1, 4580, group)
+
+        def world(final=None, hub_final=None):
+            seen, hub_seen = [], []
+            c = self.provided_world([row], [base], mem=64 * GIB)
+            c.read_census = lambda d: seen.append(d) or ([base] if len(seen) == 1 or final is None else final)
+            c.read_hub_rows = lambda d: hub_seen.append(d) or ([] if len(hub_seen) == 1 or hub_final is None else hub_final)
+            return c, seen, hub_seen
+
+        c, seen, hub_seen = world()
+        c.admit()
+        self.assertEqual((len(seen), len(hub_seen)), (2, 2))  # one final census and one final Hub read, same deadline
+        # Unrelated members joining/leaving AT the final sample (and between all three) are fine.
+        for index in (0, 1, 2):
+            c, _, _ = world()
+            self.hook_sampler(c, index, lambda: self.procs(group, [4580, 4999]))
+            c.admit()
+        changes = {
+            "pid": dict(base, workload_pid=4581), "recorded group": dict(base, workload_cgroup="/user.slice/other.scope"),
+            "state": dict(base, state="stopping"), "limits": dict(base, limits={"memory_bytes": 1}),
+            "identity wrong boot": dict(base, containment_cgroup_identity={"boot_id": "nope"}),
+            "identity null": dict(base, containment_cgroup_identity=None),
+            "identity coordinate added": dict(base, containment_cgroup_identity={"boot_id": "boot-1", "cgroup_mount_id": self.MOUNT_ID}),
+            "identity removed": {k: v for k, v in base.items() if k != "containment_cgroup_identity"},
+        }
+        for label, changed in changes.items():
+            with self.subTest(label):
+                c, _, _ = world([changed])
+                self.assertHold(c, "resident_fallback_changed")
+        other = census_row(5, 7777, "/user.slice/new.scope")
+        for label, final in {"vanished": [], "extra row": [base, other], "duplicate": [base, dict(base)]}.items():
+            with self.subTest(label):
+                c, seen, _ = world(final)
+                self.assertHold(c, "resident_fallback_changed")
+                self.assertEqual(len(seen), 2)  # no retry or poll
+        new_task = {"id": "h-new", "state": "running", "machine_id": "HOST-1", "native_id": None, "workspace": "/w", "cwd": "/w"}
+        c, _, _ = world(hub_final=[new_task])
+        self.assertHold(c, "resident_fallback_changed")
+        # Provided kernel coordinates changing only before the final sample hold too.
+        c, _, _ = world()
+        self.hook_sampler(c, 2, lambda: setattr(self, "mount_id", 5))
+        self.assertHold(c, "resident_fallback_changed")
+
+    def test_provided_budget_is_the_original_deadline_and_preview_uses_the_same_function(self):
+        mod = self.mod()
+        group = self.PGROUP
+        row = self.worker_row(1, 4590, group)
+        census = [census_row(1, 4590, group)]
+        c = self.provided_world([row], census, mem=64 * GIB)
+        c.active_deadline = time.monotonic() + 0.5
+        self.hook_sampler(c, 1, lambda: time.sleep(0.6))
+        self.assertHold(c, "admission_deadline_exceeded")  # no renewal, no retry, no later sample
+        c = self.provided_world([row], census, mem=64 * GIB)
+        calls = self.hook_sampler(c, 99, lambda: None)
+        c.active_deadline = time.monotonic() - 1
+        self.assertHold(c, "admission_deadline_exceeded")
+        self.assertEqual(calls, [])
+        # The read-only preview runs the very same corrected function under the same churn.
+        self.assertIs(mod.Canary.physical_admit, mod.PhysicalAdmission.physical_admit)
+        churn_row = dict(row, members=[4590, 4991])
+        physical = self.physical_world([churn_row], census, mem=self.FLOOR)
+        self.churn_after_first_group_read(lambda: self.procs(group, [4590]))
+        result = mod.physical_admission_check(physical)
+        self.assertEqual((result["ok"], result["status"], result["mature"], result["young"]), (True, "pass", 1, 0))
 
     def physical_world(self, rows, census, **kwargs):
         mod = self.mod()
