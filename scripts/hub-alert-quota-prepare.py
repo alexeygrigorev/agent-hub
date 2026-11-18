@@ -25,7 +25,7 @@ FAN_MARK_ADD = 0x00000001
 FAN_OPEN = 0x00000020
 MAX_SOURCE_BYTES = 262144
 MAX_ENTRY_BYTES = 16 * 1024 * 1024
-DEFAULT_ENTRY_ARCHIVE = '/usr/local/lib/agent-hub/agent-hub-host.pyz'
+DEFAULT_ENTRY_ARCHIVE = '/usr/local/lib/agent-hub/agent-hub-quota-dispatcher.pyz'
 HANDOFF_DEADLINE_NS = 5_000_000_000
 APPROVED_INTERPRETERS = frozenset({
     '/usr/bin/python3',
@@ -168,6 +168,7 @@ def pin_source(dir_path, name, target_uid):
             raise PermissionError('source_size_mismatch')
         return fd, dir_fd, {
             'name': name, 'dev': info.st_dev, 'ino': info.st_ino,
+            'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns,
             'sha256': hashlib.sha256(raw).hexdigest(),
         }
     except BaseException:
@@ -279,6 +280,45 @@ def drop_privileges(target_uid, target_gid):
     _verify_proc_dropped()
 
 
+def _sealed_plan(args, target_uid):
+    unit = getattr(args, 'unit', None)
+    cgroup = getattr(args, 'cgroup', None)
+    primary_args = getattr(args, 'primary_args', None)
+    cfg_path = Path(args.config)
+    if (unit is None or cgroup is None or primary_args is None) and cfg_path.is_file():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+            qsp = cfg.get('quota_same_process') if isinstance(cfg, dict) else None
+            if isinstance(qsp, dict):
+                if unit is None and isinstance(qsp.get('unit'), str):
+                    unit = qsp['unit']
+                if cgroup is None and isinstance(qsp.get('cgroup'), str):
+                    cgroup = qsp['cgroup']
+                if primary_args is None and isinstance(qsp.get('primary_args'), list):
+                    primary_args = list(qsp['primary_args'])
+        except (OSError, json.JSONDecodeError):
+            pass
+    if unit is None:
+        unit = 'agent-hub-quota-monitor.service'
+    if cgroup is None:
+        cgroup = f'/user.slice/user-{target_uid}.slice/user@{target_uid}.service/app.slice/{unit}'
+    if primary_args is None:
+        primary_args = ['--check']
+    if (not isinstance(unit, str) or not unit.endswith('.service') or '/' in unit or any(c.isspace() for c in unit)):
+        raise ValueError('invalid_sealed_unit')
+    if not isinstance(cgroup, str) or not cgroup.startswith('/'):
+        raise ValueError('invalid_sealed_cgroup')
+    if not isinstance(primary_args, list) or not primary_args or not all(isinstance(a, str) for a in primary_args):
+        raise ValueError('invalid_sealed_primary_args')
+    return {
+        'source_directory': str(args.source_dir),
+        'gate_directory': str(args.gate_dir),
+        'unit': unit,
+        'cgroup': cgroup,
+        'primary_args': primary_args,
+    }
+
+
 def prepare_and_handoff(args, *, runner=subprocess.run):
     if os.getuid() != 0 or os.geteuid() != 0:
         raise PermissionError('root_entry_required')
@@ -294,8 +334,8 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
     gate_node_identity = None
     pipe_r = pipe_w = -1
     ack_r = ack_w = -1
-    handed_off = False
     try:
+        sealed_plan = _sealed_plan(args, target_uid)
         interp_fd, interp_pin = pin_interpreter(args.python_bin)
         owned_fds.append(interp_fd)
         entry_fd, entry_pin = pin_entry_archive(args.entry_archive)
@@ -320,6 +360,7 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
             'target_uid': target_uid,
             'handoff_deadline_ns': time.monotonic_ns() + HANDOFF_DEADLINE_NS,
             'ack_fd': ack_w,
+            'plan': sealed_plan,
             'interpreter': {'fd': interp_fd, **interp_pin},
             'entry': {'fd': entry_fd, **entry_pin},
             'source': {'fd': q_fd, 'dir_fd': q_dir_fd, **q_pin},
@@ -351,10 +392,9 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
         ack_w = -1
         os.set_blocking(ack_r, False)
         try:
-            ack_data = os.read(ack_r, 8)
+            _ack_data = os.read(ack_r, 8)
         except OSError:
-            ack_data = b''
-        handed_off = ack_data == b'ACK\n'
+            _ack_data = b''
         return res.returncode
     finally:
         for fd in (pipe_w, pipe_r, ack_w, ack_r):
@@ -365,7 +405,8 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
                     pass
         if gate_sock is not None:
             gate_sock.close()
-        if not handed_off and gate_node_identity is not None and gate_dir_fd >= 0:
+        # Reconcile exact Root-pinned socket node after runner/child termination even if child ACKed adoption and crashed before cleanup.
+        if gate_node_identity is not None and gate_dir_fd >= 0:
             try:
                 cur = os.stat('source-gate.sock', dir_fd=gate_dir_fd, follow_symlinks=False)
                 if (cur.st_dev, cur.st_ino) == gate_node_identity:

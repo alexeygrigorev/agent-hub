@@ -1746,6 +1746,8 @@ class SameProcessLifecycleTests(unittest.TestCase):
         node_st = os.fstat(gate_node_fd)
         interp_fd = os.open(real_py, os.O_RDONLY)
         entry_fd = os.open(str(entry_file), os.O_RDONLY)
+        entry_st_raw = os.fstat(entry_fd)
+        entry_st = os.stat_result((entry_st_raw.st_mode, entry_st_raw.st_ino, entry_st_raw.st_dev, entry_st_raw.st_nlink, 0, 0, entry_st_raw.st_size, entry_st_raw.st_atime, entry_st_raw.st_mtime, entry_st_raw.st_ctime))
         q_fd = os.open(str(q_path), os.O_RDONLY)
         q_dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
         c_fd = os.open(str(c_path), os.O_RDONLY)
@@ -1766,11 +1768,18 @@ class SameProcessLifecycleTests(unittest.TestCase):
             'target_uid': os.getuid(),
             'handoff_deadline_ns': time.monotonic_ns() + 5_000_000_000,
             'ack_fd': ack_w,
+            'plan': {
+                'source_directory': str(src_dir),
+                'gate_directory': str(gate_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check'],
+            },
             'interpreter': {'fd': interp_fd, 'path': real_py, 'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(py_bytes).hexdigest()},
             'entry': {'fd': entry_fd, 'path': str(entry_file), 'dev': entry_st.st_dev, 'ino': entry_st.st_ino, 'size': entry_st.st_size, 'mtime_ns': entry_st.st_mtime_ns, 'ctime_ns': entry_st.st_ctime_ns, 'sha256': entry_sha},
-            'source': {'fd': q_fd, 'dir_fd': q_dir_fd, 'name': 'hub-quota-publish.py', 'dev': q_st.st_dev, 'ino': q_st.st_ino, 'sha256': hashlib.sha256(b'print("q")\n').hexdigest()},
-            'client': {'fd': c_fd, 'dir_fd': c_dir_fd, 'name': 'hub_alert_client.py', 'dev': c_st.st_dev, 'ino': c_st.st_ino, 'sha256': hashlib.sha256(b'print("c")\n').hexdigest()},
-            'prelude': {'fd': p_fd, 'dir_fd': p_dir_fd, 'name': 'hub-alert-quota-dispatch.py', 'dev': p_st.st_dev, 'ino': p_st.st_ino, 'sha256': hashlib.sha256(b'print("p")\n').hexdigest()},
+            'source': {'fd': q_fd, 'dir_fd': q_dir_fd, 'name': 'hub-quota-publish.py', 'dev': q_st.st_dev, 'ino': q_st.st_ino, 'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("q")\n').hexdigest()},
+            'client': {'fd': c_fd, 'dir_fd': c_dir_fd, 'name': 'hub_alert_client.py', 'dev': c_st.st_dev, 'ino': c_st.st_ino, 'mtime_ns': c_st.st_mtime_ns, 'ctime_ns': c_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("c")\n').hexdigest()},
+            'prelude': {'fd': p_fd, 'dir_fd': p_dir_fd, 'name': 'hub-alert-quota-dispatch.py', 'dev': p_st.st_dev, 'ino': p_st.st_ino, 'mtime_ns': p_st.st_mtime_ns, 'ctime_ns': p_st.st_ctime_ns, 'sha256': hashlib.sha256(b'print("p")\n').hexdigest()},
             'fan_group': fan_r,
             'gate_sock_fd': gate_sock.fileno(),
             'gate_dir_fd': gate_dir_fd,
@@ -1947,3 +1956,207 @@ class SameProcessLifecycleTests(unittest.TestCase):
             rc = prep.prepare_and_handoff(args, runner=lambda *a, **kw: SimpleNamespace(returncode=1))
         self.assertEqual(rc, 1)
         self.assertFalse((gate_dir / 'source-gate.sock').exists())
+
+    def test_r1_sealed_plan_drift_and_source_fd_access_mode_refused(self):
+        import contextlib, fcntl, hashlib, io, json
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch_entry import run_quota_dispatch_cli
+        from agent_hub_host.quota_dispatch_manager import _adopt_held_source
+        root = self._short_temp()
+        src_dir = root / 'src'
+        alt_dir = root / 'alt'
+        gate_dir = root / 'gate'
+        broker_dir = root / 'broker'
+        for d in (src_dir, alt_dir, gate_dir, broker_dir):
+            d.mkdir(mode=0o700)
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', b'def main(*a, **kw):\n    return 0\n')
+        q_fd = os.open(str(q_path), os.O_RDONLY)
+        dir_fd = os.open(str(src_dir), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(lambda: (os.close(q_fd), os.close(dir_fd)))
+        q_st = os.fstat(q_fd)
+        entry = {
+            'fd': q_fd, 'dir_fd': dir_fd, 'name': 'hub-quota-publish.py',
+            'dev': q_st.st_dev, 'ino': q_st.st_ino,
+            'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns,
+            'sha256': hashlib.sha256(q_path.read_bytes()).hexdigest(),
+        }
+        # O_RDWR source FD must be refused by _adopt_held_source
+        with patch('fcntl.fcntl', return_value=os.O_RDWR):
+            with self.assertRaises(ram.Unknown):
+                _adopt_held_source(entry)
+        # mtime_ns mismatch must be refused
+        bad_mtime = dict(entry, mtime_ns=entry['mtime_ns'] + 1)
+        with self.assertRaises(ram.Unknown):
+            _adopt_held_source(bad_mtime)
+
+        # Post-drop config drift vs Root-sealed plan must be refused without launching systemd-run
+        self._write_readonly(alt_dir, 'hub-alert-quota-dispatch.py', b'raise AssertionError("evil_prelude")\n')
+        adopted = {
+            'source': SimpleNamespace(raw=b'def main(*a, **kw):\n    return 41\n', fd=q_fd, pin=SimpleNamespace(sha256='a'*64)),
+            'client': SimpleNamespace(pin=SimpleNamespace(sha256='b'*64)),
+            'prelude': SimpleNamespace(),
+            'fan_group': None,
+            'gate': SimpleNamespace(cleanup=lambda: None),
+            'interp_fd': None,
+            'entry_fd': None,
+            'interpreter_pin': {'path': '/usr/bin/python3'},
+            'plan': {
+                'source_directory': str(src_dir),
+                'gate_directory': str(gate_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check'],
+            },
+        }
+        cfg = {
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(alt_dir),  # Drifted from Root-sealed src_dir!
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check'],
+            }
+        }
+        out = io.StringIO()
+        with patch('agent_hub_host.quota_dispatch_entry.consume_handoff_fd', return_value=adopted), \
+             patch('agent_hub_host.quota_dispatch_entry.close_held_source', lambda h: None), \
+             patch('subprocess.run', side_effect=AssertionError('must not launch on plan drift')), \
+             contextlib.redirect_stdout(out):
+            rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=99), cfg)
+        self.assertEqual(rc, 41)
+        payload = json.loads(out.getvalue())
+        self.assertTrue(payload['fail_open_business'])
+        self.assertFalse(payload['dispatched'])
+
+    def test_r3_pre_reservation_swap_executes_verified_original_once_without_systemd(self):
+        import contextlib, io, json
+        from types import SimpleNamespace
+        from agent_hub_host.quota_dispatch_entry import run_quota_dispatch_cli
+        from agent_hub_host.quota_dispatch_manager import FanotifyReader
+        root = self._short_temp()
+        src_dir = root / 'src'
+        gate_dir = root / 'gate'
+        broker_dir = root / 'broker'
+        for d in (src_dir, gate_dir, broker_dir):
+            d.mkdir(mode=0o700)
+        orig_bytes = b'CALLS = []\ndef main(argv=None, *, _managed_observer=None):\n    CALLS.append((argv, _managed_observer))\n    return 53 if _managed_observer is None else 99\n'
+        q_path = self._write_readonly(src_dir, 'hub-quota-publish.py', orig_bytes)
+        self._write_readonly(src_dir, 'hub_alert_client.py', b'print("c")\n')
+        self._write_readonly(src_dir, 'hub-alert-quota-dispatch.py', b'print("p")\n')
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        cfg = {
+            'quota_same_process': {
+                'v': 1, 'enabled': True,
+                'broker_directory': str(broker_dir),
+                'gate_directory': str(gate_dir),
+                'source_directory': str(src_dir),
+                'unit': 'agent-hub-quota-monitor.service',
+                'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
+                'primary_args': ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'],
+            }
+        }
+        # Swap quota_path right before reserve() runs in run_same_process_quota -> ticket is None!
+        from agent_hub_host.quota_dispatch import QuotaDispatch
+        real_reserve = QuotaDispatch.reserve
+        def _swap_then_reserve(self_owner, source):
+            q_path.unlink()
+            self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
+            return real_reserve(self_owner, source)
+
+        out = io.StringIO()
+        calls = []
+        import agent_hub_host.quota_dispatch_entry as qde
+        real_once = qde._run_verified_original_once
+        def _track_once(raw, qpath, pargs):
+            calls.append((qpath, pargs))
+            return real_once(raw, qpath, pargs)
+        with patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
+             patch.object(QuotaDispatch, 'reserve', _swap_then_reserve), \
+             patch.object(qde, '_run_verified_original_once', _track_once), \
+             patch('agent_hub_host.quota_dispatch_entry.time.monotonic', side_effect=[0.0, 0.0, 0.0, 0.0, 100.0, 100.0]), \
+             patch('subprocess.run', side_effect=AssertionError('must not call systemd-run on ticket=None')), \
+             contextlib.redirect_stdout(out):
+            rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=None), cfg)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [(str(q_path), ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'])])
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload['reserved'])
+        self.assertEqual(payload['phase'], 'failed')
+
+    def test_r4_ack_then_child_crash_reconciles_owned_node_and_preserves_foreign(self):
+        import hashlib, json, shutil, socket
+        from types import SimpleNamespace
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r4_ack', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        gate_dir = root / 'gate'
+        src_dir = root / 'src'
+        gate_dir.mkdir(mode=0o700)
+        src_dir.mkdir(mode=0o700)
+        self._write_readonly(src_dir, 'hub-quota-publish.py', b'print("q")\n')
+        shutil.copyfile(repo_root / 'scripts/hub_alert_client.py', src_dir / 'hub_alert_client.py')
+        shutil.copyfile(repo_root / 'scripts/hub-alert-quota-dispatch.py', src_dir / 'hub-alert-quota-dispatch.py')
+        (src_dir / 'hub_alert_client.py').chmod(0o400)
+        (src_dir / 'hub-alert-quota-dispatch.py').chmod(0o400)
+        real_py = os.path.realpath('/usr/bin/python3')
+        py_st = os.stat(real_py)
+        pin = {'dev': py_st.st_dev, 'ino': py_st.st_ino, 'size': py_st.st_size, 'mtime_ns': py_st.st_mtime_ns, 'ctime_ns': py_st.st_ctime_ns, 'sha256': hashlib.sha256(Path(real_py).read_bytes()).hexdigest()}
+        args = SimpleNamespace(
+            target_uid=os.getuid(), config=str(root / 'v2.json'),
+            source_dir=str(src_dir), gate_dir=str(gate_dir), python_bin='/usr/bin/python3',
+            entry_archive='/usr/local/lib/agent-hub/agent-hub-quota-dispatcher.pyz',
+        )
+        # Case 1: Child sends ACK then crashes before cleanup -> parent reconciles own node
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock.bind(str(gate_dir / 'source-gate.sock'))
+        sock.listen(1)
+        g_dir_fd = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd)
+        nst = os.fstat(g_node_fd)
+        r_fan, w_fan = os.pipe()
+        os.close(w_fan)
+        def _ack_then_crash(cmd, *, pass_fds, env, check):
+            pipe_fd = int(cmd[cmd.index('--handoff-fd') + 1])
+            m = json.loads(os.read(pipe_fd, 65536).decode('utf-8'))
+            os.write(m['ack_fd'], b'ACK\n')
+            return SimpleNamespace(returncode=139)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock, g_dir_fd, g_node_fd, (nst.st_dev, nst.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            rc = prep.prepare_and_handoff(args, runner=_ack_then_crash)
+        self.assertEqual(rc, 139)
+        self.assertFalse((gate_dir / 'source-gate.sock').exists())
+
+        # Case 2: Foreign node swapped onto source-gate.sock -> parent preserves foreign node
+        sock2 = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        sock2.bind(str(gate_dir / 'source-gate.sock'))
+        sock2.listen(1)
+        g_dir_fd2 = os.open(str(gate_dir), os.O_RDONLY | os.O_DIRECTORY)
+        g_node_fd2 = os.open('source-gate.sock', os.O_PATH | os.O_NOFOLLOW, dir_fd=g_dir_fd2)
+        nst2 = os.fstat(g_node_fd2)
+        r_fan2, w_fan2 = os.pipe()
+        os.close(w_fan2)
+        def _swap_foreign(*_a, **_kw):
+            (gate_dir / 'source-gate.sock').unlink()
+            (gate_dir / 'source-gate.sock').write_text('foreign')
+            return SimpleNamespace(returncode=1)
+        with patch.object(prep, 'open_fanotify_group', return_value=r_fan2), \
+             patch.object(prep, 'pin_interpreter', return_value=(os.open(real_py, os.O_RDONLY), {'path': real_py, **pin})), \
+             patch.object(prep, 'pin_entry_archive', return_value=(os.open(real_py, os.O_RDONLY), {'path': args.entry_archive, **pin})), \
+             patch.object(prep, 'validate_user_runtime', return_value={'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}', 'DBUS_SESSION_BUS_ADDRESS': f'unix:path=/run/user/{os.getuid()}/bus'}), \
+             patch.object(prep, 'bind_source_gate', return_value=(sock2, g_dir_fd2, g_node_fd2, (nst2.st_dev, nst2.st_ino))), \
+             patch.object(prep.os, 'getuid', return_value=0), \
+             patch.object(prep.os, 'geteuid', return_value=0), \
+             patch.object(prep, 'drop_privileges', lambda u, g: None):
+            prep.prepare_and_handoff(args, runner=_swap_foreign)
+        self.assertEqual((gate_dir / 'source-gate.sock').read_text(), 'foreign')
