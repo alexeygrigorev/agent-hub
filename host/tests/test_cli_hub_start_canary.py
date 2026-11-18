@@ -4098,8 +4098,12 @@ class AdmissionTests(unittest.TestCase):
             {"id": "c", "state": "stopped", "machine_id": "HOST-1", "native_id": None},
             {"id": "d", "state": "queued", "machine_id": "OTHER", "native_id": None},
             {"id": "e", "state": "lost", "machine_id": "HOST-1", "native_id": None},
+            {"id": "f", "state": "staged", "machine_id": "HOST-1", "native_id": None},
+            {"id": "g", "state": "offered", "machine_id": "HOST-1", "native_id": None},
+            {"id": "h", "state": "claimed", "machine_id": "HOST-1", "native_id": None},
+            {"id": "i", "state": "expired", "machine_id": "HOST-1", "native_id": None},
         ]
-        self.assertEqual(c.uncovered_inflight_reserve(rows, {native}), 1500 * MIB)
+        self.assertEqual(c.uncovered_inflight_reserve(rows, {native}), 4 * 1500 * MIB)
         with self.assertRaises(mod.StageFailure) as caught:
             c.uncovered_inflight_reserve([{"id": "z", "state": "mystery", "machine_id": "HOST-1"}], set())
         self.assertEqual(caught.exception.reason, "managed_inflight_unknown_state")
