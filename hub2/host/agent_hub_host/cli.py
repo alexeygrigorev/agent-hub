@@ -115,9 +115,11 @@ def main(argv=None):
             held = []
             gate = None
             group = None
+            verified_quota_raw = None
             try:
                 quota_fd = hold_source_fd(src_dir, "hub-quota-publish.py")
                 held.append(quota_fd)
+                verified_quota_raw = quota_fd.raw
                 client_fd = hold_source_fd(src_dir, "hub_alert_client.py")
                 held.append(client_fd)
                 prelude_fd = hold_source_fd(src_dir, "hub-alert-quota-dispatch.py")
@@ -143,10 +145,17 @@ def main(argv=None):
                 if group is not None:
                     os.close(group)
                 reason = error.args[0] if isinstance(error, ram.Unknown) and error.args else type(error).__name__
-                # Fail-open once: primary business still runs once when observation preparation fails.
-                fallback_argv = ["/usr/bin/systemd-run", "--user", "--unit=" + spec["unit"], "--no-block", "--",
-                                 "/usr/bin/python3", "-I", "-S", quota_path, *primary_args]
-                launch_rc = subprocess.run(fallback_argv, capture_output=True, timeout=5, check=False).returncode
+                if verified_quota_raw is None:
+                    # Source pin/open itself rejected: never execute unverified/rejected quota_path.
+                    print(json.dumps({"enabled": True, "dispatched": False, "source_rejected": True,
+                                      "error": str(reason), "complete": False}))
+                    return 1
+                # Source was verified; execute retained verified original bytes once unqualified.
+                import types
+                selected = types.ModuleType("selected_quota_monitor")
+                selected.__file__ = quota_path
+                exec(compile(verified_quota_raw, quota_path, "exec"), selected.__dict__)
+                launch_rc = selected.main(primary_args, _managed_observer=None)
                 print(json.dumps({"enabled": True, "dispatched": False, "fail_open_business": True,
                                   "launch_rc": launch_rc, "error": str(reason), "complete": False}))
                 return launch_rc

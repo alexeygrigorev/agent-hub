@@ -272,8 +272,20 @@ def run_same_process_quota(
     ram.require(broker_directory is not None)
 
     state = {'dispatch': None, 'manager': None, 'ready': threading.Event(), 'error': None}
+    cleanup_lock = threading.Lock()
+    cleaned = {'done': False}
+
+    def _cleanup_once():
+        with cleanup_lock:
+            if cleaned['done']:
+                return
+            cleaned['done'] = True
+        prepared.cleanup_owned()
 
     def _dispatch_factory(broker):
+        if broker.stop_event.is_set():
+            _cleanup_once()
+            raise ram.Unknown('broker_stopped')
         try:
             mgr = V4QuotaManager(
                 prepared,
@@ -301,10 +313,10 @@ def run_same_process_quota(
 
     broker = None
     launch_result = None
-    launched = False
     snapshot = None
     ticket = None
     mgr = None
+    primary_error = None
     try:
         try:
             broker = wire.Broker._selected_quota_attempt(broker_directory, prepared.source, **kwargs)
@@ -321,8 +333,11 @@ def run_same_process_quota(
                 ticket = offer.await_owner(now=now)
         except Exception:
             # Observer/broker setup failure fails open once; primary exceptions propagate.
-            launched = True
-            launch_result = launcher(None)
+            try:
+                launch_result = launcher(None)
+            except BaseException as err:
+                primary_error = err
+                raise
             return {
                 'enabled': True,
                 'dispatched': False,
@@ -335,8 +350,11 @@ def run_same_process_quota(
 
         # Selection reservation precedes launch; run original selected business ONCE.
         # Never swallow or retry original primary exceptions.
-        launched = True
-        launch_result = launcher(ticket)
+        try:
+            launch_result = launcher(ticket)
+        except BaseException as err:
+            primary_error = err
+            raise
 
         try:
             while (mgr is not None and mgr.phase not in ('done', 'failed')
@@ -357,9 +375,11 @@ def run_same_process_quota(
             'complete': False,
         }
     finally:
-        wire.stop_optional(broker)
-        if state['manager'] is None:
-            try:
-                prepared.cleanup_owned()
-            except Exception:
-                pass
+        try:
+            wire.stop_optional(broker)
+            owner_gone = broker is None or broker.thread is None or not broker.thread.is_alive()
+            if state['manager'] is None and owner_gone:
+                _cleanup_once()
+        except BaseException:
+            if primary_error is None:
+                raise

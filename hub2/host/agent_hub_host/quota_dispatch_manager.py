@@ -566,21 +566,22 @@ class FanotifyReader:
 
     @classmethod
     def _close_remaining(cls, buf, offset):
-        """Close every valid event FD in the remainder of an already-read buffer."""
+        """Close every structurally locatable event FD in the remainder of an already-read buffer."""
         while offset + cls._STRUCT.size <= len(buf):
-            event_len, vers, _res, meta_len, _mask, fd, _pid = cls._STRUCT.unpack_from(buf, offset)
+            event_len, _vers, _res, _meta_len, _mask, fd, _pid = cls._STRUCT.unpack_from(buf, offset)
+            if event_len < cls._STRUCT.size or offset + event_len > len(buf):
+                break
             if fd >= 0:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-            if vers != cls._VERS or meta_len < cls._STRUCT.size or event_len < meta_len or offset + event_len > len(buf):
-                break
             offset += event_len
 
     def drain(self, group, observation):
-        observation.records = []
-        observation.unknown = False
+        if observation.unknown:
+            observation.records = []
+            return
         deadline = time.monotonic() + self.BUDGET_S
         reads = 0
         try:
