@@ -156,9 +156,36 @@ if staged_digest != expected_digest:
 
 out_fd = os.open(verified_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 try:
-    os.write(out_fd, staged_bytes)
+    view = memoryview(staged_bytes)
+    written = 0
+    while written < len(staged_bytes):
+        n = os.write(out_fd, view[written:])
+        if n <= 0:
+            raise OSError('short or zero-progress write to verified provisioner copy')
+        written += n
+    os.fsync(out_fd)
 finally:
     os.close(out_fd)
+
+rb_fd = os.open(verified_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    rb_info = os.fstat(rb_fd)
+    if not stat.S_ISREG(rb_info.st_mode) or rb_info.st_uid != os.getuid() or (rb_info.st_mode & 0o077) != 0:
+        print('ERROR: verified provisioner execution copy failed readback custody checks', file=sys.stderr)
+        sys.exit(1)
+    rb_chunks = []
+    while True:
+        chunk = os.read(rb_fd, 65536)
+        if not chunk:
+            break
+        rb_chunks.append(chunk)
+    readback_bytes = b''.join(rb_chunks)
+finally:
+    os.close(rb_fd)
+
+if len(readback_bytes) != len(expected_bytes) or hashlib.sha256(readback_bytes).hexdigest() != expected_digest:
+    print('ERROR: verified provisioner execution copy readback length or digest mismatch; refusing truncated/corrupt copy', file=sys.stderr)
+    sys.exit(1)
 PY
   then
     rm -rf -- "$verified_dir"
@@ -653,24 +680,6 @@ apply_release() {
     fail "current VM revision $previous_sha does not match the Node24-qualified previous release $qualified_previous_sha; refusing to provision or mutate before re-qualifying $previous_sha on Node24"
   fi
 
-  # Runtime phase, still under this transaction's single deploy lock and
-  # before any candidate checkout, npm dependency mutation, transaction state
-  # or unit/config write. When CI passed the provision-node24 token, the
-  # staged candidate provisioner runs here so package and application effects
-  # share one lock owner; a competing transaction cannot acquire the lock
-  # between package verification and the app stage. The guard afterwards
-  # binds every later stage to the provisioned runtime. Existing
-  # schema-transaction fixtures run in test mode without a runtime fixture
-  # and without the token, so those paths stay unchanged.
-  if [[ "$provision_arg" == provision-node24 ]]; then
-    provision_node24_runtime "$deploy_sha"
-  fi
-  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && -z "${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-}" ]]; then
-    printf 'Node24 runtime guard skipped: test mode without a AGENT_HUB_NODE24_TEST_SERVICE_NODE fixture.\n'
-  else
-    require_node24_runtime
-  fi
-
   mkdir -p "$TMPDIR"
   chmod 750 "$TMPDIR"
   if [[ "$caddy_mode" == full ]]; then
@@ -694,6 +703,24 @@ apply_release() {
     || fail "candidate cannot be safely rolled back against the current databases"
   [[ "$schema_mode" == defer || "$schema_mode" == apply ]] || fail "invalid schema preflight result"
   printf 'Schema rollback preflight passed; migration mode=%s.\n' "$schema_mode"
+
+  # Runtime phase, still under this transaction's single deploy lock, after
+  # all read-only Caddy/schema preconditions and before any candidate checkout,
+  # npm dependency mutation, transaction state or unit/config write. When CI
+  # passed the provision-node24 token, the staged candidate provisioner runs
+  # here so package and application effects share one lock owner; a competing
+  # transaction cannot acquire the lock between package verification and the
+  # app stage. The guard afterwards binds every later stage to the provisioned
+  # runtime. Existing schema-transaction fixtures run in test mode without a
+  # runtime fixture and without the token, so those paths stay unchanged.
+  if [[ "$provision_arg" == provision-node24 ]]; then
+    provision_node24_runtime "$deploy_sha"
+  fi
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && -z "${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-}" ]]; then
+    printf 'Node24 runtime guard skipped: test mode without a AGENT_HUB_NODE24_TEST_SERVICE_NODE fixture.\n'
+  else
+    require_node24_runtime
+  fi
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
   publication_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
