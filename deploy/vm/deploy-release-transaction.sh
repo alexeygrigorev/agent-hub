@@ -54,6 +54,40 @@ fail() {
   exit 1
 }
 
+REQUIRED_NODE_MAJOR=24
+
+# Fixed service runtime contract: agent-hub-hub2.service selects the absolute
+# /usr/bin/node, and the npm dependency build must run on the same major. The
+# runtime itself is provisioned by deploy/vm/provision-node24.sh through the
+# normal CI SSH path before any deployment mutation.
+node_runtime_major() {
+  local version
+  version="$("$1" --version)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\. ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+require_node24_runtime() {
+  local service_node path_node service_major path_major
+  service_node="${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-/usr/bin/node}"
+  [[ -x "$service_node" ]] \
+    || fail "Hub2 service runtime $service_node is missing; provision Node24 first (deploy/vm/provision-node24.sh through normal CI)"
+  service_major="$(node_runtime_major "$service_node")" \
+    || fail "Hub2 service runtime probe failed at $service_node"
+  [[ "$service_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "Hub2 service runtime at $service_node is Node $service_major, not Node24; provision Node24 before deploying (deploy/vm/provision-node24.sh)"
+  path_node="$(command -v node)" \
+    || fail "no node on PATH for the npm dependency build; the build toolchain must match the Node24 service runtime"
+  path_major="$(node_runtime_major "$path_node")" \
+    || fail "PATH node probe failed at $path_node"
+  [[ "$path_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "npm dependency build would run on Node $path_major ($path_node), not Node24; align the build runtime before deploying"
+  command -v npm >/dev/null 2>&1 \
+    || fail "npm is required to install release dependencies"
+  printf 'Node24 runtime check passed: service %s at %s, build Node %s at %s.\n' \
+    "$("$service_node" --version)" "$service_node" "$("$path_node" --version)" "$path_node"
+}
+
 validate_hub_caddyfile() {
   local config="$1"
   [[ -s "$config" ]] || return 1
@@ -413,6 +447,11 @@ restore_previous_release() {
       rollback --receipt "$TRANSACTION_DIR/cli-assets.json" --transaction-token "$publication_token" || return 1
   fi
 
+  # Rollback is code/config-only: it never provisions, downgrades or restores
+  # the OS Node runtime. CI provisioned Node24 before the transaction, so the
+  # restored release (and its own installer, when it carries the runtime
+  # guard) runs on the same provisioned Node24.
+  printf 'Rollback runtime note: keeping the installed OS Node runtime; application rollback never restores or downgrades /usr/bin/node.\n'
   printf 'Rolling Hub2 back to %s\n' "$previous_sha"
   git -C "$REPO" checkout --detach --force "$previous_sha" || return 1
   install_release_dependencies || return 1
@@ -507,6 +546,18 @@ apply_release() {
   local_status="$(git -C "$REPO" status --porcelain --untracked-files=all)"
   [[ -z "$local_status" ]] \
     || fail "refusing deployment because the VM checkout has uncommitted files"
+
+  # Fail closed on the selected service runtime BEFORE any candidate checkout,
+  # npm dependency mutation, transaction state or unit/config write. CI
+  # provisions Node24 (deploy/vm/provision-node24.sh) in its own SSH step
+  # before invoking this transaction. Existing schema-transaction fixtures run
+  # in test mode without a runtime fixture, so the probe is skipped there and
+  # they keep exercising the code paths below unchanged.
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && -z "${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-}" ]]; then
+    printf 'Node24 runtime guard skipped: test mode without a AGENT_HUB_NODE24_TEST_SERVICE_NODE fixture.\n'
+  else
+    require_node24_runtime
+  fi
 
   mkdir -p "$TMPDIR"
   chmod 750 "$TMPDIR"

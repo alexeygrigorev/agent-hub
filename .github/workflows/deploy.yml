@@ -53,6 +53,7 @@ jobs:
       - name: Validate Hub2 VM installer inputs
         run: |
           bash -n deploy/vm/install-hub2-node.sh
+          bash -n deploy/vm/provision-node24.sh
           test -s deploy/agent-hub-hub2.service
           test -s deploy/hub.caddy
           test -s deploy/vm/hub2-dns-update.sh
@@ -65,6 +66,7 @@ jobs:
           bash -n deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-site-ownership.sh
+          python3 test/test_node24_runtime.py
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
@@ -83,8 +85,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
+      - run: |
+          node --version | grep -Eq '^v24\.' \
+            || { echo "::error::distribution validation must run on Node24; setup-node drifted" >&2; exit 1; }
+          npm --version
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -301,6 +307,21 @@ jobs:
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             "$SSH_TARGET" \
             "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-cli-release-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
+      - name: Provision the required Node24 VM runtime
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          # Streams the reviewed provisioner bytes itself (never a remote curl
+          # setup script) through the normal CI SSH path. Runs BEFORE the
+          # deployment transaction so the runtime exists before npm/source/
+          # config/unit mutation; a provisioning failure is handled entirely
+          # inside this step and never reaches the transaction.
+          ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- < deploy/vm/provision-node24.sh
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:

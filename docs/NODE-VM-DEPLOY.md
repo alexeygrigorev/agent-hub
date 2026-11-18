@@ -73,7 +73,62 @@ npm ci + install + restart` over SSH, then verify
   (release modes and bootstrap allowlist intact) with the five DO classes.
 
 Run locally: `node --experimental-transform-types hub2/node/main.ts --data-dir
-.local/tmp/db --dev-vars hub2/.dev.vars` (TLA; needs Node ≥ 22.13).
+.local/tmp/db --dev-vars hub2/.dev.vars` (TLA). Production requires the
+provisioned Node 24 runtime at `/usr/bin/node`; Node 22 and older are refused
+by the deploy guards (see below).
+
+## Node runtime provisioning (Node24, CI-owned)
+
+The VM service unit selects the absolute `/usr/bin/node`. Production requires
+major 24 there, and production CI owns that upgrade: `deploy.yml` streams
+`deploy/vm/provision-node24.sh` to the VM over the normal deploy-key SSH path
+as its own step, BEFORE the deployment transaction mutates source, npm
+dependencies, configuration or systemd units. The provisioner:
+
+- supports exactly Ubuntu 24.04 (`noble`) and Debian 12 (`bookworm`) on
+  `amd64`/`arm64`, read from `/etc/os-release` and `dpkg`, and refuses any
+  other OS or architecture before it has any effect;
+- binds one reviewed selection: the signed NodeSource repository
+  `https://deb.nodesource.com/node_24.x` (`nodistro`/`main`), the approved
+  signing key (`https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key`,
+  pinned primary fingerprint) and the exact `nodejs` package version with its
+  per-architecture SHA-256 (verified against the downloaded archive before
+  installation);
+- is idempotent: when `/usr/bin/node` already reports major 24 and the exact
+  pinned, package-owned identity, it verifies and no-ops; otherwise it
+  validates the downloaded key, installs/keeps the keyring and apt source
+  (never overwriting a foreign or mutated apt source), refreshes the package
+  index, binds the candidate version to the approved origin, then performs
+  exactly one bounded package install and re-verifies `/usr/bin/node`;
+- never runs a general OS upgrade, never pipes a remote script into a shell,
+  never downgrades an installed package, and refuses on any mismatch
+  (fingerprint, origin, version, hash, ownership) before installing;
+- serializes with the deploy transaction through the same non-blocking
+  `.deploy-transaction.lock` (single owner, never nested).
+
+Both the direct installer (`install-hub2-node.sh`) and the transaction
+(`deploy-release-transaction.sh`, before any checkout/npm/state mutation) fail
+closed when the selected service runtime or the npm build toolchain is not
+Node 24. Because the provision step precedes the transaction in the same CI
+run, the guard pair upgrades the VM from Node 22 to Node 24 in the first
+deploy of this feature instead of blocking it.
+
+## Runtime failure and rollback semantics
+
+Application rollback stays code/config-only. The deployment transaction does
+not snapshot, restore or downgrade OS packages: a rollback restores the
+previous Hub2 source, dependencies and protected configuration and keeps the
+installed Node runtime. A provisioned Node 24 therefore survives application
+rollbacks (the restored release rebuilds and runs on 24), and a Node runtime
+failure is never repaired — or claimed repaired — by an application rollback.
+
+Provisioning failures are contained in their own CI step before any candidate
+transaction starts: a failed key download, key/fingerprint mismatch, foreign
+apt source, index refresh failure, origin/version/hash mismatch or failed
+install exits nonzero with a receipt, and no application code, npm state,
+configuration or unit was touched. Recovery is package-manager custody
+(inspect `apt-get`/`dpkg` state on the VM as the operator); there is no
+automatic retry, no blind downgrade to Node 22 and no repeated install.
 
 ## Rollout steps (per revision)
 
@@ -81,6 +136,11 @@ Run locally: `node --experimental-transform-types hub2/node/main.ts --data-dir
 2. CI deploy (manual dispatch, `dry_run=false`) or on the VM:
    `cd /opt/agent-hub && git fetch && git checkout --detach origin/main &&
    npm ci --omit=dev && sudo bash deploy/vm/install-hub2-node.sh`.
+   The CI path provisions Node24 over SSH before the transaction; a manual
+   rollout must reach the same state first
+   (`sudo bash deploy/vm/provision-node24.sh` on the VM), because both the
+   installer and the transaction refuse to run against a non-Node24 service
+   runtime.
 3. `systemctl status agent-hub-hub2` + `curl -s http://127.0.0.1:8787/health`.
 
 The CI dispatch `release_mode` choice is passed to the installer. The installer
