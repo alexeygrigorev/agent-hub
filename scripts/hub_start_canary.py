@@ -1619,8 +1619,11 @@ class PhysicalAdmission:
             premise, failure = "none", "resident_identity_unknown"
         elif type(pid) is int and pid > 0:
             if not self.workload_pid_absent(pid):
-                if "containment_cgroup_identity" not in row:
-                    return self.select_current_workload(row, pid)  # genuinely absent recorded identity only
+                if row.get("containment_cgroup_identity") is None:
+                    # Unrecorded identity: the key is missing OR the whole value is null (public SDK
+                    # Option<CgroupIdentity>, serde default/skip-None). A non-null value, however malformed, is a
+                    # PROVIDED object and takes the strict path below; null INSIDE an object still holds there.
+                    return self.select_current_workload(row, pid)
                 return workload
             premise, failure = "enoent", "resident_measurement_unknown"
         else:
