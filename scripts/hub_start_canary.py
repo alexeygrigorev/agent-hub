@@ -868,7 +868,7 @@ try:
         from urllib.parse import quote
         rows, known, cursors, cursor = [], set(), set(), None
         for _ in range(PAGES_MAX):
-            path = "/api/sessions?limit=100" + ("&cursor=" + quote(cursor, safe="") if cursor else "")
+            path = "/api/sessions?live=1&limit=100" + ("&cursor=" + quote(cursor, safe="") if cursor else "")
             try:
                 entries, cursor = session_control._session_page(get(path))
             except ValueError:

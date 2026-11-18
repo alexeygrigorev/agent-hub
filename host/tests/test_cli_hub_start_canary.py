@@ -5241,7 +5241,10 @@ class AdmissionTests(unittest.TestCase):
                 if route == "/api/resource-settings":
                     return self.reply(200, {"resource_settings": {"disk_floor_gb": floor}} if mode == "ok" else floor)
                 if route == "/api/sessions":
-                    cursor = dict(p.split("=", 1) for p in query.split("&") if "=" in p).get("cursor")
+                    params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+                    if params.get("live") != "1":  # history form: a physical admission must only ever read CURRENT sessions
+                        return self.reply(400, {"error": "history_form_rejected"})
+                    cursor = params.get("cursor")
                     cursor = urllib.parse.unquote(cursor) if cursor else "first"
                     page = pages(cursor) if callable(pages) else (pages or {"first": {"sessions": []}}).get(cursor)
                     return self.reply(200, page) if page is not None else self.reply(404, {"error": "nope"})
@@ -5310,8 +5313,25 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual([h[0] for h in hits], ["GET"] * 4)
         self.assertEqual({h[2] for h in hits}, {"Bearer synthetic-human-token"})
         self.assertEqual(hits[0][1], "/api/resource-settings")
-        self.assertEqual([h[1] for h in hits[1:]], ["/api/sessions?limit=100", "/api/sessions?limit=100&cursor=c%201%2F%2B", "/api/sessions?limit=100&cursor=c2"])
+        self.assertEqual([h[1] for h in hits[1:]], ["/api/sessions?live=1&limit=100", "/api/sessions?live=1&limit=100&cursor=c%201%2F%2B", "/api/sessions?live=1&limit=100&cursor=c2"])
         self.assertEqual(self.snapshot_home(home), before)  # no profile or other file written
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_sessions_are_current_only_and_a_history_form_request_is_rejected(self):
+        mod = self.mod()
+        url, hits = self.bridge_fixture(pages={"first": {"sessions": []}})
+        home, _ = self.bridge_home(url)
+        env = self.bridge_env(home)
+        self.assertEqual(self.run_bridge(mod, "sessions", env), [])
+        self.assertEqual([h[1] for h in hits], ["/api/sessions?live=1&limit=100"])
+        # Causal sensitivity control: the SAME real bridge with the history-form path (no live=1) reaches the
+        # fixture and is rejected there, so the live=1 assertions above catch a regression.
+        hits.clear()
+        history = mod.ADMISSION_BRIDGE.replace("/api/sessions?live=1&limit=100", "/api/sessions?limit=100")
+        self.assertNotEqual(history, mod.ADMISSION_BRIDGE)
+        with mock.patch.object(mod, "ADMISSION_BRIDGE", history):
+            self.run_bridge(mod, "sessions", env, expect="managed_inflight_unavailable")
+        self.assertEqual([h[1] for h in hits], ["/api/sessions?limit=100"])
 
     @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
     def test_bridge_real_401_never_refreshes_or_writes_config_and_is_a_typed_hold(self):
@@ -5325,11 +5345,11 @@ class AdmissionTests(unittest.TestCase):
         self.run_bridge(mod, "sessions", env, expect="managed_inflight_unauthorized")
         self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(hits, [("GET", "/api/resource-settings", "Bearer synthetic-human-token"),
-                                ("GET", "/api/sessions?limit=100", "Bearer synthetic-human-token")])  # one GET each, no retry/POST
+                                ("GET", "/api/sessions?live=1&limit=100", "Bearer synthetic-human-token")])  # one GET each, no retry/POST
         self.assertEqual(self.snapshot_home(home), before)
         # Sensitivity control: the SAME fixture, profile and archive through the ordinary request path
         # (no request deadline) DOES attempt a refresh, so the assertions above catch a regression.
-        ordinary = "import sys; sys.path.insert(0, sys.argv[1])\nfrom agent_hub_host import session_control\ntry:\n    session_control.request('GET', '/api/sessions?limit=100')\nexcept Exception:\n    pass\n"
+        ordinary = "import sys; sys.path.insert(0, sys.argv[1])\nfrom agent_hub_host import session_control\ntry:\n    session_control.request('GET', '/api/sessions?live=1&limit=100')\nexcept Exception:\n    pass\n"
         c = self.bridge_canary(mod)
         hits.clear()
         with mock.patch.dict(os.environ, env):
@@ -5467,7 +5487,7 @@ class AdmissionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, self.bridge_env(home)), mock.patch.object(mod, "read_workspace_config", return_value=str(self.tmp / "ws")):
             result = mod.physical_admission_check(physical)
             self.assertEqual((result["ok"], result["reason"], result["disk_floor_gb"]), (True, "physical_ok", 1), result)
-            self.assertEqual([h[1] for h in hits], ["/api/resource-settings", "/api/sessions?limit=100", "/api/sessions?limit=100&cursor=n", "/api/sessions?limit=100", "/api/sessions?limit=100&cursor=n"])
+            self.assertEqual([h[1] for h in hits], ["/api/resource-settings", "/api/sessions?live=1&limit=100", "/api/sessions?live=1&limit=100&cursor=n", "/api/sessions?live=1&limit=100", "/api/sessions?live=1&limit=100&cursor=n"])
             hits.clear()
             for key in ("HUB_TOKEN",):
                 with mock.patch.dict(os.environ, {key: "tok"}):
