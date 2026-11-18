@@ -1804,7 +1804,8 @@ class SameProcessLifecycleTests(unittest.TestCase):
             return real_open(file, *a, **kw)
         with patch('os.fstat', side_effect=_fstat_pos), \
              patch('os.readlink', side_effect=lambda p: 'anon_inode:[fanotify]' if p == f'/proc/self/fd/{fan_r}' else real_readlink(p)), \
-             patch('builtins.open', side_effect=_open_pos):
+             patch('builtins.open', side_effect=_open_pos), \
+             patch('agent_hub_host.quota_dispatch_manager.StableRuntime.verify_root_owned_file', lambda p, pin: None):
             adopted = consume_handoff_fd(r_ok, str(gate_dir))
         self.assertEqual(os.read(ack_r, 8), b'ACK\n')
         adopted['gate'].cleanup()
@@ -1989,10 +1990,10 @@ class SameProcessLifecycleTests(unittest.TestCase):
         with self.assertRaises(ram.Unknown):
             _adopt_held_source(bad_mtime)
 
-        # Post-drop config drift vs Root-sealed plan must be refused without launching systemd-run
+        # Post-drop config drift (both directory and primary_args) must use Root-sealed path & args on fallback!
         self._write_readonly(alt_dir, 'hub-alert-quota-dispatch.py', b'raise AssertionError("evil_prelude")\n')
         adopted = {
-            'source': SimpleNamespace(raw=b'def main(*a, **kw):\n    return 41\n', fd=q_fd, pin=SimpleNamespace(sha256='a'*64)),
+            'source': SimpleNamespace(raw=b'CALLS=[]\ndef main(argv=None, *, _managed_observer=None):\n    return 41 if argv == ["--check"] and _managed_observer is None else 99\n', fd=q_fd, pin=SimpleNamespace(sha256='a'*64)),
             'client': SimpleNamespace(pin=SimpleNamespace(sha256='b'*64)),
             'prelude': SimpleNamespace(),
             'fan_group': None,
@@ -2000,6 +2001,7 @@ class SameProcessLifecycleTests(unittest.TestCase):
             'interp_fd': None,
             'entry_fd': None,
             'interpreter_pin': {'path': '/usr/bin/python3'},
+            'entry_pin': {'path': '/usr/local/lib/agent-hub/agent-hub-quota-dispatcher.pyz'},
             'plan': {
                 'source_directory': str(src_dir),
                 'gate_directory': str(gate_dir),
@@ -2016,19 +2018,32 @@ class SameProcessLifecycleTests(unittest.TestCase):
                 'source_directory': str(alt_dir),  # Drifted from Root-sealed src_dir!
                 'unit': 'agent-hub-quota-monitor.service',
                 'cgroup': '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub-quota-monitor.service',
-                'primary_args': ['--check'],
+                'primary_args': ['--evil-arg'],  # Drifted primary_args!
             }
         }
         out = io.StringIO()
+        import agent_hub_host.quota_dispatch_entry as qde
+        seen_fallback = []
+        real_once = qde._run_verified_original_once
+        def _cap_once(raw, qp, pa):
+            seen_fallback.append((qp, list(pa)))
+            return real_once(raw, qp, pa)
         with patch('agent_hub_host.quota_dispatch_entry.consume_handoff_fd', return_value=adopted), \
              patch('agent_hub_host.quota_dispatch_entry.close_held_source', lambda h: None), \
+             patch.object(qde, '_run_verified_original_once', _cap_once), \
              patch('subprocess.run', side_effect=AssertionError('must not launch on plan drift')), \
              contextlib.redirect_stdout(out):
             rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=99), cfg)
         self.assertEqual(rc, 41)
+        self.assertEqual(seen_fallback, [(str(src_dir / 'hub-quota-publish.py'), ['--check'])])
         payload = json.loads(out.getvalue())
         self.assertTrue(payload['fail_open_business'])
         self.assertFalse(payload['dispatched'])
+
+        # verify_root_owned_file must refuse non-Root-owned path/parent!
+        from agent_hub_host.quota_dispatch_manager import StableRuntime
+        with self.assertRaises(ram.Unknown):
+            StableRuntime.verify_root_owned_file(str(q_path), {'dev': q_st.st_dev, 'ino': q_st.st_ino, 'mtime_ns': q_st.st_mtime_ns, 'ctime_ns': q_st.st_ctime_ns, 'size': q_st.st_size, 'sha256': entry['sha256']})
 
     def test_r3_pre_reservation_swap_executes_verified_original_once_without_systemd(self):
         import contextlib, io, json
@@ -2061,30 +2076,62 @@ class SameProcessLifecycleTests(unittest.TestCase):
         # Swap quota_path right before reserve() runs in run_same_process_quota -> ticket is None!
         from agent_hub_host.quota_dispatch import QuotaDispatch
         real_reserve = QuotaDispatch.reserve
-        def _swap_then_reserve(self_owner, source):
+        swapped = {'done': False, 'deadline': None}
+        def _swap_then_reserve(self_owner, source, deadline):
             q_path.unlink()
             self._write_readonly(src_dir, 'hub-quota-publish.py', b'raise AssertionError("replacement_executed")\n')
-            return real_reserve(self_owner, source)
+            swapped['done'] = True
+            swapped['deadline'] = deadline
+            return real_reserve(self_owner, source, deadline)
 
         out = io.StringIO()
         calls = []
         import agent_hub_host.quota_dispatch_entry as qde
         real_once = qde._run_verified_original_once
         def _track_once(raw, qpath, pargs):
-            calls.append((qpath, pargs))
-            return real_once(raw, qpath, pargs)
+            rc_inner = real_once(raw, qpath, pargs)
+            calls.append((qpath, pargs, rc_inner))
+            return rc_inner
+        real_prep = qde.prepare_selected_quota
+        def _short_prep(*a, **kw):
+            kw['service_deadline'] = time.monotonic() + 0.15
+            return real_prep(*a, **kw)
         with patch.object(FanotifyReader, 'open_group', return_value=r_fan), \
              patch.object(QuotaDispatch, 'reserve', _swap_then_reserve), \
+             patch.object(qde, 'prepare_selected_quota', _short_prep), \
              patch.object(qde, '_run_verified_original_once', _track_once), \
-             patch('agent_hub_host.quota_dispatch_entry.time.monotonic', side_effect=[0.0, 0.0, 0.0, 0.0, 100.0, 100.0]), \
              patch('subprocess.run', side_effect=AssertionError('must not call systemd-run on ticket=None')), \
              contextlib.redirect_stdout(out):
             rc = run_quota_dispatch_cli(SimpleNamespace(enable=True, handoff_fd=None), cfg)
         self.assertEqual(rc, 0)
-        self.assertEqual(calls, [(str(q_path), ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'])])
+        self.assertTrue(swapped['done'])
+        self.assertIsInstance(swapped['deadline'], float)
+        self.assertEqual(calls, [(str(q_path), ['--check', '--health-check', '--health-timeout', '8', '--alert-timeout', '8'], 53)])
         payload = json.loads(out.getvalue())
         self.assertFalse(payload['reserved'])
-        self.assertEqual(payload['phase'], 'failed')
+        self.assertNotEqual(payload['phase'], 'done')
+
+    def test_r2_root_sealed_plan_rejects_symlink_oversize_and_malformed_config(self):
+        from types import SimpleNamespace
+        repo_root = Path(__file__).resolve().parents[3]
+        spec = importlib.util.spec_from_file_location('root_preparer_r2_cfg', repo_root / 'scripts/hub-alert-quota-prepare.py')
+        prep = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prep)
+        root = self._short_temp()
+        real_cfg = root / 'real.json'
+        real_cfg.write_text('{"quota_same_process":{"unit":"u.service","cgroup":"/u"}}')
+        sym_cfg = root / 'sym.json'
+        sym_cfg.symlink_to(real_cfg)
+        with self.assertRaises((OSError, PermissionError)):
+            prep._read_bounded_config(str(sym_cfg), os.getuid())
+        big_cfg = root / 'big.json'
+        big_cfg.write_bytes(b' ' * 70000)
+        with self.assertRaises(PermissionError):
+            prep._read_bounded_config(str(big_cfg), os.getuid())
+        bad_cfg = root / 'bad.json'
+        bad_cfg.write_text('{"quota_same_process": "not-a-dict"}')
+        with self.assertRaises(ValueError):
+            prep._sealed_plan(SimpleNamespace(config=str(bad_cfg), source_dir=str(root), gate_dir=str(root)), os.getuid())
 
     def test_r4_ack_then_child_crash_reconciles_owned_node_and_preserves_foreign(self):
         import hashlib, json, shutil, socket
