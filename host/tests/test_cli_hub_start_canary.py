@@ -5257,6 +5257,56 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn('CANARY_WORKSPACE_CONFIG = "/etc/agent-hub/canary-workspace.json"', source)
         self.assertNotIn("os.environ.get(\"HUB_CANARY_WORKSPACE_CONFIG", source)
 
+    def test_uncontained_live_workload_without_identity_uses_kernel_birth_proof(self):
+        session_cg = "/user.slice/user-1000.slice/session-247501.scope"
+        run_cg = "/user.slice/user-1000.slice/user@1000.service/app.slice/run-u1098341.scope"
+        floor = 10 * GIB + 1500 * MIB
+
+        def uncontained_row(n, pid, cgroup, *, age=400, absent=True, **extra):
+            extra.setdefault("created_at_ms", self.birth_ms(age))
+            row = census_row(n, pid, cgroup, limits={}, **extra)
+            if absent:
+                row.pop("containment_cgroup_identity", None)
+            else:
+                row["containment_cgroup_identity"] = None
+            return row
+
+        def world(rows, census, *, mem=floor, mutate=None):
+            c = self.coordinator_world(rows, census, mem=mem, mutate=mutate)
+            c.disk_free_after_margin = lambda paths: {1: 100 * GIB}
+            return c
+
+        # Mature uncontained workloads (absent or null containment_cgroup_identity, limits={}, memory.max=max)
+        # including multiple sessions sharing a login_session cgroup reserve 0 extra.
+        rows = [
+            self.worker_row(1, 7101, session_cg, age=400, members=[7101, 7102]),
+            self.worker_row(2, 7102, session_cg, age=400, members=[7101, 7102]),
+            self.worker_row(3, 7103, run_cg, age=400),
+        ]
+        census = [
+            uncontained_row(1, 7101, session_cg, absent=True),
+            uncontained_row(2, 7102, session_cg, absent=False),
+            uncontained_row(3, 7103, run_cg, absent=True),
+        ]
+        world(rows, census, mem=floor).admit()
+        self.assertHold(world(rows, census, mem=floor - 1), "memory_below_floor")
+
+        # Young uncontained workload with memory.max=max holds resident_bound_unknown; finite kernel cap is charged.
+        young_proc = [self.worker_row(1, 7101, run_cg, age=60, max="max")]
+        young_census = [uncontained_row(1, 7101, run_cg, age=60)]
+        self.assertHold(world(young_proc, young_census, mem=64 * GIB), "resident_bound_unknown")
+        finite_proc = [self.worker_row(1, 7101, run_cg, age=60, max=str(400 * MIB))]
+        world(finite_proc, young_census, mem=floor + 400 * MIB).admit()
+        self.assertHold(world(finite_proc, young_census, mem=floor + 400 * MIB - 1), "memory_below_floor")
+
+        # Missing cgroup, birth mismatch, or invalid PID still hold.
+        self.assertHold(world(rows[:1], [uncontained_row(1, 7101, None)], mem=64 * GIB), "resident_identity_unknown")
+        self.assertHold(world(rows[:1], [uncontained_row(1, 7101, run_cg, created_at_ms=self.birth_ms(400, skew=10.0))], mem=64 * GIB),
+                        "resident_identity_unknown")
+        # Present non-null containment_cgroup_identity with mismatched boot_id still holds.
+        self.assertHold(world(rows[:1], [census_row(1, 7101, session_cg, boot_id="old-boot")], mem=64 * GIB),
+                        "resident_identity_unknown")
+
 
 def datetime_now():
     import datetime
