@@ -4,7 +4,7 @@ Mail renders to a sink; no real msmtp/sendmail is ever called.
 
 Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_cli_hub_start_canary
 """
-import errno, http.server, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unittest
+import errno, http.server, json, os, pathlib, shutil, socket, stat, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -5191,40 +5191,290 @@ class AdmissionTests(unittest.TestCase):
             z.writestr("agent_hub_host/bus.py", body)
         return buf.getvalue()
 
+    # ---- fixed read-only bridge: real archive code, synthetic fixture Hub on loopback ---------
+
+    BRIDGE_ENV_CLEAR = ("HUB_CONFIG_FILE", "HUB_JOB_TOKEN", "HUB_TOKEN", "HUB_WORKER_CONFIG_FILE", "HUB2_CONFIG", "HUB_URL",
+                        "HUB_BASE_URL", "HUB_ALLOW_LEGACY_ROUTES", "APLEXER_TAG", "APLEXER_WORKSPACE")
+
+    def real_cli_zip(self, config_patch=""):
+        """Whole-package zipapp of the maintained CLI source (real config/auth/api/session_control/bus code)."""
+        import io, zipfile
+        buf = io.BytesIO()
+        package = ROOT / "host" / "agent_hub_host"
+        with zipfile.ZipFile(buf, "w") as z:
+            for path in sorted(package.rglob("*.py")):
+                text = path.read_text()
+                if path.name == "config.py" and config_patch:
+                    text += "\n" + config_patch
+                z.writestr("agent_hub_host/" + path.relative_to(package).as_posix(), text)
+        return buf.getvalue()
+
+    def bridge_fixture(self, *, pages=None, mode="ok", floor=27.5, delay=0.0):
+        """Loopback fixture Hub. Records every request; `pages` maps cursor -> session page; mode 401 answers every GET 401."""
+        hits = []
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def handle_any(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                hits.append((self.command, self.path, self.headers.get("Authorization")))
+                if delay:
+                    time.sleep(delay)
+                if self.command != "GET":
+                    return self.reply(401, {"error": "unauthorized"})
+                if mode == "401":
+                    return self.reply(401, {"error": "unauthorized", "code": "unauthorized"})
+                route, _, query = self.path.partition("?")
+                if route == "/api/resource-settings":
+                    return self.reply(200, {"resource_settings": {"disk_floor_gb": floor}} if mode == "ok" else floor)
+                if route == "/api/sessions":
+                    cursor = dict(p.split("=", 1) for p in query.split("&") if "=" in p).get("cursor")
+                    cursor = urllib.parse.unquote(cursor) if cursor else "first"
+                    page = pages(cursor) if callable(pages) else (pages or {"first": {"sessions": []}}).get(cursor)
+                    return self.reply(200, page) if page is not None else self.reply(404, {"error": "nope"})
+                return self.reply(404, {"error": "nope"})
+
+            do_GET = do_POST = do_PUT = do_DELETE = handle_any
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        return "http://127.0.0.1:%d" % server.server_address[1], hits
+
+    def bridge_home(self, base_url, **profile):
+        """Disposable HOME holding a synthetic human profile (never a real operator profile)."""
+        home = pathlib.Path(tempfile.mkdtemp(prefix="bridge-home-", dir=self.tmp))
+        directory = home / ".config" / "agent-hub"
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+        body = {"client_kind": "human", "access_token": "synthetic-human-token", "refresh_token": "synthetic-refresh", "base_url": base_url}
+        body.update(profile)
+        path = directory / "cli.json"
+        path.write_text(json.dumps(body))
+        path.chmod(0o600)
+        return home, path
+
+    def bridge_env(self, home, **extra):
+        env = {name: "" for name in self.BRIDGE_ENV_CLEAR}
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+        env.update(extra)
+        return env
+
+    def bridge_canary(self, mod, archive=None):
+        c = mod.PhysicalAdmission()
+        c.hub = ["definitely-not-run-hub-binary"]  # the ordinary CLI must never be consulted
+        c.bridge_fd = mod.create_sealed_pyz_fd(archive if archive is not None else self.real_cli_zip())
+        self.addCleanup(os.close, c.bridge_fd)
+        return c
+
+    def snapshot_home(self, home):
+        return sorted((p.relative_to(home).as_posix(), p.read_bytes() if p.is_file() else None, p.stat().st_mtime_ns) for p in home.rglob("*"))
+
+    def run_bridge(self, mod, method, env, archive=None, budget=30, expect=None):
+        c = self.bridge_canary(mod, archive)
+        with mock.patch.dict(os.environ, env):
+            call = (lambda: c.fetch_disk_floor_gb(time.monotonic() + budget)) if method == "settings" \
+                else (lambda: c.read_hub_rows(time.monotonic() + budget))
+            if expect is None:
+                return call()
+            with self.assertRaises(mod.StageFailure) as caught:
+                call()
+            self.assertEqual(caught.exception.reason, expect)
+
     @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
-    def test_bridge_reads_disk_floor_through_sealed_cli_with_human_only_and_no_refresh(self):
+    def test_bridge_success_reads_settings_and_complete_current_pagination_with_the_human_profile(self):
         mod = self.mod()
-        marker = self.tmp / "refreshed.flag"
-        with mock.patch.dict(os.environ, {"HUB_TOKEN": "", "HUB_CONFIG_FILE": ""}):
-            for label, kwargs, expected in (
-                ("ok", {}, 27.5),
-                ("worker", dict(worker=True), "resource_settings_unavailable"),
-                ("not human", dict(human=False), "resource_settings_unavailable"),
-                ("http failure", dict(fail=True), "resource_settings_unavailable"),
-                ("floor zero", dict(floor=0), "resource_settings_invalid"),
-                ("floor huge", dict(floor=2000000), "resource_settings_invalid"),
-                ("floor bool", dict(floor=True), "resource_settings_invalid"),
-                ("no refresh", dict(refresh_marker=marker), "resource_settings_unavailable"),
-            ):
-                with self.subTest(label):
-                    c = mod.Canary("shell", "bridge")
-                    c.pyz_fd = mod.create_sealed_pyz_fd(self.bridge_zip(**kwargs))
-                    self.addCleanup(os.close, c.pyz_fd)
-                    c.hub_pass_fds = (c.pyz_fd,)
-                    if isinstance(expected, float):
-                        self.assertEqual(c.fetch_disk_floor_gb(time.monotonic() + 20), expected)
-                    else:
-                        with self.assertRaises(mod.StageFailure) as caught:
-                            c.fetch_disk_floor_gb(time.monotonic() + 20)
-                        self.assertEqual(caught.exception.reason, expected)
-        self.assertFalse(marker.exists())
-        env_token = {"HUB_JOB_TOKEN": "t"}
-        with mock.patch.dict(os.environ, env_token):
-            c = mod.Canary("shell", "bridge")
-            c.pyz_fd = mod.create_sealed_pyz_fd(self.bridge_zip())
-            self.addCleanup(os.close, c.pyz_fd)
-            with self.assertRaises(mod.StageFailure):
-                c.fetch_disk_floor_gb(time.monotonic() + 20)
+        rows = [{"id": "s%d" % n, "state": "running", "machine_id": "HOST-1", "native_id": "n%d" % n} for n in range(5)]
+        pages = {"first": {"sessions": rows[:2], "next_cursor": "c 1/+"}, "c 1/+": {"sessions": rows[2:4], "next_cursor": "c2", "complete": False},
+                 "c2": {"sessions": rows[4:], "next_cursor": None, "complete": True}}
+        url, hits = self.bridge_fixture(pages=pages)
+        home, profile = self.bridge_home(url)
+        before = self.snapshot_home(home)
+        env = self.bridge_env(home)
+        self.assertEqual(self.run_bridge(mod, "settings", env), 27.5)
+        self.assertEqual(self.run_bridge(mod, "sessions", env), rows)
+        self.assertEqual([h[0] for h in hits], ["GET"] * 4)
+        self.assertEqual({h[2] for h in hits}, {"Bearer synthetic-human-token"})
+        self.assertEqual(hits[0][1], "/api/resource-settings")
+        self.assertEqual([h[1] for h in hits[1:]], ["/api/sessions?limit=100", "/api/sessions?limit=100&cursor=c%201%2F%2B", "/api/sessions?limit=100&cursor=c2"])
+        self.assertEqual(self.snapshot_home(home), before)  # no profile or other file written
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_real_401_never_refreshes_or_writes_config_and_is_a_typed_hold(self):
+        mod = self.mod()
+        url, hits = self.bridge_fixture(mode="401")
+        home, profile = self.bridge_home(url)
+        before = self.snapshot_home(home)
+        env = self.bridge_env(home)
+        started = time.monotonic()
+        self.run_bridge(mod, "settings", env, expect="resource_settings_unauthorized")
+        self.run_bridge(mod, "sessions", env, expect="managed_inflight_unauthorized")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(hits, [("GET", "/api/resource-settings", "Bearer synthetic-human-token"),
+                                ("GET", "/api/sessions?limit=100", "Bearer synthetic-human-token")])  # one GET each, no retry/POST
+        self.assertEqual(self.snapshot_home(home), before)
+        # Sensitivity control: the SAME fixture, profile and archive through the ordinary request path
+        # (no request deadline) DOES attempt a refresh, so the assertions above catch a regression.
+        ordinary = "import sys; sys.path.insert(0, sys.argv[1])\nfrom agent_hub_host import session_control\ntry:\n    session_control.request('GET', '/api/sessions?limit=100')\nexcept Exception:\n    pass\n"
+        c = self.bridge_canary(mod)
+        hits.clear()
+        with mock.patch.dict(os.environ, env):
+            c.run([sys.executable, "-I", "-S", "-c", ordinary, f"/proc/self/fd/{c.bridge_fd}"], deadline=time.monotonic() + 20, pass_fd=c.bridge_fd)
+        self.assertTrue(any(method != "GET" for method, _, _ in hits), hits)
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_budget_clips_the_request_and_refuses_an_expired_budget(self):
+        mod = self.mod()
+        url, hits = self.bridge_fixture(delay=6.0)
+        home, _ = self.bridge_home(url)
+        env = self.bridge_env(home)
+        started = time.monotonic()
+        self.run_bridge(mod, "settings", env, budget=2, expect="resource_settings_timeout")
+        self.run_bridge(mod, "sessions", env, budget=2, expect="managed_inflight_timeout")
+        self.assertLess(time.monotonic() - started, 9)
+        started = time.monotonic()
+        self.run_bridge(mod, "sessions", env, budget=-1, expect="managed_inflight_timeout")
+        self.assertLess(time.monotonic() - started, 2)
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_refuses_any_non_genuine_human_effective_config_before_any_get(self):
+        mod = self.mod()
+        url, hits = self.bridge_fixture()
+        home, profile = self.bridge_home(url)
+        other = self.tmp / "other-profile.json"
+        other.write_text(json.dumps({"client_kind": "human", "access_token": "other", "base_url": url}))
+        other.chmod(0o600)
+        host_profile = profile.with_name("host.json")
+        patched = self.real_cli_zip("_real_load_config = load_config\ndef load_config():\n    cfg = dict(_real_load_config())\n    cfg['access_token'] = 'legacy-worker-token'\n    return cfg\n")
+        worker_cfg = self.tmp / "hub-worker-auth"
+        cases = (
+            ("task-hub2 worker identity", self.bridge_env(home, APLEXER_TAG="task-hub2-6ce0e213"), None),
+            ("hub2 context selector", self.bridge_env(home, HUB2_CONFIG=str(self.tmp / "hub2-contexts" / "x.json")), None),
+            ("env job token", self.bridge_env(home, HUB_JOB_TOKEN="job"), None),
+            ("env token", self.bridge_env(home, HUB_TOKEN="tok"), None),
+            ("config file override", self.bridge_env(home, HUB_CONFIG_FILE=str(other)), None),
+            ("worker config selector", self.bridge_env(home, HUB_WORKER_CONFIG_FILE=str(worker_cfg / "hub-x.json")), None),
+            ("url override elsewhere", self.bridge_env(home, HUB_URL="http://127.0.0.1:1"), None),
+            ("effective mapping differs from human", self.bridge_env(home), patched),
+        )
+        for label, env, archive in cases:
+            with self.subTest(label):
+                self.run_bridge(mod, "settings", env, archive=archive, expect="resource_settings_unauthorized")
+                self.run_bridge(mod, "sessions", env, archive=archive, expect="managed_inflight_unauthorized")
+        host_profile.write_text(json.dumps({"client_kind": "host", "access_token": "host-token", "base_url": url}))
+        host_profile.chmod(0o600)
+        profile.write_text(json.dumps({"client_kind": "host", "access_token": "x", "base_url": url}))
+        profile.chmod(0o600)
+        with self.subTest("human profile of another kind"):
+            self.run_bridge(mod, "settings", self.bridge_env(home), expect="resource_settings_unauthorized")
+        profile.write_text("{}")
+        with self.subTest("no human profile but host profile"):
+            self.run_bridge(mod, "sessions", self.bridge_env(home), expect="managed_inflight_unauthorized")
+        self.assertEqual(hits, [])  # every refusal happened before the first HTTP request
+        # Control: a matching human profile with the same environment succeeds.
+        home2, _ = self.bridge_home(url)
+        self.assertEqual(self.run_bridge(mod, "settings", self.bridge_env(home2)), 27.5)
+        self.assertEqual(len(hits), 1)
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_reproves_the_human_profile_before_every_get_of_a_pagination(self):
+        mod = self.mod()
+        state = {}
+
+        def pages(cursor):
+            if cursor == "first":  # the profile is replaced while the listing is in flight
+                state["profile"].write_text(json.dumps({"client_kind": "human", "access_token": "swapped", "base_url": state["url"]}))
+                return {"sessions": [{"id": "r1"}], "next_cursor": "more"}
+            return {"sessions": [{"id": "r2"}]}
+
+        url, hits = self.bridge_fixture(pages=pages)
+        home, state["profile"] = self.bridge_home(url)
+        state["url"] = url
+        self.run_bridge(mod, "sessions", self.bridge_env(home), expect="managed_inflight_unauthorized")
+        self.assertEqual(len(hits), 1)  # the second GET never left the bridge
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_bridge_refuses_invalid_or_unbounded_settings_and_session_pages(self):
+        mod = self.mod()
+        row = lambda n: {"id": "r%d" % n, "state": "running"}
+        counter = iter(range(10 ** 6))
+        loops = {"first": {"sessions": [row(1)], "next_cursor": "a"}, "a": {"sessions": [row(2)], "next_cursor": "b"}, "b": {"sessions": [row(3)], "next_cursor": "a"}}
+        cases = {
+            "repeated cursor": loops,
+            "unfinished incomplete page": {"first": {"sessions": [row(1)], "complete": False}},
+            "complete page with cursor": {"first": {"sessions": [row(1)], "complete": True, "next_cursor": "z"}, "z": {"sessions": []}},
+            "conflicting cursors": {"first": {"sessions": [], "next_cursor": "a", "next": "b"}},
+            "duplicate id across pages": {"first": {"sessions": [row(1)], "next_cursor": "a"}, "a": {"sessions": [row(1)]}},
+            "oversize page": {"first": {"sessions": [row(n) for n in range(101)]}},
+            "row without id": {"first": {"sessions": [{"state": "running"}]}},
+            "non-list sessions": {"first": {"sessions": {"id": "x"}}},
+            "non-object page": {"first": []},
+            "non-string cursor": {"first": {"sessions": [], "next_cursor": 5}},
+            "missing continuation page": {"first": {"sessions": [row(1)], "next_cursor": "gone"}},
+        }
+        for label, pages in cases.items():
+            with self.subTest(label):
+                url, hits = self.bridge_fixture(pages=pages)
+                home, _ = self.bridge_home(url)
+                self.run_bridge(mod, "sessions", self.bridge_env(home), expect="managed_inflight_invalid" if "missing" not in label else "managed_inflight_unavailable")
+                if label == "repeated cursor":
+                    self.assertEqual(len(hits), 3)  # stops at the first repeated cursor, not at the page bound
+        for label, per_page in (("endless one-row pages", 1), ("endless full pages exceed the row bound", 100)):
+            with self.subTest(label):
+                url, hits = self.bridge_fixture(pages=lambda cursor, per_page=per_page: {"sessions": [row(next(counter)) for _ in range(per_page)], "next_cursor": "c%d" % next(counter)})
+                home, _ = self.bridge_home(url)
+                self.run_bridge(mod, "sessions", self.bridge_env(home), expect="managed_inflight_invalid")
+                self.assertLessEqual(len(hits), mod.ADMISSION_MAX_ROWS // 100 + 2)
+        for label, floor, expect in (("zero", 0, "resource_settings_invalid"), ("huge", 2000000, "resource_settings_invalid"),
+                                     ("bool", True, "resource_settings_invalid"), ("string", "27", "resource_settings_invalid"),
+                                     ("null", None, "resource_settings_invalid")):
+            with self.subTest("floor " + label):
+                url, _ = self.bridge_fixture(floor=floor)
+                home, _ = self.bridge_home(url)
+                self.run_bridge(mod, "settings", self.bridge_env(home), expect=expect)
+        url, _ = self.bridge_fixture(mode="shape", floor=5)
+        home, _ = self.bridge_home(url)
+        self.run_bridge(mod, "settings", self.bridge_env(home), expect="resource_settings_invalid")
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
+    def test_physical_check_reaches_the_real_bridge_for_settings_and_sessions_and_is_read_only(self):
+        mod = self.mod()
+        group = "/user.slice/p1.scope"
+        rows = [self.worker_row(1, 5100, group)]
+        census = [self.current_census(1, 5100, group)]
+        url, hits = self.bridge_fixture(pages={"first": {"sessions": [], "next_cursor": "n"}, "n": {"sessions": [], "next_cursor": None}}, floor=1)
+        home, profile = self.bridge_home(url)
+        before = self.snapshot_home(home)
+        physical = self.physical_world(rows, census, mem=64 * GIB)
+        del physical.fetch_disk_floor_gb, physical.read_hub_rows  # the real bridge-backed methods
+        physical.hub = ["definitely-not-run-hub-binary"]
+        physical.bridge_fd = mod.create_sealed_pyz_fd(self.real_cli_zip())
+        self.addCleanup(os.close, physical.bridge_fd)
+        with mock.patch.dict(os.environ, self.bridge_env(home)), mock.patch.object(mod, "read_workspace_config", return_value=str(self.tmp / "ws")):
+            result = mod.physical_admission_check(physical)
+            self.assertEqual((result["ok"], result["reason"], result["disk_floor_gb"]), (True, "physical_ok", 1), result)
+            self.assertEqual([h[1] for h in hits], ["/api/resource-settings", "/api/sessions?limit=100", "/api/sessions?limit=100&cursor=n", "/api/sessions?limit=100", "/api/sessions?limit=100&cursor=n"])
+            hits.clear()
+            for key in ("HUB_TOKEN",):
+                with mock.patch.dict(os.environ, {key: "tok"}):
+                    held = mod.physical_admission_check(physical)
+                self.assertEqual((held["ok"], held["reason"]), (False, "resource_settings_unauthorized"))
+            self.assertEqual(hits, [])
+        self.assertEqual(self.snapshot_home(home), before)
 
     @unittest.skipUnless(hasattr(os, "memfd_create"), "sealed memfd unsupported by this Python (same limit as the existing sealed-CLI tests)")
     def test_periodic_cli_must_be_a_bindable_owned_zipapp(self):
