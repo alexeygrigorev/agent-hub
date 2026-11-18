@@ -1,8 +1,8 @@
 """Host lifecycle helpers: loud serve logging, release identity and Windows self-update.
 
 Intake 41ef7048: a Windows Hub2 host refused every launch with a bare reason and
-left serve.log empty, because `hub2 serve` only logged to an unredirected stderr.
-The daemon now owns its log file. On Windows `hub2 self-update` installs the
+left serve.log empty, because `hub host serve` only logged to an unredirected stderr.
+The daemon now owns its log file. On Windows `hub host self-update` installs the
 verified published release through the release's own host-install.ps1, which
 stops and restarts the AgentHub2Host scheduled task.
 """

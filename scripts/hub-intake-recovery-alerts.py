@@ -218,7 +218,7 @@ def render_host(machine, alert, now=None):
     return ('Hub2 host {machine} is running but disconnected since {stamp} ({minutes} min; evidence: {evidence}). '
             'Sessions routed to it cannot start. On the host: check scheduled task AgentHub2Host and '
             '%LOCALAPPDATA%\\agent-hub2\\serve.log (Linux: journalctl --user -u agent-hub2-host); '
-            'reinstall/update: hub2 self-update. Status: hub routing-machines.').format(
+            'reinstall/update: hub host self-update. Status: hub routing-machines.').format(
         machine=machine.get('machine_id'), stamp=stamp, minutes=minutes,
         evidence=alert.get('evidence') or 'unknown')
 

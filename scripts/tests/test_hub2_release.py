@@ -88,7 +88,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
 
     def status_command(self, args, *, stdout, stderr, timeout):
         self.calls.append(args)
-        self.assertEqual(args, [str(self.root / 'releases' / SHA / 'bin/hub2'), '--config', str(self.config),
+        self.assertEqual(args, [str(self.root / 'releases' / SHA / 'bin/python'), '-I', '-m', 'agent_hub_host.cli', '--config', str(self.config),
                                 'request', 'GET', STATUS_PATH])
         self.assertEqual(stdout, subprocess.PIPE)
         self.assertEqual(stderr, subprocess.DEVNULL)
@@ -529,11 +529,11 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         entry.unlink()
         entry.write_text('old wheel entry point')
         host_entry = target / 'bin/hub2'
-        host_entry.write_text('host entry point')
+        host_entry.write_text('retired host entry point')
         self.calls.clear()
         self.install()
         self.assertEqual(os.readlink(entry), '../hub.pyz')
-        self.assertEqual(host_entry.read_text(), 'host entry point')
+        self.assertFalse(host_entry.exists(), 'there is no separate hub2 CLI')
         self.assertFalse(any('systemctl' in args or 'pip' in args for args in self.calls))
         self.calls.clear()
         self.install()
@@ -561,10 +561,13 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         # points. PYTHONPATH supplies the actual host package to this venv.
         with patch('sys.stdout', new=io.StringIO()):
             module('build-hub-cli').build(target, '0.2.0')
-        for name in ('hub', 'hub2'):
-            entry = target / 'bin' / name
-            entry.write_text(f'#!{target}/bin/python\nfrom agent_hub_host.cli import main\nraise SystemExit(main())\n')
-            entry.chmod(0o755)
+        entry = target / 'bin/hub'
+        entry.write_text(f'#!{target}/bin/python\nfrom agent_hub_host.cli import main\nraise SystemExit(main())\n')
+        entry.chmod(0o755)
+        # The daemon module `hub host` runs lives in the release venv (isolated -I).
+        site, = (target / 'lib').glob('python*/site-packages')
+        shutil.copytree(REPO / 'hub2/host/agent_hub_host', site / 'agent_hub_host',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         data = (target / 'hub.pyz').read_bytes()
         manifest = {'artifacts': {'hub.pyz': {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}
         updater.install_operator_cli(target, manifest)
@@ -596,13 +599,14 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
                        HUB_URL=f'http://127.0.0.1:{server.server_port}', HUB_TOKEN='synthetic-operator-token',
                        PYTHONPATH=str(REPO / 'hub2/host'))
             result = subprocess.run(['/bin/sh', '-ec',
-                                     '. "$1/bin/activate"; command -v hub; hub --version; hub sessions list; hub2 --help',
+                                     '. "$1/bin/activate"; command -v hub; hub --version; hub sessions list; hub host --help',
                                      'activated-shell', str(self.root / 'current')],
                                     env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(str(target / 'bin/hub'), result.stdout)
             self.assertIn('hub 0.2.0', result.stdout)
-            self.assertIn('usage: hub2', result.stdout)
+            self.assertIn('usage: hub host', result.stdout)
+            self.assertNotIn('hub2', result.stdout.replace('agent-hub2', ''))
             self.assertTrue(any(path.startswith('/api/sessions') and token == 'Bearer synthetic-operator-token'
                                 for path, token in requests), requests)
         finally:
@@ -1466,6 +1470,8 @@ import json, os, shutil, sys
 from pathlib import Path
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+if name == 'python' and args[:3] != ['-I', '-m', 'agent_hub_host.cli']:
+    os.execv(sys.executable, [sys.executable, *args])  # only the host CLI module is stubbed
 config = Path(os.environ['INSTALL_TEST_CONFIG'])
 if name == 'curl':
     shutil.copyfile(os.environ['INSTALL_TEST_UPDATER'], args[args.index('-o')+1])
@@ -1475,7 +1481,8 @@ if name == 'hub2-enroll.py':
 elif name == 'systemctl':
     event = args[1]
     assert args[0] == '--user'
-elif name == 'hub2':
+elif name == 'python' and args[:3] == ['-I', '-m', 'agent_hub_host.cli']:
+    args = args[3:]
     assert args == ['--config', str(config), 'request', 'GET', {STATUS_PATH!r}]
     assert os.environ['HUB2_TOKEN'] == 'synthetic-override-token'
     event = 'routing'
@@ -1498,8 +1505,7 @@ elif event in ('start', 'routing', 'enable'):
                 for name in ('curl', 'loginctl', 'systemctl'):
                     (fake_bin / name).symlink_to(stub)
                 (fake_bin / 'python3').symlink_to(sys.executable)
-                (current_bin / 'python').symlink_to(sys.executable)
-                (current_bin / 'hub2').symlink_to(stub)
+                (current_bin / 'python').symlink_to(stub)
                 (current / 'hub2-enroll.py').symlink_to(stub)
                 result = subprocess.run(['/bin/sh', str(REPO / 'deploy/host-install.sh')],
                                         env={**os.environ, 'HOME': str(home), 'PATH': str(fake_bin)+':/usr/bin:/bin',
@@ -1605,6 +1611,70 @@ def publication_bundle(directory, commit, label='fixture'):
     raw = json.dumps(manifest, sort_keys=True).encode()
     (directory / 'host-release.json').write_bytes(raw)
     return directory, hashlib.sha256(raw).hexdigest()
+
+
+
+class HostDropinAlignmentTests(unittest.TestCase):
+    """Hand-made host drop-ins follow the entry point of the release that will run."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.root = self.home / '.local/share/agent-hub2'
+        self.dropin = self.home / '.config/systemd/user' / (updater.UNITS[0] + '.d') / '90-strict-aplexer.conf'
+        self.dropin.parent.mkdir(parents=True)
+        self.legacy = ('[Service]\nExecStart=\nExecStart=%s/current/bin/hub2 serve --aplexer /x/a\n'
+                       % self.root)
+        self.dropin.write_text(self.legacy)
+        self.calls = []
+        patcher = patch.multiple(updater, command=lambda args: self.calls.append([str(a) for a in args]))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        home = patch.object(Path, 'home', return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+
+    def current(self, *, legacy):
+        release = self.root / 'releases' / SHA
+        (release / 'bin').mkdir(parents=True, exist_ok=True)
+        (release / 'bin/hub2').unlink(missing_ok=True)
+        if legacy:
+            (release / 'bin/hub2').write_text('')
+        link = self.root / 'current'
+        link.unlink(missing_ok=True)
+        link.symlink_to(release)
+
+    def test_release_without_hub2_gets_hub_host_and_reverts_for_a_legacy_release(self):
+        self.current(legacy=False)
+        updater.restart_host(self.root)
+        self.assertIn('current/bin/hub host serve --aplexer /x/a', self.dropin.read_text())
+        self.assertNotIn('/bin/hub2', self.dropin.read_text())
+        self.assertEqual(self.calls, [['systemctl', '--user', 'daemon-reload'],
+                                      ['systemctl', '--user', 'restart', updater.UNITS[0]]])
+        self.calls.clear()
+        updater.restart_host(self.root)  # already aligned: no reload
+        self.assertEqual(self.calls, [['systemctl', '--user', 'restart', updater.UNITS[0]]])
+        self.current(legacy=True)  # rollback to a release that still ships bin/hub2
+        updater.restart_host(self.root)
+        self.assertEqual(self.dropin.read_text(), self.legacy)
+
+    def test_no_hub2_cli_remains_in_packaging_units_or_installers(self):
+        import re
+        retired = re.compile(r'bin/hub2\b|Scripts.hub2\.exe|^hub2 = |\bhub2 (serve|enroll|heartbeat|self-update|--config)\b', re.M)
+        paths = [REPO / 'pyproject.toml', REPO / 'hub2/host/pyproject.toml', REPO / 'deploy/host-install.ps1',
+                 REPO / 'scripts/switch-host-release.py', *sorted((REPO / 'deploy').glob('*.service'))]
+        for path in paths:
+            self.assertIsNone(retired.search(path.read_text()), str(path))
+        # host-install.sh only mentions the old name to retire a stale link.
+        self.assertNotIn('ln -s "$ROOT/current/bin/hub2"', (REPO / 'deploy/host-install.sh').read_text())
+
+    def test_unrelated_drop_in_commands_are_left_alone(self):
+        other = self.dropin.with_name('10-other.conf')
+        other.write_text('[Service]\nExecStart=/usr/bin/hub2 serve\nEnvironment=X=/agent-hub2/current/bin/hub2x\n')
+        self.current(legacy=False)
+        updater.restart_host(self.root)
+        self.assertEqual(other.read_text(), '[Service]\nExecStart=/usr/bin/hub2 serve\nEnvironment=X=/agent-hub2/current/bin/hub2x\n')
 
 
 class AlertClientPackagingTests(unittest.TestCase):
