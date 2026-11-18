@@ -751,9 +751,19 @@ DISK_FLOOR_GB_RANGE = (1, 1048576)
 MATURE_RESIDENT_AGE_S = 180.0
 QUOTA_STALE_S = 1200.0
 CODEX_QUOTA_RESERVE_PERCENT = 15.0
-# Mirrors agent-quota-launcher launcher/provider_admission.py ABSENT_OPTIONAL (quse route name -> optional plan windows).
-QUOTA_ABSENT_OPTIONAL_WINDOWS = {"claude": frozenset(("monthly",)), "codex": frozenset(("5h", "monthly")),
-                                 "codex-orin": frozenset(("5h", "monthly"))}
+# Finite supported quse routes with their required window groups (any alias satisfies a group) and
+# the source-proven optional null plan slots. Data semantics only, from the maintained
+# agent-quota-launcher launcher/provider_admission.py REQUIRED_WINDOWS/ABSENT_OPTIONAL (quse key `go`
+# is the launcher's opencode) and quse usage.py (Claude monthly is a canonical null slot; Go monthly
+# is a real window). Any other route (copilot, zai, gemini, grok, codex-orin, unknown names) has no
+# maintained required-window metadata here, so it can never make a native canary eligible. This is
+# data validation only: the launcher's executor lifecycle and its Codex execution prohibition are
+# not imported; the protected Codex wrapper and the 15% reserve stay authoritative for Codex.
+QUOTA_ROUTE_POLICY = {
+    "claude": {"required": (("5h", "five_hour"), ("7d", "weekly", "seven_day")), "optional": frozenset(("monthly",))},
+    "go": {"required": (("5h", "rolling"), ("7d", "weekly"), ("monthly",)), "optional": frozenset()},
+    "codex": {"required": (("7d", "weekly"),), "optional": frozenset(("5h", "monthly"))},
+}
 ADMISSION_JSON_MAX_BYTES = 16 * 1024 * 1024
 ADMISSION_MAX_ROWS = 5000
 PROC_ROOT = "/proc"
@@ -1048,21 +1058,26 @@ def parse_iso_utc(value):
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def quota_route_usable(name, route, now):
-    """Mirror of the maintained quota sanitizer's fail-closed acceptance of one route.
+def _quota_record_unhealthy(record):
+    return any(record.get(flag) for flag in ("error", "stale", "limit_reached", "infinite"))
 
-    Pure and in-memory; raw quota is never retained or printed. A route is
-    usable only when it is status ok, fresh, not stale/limit-reached, every
-    window is well formed, and the lowest present remaining percentage is
-    strictly above the provider reserve (OpenAI Codex: 15). A fully null
-    window (no percentage, no reset, not explicitly present) is skipped only
-    when it is a provider-optional plan window (Claude monthly; Codex 5h and
-    monthly); a null required or unlisted window is never ignored.
+
+def quota_route_usable(name, route, now):
+    """Mirror of the maintained quota sanitizer's fail-closed data acceptance of one route.
+
+    Pure and in-memory; raw quota is never retained or printed. Only the finite routes in
+    QUOTA_ROUTE_POLICY can be eligible. A route is usable only when it is status ok, fresh,
+    not stale/limit-reached, every window (required and extra) is well formed with an ok
+    status, every required window group has a validated present member, and the lowest
+    present remaining percentage is strictly above the provider reserve (Codex: 15). A fully
+    null slot (no percentage, no reset, not explicitly present, no error/status fault) is
+    skipped only when it is a source-proven optional plan window of that provider.
     """
-    if not isinstance(route, dict) or route.get("status") != "ok" or route.get("error") is not None:
+    policy = QUOTA_ROUTE_POLICY.get(name)
+    if policy is None or not isinstance(route, dict) or route.get("status") != "ok" or _quota_record_unhealthy(route):
         return False
     details = route.get("details") if route.get("details") is not None else {}
-    if not isinstance(details, dict) or details.get("limit_reached") is True:
+    if not isinstance(details, dict) or details.get("limit_reached") is True or _quota_record_unhealthy(details):
         return False
     if details.get("limit_reached") is not None and type(details.get("limit_reached")) is not bool:
         return False
@@ -1081,15 +1096,17 @@ def quota_route_usable(name, route, now):
     if not isinstance(windows, dict) or not 1 <= len(windows) <= 32:
         return False
     lowest = None
+    available = set()
     for window_name, window in windows.items():
-        if not isinstance(window, dict) or window.get("error") is not None:
+        if not isinstance(window_name, str) or not window_name or not isinstance(window, dict):
+            return False
+        # Health and status are checked before any absent-slot handling, so a null slot
+        # cannot hide an explicit error or a non-ok status.
+        if _quota_record_unhealthy(window) or ("status" in window and window["status"] != "ok"):
             return False
         if "present" in window and type(window["present"]) is not bool:
             return False
-        # quse's canonical null slot is an absent plan window only where the maintained
-        # sanitizer's ABSENT_OPTIONAL permits it for this provider; any other null/unknown
-        # window (and an explicit error, checked above) is still fail-closed.
-        if (window_name in QUOTA_ABSENT_OPTIONAL_WINDOWS.get(name, ())
+        if (window_name in policy["optional"]
                 and window.get("percent_remaining") is None and window.get("reset_at") is None
                 and window.get("present") is not True):
             continue
@@ -1100,8 +1117,11 @@ def quota_route_usable(name, route, now):
             return False
         if window.get("reset_at") is not None and parse_iso_utc(window["reset_at"]) is None:
             return False
+        available.add(window_name)
         lowest = percent if lowest is None else min(lowest, percent)
-    reserve = CODEX_QUOTA_RESERVE_PERCENT if name in ("codex", "codex-orin") else 0.0
+    if any(not available.intersection(group) for group in policy["required"]):
+        return False
+    reserve = CODEX_QUOTA_RESERVE_PERCENT if name == "codex" else 0.0
     return lowest is not None and lowest > reserve
 
 
@@ -1202,9 +1222,19 @@ def open_cgroup_dir(group):
 
 
 def census_signature(census):
+    """Signature keyed by lowercase UUID ids, the same validation/uniqueness as the initial inventory.
+
+    Raises ValueError on an invalid or duplicate id; the raw id is part of the frozen row.
+    """
     def freeze(row):
-        return tuple(json.dumps(row.get(field), sort_keys=True, default=str) for field in CENSUS_SIGNATURE_FIELDS)
-    return {row.get("id"): freeze(row) for row in census}
+        return (row["id"], *(json.dumps(row.get(field), sort_keys=True, default=str) for field in CENSUS_SIGNATURE_FIELDS))
+    signature = {}
+    for row in census:
+        ident = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(ident, str) or UUID_RE.fullmatch(ident) is None or ident.lower() in signature:
+            raise ValueError("census id")
+        signature[ident.lower()] = freeze(row)
+    return signature
 
 
 def parse_meminfo_available(text):
@@ -1693,7 +1723,11 @@ class Canary:
             return
         self.admission_time_left(deadline)
         final = self.read_census(deadline)
-        if census_signature(final) != census_signature(census):
+        try:
+            changed = census_signature(final) != census_signature(census)
+        except ValueError:
+            raise StageFailure("admission", "resident_fallback_changed")  # duplicate/invalid final id: ambiguous snapshot
+        if changed:
             raise StageFailure("admission", "resident_fallback_changed")
         for row, target in fallbacks:
             self.admission_time_left(deadline)
