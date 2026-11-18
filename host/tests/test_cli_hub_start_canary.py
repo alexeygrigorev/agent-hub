@@ -23,7 +23,8 @@ def item(state, **kw):
     name = (d / "session_name").read_text() if (d / "session_name").exists() else None
     key = (d / "session_key").read_text() if (d / "session_key").exists() else None
     eng = (d / "session_engine").read_text() if (d / "session_engine").exists() else os.environ.get("FAKE_ENGINE", "shell")
-    base = {"id": SID, "state": state, "intake_id": None, "project_id": "owner/repo", "machine_id": "HOST-1", "workspace": os.environ["HUB_CANARY_WORKSPACE"],
+    ws = (d / "session_workspace").read_text() if (d / "session_workspace").exists() else os.environ["HUB_CANARY_WORKSPACE"]
+    base = {"id": SID, "state": state, "intake_id": None, "project_id": "owner/repo", "machine_id": "HOST-1", "workspace": ws,
             "epoch": 1, "operation_id": "op:0", "native_id": NATIVE, "engine": eng, "model": None,
             "name": name, "key": key, "interactive": False, "evidence": None, "attention": None}
     base.update(kw); return base
@@ -37,6 +38,7 @@ if args[:2] == ["sessions", "start"]:
     (d / "started").write_text("1"); (d / "a_running").write_text("1")
     prompt_text = args[args.index("--prompt") + 1]
     (d / "prompt").write_text(prompt_text)
+    (d / "session_workspace").write_text(args[args.index("--workspace") + 1])
     session_name = args[args.index("--name") + 1]
     session_key = args[args.index("--key") + 1]
     (d / "session_name").write_text(session_name)
@@ -263,6 +265,80 @@ class FakeHealthServer:
         self.thread.join(5)
 
 
+
+# Test-only admission collector shim, appended to a COPY of the helper (never to
+# the shipped file). The admission arithmetic, workspace-config reader, quota
+# evaluator and every start/replay seam stay the real production code; only the
+# machine/service reads (quse, resource settings, native census, MemAvailable)
+# and the fixed config location are replaced by synthetic data under FAKE_DIR.
+ADMISSION_SHIM = r"""
+def _install_test_collectors():
+    import json as _json, os as _os, pathlib as _pl
+    base = _os.environ.get("FAKE_DIR")
+    if not base:
+        return
+    d = _pl.Path(base)
+    def cfg():
+        p = d / "admission.json"
+        return _json.loads(p.read_text()) if p.exists() else {}
+    global CANARY_WORKSPACE_CONFIG, WORKSPACE_CONFIG_UID, WORKSPACE_CONFIG_TRUST_ROOT
+    CANARY_WORKSPACE_CONFIG = str(d / "etc-agent-hub" / "canary-workspace.json")
+    WORKSPACE_CONFIG_UID = _os.geteuid()
+    WORKSPACE_CONFIG_TRUST_ROOT = str(d)
+    def log(name):
+        with open(d / "admission.log", "a") as fh:
+            fh.write(name + "\n")
+    def fetch_disk_floor_gb(self, deadline):
+        log("settings")
+        floor = cfg().get("floor_gb", 1)
+        if floor == "unavailable":
+            raise StageFailure("admission", "resource_settings_unavailable")
+        if not _finite_number(floor) or not DISK_FLOOR_GB_RANGE[0] <= floor <= DISK_FLOOR_GB_RANGE[1]:
+            raise StageFailure("admission", "resource_settings_invalid")
+        time.sleep(cfg().get("slow_s", 0))
+        return floor
+    def acquire_quota(self, deadline):
+        log("quota")
+        raw = cfg().get("quota", {"codex": {"status": "ok", "details": {"limit_reached": False}, "windows": {"5h": {"percent_remaining": 80, "present": True}}}})
+        reason = evaluate_quota(raw, require_eligible_route=(self.mode == "full"))
+        if reason:
+            raise StageFailure("admission", reason)
+    def sample_mem_available(self):
+        log("mem")
+        values = cfg().get("mem_available", [64 * 1024 ** 3])
+        n = sum(1 for line in (d / "admission.log").read_text().splitlines() if line == "mem")
+        return values[min(n, len(values)) - 1]
+    def read_census(self, deadline):
+        log("census")
+        return cfg().get("census", [])
+    def read_hub_rows(self, deadline):
+        log("hub_rows")
+        return cfg().get("hub_rows", [])
+    Canary.read_hub_rows = read_hub_rows
+    Canary.fetch_disk_floor_gb = fetch_disk_floor_gb
+    Canary.acquire_quota = acquire_quota
+    Canary.sample_mem_available = sample_mem_available
+    Canary.read_census = read_census
+_install_test_collectors()
+
+"""
+
+
+def build_helper_copy(dest):
+    """Copy the three shipped helper files into dest, shimming only the Python copy."""
+    dest = pathlib.Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
+        data = (ROOT / "scripts" / name).read_text()
+        if name == "hub_start_canary.py":
+            marker = '\nif __name__ == "__main__":'
+            assert data.count(marker) == 1
+            data = data.replace(marker, "\n" + ADMISSION_SHIM + marker)
+        (dest / name).write_text(data)
+        (dest / name).chmod(0o755)
+    return dest
+
+
 class CanaryTest(unittest.TestCase):
     def setUp(self):
         base = ROOT / ".local" / "tmp"
@@ -291,6 +367,10 @@ class CanaryTest(unittest.TestCase):
         os.chmod(self.xdg_runtime, 0o700)
         self.sink = self.tmp / "mail.sink"
         self.state = self.tmp / "state"
+        self.helper_dir = build_helper_copy(self.tmp / "helper-copy")
+        sys.path.insert(0, str(ROOT))
+        from scripts import hub_start_canary as _mod
+        self.shim_inprocess(_mod)
 
     def run_canary(self, scenario="ok", *args, mode_prompt=None, **extra):
         running_timeout = (
@@ -324,12 +404,31 @@ class CanaryTest(unittest.TestCase):
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
-        for f in ("started", "a_running", "stopped", "list_count", "systemctl.jsonl", "session_engine", "capture_idx"):
+        for f in ("started", "a_running", "stopped", "list_count", "systemctl.jsonl", "session_engine", "capture_idx", "session_workspace"):
             (self.tmp / f).unlink(missing_ok=True)
         (self.tmp / "calls.log").write_text("")
-        r = subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True, timeout=60)
+        root_sha, copy_sha = self.helper_sha256(), self.copy_sha256()
+        args = tuple(copy_sha if a == root_sha else a for a in args)
+        r = subprocess.run([str(self.helper_dir / "hub-start-canary.sh"), *args], env=env, capture_output=True, text=True, timeout=60)
+        # The shimmed copy stands in for the shipped helper: report the shipped bundle digest.
+        r.stdout, r.stderr = r.stdout.replace(copy_sha, root_sha), r.stderr.replace(copy_sha, root_sha)
         verdict = json.loads(r.stdout.strip().splitlines()[-1])
         return r, verdict
+
+    def shim_inprocess(self, mod):
+        """Install the synthetic collectors on an imported helper module for one test."""
+        saved = {n: getattr(mod.Canary, n) for n in ("read_hub_rows", "fetch_disk_floor_gb", "acquire_quota", "sample_mem_available", "read_census")}
+        names = ("CANARY_WORKSPACE_CONFIG", "WORKSPACE_CONFIG_UID", "WORKSPACE_CONFIG_TRUST_ROOT")
+        saved_globals = {n: getattr(mod, n) for n in names}
+        def restore():
+            for n, v in saved.items():
+                setattr(mod.Canary, n, v)
+            for n, v in saved_globals.items():
+                setattr(mod, n, v)
+        self.addCleanup(restore)
+        self._restore_inprocess = restore
+        with mock.patch.dict(os.environ, {"FAKE_DIR": str(self.tmp)}):
+            exec(ADMISSION_SHIM, mod.__dict__)
 
     def calls(self):
         return (self.tmp / "calls.log").read_text()
@@ -858,13 +957,16 @@ class CanaryTest(unittest.TestCase):
             current.symlink_to(rel)
         return root, digest
 
-    def helper_sha256(self):
+    def helper_sha256(self, directory=None):
         out = subprocess.check_output(
-            [sys.executable, str(ROOT / "scripts" / "hub_start_canary.py"), "--print-helper-sha256"],
+            [sys.executable, str(pathlib.Path(directory or ROOT / "scripts") / "hub_start_canary.py"), "--print-helper-sha256"],
             text=True,
         ).strip()
         self.assertRegex(out, r"^[0-9a-f]{64}$")
         return out
+
+    def copy_sha256(self):
+        return self.helper_sha256(self.helper_dir)
 
     def test_precommit_deploy_gate_binds_candidate_sha_run_token_helper_and_hub_pyz(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
@@ -1232,11 +1334,11 @@ class CanaryTest(unittest.TestCase):
         import fcntl
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-        helper_sha = self.helper_sha256()
+        helper_sha = self.copy_sha256()
         rel_root, pyz_sha = self.prepare_candidate_release(sha)
         lib = self.tmp / "waiting-canary-lib"; lib.mkdir()
         for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
-            shutil.copy2(ROOT / "scripts" / name, lib / name)
+            shutil.copy2(self.helper_dir / name, lib / name)
             (lib / name).chmod(0o755)
         # Do NOT override DEPLOY_GATE_LOCK_WAIT_S: exercise the actual fixed wrapper policy.
         (lib / ".test-harness.env").write_text(
@@ -1285,13 +1387,13 @@ class CanaryTest(unittest.TestCase):
     def test_forced_command_wrapper_validates_ssh_original_command_purges_env_and_locks(self):
         sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
         token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-        helper_sha = self.helper_sha256()
+        helper_sha = self.copy_sha256()
         rel_root, pyz_sha = self.prepare_candidate_release(sha)
         lib = self.tmp / "canary-lib"
         lib.mkdir()
         for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
             dst = lib / name
-            shutil.copy2(ROOT / "scripts" / name, dst)
+            shutil.copy2(self.helper_dir / name, dst)
             dst.chmod(0o755)
         # B4: Create a poisoned user site-packages directory under USER_HOME
         # to prove python3 -I -S never imports user site-packages or .pth files.
@@ -3731,3 +3833,600 @@ class FirstCallCanaryProofTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+
+
+def synthetic_proc(root, *, boot_id="boot-1", rows=()):
+    """Write a synthetic /proc + cgroup tree; rows: dict(pid, cgroup, start_s_ago, anon, current, rss_anon, members)."""
+    proc, cg = root / "proc", root / "cgroup"
+    (proc / "sys/kernel/random").mkdir(parents=True, exist_ok=True)
+    (proc / "sys/kernel/random/boot_id").write_text(boot_id + "\n")
+    (proc / "self/ns").mkdir(parents=True, exist_ok=True)
+    (proc / "self/ns/cgroup").write_text("")
+    (proc / "self/ns/mnt").write_text("")
+    for row in rows:
+        pid = row["pid"]
+        (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+        ticks = int((1000.0 - row["age"]) * os.sysconf("SC_CLK_TCK"))
+        (proc / str(pid) / "stat").write_text(f"{pid} (worker x) S " + " ".join(["0"] * 18 + [str(ticks)] + ["0"] * 10) + "\n")
+        (proc / str(pid) / "cgroup").write_text(f"0::{row['cgroup']}\n")
+        (proc / str(pid) / "status").write_text(f"Name:\tw\nRssAnon:\t{row['rss_anon'] // 1024} kB\n")
+        group = cg / row["cgroup"].lstrip("/")
+        group.mkdir(parents=True, exist_ok=True)
+        (group / "cgroup.procs").write_text("\n".join(str(m) for m in row.get("members", [pid])) + "\n")
+        (group / "memory.stat").write_text(f"anon {row['anon']}\nfile 4096\n")
+        (group / "memory.current").write_text(f"{row['current']}\n")
+    return proc, cg
+
+
+def census_row(n, pid, cgroup, *, boot_id="boot-1", cap=1500 * MIB, **extra):
+    row = {
+        "id": f"aaaaaaaa-0000-4000-8000-{n:012d}", "tag": f"task-{n}", "workspace": "/w", "phase": "running", "state": "running",
+        "worker_alive": True, "workload_pid": pid, "workload_cgroup": cgroup, "containment_empty": False,
+        "containment_cgroup_identity": {"boot_id": boot_id}, "limits": {"memory_bytes": cap, "pids": 256},
+    }
+    row.update(extra)
+    return row
+
+
+class AdmissionTests(unittest.TestCase):
+    def setUp(self):
+        CanaryTest.setUp(self)
+        self._restore_inprocess()  # these tests exercise the real collectors/arithmetic in-process
+
+    prepare_candidate_release = CanaryTest.prepare_candidate_release
+    run_canary = CanaryTest.run_canary
+    shim_inprocess = CanaryTest.shim_inprocess
+    calls = CanaryTest.calls
+    helper_sha256 = CanaryTest.helper_sha256
+    copy_sha256 = CanaryTest.copy_sha256
+
+    def mod(self):
+        sys.path.insert(0, str(ROOT))
+        from scripts import hub_start_canary as mod
+        return mod
+
+    def cfg(self, **values):
+        (self.tmp / "admission.json").write_text(json.dumps(values))
+
+    def write_config(self, workspace, mode=0o644, raw=None):
+        directory = self.tmp / "etc-agent-hub"
+        directory.mkdir(exist_ok=True)
+        directory.chmod(0o755)
+        path = directory / "canary-workspace.json"
+        path.unlink(missing_ok=True)
+        path.write_text(raw if raw is not None else json.dumps({"workspace": str(workspace)}))
+        path.chmod(mode)
+        return path
+
+    def starts(self):
+        path = self.tmp / "argv.jsonl"
+        if not path.exists():
+            return []
+        return [a for a in map(json.loads, path.read_text().splitlines()) if a[:2] == ["sessions", "start"]]
+
+    def canary(self, mode="shell", **patches):
+        """Real Canary with real admission arithmetic; the pure-collector seams are replaced per test."""
+        mod = self.mod()
+        c = mod.Canary(mode, "adm-test")
+        c.active_deadline = time.monotonic() + 30
+        c.workspace = str(self.tmp / "ws")
+        c.machine = "HOST-1"
+        defaults = dict(
+            fetch_disk_floor_gb=lambda deadline: 1,
+            acquire_quota=lambda deadline: None,
+            read_census=lambda deadline: [],
+            read_hub_rows=lambda deadline: [],
+            sample_mem_available=lambda: 64 * GIB,
+        )
+        defaults.update(patches)
+        for name, fn in defaults.items():
+            setattr(c, name, fn)
+        return c
+
+    def assertHold(self, canary, reason, **kwargs):
+        with self.assertRaises(self.mod().StageFailure) as caught:
+            canary.admit(**kwargs)
+        self.assertEqual((caught.exception.stage, caught.exception.reason), ("admission", reason))
+
+    # ---- root workspace config -------------------------------------------------
+
+    def test_root_config_overrides_hostile_environment_and_is_used_for_start(self):
+        data = self.tmp / "data-ws"
+        self.write_config(data)
+        hostile = self.tmp / "hostile-ws"
+        r, v = self.run_canary("ok", "--mode", "shell", HUB_CANARY_WORKSPACE=str(hostile))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        starts = self.starts()
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--workspace") + 1], str(data))
+        self.assertTrue(data.is_dir() and not hostile.exists())
+
+    def test_unchanged_forced_wrapper_reaches_root_configured_workspace(self):
+        sha, token = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7", "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.copy_sha256()
+        rel_root, pyz_sha = self.prepare_candidate_release(sha)
+        lib = self.tmp / "forced-lib"
+        lib.mkdir()
+        for name in ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py"):
+            shutil.copy2(self.helper_dir / name, lib / name)
+        self.assertEqual((lib / "hub-deploy-gate-forced.sh").read_bytes(), (ROOT / "scripts" / "hub-deploy-gate-forced.sh").read_bytes())
+        self.assertEqual((lib / "hub-start-canary.sh").read_bytes(), (ROOT / "scripts" / "hub-start-canary.sh").read_bytes())
+        data, hostile = self.tmp / "data-ws", self.tmp / "hostile-wrapper-ws"
+        self.write_config(data)
+        (lib / ".test-harness.env").write_text(
+            f'USER_HOME="{self.tmp}"\nA_BIN="{sys.executable} -I -S {self.tmp / "fake_a.py"}"\n'
+            f'HOST_RELEASE_ROOT="{rel_root}"\nWORKSPACE_DIR="{hostile}"\nSTATE_DIR="{self.state}"\nDEPLOY_GATE_LOCK_WAIT_S="0"\n'
+            f'EXTRA_ENV=(FAKE_DIR="{self.tmp}" FAKE_SCENARIO="ok" FAKE_HOST_VERSION="{sha}" HUB_CANARY_MACHINE="HOST-1" '
+            f'HUB_CANARY_REPO="owner/repo" HUB_CANARY_POLL_S="0.02" HUB_CANARY_CONVERGE_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_RUNNING_TIMEOUT_S="1.5" HUB_CANARY_CAPTURE_TIMEOUT_S="1.5" HUB_CANARY_STOP_TIMEOUT_S="1.5" '
+            f'HUB_CANARY_CLEANUP_BUDGET_S="1.5" HUB_CANARY_HEALTH_URL="{self.health.url}")\n'
+        )
+        command = (f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} "
+                   f"--run-token {token} --helper-sha256 {helper_sha}")
+        r = subprocess.run([str(lib / "hub-deploy-gate-forced.sh")], env={"SSH_ORIGINAL_COMMAND": command},
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        starts = self.starts()
+        self.assertEqual([a[a.index("--workspace") + 1] for a in starts], [str(data)])
+        self.assertFalse(hostile.exists())
+
+    def test_invalid_present_config_fails_closed_without_fallback_or_start(self):
+        data = self.tmp / "data-ws"
+        cases = {
+            "workspace_config_json": dict(raw="{not json"),
+            "workspace_config_schema": dict(raw=json.dumps({"workspace": str(data), "extra": 1})),
+            "workspace_config_json#dup": dict(raw='{"workspace": "/a", "workspace": "/b"}'),
+            "workspace_config_schema#rel": dict(raw=json.dumps({"workspace": "relative/ws"})),
+            "workspace_config_schema#dots": dict(raw=json.dumps({"workspace": str(data) + "/../x"})),
+            "workspace_config_writable": dict(workspace=data, mode=0o664),
+            "workspace_config_size": dict(raw=json.dumps({"workspace": "/" + "a" * 5000})),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                kwargs = dict(kwargs)
+                self.write_config(kwargs.pop("workspace", data), **kwargs)
+                (self.tmp / "argv.jsonl").unlink(missing_ok=True)
+                r, v = self.run_canary("ok", "--mode", "shell", HUB_CANARY_WORKSPACE=str(self.tmp / "fallback-ws"))
+                self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "admission", label.split("#")[0]), r.stdout)
+                self.assertEqual(self.starts(), [])
+                self.assertFalse((self.tmp / "fallback-ws").exists() or data.exists())
+
+    def test_config_symlink_wrong_owner_hardlink_and_bad_parent_refuse(self):
+        mod = self.mod()
+        real = self.tmp / "real.json"
+        real.write_text(json.dumps({"workspace": str(self.tmp / "w")}))
+        directory = self.tmp / "etc-agent-hub"
+        directory.mkdir()
+        directory.chmod(0o755)
+        link = directory / "canary-workspace.json"
+        link.symlink_to(real)
+        with mock.patch.dict(os.environ, {"FAKE_DIR": str(self.tmp)}):
+            self.assertEqual(self.reason(mod), "workspace_config_symlink")
+            link.unlink()
+            link.write_text(real.read_text())
+            link.chmod(0o644)
+            os.link(link, self.tmp / "second-link")
+            self.assertEqual(self.reason(mod), "workspace_config_nlink")
+            (self.tmp / "second-link").unlink()
+            with mock.patch.object(mod, "_nofollow_ancestors", return_value=[]):  # file owner only (ancestors are user-owned here)
+                self.assertEqual(self.reason(mod, uid=os.geteuid() + 1), "workspace_config_owner")
+            directory.chmod(0o775)
+            self.assertEqual(self.reason(mod), "workspace_config_parent")
+            directory.chmod(0o755)
+            with mock.patch.object(mod, "WORKSPACE_CONFIG_UID", os.geteuid()), \
+                    mock.patch.object(mod, "WORKSPACE_CONFIG_TRUST_ROOT", str(self.tmp)):
+                self.assertEqual(mod.read_workspace_config(str(link)), str(self.tmp / "w"))
+
+    def reason(self, mod, uid=None):
+        link = self.tmp / "etc-agent-hub" / "canary-workspace.json"
+        with mock.patch.object(mod, "WORKSPACE_CONFIG_TRUST_ROOT", str(self.tmp)), \
+                mock.patch.object(mod, "WORKSPACE_CONFIG_UID", os.geteuid() if uid is None else uid):
+            with self.assertRaises(mod.StageFailure) as caught:
+                mod.read_workspace_config(str(link))
+        return caught.exception.reason
+
+    def test_absent_config_keeps_env_fallback_but_still_requires_admission(self):
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.starts()), 1)
+        self.cfg(floor_gb="unavailable")
+        (self.tmp / "argv.jsonl").unlink()
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "admission", "resource_settings_unavailable"))
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(list((self.state / "pending").glob("*.json")) if (self.state / "pending").exists() else [], [])
+        self.assertEqual(v["cleanup"], "not_needed")
+
+    # ---- admission controls ----------------------------------------------------
+
+    def test_memory_boundary_after_known_inflight_and_new_estimate(self):
+        mod = self.mod()
+        inflight = [{"id": "s1", "state": "starting", "machine_id": "HOST-1", "native_id": None}]
+        need = 10 * GIB + 1500 * MIB + 1500 * MIB
+        ok = self.canary(read_hub_rows=lambda d: inflight, sample_mem_available=lambda: need)
+        ok.admit()
+        self.assertHold(self.canary(read_hub_rows=lambda d: inflight, sample_mem_available=lambda: need - 1), "memory_below_floor")
+        self.assertHold(self.canary(sample_mem_available=lambda: 10 * GIB + 1500 * MIB - 1), "memory_below_floor")
+        self.canary(sample_mem_available=lambda: 10 * GIB + 1500 * MIB).admit()
+
+    def test_meminfo_missing_nan_bool_and_malformed_refuse(self):
+        mod = self.mod()
+        for text in ("", "MemAvailable: nan kB", "MemAvailable: 12", "MemAvailable: -5 kB", "MemAvailable: 1.5 kB", "MemTotal: 5 kB"):
+            self.assertIsNone(mod.parse_meminfo_available(text), text)
+        self.assertEqual(mod.parse_meminfo_available("MemAvailable:  2048 kB\n"), 2048 * 1024)
+        root = self.tmp / "emptyproc"
+        root.mkdir()
+        c = mod.Canary("shell", "x")
+        with mock.patch.object(mod, "PROC_ROOT", str(root)):
+            with self.assertRaises(mod.StageFailure) as caught:
+                c.sample_mem_available()
+        self.assertEqual(caught.exception.reason, "mem_available_unknown")
+
+    def test_final_memory_sample_is_taken_after_slow_reads(self):
+        samples = []
+        order = []
+        c = self.canary(
+            fetch_disk_floor_gb=lambda d: order.append("settings") or 1,
+            acquire_quota=lambda d: order.append("quota"),
+            read_census=lambda d: order.append("census") or [],
+            sample_mem_available=lambda: order.append("mem") or samples.append(1) or 64 * GIB,
+        )
+        c.admit()
+        self.assertEqual(order[-1], "mem")
+        self.assertEqual(samples, [1])
+        self.assertLess(max(order.index(x) for x in ("settings", "quota", "census")), order.index("mem"))
+
+    def test_inflight_projection_charges_uncovered_once_and_unknown_state_holds(self):
+        mod = self.mod()
+        c = self.canary()
+        native = "aaaaaaaa-0000-4000-8000-000000000001"
+        rows = [
+            {"id": "a", "state": "starting", "machine_id": "HOST-1", "native_id": None},
+            {"id": "b", "state": "running", "machine_id": "HOST-1", "native_id": native},
+            {"id": "c", "state": "stopped", "machine_id": "HOST-1", "native_id": None},
+            {"id": "d", "state": "queued", "machine_id": "OTHER", "native_id": None},
+            {"id": "e", "state": "lost", "machine_id": "HOST-1", "native_id": None},
+        ]
+        self.assertEqual(c.uncovered_inflight_reserve(rows, {native}), 1500 * MIB)
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.uncovered_inflight_reserve([{"id": "z", "state": "mystery", "machine_id": "HOST-1"}], set())
+        self.assertEqual(caught.exception.reason, "managed_inflight_unknown_state")
+
+    def residency(self, rows, census, *, mem, boot_id="boot-1", caps=True, hub_rows=()):
+        mod = self.mod()
+        proc, cg = synthetic_proc(self.tmp, boot_id="boot-1", rows=rows)
+        c = self.canary(read_census=lambda d: census, read_hub_rows=lambda d: list(hub_rows), sample_mem_available=lambda: mem)
+        c.boottime = lambda: 1000.0
+        stack = mock.patch.multiple(mod, PROC_ROOT=str(proc), CGROUP_ROOT=str(cg))
+        stack.start()
+        self.addCleanup(stack.stop)
+        return c
+
+    def test_mature_resident_reserves_nothing_even_with_unbounded_memory_max(self):
+        row = dict(pid=4242, cgroup="/user.slice/w1.scope", age=400, anon=300 * MIB, current=400 * MIB, rss_anon=300 * MIB)
+        census = [census_row(1, 4242, "/user.slice/w1.scope", cap=2 ** 63 - 1)]
+        floor_mem = 10 * GIB + 1500 * MIB
+        self.residency([row], census, mem=floor_mem).admit()
+        # No cap at all (memory.max=max recorded as no finite limit) is still fine when mature and measured.
+        census_nocap = [census_row(1, 4242, "/user.slice/w1.scope", limits={})]
+        self.residency([row], census_nocap, mem=floor_mem).admit()
+        self.assertHold(self.residency([row], census, mem=floor_mem - 1), "memory_below_floor")
+
+    def test_young_resident_reserves_cap_minus_proven_anon_and_unknown_cap_holds(self):
+        row = dict(pid=4243, cgroup="/user.slice/w2.scope", age=10, anon=200 * MIB, current=300 * MIB, rss_anon=200 * MIB)
+        census = [census_row(2, 4243, "/user.slice/w2.scope")]
+        need = 10 * GIB + 1500 * MIB + 1300 * MIB
+        self.residency([row], census, mem=need).admit()
+        self.assertHold(self.residency([row], census, mem=need - 1), "memory_below_floor")
+        nocap = [census_row(2, 4243, "/user.slice/w2.scope", limits={})]
+        self.assertHold(self.residency([row], nocap, mem=64 * GIB), "resident_bound_unknown")
+
+    def test_mature_requires_positive_anon_age_boot_and_stable_membership(self):
+        base = dict(pid=4244, cgroup="/user.slice/w3.scope", age=500, anon=100 * MIB, current=150 * MIB, rss_anon=100 * MIB)
+        census = [census_row(3, 4244, "/user.slice/w3.scope")]
+        # zero anonymous memory: not mature, falls back to the full recorded cap
+        zero = dict(base, anon=0, rss_anon=0)
+        self.assertHold(self.residency([zero], census, mem=10 * GIB + 1500 * MIB + 1500 * MIB - 1), "memory_below_floor")
+        # anon above current is inconsistent: conservative cap
+        bad = dict(base, anon=200 * MIB, current=150 * MIB)
+        self.assertHold(self.residency([bad], census, mem=10 * GIB + 1500 * MIB + 1400 * MIB - 1), "memory_below_floor")
+        # wrong kernel boot id, unknown pid/cgroup membership, missing counters: HOLD, never zero
+        self.assertHold(self.residency([base], [census_row(3, 4244, "/user.slice/w3.scope", boot_id="old-boot")], mem=64 * GIB), "resident_identity_unknown")
+        self.assertHold(self.residency([dict(base, members=[1])], census, mem=64 * GIB), "resident_measurement_unknown")
+        self.assertHold(self.residency([], census, mem=64 * GIB), "resident_measurement_unknown")
+        self.assertHold(self.residency([base], [census_row(3, None, "/user.slice/w3.scope", phase="running")], mem=64 * GIB), "resident_identity_unknown")
+
+    def test_shared_cgroup_needs_distinct_pids_and_per_pid_anon(self):
+        rows = [
+            dict(pid=5001, cgroup="/user.slice/shared.scope", age=600, anon=300 * MIB, current=400 * MIB, rss_anon=100 * MIB, members=[5001, 5002]),
+            dict(pid=5002, cgroup="/user.slice/shared.scope", age=600, anon=300 * MIB, current=400 * MIB, rss_anon=100 * MIB, members=[5001, 5002]),
+        ]
+        census = [census_row(10, 5001, "/user.slice/shared.scope"), census_row(11, 5002, "/user.slice/shared.scope")]
+        self.residency(rows, census, mem=10 * GIB + 1500 * MIB).admit()
+        # one PID without anonymous memory is not credited just because the group has some
+        rows[1] = dict(rows[1], rss_anon=0)
+        self.assertHold(self.residency(rows, census, mem=10 * GIB + 1500 * MIB), "memory_below_floor")
+        # same PID claimed by two census rows is ambiguous identity
+        dup = [census_row(10, 5001, "/user.slice/shared.scope"), census_row(11, 5001, "/user.slice/shared.scope")]
+        self.assertHold(self.residency(rows, dup, mem=64 * GIB), "resident_identity_ambiguous")
+
+    def test_exited_and_starting_rows(self):
+        gone = census_row(20, None, None, phase="exited", state="exited", worker_alive=False, containment_empty=True)
+        starting = census_row(21, None, None, phase="starting", state="starting", worker_alive=None)
+        self.residency([], [gone], mem=10 * GIB + 1500 * MIB).admit()
+        self.assertHold(self.residency([], [starting], mem=10 * GIB + 1500 * MIB + 1500 * MIB - 1), "memory_below_floor")
+        self.residency([], [starting], mem=10 * GIB + 1500 * MIB + 1500 * MIB).admit()
+        unbounded = census_row(21, None, None, phase="starting", state="starting", worker_alive=None, limits={})
+        self.assertHold(self.residency([], [unbounded], mem=64 * GIB), "resident_bound_unknown")
+
+    def test_disk_floor_boundary_spike_and_device_accounting(self):
+        gib = GIB
+        c = self.canary(fetch_disk_floor_gb=lambda d: 27.5)
+        floor = int(27.5 * gib)
+        spike = 512 * MIB
+        c.disk_free_after_margin = lambda paths: [floor + spike]
+        c.admit()
+        c.disk_free_after_margin = lambda paths: [floor + spike - 1]
+        self.assertHold(c, "disk_below_floor")
+        c.disk_free_after_margin = lambda paths: [floor + spike + 5, floor + spike - 1]  # distinct devices each count
+        self.assertHold(c, "disk_below_floor")
+        for bad in (True, 0, 0.5, 1048577, float("nan"), "15", None):
+            with self.subTest(bad=bad):
+                mod = self.mod()
+                self.assertFalse(mod._finite_number(bad) and mod.DISK_FLOOR_GB_RANGE[0] <= bad <= mod.DISK_FLOOR_GB_RANGE[1])
+
+    def test_real_disk_sampling_counts_same_device_once_and_uses_nearest_existing_path(self):
+        c = self.canary()
+        self.assertEqual(len(c.disk_free_after_margin([str(self.tmp), str(self.tmp / "missing" / "deeper")])), 1)
+        c.workspace = str(self.tmp / "not" / "created")
+        c.fetch_disk_floor_gb = lambda d: 1048576
+        self.assertHold(c, "disk_below_floor")
+        self.assertFalse((self.tmp / "not").exists())
+
+    def test_quota_acceptance_and_privacy(self):
+        mod = self.mod()
+        now = datetime_now()
+        good = {"status": "ok", "details": {"limit_reached": False}, "windows": {"w": {"percent_remaining": 40, "present": True}}}
+        self.assertIsNone(mod.evaluate_quota({"claude": good}, require_eligible_route=True, now=now))
+        cases = {
+            "limit": dict(good, details={"limit_reached": True}),
+            "stale_flag": dict(good, stale=True),
+            "error": dict(good, error="boom"),
+            "old": dict(good, observed_at="2000-01-01T00:00:00Z"),
+            "future": dict(good, observed_at="2999-01-01T00:00:00Z"),
+            "bool_pct": dict(good, windows={"w": {"percent_remaining": True}}),
+            "nan_pct": dict(good, windows={"w": {"percent_remaining": float("nan")}}),
+            "no_windows": dict(good, windows={}),
+            "exhausted": dict(good, windows={"w": {"percent_remaining": 0, "present": True}}),
+            "status_unknown": dict(good, status="unknown"),
+        }
+        for label, route in cases.items():
+            with self.subTest(label):
+                self.assertEqual(mod.evaluate_quota({"claude": route}, require_eligible_route=True, now=now), "quota_no_eligible_route")
+        reserve = dict(good, windows={"w": {"percent_remaining": 15, "present": True}})
+        self.assertEqual(mod.evaluate_quota({"codex": reserve}, require_eligible_route=True, now=now), "quota_no_eligible_route")
+        self.assertIsNone(mod.evaluate_quota({"claude": reserve}, require_eligible_route=True, now=now))
+        self.assertEqual(mod.evaluate_quota([], require_eligible_route=False, now=now), "quota_unparseable")
+        self.assertIsNone(mod.evaluate_quota({"codex": cases["limit"]}, require_eligible_route=False, now=now))  # shell: acquisition only
+
+    def test_quota_failure_is_closed_and_raw_output_never_leaks(self):
+        secret = "SECRET-ACCOUNT-xyz"
+        self.cfg(quota={"codex": {"status": "error", "error": secret}})
+        r, v = self.run_canary("ok", "--mode", "full")
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "admission", "quota_no_eligible_route"), r.stdout)
+        self.assertNotIn(secret, r.stdout + r.stderr)
+        self.assertEqual(self.starts(), [])
+
+    def test_slow_reads_consume_the_original_deadline_without_reset(self):
+        mod = self.mod()
+        c = self.canary(fetch_disk_floor_gb=lambda d: time.sleep(0.15) or 1)
+        c.active_deadline = time.monotonic() + 0.05
+        self.assertHold(c, "admission_deadline_exceeded")
+        c = self.canary(fetch_disk_floor_gb=lambda d: time.sleep(0.15) or 1)
+        c.active_deadline = time.monotonic() + 30
+        self.assertHold(c, "admission_deadline_exceeded", deadline=time.monotonic() + 0.05)
+        c = self.canary()
+        self.assertGreaterEqual(c.admission_deadline(time.monotonic() + 999), 0)
+        self.assertLessEqual(c.admission_deadline(time.monotonic() + 999), c.active_deadline)
+        # cleanup deadlines are the caller's original ones: not extended by the admission budget
+        c.in_cleanup = True
+        limit = time.monotonic() + 1
+        self.assertEqual(c.admission_deadline(limit), limit)
+
+    # ---- every possible START seam --------------------------------------------
+
+    def test_main_start_refusal_leaves_no_session_pending_or_effects(self):
+        self.cfg(mem_available=[1 * GIB])
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "admission", "memory_below_floor"))
+        self.assertEqual(self.starts(), [])
+        self.assertIsNone(v["session_id"])
+        self.assertEqual(v["cleanup"], "not_needed")
+        self.assertFalse((self.tmp / "ws").exists())
+        self.assertEqual(list((self.state / "pending").glob("*.json")) if (self.state / "pending").exists() else [], [])
+        self.cfg()
+        (self.tmp / "admission.log").unlink()
+        r, v = self.run_canary("ok", "--mode", "shell")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        log = (self.tmp / "admission.log").read_text().split()
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(log.count("settings"), 1)
+
+    def test_cleanup_missing_receipt_replay_is_gated_and_keeps_original_body(self):
+        mod = self.mod()
+        calls = []
+        c = self.canary(sample_mem_available=lambda: 1 * GIB)
+        c.start_attempted = True
+        c.in_cleanup = True
+        c.run = lambda argv, *a, **kw: calls.append(list(argv)) or (1, "", "")
+        c.list_items = lambda stage, deadline: []
+        self.assertEqual(c.cleanup(deadline=time.monotonic() + 5), "FAILED_needs_reconciliation")
+        self.assertEqual([a for a in calls if a[1:3] == ["sessions", "start"] or a[:2] == ["sessions", "start"]], [])
+        self.assertEqual(c.admission_hold, "memory_below_floor")
+        # admitted: the replay is the identical original start body (same key/workspace/prompt)
+        c2 = self.canary()
+        c2.start_attempted = True
+        c2.in_cleanup = True
+        expected = c2.start_args()
+        seen = []
+        c2.run = lambda argv, *a, **kw: seen.append(list(argv)) or (0, "", "")
+        c2.list_items = lambda stage, deadline: []
+        c2.cleanup(deadline=time.monotonic() + 5)
+        self.assertIn(expected, seen)
+
+    def write_pending(self, c, **overrides):
+        pending = self.state / "pending"
+        pending.mkdir(parents=True, exist_ok=True, mode=0o700)
+        rec = {
+            "session_id": None, "native_id": None, "repo": "owner/repo", "machine": "HOST-1",
+            "workspace": str(self.tmp / "orig-ws"), "name": "hub-canary-shell-old", "key": "canary-old",
+            "prompt": "printf CANARY-OK; sleep 30", "mode": "shell", "purpose": "review",
+        }
+        rec.update(overrides)
+        path = pending / "old.json"
+        path.write_text(json.dumps(rec))
+        return path
+
+    def test_pending_missing_sid_replay_is_gated_and_never_retargeted(self):
+        mod = self.mod()
+        calls = []
+        c = self.canary(sample_mem_available=lambda: 1 * GIB)
+        c.pending_dir = self.state / "pending"
+        path = self.write_pending(c)
+        c.run = lambda argv, *a, **kw: calls.append(list(argv)) or (1, "", "")
+        c.list_items = lambda stage, deadline: []
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.reconcile_prior_pending()
+        self.assertEqual(caught.exception.reason, "prior_pending_reconciliation_failed")
+        self.assertTrue(path.exists())
+        self.assertEqual([a for a in calls if "start" in a and "sessions" in a], [])
+        # When admitted, the replay carries the ORIGINAL recorded workspace/key, not the current one.
+        calls.clear()
+        c2 = self.canary()
+        c2.pending_dir = self.state / "pending"
+        c2.workspace = str(self.tmp / "a-different-current-ws")
+        c2.run = lambda argv, *a, **kw: calls.append(list(argv)) or (1, "", "")
+        c2.list_items = lambda stage, deadline: []
+        with self.assertRaises(mod.StageFailure):
+            c2.reconcile_prior_pending()
+        replay = next(a for a in calls if "start" in a)
+        self.assertEqual(replay[replay.index("--workspace") + 1], str(self.tmp / "orig-ws"))
+        self.assertEqual(replay[replay.index("--key") + 1], "canary-old")
+        self.assertTrue(path.exists())
+
+    def test_known_sid_stop_and_cleanup_are_not_gated_by_admission(self):
+        mod = self.mod()
+        admitted = []
+        c = self.canary()
+        c.admit = lambda *a, **kw: admitted.append(1) or (_ for _ in ()).throw(mod.StageFailure("admission", "memory_below_floor"))
+        c.pending_dir = self.state / "pending"
+        sid = "11111111-2222-4333-8444-555555555555"
+        self.write_pending(c, session_id=sid, native_id=NATIVE)
+        stopped = []
+        c.stop_or_confirm_retired = lambda *a, **kw: stopped.append(a[0]) or (True, NATIVE)
+        c.wait_gone_for = lambda *a, **kw: None
+        c.archive_intake_for = lambda *a, **kw: True
+        c.reconcile_prior_pending()
+        self.assertEqual(stopped, [sid])
+        self.assertEqual(admitted, [])
+        c.session, c.native, c.start_attempted, c.in_cleanup = sid, NATIVE, True, True
+        c.wait_gone = lambda deadline: None
+        self.assertEqual(c.cleanup(deadline=time.monotonic() + 5), "stopped")
+        self.assertEqual(admitted, [])
+
+    # ---- bridge through the whole-archive-verified CLI --------------------------
+
+    def bridge_zip(self, *, worker=False, human=True, floor=27.5, fail=False, refresh_marker=None):
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("agent_hub_host/__init__.py", "")
+            z.writestr("agent_hub_host/auth.py", "def refresh_token(*a, **k):\n    return 'refreshed'\n")
+            z.writestr("agent_hub_host/worker_auth.py", f"def is_v2_worker():\n    return {worker!r}\n")
+            z.writestr("agent_hub_host/config.py", f"def load_human_config():\n    return {({'access_token': 'x'} if human else {})!r}\n")
+            body = "from . import auth\n"
+            if refresh_marker:
+                body += f"def _do_request(method, path):\n    auth.refresh_token()\n    open({str(refresh_marker)!r}, 'w').write('refreshed')\n    return {{}}\n"
+            elif fail:
+                body += "def _do_request(method, path):\n    raise RuntimeError('503')\n"
+            else:
+                body += f"def _do_request(method, path):\n    assert (method, path) == ('GET', '/api/resource-settings')\n    return {{'resource_settings': {{'disk_floor_gb': {floor!r}}}}}\n"
+            z.writestr("agent_hub_host/bus.py", body)
+        return buf.getvalue()
+
+    def test_bridge_reads_disk_floor_through_sealed_cli_with_human_only_and_no_refresh(self):
+        mod = self.mod()
+        marker = self.tmp / "refreshed.flag"
+        with mock.patch.dict(os.environ, {"HUB_TOKEN": "", "HUB_CONFIG_FILE": ""}):
+            for label, kwargs, expected in (
+                ("ok", {}, 27.5),
+                ("worker", dict(worker=True), "resource_settings_unavailable"),
+                ("not human", dict(human=False), "resource_settings_unavailable"),
+                ("http failure", dict(fail=True), "resource_settings_unavailable"),
+                ("floor zero", dict(floor=0), "resource_settings_invalid"),
+                ("floor huge", dict(floor=2000000), "resource_settings_invalid"),
+                ("floor bool", dict(floor=True), "resource_settings_invalid"),
+                ("no refresh", dict(refresh_marker=marker), "resource_settings_unavailable"),
+            ):
+                with self.subTest(label):
+                    c = mod.Canary("shell", "bridge")
+                    c.pyz_fd = mod.create_sealed_pyz_fd(self.bridge_zip(**kwargs))
+                    self.addCleanup(os.close, c.pyz_fd)
+                    c.hub_pass_fds = (c.pyz_fd,)
+                    if isinstance(expected, float):
+                        self.assertEqual(c.fetch_disk_floor_gb(time.monotonic() + 20), expected)
+                    else:
+                        with self.assertRaises(mod.StageFailure) as caught:
+                            c.fetch_disk_floor_gb(time.monotonic() + 20)
+                        self.assertEqual(caught.exception.reason, expected)
+        self.assertFalse(marker.exists())
+        env_token = {"HUB_JOB_TOKEN": "t"}
+        with mock.patch.dict(os.environ, env_token):
+            c = mod.Canary("shell", "bridge")
+            c.pyz_fd = mod.create_sealed_pyz_fd(self.bridge_zip())
+            self.addCleanup(os.close, c.pyz_fd)
+            with self.assertRaises(mod.StageFailure):
+                c.fetch_disk_floor_gb(time.monotonic() + 20)
+
+    def test_periodic_cli_must_be_a_bindable_owned_zipapp(self):
+        mod = self.mod()
+        c = mod.Canary("shell", "periodic")
+        c.hub = ["definitely-not-a-hub-binary-xyz"]
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.bridge_artifact_fd()
+        self.assertEqual(caught.exception.reason, "cli_artifact_unbindable")
+        fake = self.tmp / "bin" / "hub"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        c.hub = [str(fake)]
+        with self.assertRaises(mod.StageFailure):
+            c.bridge_artifact_fd()
+        fake.write_bytes(self.bridge_zip())
+        fake.chmod(0o755)
+        fd = c.bridge_artifact_fd()
+        self.addCleanup(os.close, fd)
+        self.assertEqual(c.bridge_artifact_fd(), fd)
+        fake.chmod(0o777)
+        c2 = mod.Canary("shell", "periodic2")
+        c2.hub = [str(fake)]
+        with self.assertRaises(mod.StageFailure):
+            c2.bridge_artifact_fd()
+
+    def test_scope_preserved_stages_wrappers_and_limits(self):
+        mod = self.mod()
+        self.assertLess(mod.STAGES.index("health"), mod.STAGES.index("admission"))
+        self.assertLess(mod.STAGES.index("admission"), mod.STAGES.index("start"))
+        self.assertEqual((mod.NEW_WORKER_MEMORY_BYTES, mod.NEW_WORKER_PIDS, mod.ADMISSION_RAM_FLOOR_BYTES, mod.ADMISSION_DISK_SPIKE_BYTES),
+                         (1500 * MIB, 256, 10 * GIB, 512 * MIB))
+        source = (ROOT / "scripts" / "hub_start_canary.py").read_text()
+        self.assertIn('CANARY_WORKSPACE_CONFIG = "/etc/agent-hub/canary-workspace.json"', source)
+        self.assertNotIn("os.environ.get(\"HUB_CANARY_WORKSPACE_CONFIG", source)
+
+
+def datetime_now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc)
