@@ -1123,3 +1123,445 @@ def prepare_selected_quota(
         entry_pin=entry_pin,
         retained_source_fd=retained_source_fd,
     )
+
+# Inactive natural-dispatch tranche. No Broker/config/CLI caller selects this.
+def _natural_access_flags(fd):
+    import fcntl # Linux-only selected construction; no default import dependency.
+    return fcntl.fcntl(fd,fcntl.F_GETFL)
+
+
+NATURAL_UNITS = {'quota_publish':'agent-hub-quota-publish.service',
+                 'quota_monitor':'agent-hub-quota-monitor.service'}
+NATURAL_FRAMES = {'quota_publish':4, 'quota_monitor':6}
+# publish: begin + quota_publication + optional recovery + terminal (source9a
+# hub-quota-publish.py258-291,542-609). Failed/incomplete decisions never qualify.
+
+
+@dataclass(frozen=True)
+class HeldExecutableFD:
+    """Full interpreter/entry-image bytes, separate from 256KiB source scripts.
+
+    Root startup verifies the actual FD/name/ancestry before donation. The
+    16MiB bound matches StableRuntime.verify_root_owned_file. Cached digest is
+    computed here, not accepted as a caller assertion, keeping owner metadata
+    checks independent of executable size.
+    """
+    fd: int
+    directory_fd: int
+    name: str
+    raw: bytes
+    stamp: tuple
+    pin: ram.SourcePin
+    def __post_init__(self):
+        ram.require(type(self.fd) is int and self.fd>2
+            and type(self.directory_fd) is int and self.directory_fd>2
+            and type(self.name) is str and '/' not in self.name
+            and self.name not in ('','.','..') and type(self.raw) is bytes
+            and 0<len(self.raw)<=16*1024*1024 and type(self.stamp) is tuple
+            and type(self.pin) is ram.SourcePin)
+        self.pin.checked()
+        digest=hashlib.sha256(self.raw).hexdigest()
+        ram.require(digest==self.pin.sha256)
+        object.__setattr__(self,'_digest',digest)
+
+
+def _natural_held_pin(held,info):
+    if type(held) is HeldExecutableFD:
+        ram.require(stat.S_ISREG(info.st_mode) and
+            held.pin==ram.SourcePin(info.st_dev,info.st_ino,held._digest))
+    else:
+        V4QuotaManager.held_pin(held,info)
+
+
+def original_hold(started_ns, now):
+    ram.require(type(started_ns) is int and started_ns>0
+        and type(now) in (int,float) and math.isfinite(now) and now>=0)
+    start=started_ns/1e9
+    ram.require(start<=now<start+.15)
+    return start+.15
+
+
+@dataclass(frozen=True)
+class NaturalRole:
+    role: str
+    source: HeldSourceFD
+    bootstrap: HeldSourceFD | HeldExecutableFD
+    client: HeldSourceFD
+    interpreter: HeldSourceFD | HeldExecutableFD
+    exec_start: tuple
+    argv: tuple
+    # Root-held ancestry edges: (parentFD, single name, childDirectoryFD).
+    ancestry: tuple
+    def checked(self):
+        ram.require(self.role in NATURAL_UNITS and type(self.exec_start) is tuple
+            and self.exec_start and all(type(s) is str and '\0' not in s for s in self.exec_start)
+            and type(self.argv) is tuple and all(type(s) is str for s in self.argv)
+            and type(self.ancestry) is tuple)
+        if self.role=='quota_publish':ram.require(self.argv==())
+        else:
+            ram.require(len(self.argv)==8 and self.argv[:3]==('--check','--health-check','--health-config')
+                and self.argv[3].startswith('/') and self.argv[4:]==('--health-timeout','8','--alert-timeout','8'))
+        for held in (self.source,self.client):
+            ram.require(type(held) is HeldSourceFD)
+        ram.require(type(self.bootstrap) in (HeldSourceFD,HeldExecutableFD))
+        ram.require(type(self.interpreter) in (HeldSourceFD,HeldExecutableFD))
+        return self
+    def sources(self):return (self.source,self.bootstrap,self.client,self.interpreter)
+
+
+def _natural_stamp(s):
+    return (s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns,s.st_uid,s.st_mode,s.st_nlink)
+
+
+def _natural_directories(edges):
+    """A root-connected directory graph, including interpreter/script branches."""
+    ram.require(type(edges) is tuple and edges)
+    root=os.stat('/',follow_symlinks=False)
+    first=os.fstat(edges[0][0])
+    ram.require((first.st_dev,first.st_ino)==(root.st_dev,root.st_ino))
+    directories={(root.st_dev,root.st_ino)}
+    for parent,name,child in edges:
+        ram.require(type(name) is str and '/' not in name and name not in ('','.','..'))
+        a=os.fstat(parent);b=os.fstat(child)
+        n=os.stat(name,dir_fd=parent,follow_symlinks=False)
+        ram.require((a.st_dev,a.st_ino) in directories
+            and all(stat.S_ISDIR(s.st_mode) and s.st_uid==0
+                    and not s.st_mode&0o022 for s in (a,b,n))
+            and (b.st_dev,b.st_ino)==(n.st_dev,n.st_ino))
+        directories.add((b.st_dev,b.st_ino))
+    return directories
+
+
+class PeriodicQuotaSelection:
+    """Created once by a reviewed ROOT startup caller, not JSON/producer input.
+
+    The dedicated Root-pipe receiver is separate from the consumed fixture and
+    PreparedQuotaSelection. Borrowed FDs are NEVER closed here.
+    """
+    def __init__(self,*a,**k):raise ram.Unknown('startup_handoff_missing')
+    @classmethod
+    def from_root(cls, roles):
+        ram.require(os.name=='posix' and hasattr(os,'geteuid') and os.geteuid()==0)
+        return cls._checked_roles(roles)
+    @classmethod
+    def _checked_roles(cls, roles, *, context_sources=()):
+        # Private trusted startup path. A non-root caller may use it ONLY after
+        # the separate receiver verifies a fresh ROOT-owned donation pipe.
+        # No wire/config/source frame dispatches to this method.
+        ram.require(type(roles) is tuple and len(roles)==2
+                    and {r.role for r in roles if type(r) is NaturalRole}==set(NATURAL_UNITS))
+        ram.require(type(context_sources) is tuple
+            and all(type(h) in (HeldSourceFD,HeldExecutableFD) for h in context_sources))
+        instance=object.__new__(cls);instance.roles={r.role:r.checked() for r in roles}
+        instance.context_sources=context_sources
+        instance.stamps={}
+        for plan in roles:
+            directories=_natural_directories(plan.ancestry)
+            for held in plan.sources()+context_sources:
+                d=os.fstat(held.directory_fd)
+                ram.require((d.st_dev,d.st_ino) in directories)
+                info=os.fstat(held.fd);_natural_held_pin(held,info)
+                ram.require(_natural_access_flags(held.fd)&os.O_ACCMODE==os.O_RDONLY)
+                ram.require(info.st_uid==0 and info.st_nlink==1 and not info.st_mode&0o022
+                    and info.st_size==len(held.raw)
+                    and os.pread(held.fd,len(held.raw)+1,0)==held.raw)
+                name=os.stat(held.name,dir_fd=held.directory_fd,follow_symlinks=False)
+                ram.require(_natural_stamp(name)==_natural_stamp(info))
+                instance.stamps[held.fd]=_natural_stamp(info)
+        return instance
+    def current(self,plan,*,full=False):
+        ram.require(type(plan) is NaturalRole and self.roles.get(plan.role) is plan)
+        directories=_natural_directories(plan.ancestry)
+        for held in plan.sources()+self.context_sources:
+            directory=os.fstat(held.directory_fd)
+            ram.require((directory.st_dev,directory.st_ino) in directories)
+            info=os.fstat(held.fd);name=os.stat(held.name,dir_fd=held.directory_fd,follow_symlinks=False)
+            ram.require(_natural_stamp(info)==self.stamps[held.fd]==_natural_stamp(name))
+            _natural_held_pin(held,info)
+            if full:ram.require(os.pread(held.fd,len(held.raw)+1,0)==held.raw)
+
+
+@dataclass(eq=False)
+class NaturalLease:
+    # Created only by the trusted metadata worker's independent manager probe.
+    unit: str
+    job_id: int
+    invocation: str
+    process: ram.ProcessKey
+    pidfd: int
+    channel: object
+    source: HeldSourceFD
+    started_ns: int
+    released: bool = False
+
+
+class NaturalResources:
+    """Unsupported interface defaults, never substitute runtime facts.
+
+    No callable supplied by producer is accepted. Subclasses must bind the
+    original manager owner/epoch, unit Job property, InvocationID,
+    MainPID/CG/ExecStart, same-time namespace, interpreter, live birth+pidfd and
+    exact held-source identities. It must NEVER start/stop natural units.
+    """
+    def accept(self):raise ram.Unknown('startup_listener_missing')
+    def drain(self):raise ram.Unknown('notification_drain_missing')
+    def bind(self,channel,started_ns,deadline):raise ram.Unknown('manager_binding_missing')
+    def current(self,lease):raise ram.Unknown('live_pidfd_binding_missing')
+    def source_event(self,lease):raise ram.Unknown('notification_watch_missing')
+    def exact_open(self,lease,event):raise ram.Unknown('notification_binding_missing')
+    def exited(self,lease):raise ram.Unknown('original_pidfd_exit_missing')
+    def retirement(self,lease):raise ram.Unknown('same_invocation_exit_retention_missing')
+    def retire_owned(self,lease):raise ram.Unknown('settled_resource_retirement_missing')
+    def close_owned(self,channels,leases):
+        # Implementations close only accepted channels/owned pidfds;
+        # never fixture cleanup/start/stop, sources, watch or directory FDs.
+        raise ram.Unknown('local_cleanup_missing')
+
+
+class PeriodicQuotaManager:
+    """Two-role state machine on the EXISTING broker owner thread.
+
+    The constructor never clears RAM/global UNKNOWN. One serial metadata
+    worker, no Collector/RAM calls from it and no quota unit start/stop code.
+    Settled descriptors retire before active capacity is reused; bounded Job
+    and context history stays in the same epoch until explicit exhaustion.
+    """
+    def __init__(self,selection,collector,events,resources,*,now=time.monotonic,
+                 probe_factory=SerialProbe,barrier_factory=OrderedBarrier,
+                 on_resources_closed=None):
+        ram.require(type(selection) is PeriodicQuotaSelection and isinstance(resources,NaturalResources))
+        ram.require(on_resources_closed is None or callable(on_resources_closed))
+        self.on_resources_closed=on_resources_closed
+        self.p,self.collector,self.events,self.resources=selection,collector,events,resources
+        self._time=now;self._last_time=None;self.now=self._clock
+        self.epoch=collector.epoch;self._barriers=barrier_factory(collector,self.now)
+        self.initial=None;self.barrier_for=None;self.barrier_mode='initial_begin'
+        self.cursor=0;self.jobs={};self.channels=[];self.leases=[];self.attempts=[]
+        self.probing=None;self.binding=None;self.retirement_value=None
+        self.closed=False;self.loss=False;self.round=0;self.accept_turn=True;self.probe=probe_factory(self._cleanup)
+    def _clock(self):
+        value=self._time()
+        ram.require(type(value) in (int,float) and math.isfinite(value) and value>=0
+            and (self._last_time is None or value>=self._last_time))
+        self._last_time=value;return value
+    def source_current(self,source):
+        plans=[p for p in self.p.roles.values() if p.source is source]
+        ram.require(plans and not self.closed and self.collector.fault is None and self.collector.epoch==self.epoch)
+        self.p.current(plans[0])
+    def _poison(self,owner,a=None):
+        self.loss=True;owner.fail(a.get('ticket') if a else None)
+        if a:
+            a['phase']='failed'
+            if a.get('ticket') and not a['ticket'].released:owner.release(a['ticket'])
+    def _drain_notifications(self):
+        # Same owner services notifications throughout the attempt, including
+        # after source-open. A later good drain cannot heal a missed interval.
+        try:self.resources.drain()
+        except BaseException:
+            self.loss=True
+            raise
+    def _read(self,channel):
+        try:raw,anc,flags,_=channel.recvmsg(2049,0,socket.MSG_DONTWAIT)
+        except BlockingIOError:return None
+        ram.require(raw and len(raw)<=2048 and not anc and not flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC))
+        return raw
+    def _probe_bind(self,a):
+        lease=self.resources.bind(a['channel'],a['start'],a['end'])
+        ram.require(type(lease) is NaturalLease and lease.channel is a['channel'] and lease.started_ns==a['start'])
+        # Register worker-created resources immediately, before further checks.
+        self.leases.append(lease)
+        role=next((r for r,u in NATURAL_UNITS.items() if u==lease.unit),None)
+        ram.require(role in self.p.roles);plan=self.p.roles[role]
+        ram.require(lease.source is plan.source and type(lease.invocation) is str
+            and len(lease.invocation)==32 and all(c in '0123456789abcdef' for c in lease.invocation)
+            and type(lease.job_id) is int and lease.job_id>0 and type(lease.pidfd) is int and lease.pidfd>2)
+        lease.process.checked();self.p.current(plan,full=True);self.resources.current(lease)
+        ram.require(self.now()<a['end']);return lease
+    def bind_held(self,source,channel,deadline):
+        lease=self.binding
+        ram.require(type(lease) is NaturalLease and lease.channel is channel and lease.source is source
+            and deadline==original_hold(lease.started_ns,self.now()))
+        self.binding=None;self.resources.current(lease);return lease
+    def lease_current(self,lease):
+        ram.require(any(l is lease for l in self.leases));self.resources.current(lease)
+    def drain_before_open(self,lease,deadline):
+        self.lease_current(lease);ram.require(self.now()<deadline and self.resources.source_event(lease) is None)
+    def exact_open(self,lease,source,event):
+        self.lease_current(lease);ram.require(lease.source is source)
+        self.resources.exact_open(lease,event) # Real marked inode + pinned livePID, not child claims.
+    def channel_current(self,lease,channel):
+        ram.require(lease.channel is channel);self.lease_current(lease)
+    def release_once(self,lease,qualified,context,deadline):
+        if lease is None:return # Prelude independently expires original hold, never permission gate.
+        ram.require(not lease.released);lease.released=True
+        if self.now()<deadline:
+            raw=b'qualified-run' if qualified else b'unqualified-run'
+            ram.require(lease.channel.send(raw)==len(raw))
+    def retired(self,lease):
+        ram.require(self.retirement_value is not None and self.retirement_value[0] is lease
+            and type(self.retirement_value[1]) is int and self.resources.exited(lease))
+        return self.retirement_value[1]
+    def _submit(self,a,operation,function):
+        ram.require(self.probing is None);self.probe.submit(operation,function);self.probing=(a,operation)
+    def step(self,owner):
+        if self.closed:return
+        try:self._step(owner)
+        except BaseException as error:
+            self._poison(owner)
+            if not isinstance(error,Exception):raise
+    def _step(self,owner):
+        ram.require(self.collector.fault is None and self.collector.epoch==self.epoch)
+        self._drain_notifications()
+        if self.barrier_mode=='initial_begin':
+            self._barriers.begin(self.now()+.15);self.barrier_mode='initial_poll';return
+        if self.barrier_mode=='initial_poll':
+            value=self._barriers.poll()
+            if value is not None:self.initial=value;self.barrier_mode=None
+            return
+        # Consume one authenticated Collector event per tick, never unlimited scan.
+        if self.cursor<len(self.events):
+            e=self.events[self.cursor];self.cursor+=1
+            if e['unit'] in NATURAL_UNITS.values():
+                ram.require(e['epoch']==self.epoch)
+                if e['member']=='JobNew':
+                    ram.require(len(self.jobs)<ram.MAX_LIFETIME and e['job_id'] not in self.jobs
+                        and self.initial['stream_index']<e['stream_index'])
+                    self.jobs[e['job_id']]={'new':e,'removed':None}
+                else:
+                    ram.require(e['job_id'] in self.jobs and self.jobs[e['job_id']]['removed'] is None)
+                    self.jobs[e['job_id']]['removed']=e
+                    if not any(a.get('lease') and a['lease'].job_id==e['job_id'] for a in self.attempts):self._poison(owner)
+            return
+        if self.probing:
+            result=self.probe.poll()
+            if result is not None:
+                a,operation=self.probing;self.probing=None
+                try:
+                    ram.require(type(result) is ProbeResult and result.operation==operation)
+                    if result.error is not None:raise result.error
+                    if operation=='bind':
+                        lease=result.value;job=self.jobs.get(lease.job_id)
+                        ram.require(job and job['new']['unit']==lease.unit and job['removed'] is None
+                            and not self.loss and self.now()<a['end'])
+                        plan=next(p for p in self.p.roles.values() if NATURAL_UNITS[p.role]==lease.unit)
+                        a['lease']=lease;self.binding=lease
+                        a['ticket']=owner.reserve(plan.source,a['end'],role=plan.role)
+                        ram.require(owner.bind_started(a['ticket'],a['channel']))
+                        a['phase']='open_send'
+                    elif operation=='retire':
+                        ram.require(type(result.value) is tuple and result.value[0] is a['lease']
+                            and type(result.value[1]) is int)
+                        a['status']=result.value[1];a['phase']='barrier_begin'
+                    elif operation=='cleanup':
+                        ram.require(result.value is a['lease'])
+                        self.channels=[c for c in self.channels if c is not a['channel']]
+                        self.leases=[lease for lease in self.leases if lease is not a['lease']]
+                        a['phase']='done'
+                    else:raise ram.Unknown('unknown_metadata_operation')
+                except BaseException:
+                    self._poison(owner,a);raise
+                return
+        # One accept/action per tick. A slow metadata worker never monopolizes
+        # hook service for another role. Round robin retains bounded overlap.
+        if (self.accept_turn and not self.loss and len(self.channels)<ram.MAX_ACTIVE
+                and len(self.attempts)<ram.MAX_LIFETIME):
+            self.accept_turn=False
+            channel=self.resources.accept()
+            if channel is not None:
+                self.channels.append(channel) # custody before ANY validation
+                channel.setblocking(False)
+                self.attempts.append({'channel':channel,'phase':'held','arrival':self.now(),'ticket':None,'frames':0})
+                return
+        self.accept_turn=True
+        for _ in range(len(self.attempts)):
+            a=self.attempts[self.round%len(self.attempts)];self.round+=1
+            if a['phase'] in ('done','failed','bind_poll','retire_poll','cleanup_poll'):continue
+            if self.probing and a['phase'] in ('held','exit','cleanup'):continue
+            # ListJobs is single-connection/one-pending; no second barrier.
+            if a['phase']=='barrier_begin' and self.barrier_for is not None:continue
+            try:self._advance(owner,a)
+            except BaseException:
+                self._poison(owner,a);raise
+            return
+    def _advance(self,owner,a):
+        channel=a['channel'];phase=a['phase']
+        if a.get('lease'):
+            role=next(r for r,u in NATURAL_UNITS.items() if u==a['lease'].unit)
+            ram.require(self.now()<a['start']/1e9+(45 if role=='quota_monitor' else 135))
+        if phase=='held':
+            ram.require(self.now()<a['arrival']+.15)
+            raw=self._read(channel)
+            if raw is None:return
+            value=decode(raw,2048);ram.require(set(value)=={'v','op','started_ns'} and type(value['v']) is int
+                and value['v']==1 and value['op']=='held')
+            a['start']=value['started_ns'];a['end']=original_hold(a['start'],self.now())
+            self._submit(a,'bind',lambda:self._probe_bind(a));a['phase']='bind_poll'
+        elif phase=='open_send':
+            raw=b'open:'+a['ticket'].context.encode('ascii');ram.require(self.now()<a['end'] and channel.send(raw)==len(raw));a['phase']='open_receive'
+        elif phase=='open_receive':
+            ram.require(self.now()<a['end']);raw=self._read(channel)
+            if raw is None:return
+            ram.require(raw==b'quota-source-opened');event=self.resources.source_event(a['lease'])
+            ram.require(event is not None and owner.source_open(a['ticket'],event));ram.require(owner.release(a['ticket']));a['phase']='hooks'
+        elif phase=='hooks':
+            plan=self.p.roles[a['ticket'].role];end=a['start']/1e9+(45 if plan.role=='quota_monitor' else 135)
+            ram.require(self.now()<end and a['frames']<NATURAL_FRAMES[plan.role])
+            raw=self._read(channel)
+            if raw is None:return
+            a['ack_end']=min(end,self.now()+.15);request=decode(raw,2048)
+            ram.require(set(request)=={'v','op','frame'} and type(request['v']) is int and request['v']==1 and request['op']=='hook')
+            a['reply']=owner.hook(a['ticket'],channel,request['frame']);a['phase']='ack'
+        elif phase=='ack':
+            raw=json.dumps(a.pop('reply'),separators=(',',':')).encode();ram.require(self.now()<a['ack_end'] and channel.send(raw)==len(raw))
+            a['frames']+=1;ram.require(a['ticket'].fault is None)
+            a['phase']='exit' if a['ticket'].terminal else 'hooks'
+        elif phase=='exit':
+            # Nonready/EOF is not exit. Refuse observed post-terminal packets.
+            try:tail,anc,flags,_=channel.recvmsg(2049,0,socket.MSG_DONTWAIT)
+            except BlockingIOError:tail=b'';anc=[];flags=0
+            ram.require(not tail and not anc and not flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC))
+            if not self.resources.exited(a['lease']):return
+            self._submit(a,'retire',lambda:self.resources.retirement(a['lease']));a['phase']='retire_poll'
+        elif phase=='barrier_begin':
+            self._barriers.begin(self.now()+.15);self.barrier_for=a;a['phase']='barrier_poll'
+        elif phase=='barrier_poll':
+            ram.require(self.barrier_for is a)
+            receipt=self._barriers.poll()
+            if receipt is None:return
+            self.barrier_for=None
+            job=self.jobs[a['lease'].job_id];end=job['removed'];expected='done' if a['status']==0 else 'failed'
+            ram.require(end and end['result']==expected and self.initial['stream_index']<job['new']['stream_index']<end['stream_index']<receipt['stream_index'])
+            # Notifications may arrive while the ordered manager barrier is
+            # pending or even in its final poll. Observe them BEFORE finishing.
+            self._drain_notifications()
+            self.retirement_value=(a['lease'],a['status'])
+            try:owner.retire(a['ticket'])
+            finally:self.retirement_value=None
+            ram.require(a['ticket'].retired and a['ticket'].fault is None)
+            a['phase']='cleanup'
+        elif phase=='cleanup':
+            # The same serial metadata worker is the sole lifetime owner of
+            # acquired pidfds. Its acknowledgement precedes capacity reuse.
+            self._submit(a,'cleanup',lambda:self.resources.retire_owned(a['lease']))
+            a['phase']='cleanup_poll'
+        elif phase not in ('bind_poll','retire_poll','cleanup_poll'):raise ram.Unknown('phase_unqualified')
+    def barrier(self,deadline):
+        ram.require(not self.loss and not self.closed and self.now()<deadline
+            and self.probing is None and all(a['phase']=='done' for a in self.attempts))
+        self._drain_notifications()
+        # Source-level state only; global poison remains. No healthy cache.
+    def _cleanup(self):
+        original=None
+        try:self.resources.close_owned(tuple(self.channels),tuple(self.leases))
+        except BaseException as error:original=error
+        try:
+            if self.on_resources_closed is not None:self.on_resources_closed()
+        except BaseException:
+            if original is None:raise
+        if original is not None:raise original
+    @property
+    def resources_retired(self):
+        return self.closed and self.probe.done.is_set() and not self.probe.cleanup_failed
+    def close(self):
+        if self.closed:return
+        self.closed=True;self._barriers.close();self.probe.close()

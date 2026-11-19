@@ -24,10 +24,11 @@ class DispatchOffer:
 
 class Held:
     __slots__ = ('owner', 'context', 'epoch', 'source', 'deadline', 'lease', 'opened',
-                 'terminal', 'released', 'retired', 'fault')
-    def __init__(self, owner, source, deadline):
+                 'terminal', 'released', 'retired', 'fault', 'role')
+    def __init__(self, owner, source, deadline, role='quota_monitor'):
         self.owner, self.context, self.epoch = owner, uuid.uuid4().hex, owner.ram.epoch
         self.source, self.deadline, self.lease = source, deadline, None
+        self.role = role
         self.opened = self.terminal = self.released = self.retired = False
         self.fault = None
 
@@ -68,7 +69,7 @@ class QuotaDispatch:
         except queue.Full:
             self.pending_loss.set(); offer.failed=True; offer.ready.set()
         return offer
-    def reserve(self, source, deadline=None):
+    def reserve(self, source, deadline=None, *, role='quota_monitor'):
         self.owner()
         try:
             ram.require(not self.closed and len(self.active) < ram.MAX_ACTIVE and len(self.seen) < ram.MAX_LIFETIME)
@@ -77,8 +78,8 @@ class QuotaDispatch:
             ram.require(self.now() < end)
             self.manager.source_current(source)
             ram.require(self.now() < end)
-            ram.require(source.pin == self.ram.pins['quota_monitor'])
-            ticket = Held(self, source, end)
+            ram.require(role in ('quota_monitor','quota_publish') and source.pin == self.ram.pins.get(role))
+            ticket = Held(self, source, end, role)
             ram.require(ticket.context not in self.seen)
             self.seen.add(ticket.context); self.active[ticket.context] = ticket
             return ticket
@@ -97,7 +98,7 @@ class QuotaDispatch:
             self.manager.source_current(ticket.source)
             self.manager.drain_before_open(lease, ticket.deadline)
             self.checked(ticket)
-            self.ram.admit(ticket.context, 'quota_monitor', None, lease.process, ticket.source.pin)
+            self.ram.admit(ticket.context, ticket.role, None, lease.process, ticket.source.pin)
             ticket.lease = lease
             return True
         except BaseException as error:
@@ -113,7 +114,7 @@ class QuotaDispatch:
             # Real kernel record from the marked source, not wrapper's claimed
             # digest/message. Manager validates event origin and live pidfd.
             self.manager.exact_open(ticket.lease, ticket.source, event)
-            self.ram.source_open('quota_monitor', ticket.source.pin, ticket.lease.process.pid, ticket.lease.process)
+            self.ram.source_open(ticket.role, ticket.source.pin, ticket.lease.process.pid, ticket.lease.process)
             self.checked(ticket); ticket.opened = True
             return True
         except BaseException as error:

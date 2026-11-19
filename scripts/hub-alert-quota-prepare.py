@@ -160,11 +160,11 @@ def validate_user_runtime(target_uid):
         os.close(rt_fd)
 
 
-def pin_source(dir_path, name, target_uid):
+def pin_source(dir_path, name, target_uid, *, root_only=False):
     """Open and pin a regular non-writable source file via dir_fd + O_NOFOLLOW."""
     if '/' in name or name in ('', '.', '..'):
         raise PermissionError('invalid_source_name')
-    dir_fd = _walk_dir(dir_path, target_uid)
+    dir_fd = _walk_dir(dir_path, target_uid, root_only=root_only)
     fd = -1
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
@@ -474,12 +474,121 @@ def prepare_and_handoff(args, *, runner=subprocess.run):
                 pass
 
 
+def _pin_natural_source(directory, name):
+    """Natural source ancestry and every donated file must belong to Root."""
+    return pin_source(directory, name, 0, root_only=True)
+
+
+def prepare_natural_and_exec(args, *, execve=os.execve):
+    """Become the ordinary USER Host after donating notification-only resources.
+
+    There is no persistent privileged parent, subprocess, ACK claim, service
+    start/stop, enrollment or caller-supplied Python code. The maintained archive
+    must contain the natural-host entry and its complete approved Host closure.
+    The production coinstall/activation of that archive is a separate operation.
+    """
+    if os.getuid() != 0 or os.geteuid() != 0:
+        raise PermissionError('root_entry_required')
+    user = pwd.getpwuid(args.target_uid)
+    if user.pw_uid <= 0 or user.pw_gid <= 0:
+        raise PermissionError('non_root_target_required')
+    selection = Path(args.selection)
+    if not selection.is_absolute() or '..' in selection.parts or not selection.name:
+        raise PermissionError('invalid_selection_path')
+    # These paths become arguments only AFTER irrevocable privilege drop.
+    if not Path(args.config).is_absolute() or '..' in Path(args.config).parts:
+        raise PermissionError('invalid_config_path')
+    if not Path(args.broker_dir).is_absolute() or '..' in Path(args.broker_dir).parts:
+        raise PermissionError('invalid_broker_path')
+    owned = []
+    gate = None
+    gate_dir = gate_node = -1
+    gate_identity = None
+    pipe_read = pipe_write = -1
+    try:
+        interpreter_fd, interpreter_pin = pin_interpreter(args.python_bin)
+        owned.append(interpreter_fd)
+        archive_fd, archive_pin = pin_entry_archive(args.entry_archive)
+        owned.append(archive_fd)
+        sections = {}
+        for key, directory, name in (
+            ('source', args.source_dir, 'hub-quota-publish.py'),
+            ('client', args.source_dir, 'hub_alert_client.py'),
+            ('selection', str(selection.parent), selection.name),
+        ):
+            fd, parent, pin = _pin_natural_source(directory, name)
+            owned.extend((fd, parent))
+            sections[key] = {'fd': fd, 'dir_fd': parent, **pin}
+        group = open_fanotify_group(sections['source']['dir_fd'], 'hub-quota-publish.py')
+        owned.append(group)
+        gate, gate_dir, gate_node, gate_identity = bind_source_gate(args.gate_dir, user.pw_uid)
+        environment = validate_user_runtime(user.pw_uid)
+        pipe_read, pipe_write = os.pipe2(os.O_CLOEXEC)
+        manifest = {
+            'v': 2, 'kind': 'natural_quota_root_donation_v1',
+            'target_uid': user.pw_uid,
+            'handoff_deadline_ns': time.monotonic_ns() + HANDOFF_DEADLINE_NS,
+            'ack_fd': None,  # exec replaces THIS process; there is no parent waiter.
+            'source_directory': args.source_dir, 'selection_path': args.selection,
+            'broker_directory': args.broker_dir, 'gate_directory': args.gate_dir,
+            'interpreter': {'fd': interpreter_fd, **interpreter_pin},
+            'entry': {'fd': archive_fd, **archive_pin}, **sections,
+            'fan_group': group, 'gate_sock_fd': gate.fileno(),
+            'gate_dir_fd': gate_dir, 'gate_node_fd': gate_node,
+            'gate_node': {'dev': gate_identity[0], 'ino': gate_identity[1]},
+        }
+        raw = json.dumps(manifest, separators=(',', ':')).encode('utf-8')
+        if len(raw) > 4096 or os.write(pipe_write, raw) != len(raw):
+            raise PermissionError('handoff_write_failed')
+        consumed, pipe_write = pipe_write, -1
+        os.close(consumed)
+        for fd in owned + [gate.fileno(), gate_dir, gate_node, pipe_read]:
+            os.set_inheritable(fd, True)
+        command = [f'/proc/self/fd/{interpreter_fd}', '-I',
+            f'/proc/self/fd/{archive_fd}', 'natural-host',
+            '--config', args.config, 'serve', '--aplexer', args.host_aplexer,
+            '--alert-handoff-fd', str(pipe_read)]
+        environment.update(HOME=user.pw_dir,
+            PATH=f'{user.pw_dir}/.local/bin:{user.pw_dir}/bin:/usr/local/bin:/usr/bin:/bin')
+        # Nothing from the Host/user site-packages is imported while privileged.
+        drop_privileges(user.pw_uid, user.pw_gid)
+        execve(command[0], command, environment)
+        raise RuntimeError('host_exec_returned')
+    finally:
+        # Reached only before exec, or if exec failed. Successful exec preserves
+        # the PID and transfers these exact descriptors to the Host receiver.
+        original_error = sys.exc_info()[1]
+        cleanup_errors = []
+        if gate is not None:
+            try:
+                gate.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+            if gate_identity is not None:
+                try:
+                    node = os.stat('source-gate.sock', dir_fd=gate_dir, follow_symlinks=False)
+                    if (node.st_dev, node.st_ino) == gate_identity:
+                        os.unlink('source-gate.sock', dir_fd=gate_dir)
+                except OSError as error:
+                    cleanup_errors.append(error)
+        for fd in reversed(owned + [gate_dir, gate_node, pipe_read, pipe_write]):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    cleanup_errors.append(error)
+        if original_error is None and cleanup_errors:
+            raise cleanup_errors[0]
+
+
 def main(argv=None):
     if not argv:
         print(json.dumps({'status': 'INERT_ROOT_PREPARER', 'authority': 'NONE', 'complete': False}))
         return 0
     parser = argparse.ArgumentParser(prog='hub-alert-quota-prepare')
-    parser.add_argument('--prepare-handoff', action='store_true', required=True)
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument('--prepare-handoff', action='store_true')
+    modes.add_argument('--prepare-natural-host', action='store_true')
     parser.add_argument('--target-uid', type=int, required=True)
     parser.add_argument('--config', required=True)
     parser.add_argument('--source-dir', required=True)
@@ -489,7 +598,16 @@ def main(argv=None):
     parser.add_argument('--unit', default=None)
     parser.add_argument('--cgroup', default=None)
     parser.add_argument('--primary-arg', dest='primary_args', action='append', default=None)
+    parser.add_argument('--selection')
+    parser.add_argument('--broker-dir')
+    parser.add_argument('--host-aplexer', default='a')
     args = parser.parse_args(argv)
+    if args.prepare_natural_host:
+        if not args.selection or not args.broker_dir:
+            parser.error('--prepare-natural-host requires --selection and --broker-dir')
+        if args.unit is not None or args.cgroup is not None or args.primary_args is not None:
+            parser.error('natural Host mode does not accept staged unit arguments')
+        return prepare_natural_and_exec(args)
     return prepare_and_handoff(args)
 
 

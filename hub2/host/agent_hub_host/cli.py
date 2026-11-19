@@ -26,6 +26,7 @@ def main(argv=None):
     enroll.add_argument("--engine", action="append", default=[])
     serve = commands.add_parser("serve")
     serve.add_argument("--once", action="store_true")
+    serve.add_argument("--alert-handoff-fd", type=int, default=None, help=argparse.SUPPRESS)
     serve.add_argument("--aplexer", default="a")
     serve.add_argument("--label", action="append", default=[])
     serve.add_argument("--log-file", type=Path, default=None,
@@ -56,6 +57,16 @@ def main(argv=None):
     quota_dispatch_cmd.add_argument("--handoff-fd", type=int, default=None,
                                     help="Inherited Root-prepared descriptor manifest pipe FD")
     args = parser.parse_args(argv)
+    natural_donation = None
+    if args.command == "serve" and args.alert_handoff_fd is not None:
+        try:
+            from .quota_natural_startup import consume_natural_handoff
+            natural_donation = consume_natural_handoff(args.alert_handoff_fd)
+            # The receiver bound this stable name to the donated FD and our
+            # actual kernel image; child exec cannot depend on inherited FDs.
+            sys.executable = natural_donation.child_interpreter
+        except Exception:
+            pass  # Missing optional evidence never gates primary host startup.
     if args.command == "self-update" and os.name == "nt":
         from .windows_host import windows_self_update
         try:
@@ -131,8 +142,8 @@ def main(argv=None):
                 "Hub2 host starting machine=%s host_version=%s protocol=%s credential_mode=%s engines=%s log=%s",
                 config.get("machine_id"), version or "unreleased", protocol, credential_mode(config),
                 ",".join(config.get("engines") or []), log_file or "stderr")
-            observer = None
-            if 'alert_observer' in config:
+            observer = natural_donation
+            if args.alert_handoff_fd is None and 'alert_observer' in config:
                 try:
                     from .alert_broker import configured
                     observer = configured(config['alert_observer'])
@@ -160,6 +171,14 @@ def main(argv=None):
             logging.getLogger("agent_hub_host").error("Hub2 serve stopped: %s", reason)
         print(f"Hub operation failed ({args.command}: {reason}); no successful result recorded.", file=sys.stderr)
         return 1
+    finally:
+        # Before start the CLI owns the donation; afterwards the resident
+        # broker/probe closes borrowed resources on its existing exit path.
+        if natural_donation is not None and not natural_donation.started:
+            try:
+                natural_donation.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

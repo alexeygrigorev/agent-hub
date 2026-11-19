@@ -83,6 +83,19 @@ class LiveRAM:
         instance.poison(PRODUCERS,'dispatch_unqualified')
         return instance
 
+    @classmethod
+    def _selected_natural_quota(cls,source_pins,checked_frame,*,now=time.monotonic_ns):
+        """Private Root-donation construction; unselected roles stay UNKNOWN."""
+        require(type(source_pins) is dict
+            and set(source_pins)=={'quota_publish','quota_monitor'}
+            and all(type(pin) is SourcePin for pin in source_pins.values())
+            and callable(checked_frame))
+        instance=cls.__new__(cls)
+        instance.pins={role:pin.checked() for role,pin in source_pins.items()}
+        instance._state(checked_frame,now,unselected=frozenset(ROLES)-set(source_pins))
+        instance.poison(PRODUCERS,'dispatch_unqualified')
+        return instance
+
     def _state(self,checked_frame,now,*,unselected=frozenset()):
         self.checked_frame=checked_frame;self.now=now
         self.epoch=uuid.uuid4().hex;self.last_clock=None

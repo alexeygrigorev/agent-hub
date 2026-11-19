@@ -226,6 +226,38 @@ class Broker:
         instance._state(collector_factory,identity,dispatch_factory,_on_owner_exit)
         return instance
 
+    @classmethod
+    def _selected_natural_quota(cls,directory,selection,gate,group,*,
+                                on_resources_closed,on_owner_exit,on_manager):
+        """Existing resident broker, with actual Root-donated two-role inputs.
+
+        This is not a configured/source-claim constructor or a new wire op.
+        No quota service is launched; the existing collector observes its jobs.
+        """
+        from . import quota_dispatch_manager as manager
+        from .quota_natural_resources import LinuxNaturalResources
+        from .quota_dispatch import QuotaDispatch
+        require(type(selection) is manager.PeriodicQuotaSelection
+            and type(gate) is manager.SourceGate and type(group) is int
+            and all(callable(fn) for fn in (on_resources_closed,on_owner_exit,on_manager)))
+        instance=cls.__new__(cls)
+        instance.directory=Path(directory);instance.path=instance.directory/'observer.sock'
+        instance.ram=ram.LiveRAM._selected_natural_quota(
+            {role:plan.source.pin for role,plan in selection.roles.items()},checked)
+        def dispatch(owner):
+            resources=LinuxNaturalResources(selection,gate,manager.FanotifyReader(),
+                group,manager.FanotifyObservation())
+            natural=manager.PeriodicQuotaManager(selection,owner.collector,owner.events,
+                resources,on_resources_closed=on_resources_closed)
+            try:
+                on_manager(natural)
+                return QuotaDispatch(owner,natural)
+            except BaseException:
+                natural.close()
+                raise
+        instance._state(None,process_key,dispatch,on_owner_exit)
+        return instance
+
     def _state(self,collector_factory,identity,_dispatch_factory,_on_owner_exit=None):
         # No independently qualified dispatcher/source-open/system/cron binding
         # exists in this increment. No hook or job is allowed to self-admit.
@@ -426,12 +458,16 @@ class Broker:
 def start_optional(spec=None):
     """No environment/config lookup. Owner supplies optional reviewed spec.
 
-    Integration wires an explicit Bridge constructor argument. Disabled is the
-    default; CLI/config enrollment is a separate unimplemented activation seam.
+    Integration wires an explicit Bridge constructor argument. A natural quota
+    donation has already passed the separate Root-pipe receiver; dictionaries
+    never acquire that authority. Disabled remains the default.
     """
     if spec is None or sys.platform != 'linux':
         return None
     try:
+        from .quota_natural_startup import NaturalDonation
+        if type(spec) is NaturalDonation:
+            return spec.start()
         require(type(spec) is dict and set(spec) == {'directory','source_pins'})
         require(set(spec['source_pins']) == set(ram.ROLES))
         pins = {role: ram.SourcePin(**value).checked() for role, value in spec['source_pins'].items()}
