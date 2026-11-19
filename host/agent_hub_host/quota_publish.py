@@ -24,6 +24,12 @@ VALID_MS = 15 * 60 * 1000
 # which Hub reports as quota_unavailable even with headroom.
 DEFAULT_CAPACITY = 8
 QUSE_TIMEOUT = 90
+# GrokBot's <1% export (GET /api/quota/grokbot, read by Dapier) mirrors the measured `grok`
+# pool on every publish. Two five-minute publisher cycles of validity: one late run keeps it
+# fresh, a stopped publisher lets it go stale (never below_threshold) within ten minutes.
+GROKBOT_REPORT = 'grokbot'
+GROKBOT_SOURCE = 'hub-quota-publish:grok'
+GROKBOT_VALID_MS = 10 * 60 * 1000
 
 
 def read_quse():
@@ -84,6 +90,19 @@ def evidence(entry, now_ms):
             'reset_at': reset_ms, 'source': 'quse'}
 
 
+def _report_grokbot(body, request, result):
+    report = {'remaining': body['remaining'], 'source': GROKBOT_SOURCE, 'captured_at': body['captured_at'],
+              'valid_for_ms': max(1000, min(GROKBOT_VALID_MS, body['valid_until'] - body['captured_at']))}
+    if body['reset_at'] is not None:
+        report['reset_at'] = body['reset_at']
+    try:
+        request('PUT', '/api/quota/' + GROKBOT_REPORT, report)
+    except Exception:  # The account pool is already published; report only the mirror gap.
+        result['skipped'][GROKBOT_REPORT] = 'quota_report_failed'
+        return
+    result['published'].append(GROKBOT_REPORT)
+
+
 def publish(quse=None, request=intake.request, now_ms=None, enable=False):
     quse = read_quse() if quse is None else quse
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
@@ -114,6 +133,8 @@ def publish(quse=None, request=intake.request, now_ms=None, enable=False):
                                     'min_remaining': (existing or {}).get('min_remaining') or 0})
         request('PUT', base + '/quota', body)
         result['published'].append(account)
+        if account == 'grok':
+            _report_grokbot(body, request, result)
     if not result['published']:
         raise ValueError('quse reported no measured quota window for any account: ' + json.dumps(result['skipped']))
     return result

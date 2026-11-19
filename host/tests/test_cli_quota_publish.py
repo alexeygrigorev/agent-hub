@@ -121,8 +121,8 @@ class QuotaPublishTests(unittest.TestCase):
                     calls.append((method, path, body)); return {}
                 quse = {key: {'status': 'ok', 'windows': {'5h': {'percent_remaining': 88.0, 'reset_at': None}}}}
                 out = qp.publish(quse=quse, request=req_new, now_ms=5, enable=True)
-                self.assertEqual(out['published'], [account])
-                self.assertEqual([c[0] for c in calls], ['GET', 'PATCH', 'PUT'])
+                self.assertEqual(out['published'], [account] + (['grokbot'] if key == 'grok' else []))
+                self.assertEqual([c[0] for c in calls[:3]], ['GET', 'PATCH', 'PUT'])
                 self.assertEqual(calls[1][2]['provider'], provider)
                 self.assertFalse(calls[1][2]['enabled'])
                 self.assertEqual(calls[2][2]['remaining'], 88.0)
@@ -133,8 +133,59 @@ class QuotaPublishTests(unittest.TestCase):
                     calls.append((method, path, body))
                     return {'account': {'enabled': 1, 'capacity': 8, 'min_remaining': 0}} if method == 'GET' else {}
                 qp.publish(quse=quse, request=req_enabled, now_ms=5, enable=True)
-                self.assertEqual([c[0] for c in calls], ['GET', 'PATCH', 'PUT'])
+                self.assertEqual([c[0] for c in calls[:3]], ['GET', 'PATCH', 'PUT'])
                 self.assertFalse(calls[1][2]['enabled'])
+
+    def test_grok_publish_mirrors_grokbot_report_every_run(self):
+        now = 1794340000000
+        reset = dt.datetime.fromtimestamp((now + 3600000) / 1000, dt.timezone.utc).isoformat()
+        for remaining, limit in ((42.5, False), (0.0, False), (80.0, True)):
+            with self.subTest(remaining=remaining, limit=limit):
+                calls = []
+                def req(method, path, body=None):
+                    calls.append((method, path, body)); return {'account': {'enabled': 0, 'capacity': 8}}
+                entry = {'status': 'ok', 'windows': {'7d': {'percent_remaining': remaining, 'reset_at': reset}}}
+                if limit:
+                    entry['details'] = {'limit_reached': True}
+                out = qp.publish(quse={'grok': entry}, request=req, now_ms=now)
+                self.assertEqual(out['published'], ['grok', 'grokbot'])
+                report = [(p, b) for m, p, b in calls if m == 'PUT' and p == '/api/quota/grokbot']
+                self.assertEqual(len(report), 1)
+                body = report[0][1]
+                # Real measured remaining (0 when exhausted) so the export reads below_threshold=true.
+                self.assertEqual(body['remaining'], 0.0 if limit else remaining)
+                self.assertEqual(body['captured_at'], now)
+                self.assertEqual(body['source'], 'hub-quota-publish:grok')
+                self.assertEqual(body['reset_at'], now + 3600000)
+                # Valid across the 5-minute publish cadence; the Hub accepts 1s..1h.
+                self.assertEqual(body['valid_for_ms'], qp.GROKBOT_VALID_MS)
+                self.assertGreater(body['valid_for_ms'], 5 * 60 * 1000)
+                self.assertNotIn('threshold', body)
+
+    def test_grokbot_validity_is_bounded_by_an_imminent_reset(self):
+        now = 1794340000000
+        reset = dt.datetime.fromtimestamp((now + 60000) / 1000, dt.timezone.utc).isoformat()
+        calls = []
+        qp.publish(quse={'grok': {'status': 'ok', 'windows': {'5h': {'percent_remaining': 3, 'reset_at': reset}}}},
+                   request=lambda m, p, b=None: calls.append((m, p, b)) or {}, now_ms=now)
+        self.assertEqual([b for m, p, b in calls if p == '/api/quota/grokbot'][0]['valid_for_ms'], 60000)
+
+    def test_grokbot_not_reported_without_measured_grok_and_failure_is_isolated(self):
+        calls = []
+        def req(method, path, body=None):
+            calls.append(path); return {'account': {'enabled': 1, 'capacity': 8}}
+        out = qp.publish(quse={'grok': {'status': 'stale'}, 'gemini': {'status': 'ok', 'windows': {'5h': {'percent_remaining': 60}}}},
+                         request=req, now_ms=5)
+        self.assertEqual(out['published'], ['gemini'])
+        self.assertNotIn('/api/quota/grokbot', calls)
+        def failing(method, path, body=None):
+            if path == '/api/quota/grokbot':
+                raise RuntimeError('PRIVATE upstream failure')
+            return {'account': {'enabled': 0, 'capacity': 8}}
+        out = qp.publish(quse={'grok': {'status': 'ok', 'windows': {'5h': {'percent_remaining': 60}}}}, request=failing, now_ms=5)
+        self.assertEqual(out['published'], ['grok'])
+        self.assertEqual(out['skipped']['grokbot'], 'quota_report_failed')
+        self.assertNotIn('PRIVATE', str(out))
 
 
 if __name__ == '__main__':
