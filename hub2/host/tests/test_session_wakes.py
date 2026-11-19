@@ -460,6 +460,21 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         self.assertEqual(self.bridge.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
         last=self.events(records)[-1]
         self.assertEqual(last,self.diag('deadline_exceeded',phase='submit',reason='wake_deadline_exceeded'))
+    def test_positive_finish_rechecks_original_budget_after_terminal_diagnostic(self):
+        records=self.capture();clock={'t':0.0}
+        original=wake_send._strict_diag_record
+        def burn_at_final(correlation,attempt,category,phase,**fields):
+            if category=='submit_verified':clock['t']+=35.0  # Deterministic advance of only the final diagnostic preparation event.
+            return original(correlation,attempt,category,phase,**fields)
+        with mock.patch.object(wake_send.time,'monotonic',lambda:clock['t']), \
+                mock.patch.object(wake_send,'_strict_diag_record',side_effect=burn_at_final):
+            with self.assertRaisesRegex(RuntimeError,'wake_deadline_exceeded'):self.invoke()
+        self.assertEqual(self.calls[0][self.calls[0].index('--idempotency-key')+1],self.command['id'])
+        self.assertEqual(len(self.calls),1)  # The expired final boundary sent no second native input.
+        self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
+        self.assertEqual(self.bridge.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)  # No done result or positive ACK.
+        last=self.events(records)[-1]
+        self.assertEqual(last,self.diag('deadline_exceeded',phase='terminal',reason='wake_deadline_exceeded'))
     def test_retry_of_same_command_keeps_command_but_rotates_attempt(self):
         records=self.capture();self.mode.write_text('busy')
         first=self.invoke();second=self.invoke()
@@ -508,6 +523,42 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         self.assertEqual(len(self.calls),1)
         self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
         self.assertEqual(len([t for t in threading.enumerate() if t.name=='wake-strict-diag']),1)
+    def test_first_worker_start_failure_keeps_attempt_results_and_singleton_recoverable(self):
+        attempts=[]
+        class Refusing:
+            def __init__(self,*args,**kwargs):attempts.append(1)
+            def start(self):raise RuntimeError('synthetic_thread_start_refused')
+        fresh=[]
+        self.mode.write_text('busy')
+        with mock.patch.object(wake_send,'_STRICT_DIAG_WORKER_THREAD',fresh), \
+                mock.patch.object(wake_send,'_STRICT_DIAG_WORKER_LOCK',threading.Lock()):
+            with mock.patch.object(wake_send.threading,'Thread',Refusing):
+                began=time.perf_counter()
+                self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+                self.assertLess(time.perf_counter()-began,1.5)  # A refused first start never fails, blocks or changes the attempt.
+            self.assertTrue(attempts)  # A first start was genuinely attempted, not skipped.
+            self.assertEqual(fresh,[])  # The singleton marker is committed only after a successful start.
+            started=[]
+            class Recorded:
+                def __init__(self,*args,**kwargs):started.append(self)
+                def start(self):pass
+                def is_alive(self):return True
+            with mock.patch.object(wake_send.threading,'Thread',Recorded):
+                wake_send._strict_diag_record('unknown','00000000000f','attempt_start','entry')  # A later emission retries startup safely.
+            self.assertEqual(started,[fresh[0]])  # Recovery commits exactly one started worker marker, with no extra OS thread.
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
+    def test_emission_never_waits_behind_startup_owner_or_hostile_emitter(self):
+        held=threading.Lock();held.acquire();self.addCleanup(held.release)
+        fresh=[]
+        with mock.patch.object(wake_send,'_STRICT_DIAG_WORKER_THREAD',fresh), \
+                mock.patch.object(wake_send,'_STRICT_DIAG_WORKER_LOCK',held):
+            began=time.perf_counter()
+            wake_send._strict_diag_record('unknown','00000000000e','attempt_start','entry')
+            self.assertLess(time.perf_counter()-began,0.5)  # Drops instead of waiting behind the active startup owner.
+            self.assertEqual(fresh,[])  # No worker is spawned while another emission owns startup.
+        with mock.patch.object(wake_send,'_strict_diag_emit',side_effect=RuntimeError('emit_hostile')):
+            self.assertIsNone(wake_send._strict_diag_record('unknown','00000000000d','attempt_start','entry'))
     def test_concurrent_commands_are_attributed_with_distinct_attempts(self):
         records=self.capture();self.mode.write_text('busy')
         errors={};results={};identities={0:'33333333-3333-4444-8555-666666666666',1:'44444444-3333-4444-8555-666666666666'}
@@ -710,6 +761,20 @@ class StrictInboxWakeTests(StrictDiagTools, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'wake_outcome_uncertain'):self.invoke()
         self.assertEqual(self.events(records)[-1],self.diag('outcome_uncertain',phase='context',reason='wake_outcome_uncertain',attempt='A3'))
         self.assertEqual(len(self.creations()),1)
+    def test_inbox_positive_finish_rechecks_original_budget_after_terminal_diagnostic(self):
+        records=self.capture();clock={'t':0.0}
+        original=wake_send._strict_diag_record
+        def burn_at_final(correlation,attempt,category,phase,**fields):
+            if category=='submit_verified':clock['t']+=35.0  # Deterministic advance of only the final diagnostic preparation event.
+            return original(correlation,attempt,category,phase,**fields)
+        with mock.patch.object(wake_send.time,'monotonic',lambda:clock['t']), \
+                mock.patch.object(wake_send,'_strict_diag_record',side_effect=burn_at_final):
+            with self.assertRaisesRegex(RuntimeError,'wake_deadline_exceeded'):self.invoke()
+        self.assertEqual(len(self.creations()),1)  # The one original business envelope; never a second creation.
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send' and '--strict' in c[0]]),1)  # The original notice effect stays at most once.
+        self.assertEqual(self.bridge.journal.db.execute('SELECT state FROM commands').fetchone()[0],'executing')
+        self.assertEqual(self.bridge.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)  # No done result or positive ACK.
+        self.assertEqual(self.events(records)[-1],self.diag('deadline_exceeded',phase='terminal',reason='wake_deadline_exceeded'))
 
 INBOX_CLI = r'''import sys,json,hashlib,os
 from pathlib import Path

@@ -22,14 +22,16 @@ import uuid
 # opaque command correlation plus one process-local per-invocation attempt
 # token, so interleaved commands and retries stay attributable without raw
 # request, text, path or environment data. Emission is bounded best-effort and
-# never blocks the native-control path: the record is serialized in the caller,
-# dropped into a bounded in-process queue (drop-on-full) and drained by one
-# lifecycle-contained daemon worker that writes through the existing Host
-# logging sink. A slow or broken sink delays or loses records only. The
-# monotonic budget is captured before the first emission; diagnostics cost
-# microseconds and the original remaining/deadline checks still gate every
-# native effect and finalization, so logging neither widens nor renews the
-# attempt budget. Logging never authorizes, retries or alters effects.
+# never blocks the native-control path: the record, its enqueueing and the
+# one-time worker construction/start are all fully guarded, nonblocking and
+# drop-on-failure; records land in a bounded in-process queue (drop-on-full)
+# drained by one lifecycle-contained daemon worker that writes through the
+# existing Host logging sink. A slow or broken sink or a refused worker start
+# delays or loses records only. The monotonic budget is captured before the
+# first emission; the original remaining/deadline checks still gate every
+# native effect, the final diagnostic preparation and the positive done/ACK
+# commit, so logging neither widens nor renews the attempt budget. Logging
+# never authorizes, retries or alters effects.
 STRICT_DIAG_LOGGER='agent_hub_host.wake_send.strict_diag'
 _STRICT_DIAG=logging.getLogger(STRICT_DIAG_LOGGER)
 _STRICT_DIAG.addHandler(logging.NullHandler())
@@ -87,17 +89,23 @@ def _strict_diag_worker():
         except Exception:pass  # A diagnostic sink failure never alters the guarded attempt.
 
 def _strict_diag_emit(line):
+    'The whole producer/startup path is guarded, nonblocking and drop-on-failure. Startup ownership is taken without waiting; the singleton marker is committed only after a successful start, so a refused first start leaves it unset and a later emission retries safely without ever spawning unbounded workers.'
     try:
         if _STRICT_DIAG_QUEUE.full():return  # Drop-on-full keeps the control path free of head-of-line blocking.
         _STRICT_DIAG_QUEUE.put_nowait(line)
+        if _STRICT_DIAG_WORKER_THREAD:return
+        if not _STRICT_DIAG_WORKER_LOCK.acquire(blocking=False):return  # Another emission owns startup; drop rather than wait behind it.
+        try:
+            if _STRICT_DIAG_WORKER_THREAD:return
+            worker=threading.Thread(target=_strict_diag_worker,name='wake-strict-diag',daemon=True)
+            worker.start()
+            _STRICT_DIAG_WORKER_THREAD.append(worker)  # Only a started worker becomes the singleton.
+        except Exception:
+            return  # A refused construction/start created no worker and never reaches the attempt.
+        finally:
+            _STRICT_DIAG_WORKER_LOCK.release()
     except Exception:
         return
-    if _STRICT_DIAG_WORKER_THREAD:return
-    with _STRICT_DIAG_WORKER_LOCK:
-        if _STRICT_DIAG_WORKER_THREAD:return
-        worker=threading.Thread(target=_strict_diag_worker,name='wake-strict-diag',daemon=True)
-        _STRICT_DIAG_WORKER_THREAD.append(worker)
-        worker.start()
 
 def _strict_diag_correlation(command):
     'Bounded opaque correlation for one strict attempt: the canonical command UUID when valid, else a truncated SHA256 over closed identity fields only. Never payload text, paths, environment or receipt content.'
@@ -130,9 +138,9 @@ def _strict_diag_record(correlation,attempt,category,phase,status=_ABSENT,reason
                 'submitted':_strict_diag_flag(submitted,submitted is not _ABSENT),
                 'replayed':_strict_diag_flag(replayed,replayed is not _ABSENT)}
         line='wake_strict_diag '+json.dumps(record,sort_keys=True,separators=(',',':'))
+        _strict_diag_emit(line)
     except Exception:
-        return  # All diagnostic construction is guarded; nothing here can alter the attempt.
-    _strict_diag_emit(line)
+        return  # All diagnostic construction and emission is guarded; nothing here can alter the attempt.
 
 
 def execute(bridge, command, digest):
@@ -465,5 +473,6 @@ def _execute_strict_locked(bridge,command,digest,phases,correlation,attempt,star
          landed=_strict_diag_receipt_field(receipt,'landed'),
          submitted=_strict_diag_receipt_field(receipt,'submitted'),
          replayed=_strict_diag_receipt_field(receipt,'replayed'))
+    remaining()  # The same captured budget re-gates the positive done/ACK commit after terminal diagnostic preparation; no renewal, no second input.
     with db: bridge.finish_command(identity,command,result)
     return result
