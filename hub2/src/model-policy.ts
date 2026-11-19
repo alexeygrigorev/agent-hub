@@ -47,6 +47,8 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
     || (engine === 'zai' && account !== 'zai-central'))
     return 'zai_picker_route_forbidden';
+  if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
+    return 'go_orin_picker_route_forbidden';
   if (/haiku/i.test(`${id} ${model}`)) return 'haiku_picker_route_forbidden';
   if (engine === 'claude' && !(
     CLAUDE_PICKER_MODELS.has(model) && candidate.effort === 'medium'

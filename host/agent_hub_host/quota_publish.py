@@ -15,8 +15,10 @@ from . import intake
 ACCOUNTS = {
     'claude': ('claude', 'claude'), 'codex': ('codex', 'codex'),
     'gemini': ('gemini', 'gemini'), 'grok': ('grok', 'grok'), 'copilot': ('copilot', 'copilot'),
-    'go': ('shared-go', 'go'), 'zai': ('zai-central', 'zai'),
+    'go': ('shared-go', 'go'), 'go-orin': ('go-orin', 'go'), 'zai': ('zai-central', 'zai'),
 }
+# Assistant-only accounts are tracked for quota visibility, never enabled for Hub coding-session routing.
+ASSISTANT_ONLY_ACCOUNTS = frozenset(('grok', 'go-orin'))
 VALID_MS = 15 * 60 * 1000
 # Concurrent sessions per account. Capacity 1 turned every second start into account_saturated,
 # which Hub reports as quota_unavailable even with headroom.
@@ -98,8 +100,14 @@ def publish(quse=None, request=intake.request, now_ms=None, enable=False):
         base = f'/api/accounts/{account}/api/account'
         current = request('GET', base)
         existing = current.get('account')
+        assistant_only = account in ASSISTANT_ONLY_ACCOUNTS
         grow = bool(existing) and (existing.get('capacity') or 0) < DEFAULT_CAPACITY
-        if not existing or grow or (enable and not existing.get('enabled')):
+        if assistant_only:
+            if not existing or grow or existing.get('enabled'):
+                request('PATCH', base, {'provider': provider, 'enabled': False,
+                                        'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),
+                                        'min_remaining': (existing or {}).get('min_remaining') or 0})
+        elif not existing or grow or (enable and not existing.get('enabled')):
             # Routable by default: pools Hub reports must be usable by engine pickers (model-roulette).
             request('PATCH', base, {'provider': provider, 'enabled': bool(existing.get('enabled')) if existing and not enable else True,
                                     'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),

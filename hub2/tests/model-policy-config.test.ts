@@ -58,6 +58,9 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'shared-zai'})), 'zai_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'})), null);
+  assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin'})), 'go_orin_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'go-orin', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'go-orin', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'haiku', effort: 'medium'})), 'haiku_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), null);
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'max'})), 'claude_picker_route_forbidden');
