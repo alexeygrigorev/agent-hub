@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 
-ACCOUNTS = frozenset(('claude', 'codex', 'codex-orin', 'gemini', 'grok', 'copilot', 'shared-go', 'zai-central'))
+ACCOUNTS = frozenset(('claude', 'codex', 'gemini', 'grok', 'copilot', 'shared-go', 'zai-central'))
 RECIPIENT = 'dev@dtcdev.click'
 MAX_STATE_BYTES = 65536
 DEFAULT_STALE_SECONDS = 840  # 14m + independent 5m cadence + bounded sink < 20m
@@ -217,10 +217,12 @@ def read_state(path, now):
             or not isinstance(data['accounts'], dict) or not isinstance(data['alerted'], list)
             or any(not isinstance(a, str) for a in data['alerted']) or len(data['alerted']) != len(set(data['alerted']))):
         raise Failure('state_invalid')
-    if any(account not in ACCOUNTS or type(at) is not int or at <= 0 or at > now + 5000 for account, at in data['accounts'].items()):
+    if any(not isinstance(account, str) or type(at) is not int or at <= 0 or at > now + 5000 for account, at in data['accounts'].items()):
         raise Failure('state_invalid')
-    if any(not isinstance(account, str) or account not in ACCOUNTS for account in data['alerted']):
-        raise Failure('state_invalid')
+    # Prune retired/removed accounts (e.g. codex-orin) without invalidating
+    # valid timestamps or triggering false alerts for active accounts.
+    data['accounts'] = {account: at for account, at in data['accounts'].items() if account in ACCOUNTS}
+    data['alerted'] = [account for account in data['alerted'] if account in ACCOUNTS]
     return data
 
 
