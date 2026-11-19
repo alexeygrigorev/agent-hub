@@ -61,6 +61,50 @@ STATE=/var/lib/agent-hub
 DB_DIR=$STATE/hub2-db
 CREDENTIAL_MONITOR_EVIDENCE_ROOT=$STATE/credential-monitor-evidence
 
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+REQUIRED_NODE_MAJOR=24
+
+# Fixed service runtime contract: agent-hub-hub2.service selects the absolute
+# /usr/bin/node, and the npm dependency build must run on the same major. The
+# runtime itself is provisioned by deploy/vm/provision-node24.sh through the
+# normal CI SSH path before any deployment mutation.
+node_runtime_major() {
+  local version
+  version="$("$1" --version)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\. ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+require_node24_runtime() {
+  local service_node path_node service_major path_major
+  service_node="${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-/usr/bin/node}"
+  [[ -x "$service_node" ]] \
+    || fail "Hub2 service runtime $service_node is missing; provision Node24 first (deploy/vm/provision-node24.sh through normal CI)"
+  service_major="$(node_runtime_major "$service_node")" \
+    || fail "Hub2 service runtime probe failed at $service_node"
+  [[ "$service_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "Hub2 service runtime at $service_node is Node $service_major, not Node24; provision Node24 before deploying (deploy/vm/provision-node24.sh)"
+  path_node="$(command -v node)" \
+    || fail "no node on PATH for the npm dependency build; the build toolchain must match the Node24 service runtime"
+  path_major="$(node_runtime_major "$path_node")" \
+    || fail "PATH node probe failed at $path_node"
+  [[ "$path_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "npm dependency build would run on Node $path_major ($path_node), not Node24; align the build runtime before deploying"
+  command -v npm >/dev/null 2>&1 \
+    || fail "npm is required to install release dependencies"
+  printf 'Node24 runtime check passed: service %s at %s, build Node %s at %s.\n' \
+    "$("$service_node" --version)" "$service_node" "$("$path_node" --version)" "$path_node"
+}
+
+# Direct-call guard: refuse BEFORE the first systemd unit, edge site, state
+# directory, CLI artifact or secret write. The transaction calls this installer
+# only after its own early guard and the CI provisioning step passed.
+require_node24_runtime
+
 echo "== systemd units"
 install -m 644 "$DEPLOY_DIR/agent-hub-hub2.service" /etc/systemd/system/agent-hub-hub2.service
 systemctl disable --now agent-hub-worker.service agent-hub-cron.timer agent-hub-cron.service 2>/dev/null || true

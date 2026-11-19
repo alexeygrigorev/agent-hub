@@ -54,6 +54,161 @@ fail() {
   exit 1
 }
 
+REQUIRED_NODE_MAJOR=24
+
+# Fixed service runtime contract: agent-hub-hub2.service selects the absolute
+# /usr/bin/node, and the npm dependency build must run on the same major. The
+# runtime itself is provisioned by deploy/vm/provision-node24.sh through the
+# normal CI SSH path before any deployment mutation.
+node_runtime_major() {
+  local version
+  version="$("$1" --version)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\. ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+require_node24_runtime() {
+  local service_node path_node service_major path_major
+  service_node="${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-/usr/bin/node}"
+  [[ -x "$service_node" ]] \
+    || fail "Hub2 service runtime $service_node is missing; provision Node24 first (deploy/vm/provision-node24.sh through normal CI)"
+  service_major="$(node_runtime_major "$service_node")" \
+    || fail "Hub2 service runtime probe failed at $service_node"
+  [[ "$service_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "Hub2 service runtime at $service_node is Node $service_major, not Node24; provision Node24 before deploying (deploy/vm/provision-node24.sh)"
+  path_node="$(command -v node)" \
+    || fail "no node on PATH for the npm dependency build; the build toolchain must match the Node24 service runtime"
+  path_major="$(node_runtime_major "$path_node")" \
+    || fail "PATH node probe failed at $path_node"
+  [[ "$path_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "npm dependency build would run on Node $path_major ($path_node), not Node24; align the build runtime before deploying"
+  command -v npm >/dev/null 2>&1 \
+    || fail "npm is required to install release dependencies"
+  printf 'Node24 runtime check passed: service %s at %s, build Node %s at %s.\n' \
+    "$("$service_node" --version)" "$service_node" "$("$path_node" --version)" "$path_node"
+}
+
+# Runs the CI-staged candidate provisioner inside this transaction's already
+# held deploy lock, so package provisioning and application effects share one
+# lock owner. The staged path is derived from the validated deploy SHA alone —
+# never an arbitrary argument — and re-validated here before execution. A
+# provisioning failure is an honest incident before any application mutation:
+# no transaction state exists yet, nothing to roll back, and the OS package
+# manager owns its own recovery.
+provision_node24_runtime() {
+  local deploy_sha="$1"
+  local staged="$TMPDIR/ci-node24-provision-$deploy_sha/provision-node24.sh"
+  local verified_dir verified_script rc=0
+  [[ -f "$staged" && ! -L "$staged" ]] \
+    || fail "the staged Node24 provisioner for $deploy_sha is missing or not a regular file at $staged; the deploy workflow must stage deploy/vm/provision-node24.sh over normal CI SSH first"
+  [[ "$(stat -c %u "$staged")" == "$EUID" ]] \
+    || fail "the staged Node24 provisioner is not owned by the invoking user; refusing untrusted provisioner bytes"
+  local mode
+  mode="$(stat -c %a "$staged")"
+  [[ $((8#$mode & 8#022)) == 0 ]] \
+    || fail "the staged Node24 provisioner is group/other writable ($mode); refusing untrusted provisioner bytes"
+  [[ "$(stat -c %s "$staged")" -le 262144 ]] \
+    || fail "the staged Node24 provisioner exceeds the bounded size; refusing untrusted provisioner bytes"
+
+  verified_dir="$(mktemp -d "$TMPDIR/ci-node24-verified.XXXXXXXX")"
+  chmod 700 "$verified_dir"
+  verified_script="$verified_dir/provision-node24.sh"
+  if ! python3 - "$REPO" "$deploy_sha" "$staged" "$verified_script" <<'PY'
+import hashlib, os, stat, subprocess, sys
+
+repo, deploy_sha, staged_path, verified_path = sys.argv[1:5]
+proc = subprocess.run(
+    ['git', '-C', repo, 'show', f'{deploy_sha}:deploy/vm/provision-node24.sh'],
+    capture_output=True,
+)
+if proc.returncode != 0:
+    print(f'ERROR: candidate {deploy_sha} has no deploy/vm/provision-node24.sh object', file=sys.stderr)
+    sys.exit(1)
+expected_bytes = proc.stdout
+if len(expected_bytes) > 262144:
+    print('ERROR: candidate provisioner exceeds the bounded size', file=sys.stderr)
+    sys.exit(1)
+expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+
+fd = os.open(staged_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or (info.st_mode & 0o022) != 0 or info.st_size > 262144:
+        print('ERROR: staged Node24 provisioner failed descriptor custody checks', file=sys.stderr)
+        sys.exit(1)
+    chunks = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    staged_bytes = b''.join(chunks)
+finally:
+    os.close(fd)
+
+staged_digest = hashlib.sha256(staged_bytes).hexdigest()
+if staged_digest != expected_digest:
+    print(
+        f'ERROR: staged Node24 provisioner digest {staged_digest} does not match candidate {deploy_sha} ({expected_digest}); refusing untrusted provisioner bytes',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+out_fd = os.open(verified_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    view = memoryview(staged_bytes)
+    written = 0
+    while written < len(staged_bytes):
+        n = os.write(out_fd, view[written:])
+        if n <= 0:
+            raise OSError('short or zero-progress write to verified provisioner copy')
+        written += n
+    os.fsync(out_fd)
+finally:
+    os.close(out_fd)
+
+rb_fd = os.open(verified_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    rb_info = os.fstat(rb_fd)
+    if not stat.S_ISREG(rb_info.st_mode) or rb_info.st_uid != os.getuid() or (rb_info.st_mode & 0o077) != 0:
+        print('ERROR: verified provisioner execution copy failed readback custody checks', file=sys.stderr)
+        sys.exit(1)
+    rb_chunks = []
+    while True:
+        chunk = os.read(rb_fd, 65536)
+        if not chunk:
+            break
+        rb_chunks.append(chunk)
+    readback_bytes = b''.join(rb_chunks)
+finally:
+    os.close(rb_fd)
+
+if len(readback_bytes) != len(expected_bytes) or hashlib.sha256(readback_bytes).hexdigest() != expected_digest:
+    print('ERROR: verified provisioner execution copy readback length or digest mismatch; refusing truncated/corrupt copy', file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    rm -rf -- "$verified_dir"
+    exit 1
+  fi
+
+  if ! bash -n "$verified_script"; then
+    rm -rf -- "$verified_dir"
+    fail "the staged Node24 provisioner does not parse"
+  fi
+  printf 'Node24 provision: running the staged candidate provisioner under this transaction deploy lock.\n'
+  # stdin is /dev/null so the child can never consume the transaction script
+  # bash is still streaming from stdin. fd 9 is kept open so the child proves
+  # genuine inherited open-file-description custody on the fixed lock inode.
+  AGENT_HUB_NODE24_LOCK_INHERITED="$TMPDIR/.deploy-transaction.lock" \
+    AGENT_HUB_NODE24_LOCK_FD=9 \
+    bash "$verified_script" </dev/null || rc=$?
+  rm -rf -- "$verified_dir"
+  if [[ "$rc" -ne 0 ]]; then
+    fail "Node24 runtime provisioning failed inside the deploy transaction; no application effect was performed and no automatic OS rollback exists (the package manager owns recovery)"
+  fi
+}
+
 validate_hub_caddyfile() {
   local config="$1"
   [[ -s "$config" ]] || return 1
@@ -413,6 +568,11 @@ restore_previous_release() {
       rollback --receipt "$TRANSACTION_DIR/cli-assets.json" --transaction-token "$publication_token" || return 1
   fi
 
+  # Rollback is code/config-only: it never provisions, downgrades or restores
+  # the OS Node runtime. CI provisioned Node24 before the transaction, so the
+  # restored release (and its own installer, when it carries the runtime
+  # guard) runs on the same provisioned Node24.
+  printf 'Rollback runtime note: keeping the installed OS Node runtime; application rollback never restores or downgrades /usr/bin/node.\n'
   printf 'Rolling Hub2 back to %s\n' "$previous_sha"
   git -C "$REPO" checkout --detach --force "$previous_sha" || return 1
   install_release_dependencies || return 1
@@ -482,7 +642,7 @@ restore_previous_release() {
 }
 
 apply_release() {
-  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" previous_sha local_status publication_token schema_mode
+  local deploy_sha="$1" release_mode="$2" caddy_mode="$3" cli_mode="$4" provision_arg="${5:-}" qualified_previous_sha="${6:-}" previous_sha local_status publication_token schema_mode
   local -a asset_args=()
   [[ "$deploy_sha" =~ ^[0-9a-f]{40}$ ]] || fail "deploy SHA must be a full lowercase Git commit SHA"
   [[ "$release_mode" == bootstrap || "$release_mode" == active ]] \
@@ -491,6 +651,12 @@ apply_release() {
     || fail "caddy mode must be full or hub-only"
   [[ "$cli_mode" == legacy || ( "$cli_mode" == matched-cli && "$release_mode" == active ) ]] \
     || fail "matched CLI publication requires an active deploy"
+  [[ "$provision_arg" == "" || "$provision_arg" == provision-node24 ]] \
+    || fail "the only optional trailing apply argument is provision-node24"
+  if [[ "$provision_arg" == provision-node24 || -n "$qualified_previous_sha" ]]; then
+    [[ "$qualified_previous_sha" =~ ^(none|[0-9a-f]{40})$ ]] \
+      || fail "qualified previous release SHA must be 'none' or a full lowercase Git commit SHA"
+  fi
   [[ -d "$REPO/.git" ]] || fail "Hub repository checkout is missing: $REPO"
   cd "$REPO" || fail "cannot enter Hub repository checkout: $REPO"
   [[ -f "$REPO/.dev.vars" ]] \
@@ -508,6 +674,12 @@ apply_release() {
   [[ -z "$local_status" ]] \
     || fail "refusing deployment because the VM checkout has uncommitted files"
 
+  previous_sha="$(git -C "$REPO" rev-parse HEAD)"
+  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
+  if [[ -n "$qualified_previous_sha" && "$qualified_previous_sha" != "$previous_sha" ]]; then
+    fail "current VM revision $previous_sha does not match the Node24-qualified previous release $qualified_previous_sha; refusing to provision or mutate before re-qualifying $previous_sha on Node24"
+  fi
+
   mkdir -p "$TMPDIR"
   chmod 750 "$TMPDIR"
   if [[ "$caddy_mode" == full ]]; then
@@ -518,8 +690,6 @@ apply_release() {
       || fail "candidate Hub site must validate and retain the Hub upstream"
   fi
 
-  previous_sha="$(git -C "$REPO" rev-parse HEAD)"
-  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail "current VM revision is not a full commit SHA"
   if [[ "$caddy_mode" == full ]]; then
     validate_shared_caddyfile || fail "shared Caddyfile must import /etc/caddy/sites/*.caddy; aws-infra owns that migration"
   fi
@@ -533,6 +703,24 @@ apply_release() {
     || fail "candidate cannot be safely rolled back against the current databases"
   [[ "$schema_mode" == defer || "$schema_mode" == apply ]] || fail "invalid schema preflight result"
   printf 'Schema rollback preflight passed; migration mode=%s.\n' "$schema_mode"
+
+  # Runtime phase, still under this transaction's single deploy lock, after
+  # all read-only Caddy/schema preconditions and before any candidate checkout,
+  # npm dependency mutation, transaction state or unit/config write. When CI
+  # passed the provision-node24 token, the staged candidate provisioner runs
+  # here so package and application effects share one lock owner; a competing
+  # transaction cannot acquire the lock between package verification and the
+  # app stage. The guard afterwards binds every later stage to the provisioned
+  # runtime. Existing schema-transaction fixtures run in test mode without a
+  # runtime fixture and without the token, so those paths stay unchanged.
+  if [[ "$provision_arg" == provision-node24 ]]; then
+    provision_node24_runtime "$deploy_sha"
+  fi
+  if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && -z "${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-}" ]]; then
+    printf 'Node24 runtime guard skipped: test mode without a AGENT_HUB_NODE24_TEST_SERVICE_NODE fixture.\n'
+  else
+    require_node24_runtime
+  fi
 
   run_root install -d -o root -g root -m 700 "$TRANSACTION_DIR"
   publication_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -708,8 +896,9 @@ if [[ "$operation" =~ ^(apply|publish|rollback|commit)$ ]]; then
 fi
 case "$operation" in
   apply)
-    [[ $# -ge 3 && $# -le 5 ]] || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only] [matched-cli]"
-    apply_release "$2" "$3" "${4:-full}" "${5:-legacy}"
+    [[ $# -ge 3 && $# -le 7 ]] \
+      || fail "usage: $0 apply <full-commit-sha> <bootstrap|active> [full|hub-only] [legacy|matched-cli] [provision-node24] [qualified-previous-sha|none]"
+    apply_release "$2" "$3" "${4:-full}" "${5:-legacy}" "${6:-}" "${7:-}"
     ;;
   rollback)
     [[ $# == 1 ]] || fail "usage: $0 rollback"
@@ -723,7 +912,16 @@ case "$operation" in
     [[ $# == 1 ]] || fail "usage: $0 commit"
     commit_release
     ;;
+  current-sha)
+    # Read-only deployed-release identity for the forward Node24
+    # compatibility probe. Takes no deploy lock: it never mutates anything.
+    [[ $# == 1 ]] || fail "usage: $0 current-sha"
+    [[ -d "$REPO/.git" ]] || { printf 'none\n'; exit 0; }
+    deployed_sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" || deployed_sha="none"
+    [[ "$deployed_sha" =~ ^[0-9a-f]{40}$ ]] || deployed_sha="none"
+    printf '%s\n' "$deployed_sha"
+    ;;
   *)
-    fail "operation must be apply, publish, rollback, or commit"
+    fail "operation must be apply, publish, rollback, commit, or current-sha"
     ;;
 esac
