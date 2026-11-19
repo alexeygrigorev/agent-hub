@@ -2402,6 +2402,178 @@ elif event in ('start', 'routing', 'enable'):
             enrollment.enroll(client, lambda *_: self.fail('must not save'), path,
                               [self.temporary.name], ['codex'], 'new-code')
 
+    def _expected_tuple(self, manifest=None):
+        m = manifest or self.manifest
+        return {
+            'expected_host_version': m['host_version'],
+            'expected_cli_sha256': m['artifacts']['hub.pyz']['sha256'],
+            'expected_updater_sha256': m['artifacts']['hub2-self-update.py']['sha256'],
+        }
+
+    def test_expected_tuple_rejects_partial_malformed_and_check_service_ready_cli(self):
+        tuple_kwargs = self._expected_tuple()
+        for bad_kwargs in (
+            {'expected_host_version': SHA},
+            {'expected_host_version': SHA, 'expected_cli_sha256': tuple_kwargs['expected_cli_sha256']},
+            {**tuple_kwargs, 'expected_host_version': 'not-40-hex'},
+            {**tuple_kwargs, 'expected_cli_sha256': 'A' * 64},
+            {**tuple_kwargs, 'expected_updater_sha256': '0' * 63},
+        ):
+            with self.assertRaises(ValueError):
+                updater.install('https://example.invalid', self.root, **bad_kwargs)
+        self.assertFalse(self.root.exists())
+
+        for bad_argv in (
+            ['--root', str(self.root), '--expected-host-version', SHA],
+            ['--root', str(self.root), '--check-service-ready',
+             '--expected-host-version', SHA,
+             '--expected-cli-sha256', tuple_kwargs['expected_cli_sha256'],
+             '--expected-updater-sha256', tuple_kwargs['expected_updater_sha256']],
+            ['--root', str(self.root),
+             '--expected-host-version', 'bad',
+             '--expected-cli-sha256', tuple_kwargs['expected_cli_sha256'],
+             '--expected-updater-sha256', tuple_kwargs['expected_updater_sha256']],
+        ):
+            with patch.object(sys, 'argv', ['hub2-self-update.py', *bad_argv]), \
+                 patch.object(updater, 'install', side_effect=AssertionError('install must not run')):
+                with self.assertRaises(SystemExit) as exc:
+                    updater.main()
+                self.assertEqual(exc.exception.code, 2)
+
+    def test_expected_tuple_under_lock_rejects_changed_manifest_busy_lock_and_backoff(self):
+        old = self.old_release()
+        tuple_kwargs = self._expected_tuple()
+
+        # 1. Busy update.lock refuses without mutating state.
+        lock_path = self.root / 'update.lock'
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock_fd)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with self.assertRaises(BlockingIOError):
+                self.install(install_service=True, **tuple_kwargs)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        self.assertEqual(self.calls, [])
+
+        # 2. Published manifest changed to OLD_SHA (with internally valid wheel metadata)
+        # under update.lock refuses BEFORE recover() or any mutation.
+        original_manifest = self.manifest
+        other_manifest = json.loads(json.dumps(original_manifest))
+        other_manifest['host_version'] = OLD_SHA
+        other_manifest['artifacts'][f'agent_hub_host_v2-2.0.0+g{OLD_SHA}-py3-none-any.whl'] = (
+            other_manifest['artifacts'].pop(HOST)
+        )
+        self.manifest = other_manifest
+        self.downloads.clear()
+        with patch.object(updater, 'recover', side_effect=AssertionError('recover must not run on mismatch')):
+            with self.assertRaisesRegex(ValueError, 'expected candidate tuple'):
+                self.install(install_service=True, **tuple_kwargs)
+        self.assertEqual(self.downloads, ['host-release.json'])
+        self.assertEqual((self.root / 'current').resolve(), old.resolve())
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+        self.assertEqual(self.calls, [])
+
+        # 3. Failed-version backoff is preserved and refuses install_service=True even with matching tuple.
+        self.manifest = original_manifest
+        updater.write_json(self.root / 'failed-releases.json', {SHA: {'count': 1, 'retry_at': time.time() + 300}})
+        with self.assertRaisesRegex(RuntimeError, 'activation backoff'):
+            self.install(install_service=True, **tuple_kwargs)
+        self.assertTrue((self.root / 'failed-releases.json').exists())
+
+    def test_expected_tuple_fresh_install_and_publication_change_during_prepare(self):
+        old = self.old_release()
+        tuple_kwargs = self._expected_tuple()
+        a00d = '/home/alexey/.local/lib/aplexer/releases/a00d4bdb69d1793a9738b893fb21f0001d4acc12/bin/aplexer'
+        dropin_dir = Path(self.temporary.name) / '.config/systemd/user/agent-hub2-host.service.d'
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / 'override.conf'
+        dropin.write_text(
+            f'[Service]\n# keep-comment\nEnvironment=FOO=bar\nExecStart=\n'
+            f'ExecStart=%h/host/current/bin/hub2 serve --aplexer {a00d}\n'
+        )
+        foreign_dropin = dropin_dir / 'foreign.conf'
+        foreign_text = f'[Service]\nExecStart=\nExecStart=/foreign/root/current/bin/hub2 serve --aplexer {a00d}\n'
+        foreign_dropin.write_text(foreign_text)
+
+        # 1. Publication change during prepare_environment refuses before switching current or restarting.
+        real_prepare = updater.prepare_environment
+        def mutating_prepare(target, download, manifest, host_wheel):
+            real_prepare(target, download, manifest, host_wheel)
+            self.manifest = {**self.manifest, 'host_version': OLD_SHA}
+
+        with patch.object(updater, 'prepare_environment', side_effect=mutating_prepare):
+            with self.assertRaisesRegex(ValueError, 'changed during candidate preparation'):
+                self.install(install_service=True, **tuple_kwargs)
+        self.assertEqual((self.root / 'current').resolve(), old.resolve())
+        self.assertFalse((self.root / 'releases' / SHA).exists())
+        self.assertFalse(any('restart' in call for call in self.calls))
+
+        # 2. Matching expected tuple succeeds through real install() and align_host_dropins preserves a00d + hub-only.
+        self.manifest = {**self.manifest, 'host_version': SHA}
+        (self.root / 'failed-releases.json').unlink(missing_ok=True)
+        self.install(install_service=True, **tuple_kwargs)
+        self.assertEqual((self.root / 'current').resolve(), (self.root / 'releases' / SHA).resolve())
+        self.assertEqual((self.root / 'updater.py').read_bytes(), self.files['hub2-self-update.py'])
+        self.assertEqual(
+            dropin.read_text(),
+            f'[Service]\n# keep-comment\nEnvironment=FOO=bar\nExecStart=\n'
+            f'ExecStart=%h/host/current/bin/hub host serve --aplexer {a00d}\n',
+        )
+        self.assertEqual(foreign_dropin.read_text(), foreign_text)
+
+    def test_expected_tuple_same_version_refuses_mismatch_and_repairs_matching(self):
+        tuple_kwargs = self._expected_tuple()
+        self.install(install_service=True, restart=False)
+        target = (self.root / 'current').resolve()
+        original_receipt = (target / 'release.json').read_bytes()
+
+        # Same-version: receipt with mismatched CLI sha refuses before repair/restart.
+        bad_receipt = json.loads(original_receipt.decode())
+        bad_receipt['artifacts']['hub.pyz']['sha256'] = 'f' * 64
+        updater.write_json(target / 'release.json', bad_receipt)
+        with patch.object(updater, 'repair_alert_client', side_effect=AssertionError('must not repair')):
+            with self.assertRaisesRegex(ValueError, 'installed release artifacts'):
+                self.install(install_service=True, **tuple_kwargs)
+
+        # Same-version: matching complete installed release + receipt succeeds through repair_service_files.
+        (target / 'release.json').write_bytes(original_receipt)
+        self.calls.clear()
+        self.install(install_service=True, **tuple_kwargs)
+        self.assertIn(['systemctl', '--user', 'daemon-reload'], self.calls)
+        self.assertIn(['systemctl', '--user', 'restart', updater.UNITS[0]], self.calls)
+        self.assertEqual((self.root / 'current').resolve(), target)
+
+    def test_expected_tuple_retained_activation_refuses_changed_publication_and_rolls_back(self):
+        tuple_kwargs = self._expected_tuple()
+        self.install(install_service=True, restart=False)
+        old = self.root / 'releases' / OLD_SHA
+        old.mkdir(parents=True)
+        updater.link(old, self.root / 'current')
+        self.status = {'machine_id': MACHINE, 'connected': True, 'host_version': SHA,
+                       'protocol_version': 1, 'version_mismatch': False}
+        fetch_count = 0
+        def changing_fetch(url, limit):
+            nonlocal fetch_count
+            if url.endswith('/host-release.json'):
+                fetch_count += 1
+                if fetch_count >= 2:
+                    return json.dumps({**self.manifest, 'host_version': OLD_SHA}).encode()
+            return self.fetch(url, limit)
+
+        with patch.object(updater, 'fetch', changing_fetch), \
+             patch.object(updater, 'command', self.command), \
+             patch.object(updater.time, 'sleep'), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.subprocess, 'run', self.status_command):
+            with self.assertRaisesRegex(ValueError, 'changed during retained activation'):
+                updater.install('https://example.invalid', self.root, install_service=True, **tuple_kwargs)
+        self.assertEqual(fetch_count, 2)
+        self.assertEqual((self.root / 'current').resolve(), old.resolve())
+        self.assertFalse((self.root / 'releases' / ('.retained-' + SHA)).exists())
+        self.assertFalse((self.root / 'retained-switch.json').exists())
+        self.assertTrue((self.root / 'releases' / SHA / 'release.json').is_file())
+
 
 def publication_bundle(directory, commit, label='fixture'):
     directory.mkdir()

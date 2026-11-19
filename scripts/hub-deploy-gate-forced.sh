@@ -23,13 +23,14 @@ if (($# != 0)); then
 fi
 
 ORIG_CMD="${SSH_ORIGINAL_COMMAND:-}"
-if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --candidate-cli-sha256\ ([0-9a-f]{64})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
+if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --candidate-cli-sha256\ ([0-9a-f]{64})\ --candidate-updater-sha256\ ([0-9a-f]{64})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
   emit_reject "forced_command" "invalid_forced_command" 2
 fi
 CANDIDATE_SHA="${BASH_REMATCH[1]}"
 CANDIDATE_CLI_SHA256="${BASH_REMATCH[2]}"
-RUN_TOKEN="${BASH_REMATCH[3]}"
-HELPER_SHA256="${BASH_REMATCH[4]}"
+CANDIDATE_UPDATER_SHA256="${BASH_REMATCH[3]}"
+RUN_TOKEN="${BASH_REMATCH[4]}"
+HELPER_SHA256="${BASH_REMATCH[5]}"
 
 USER_UID="$(/usr/bin/id -u)"
 USER_NAME="$(/usr/bin/id -un)"
@@ -72,5 +73,6 @@ exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S}s" \
   --deploy-gate \
   --candidate-sha "$CANDIDATE_SHA" \
   --candidate-cli-sha256 "$CANDIDATE_CLI_SHA256" \
+  --candidate-updater-sha256 "$CANDIDATE_UPDATER_SHA256" \
   --run-token "$RUN_TOKEN" \
   --helper-sha256 "$HELPER_SHA256"

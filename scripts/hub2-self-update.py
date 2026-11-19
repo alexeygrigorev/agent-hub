@@ -1681,15 +1681,47 @@ def timer_triggered(env, now):
     return 0 <= now - int(raw) / 1_000_000 <= TIMER_TRIGGER_FRESH_S
 
 
-def install(base_url, root, *, install_service=False, restart=True, scheduled=False):
+def validate_expected_tuple(expected_host_version, expected_cli_sha256, expected_updater_sha256):
+    values = (expected_host_version, expected_cli_sha256, expected_updater_sha256)
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise ValueError('expected candidate tuple must specify all three values or none')
+    if (not isinstance(expected_host_version, str) or not re.fullmatch(r'[0-9a-f]{40}', expected_host_version)
+            or not isinstance(expected_cli_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_cli_sha256)
+            or not isinstance(expected_updater_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_updater_sha256)):
+        raise ValueError('invalid expected candidate tuple format')
+    return expected_host_version, expected_cli_sha256, expected_updater_sha256
+
+
+def validate_expected_manifest(manifest, expected_tuple):
+    expected_host, expected_cli, expected_updater = expected_tuple
+    artifacts = manifest['artifacts']
+    if (manifest['host_version'] != expected_host
+            or artifacts['hub.pyz']['sha256'] != expected_cli
+            or artifacts['hub2-self-update.py']['sha256'] != expected_updater):
+        raise ValueError('published host release does not match expected candidate tuple')
+
+
+def install(base_url, root, *, install_service=False, restart=True, scheduled=False,
+            expected_host_version=None, expected_cli_sha256=None, expected_updater_sha256=None):
+    expected_tuple = validate_expected_tuple(
+        expected_host_version, expected_cli_sha256, expected_updater_sha256,
+    )
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with update_lock(root):
         base = base_url.rstrip('/') + '/cli/'
         releases = root / 'releases'
         releases.mkdir(exist_ok=True)
-        recover(root, releases)
-        manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
-        host_wheel = validate_manifest(manifest)
+        if expected_tuple is not None:
+            manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
+            host_wheel = validate_manifest(manifest)
+            validate_expected_manifest(manifest, expected_tuple)
+            recover(root, releases)
+        else:
+            recover(root, releases)
+            manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
+            host_wheel = validate_manifest(manifest)
         version = manifest['host_version']
         failures = root / 'failed-releases.json'
         record = json.loads(failures.read_text()).get(version, {}) if failures.exists() else {}
@@ -1710,6 +1742,16 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             if (installed['host_version'] != version
                     or installed['protocol_version'] != manifest['protocol_version']):
                 raise ValueError('installed release identity does not match the published manifest')
+            if expected_tuple is not None:
+                installed_artifacts = installed.get('artifacts') if isinstance(installed.get('artifacts'), dict) else {}
+                installed_cli = installed_artifacts.get('hub.pyz') if isinstance(installed_artifacts.get('hub.pyz'), dict) else {}
+                installed_upd = (installed_artifacts.get('hub2-self-update.py')
+                                 if isinstance(installed_artifacts.get('hub2-self-update.py'), dict) else {})
+                if (installed['host_version'] != expected_tuple[0]
+                        or installed_cli.get('sha256') != expected_tuple[1]
+                        or installed_upd.get('sha256') != expected_tuple[2]
+                        or not matches_installed_artifact(target / 'hub.pyz', manifest['artifacts']['hub.pyz'])):
+                    raise ValueError('installed release artifacts do not match expected candidate tuple')
             # Older updaters install the wheel's hub shim even for a release
             # containing this fix. Repair it on the next same-version check,
             # using the original receipt if a rebuild changed zipapp bytes.
@@ -1767,6 +1809,9 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
                 python = target / 'bin/python'
                 command([python, '-m', 'py_compile', download / 'hub2-self-update.py'])
                 command([python, download / 'hub2-self-update.py', '--help'])
+                if expected_tuple is not None:
+                    if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
+                        raise ValueError('published host release changed during candidate preparation')
                 # Preparation can take time: recheck just before switching.
                 # Returning here removes only our new unactivated environment.
                 if scheduled and restart and old and defer_activation(root, current, version):
@@ -1844,12 +1889,21 @@ def main():
     parser.add_argument('--base-url', default=os.environ.get('HUB_BASE_URL'))
     parser.add_argument('--root', type=Path, default=Path.home() / '.local/share/agent-hub2')
     parser.add_argument('--install-service', action='store_true', help='Install user units; enable after readiness when restarting')
+    parser.add_argument('--expected-host-version', default=None, help='40-hex expected candidate host_version for deploy-gate bootstrap')
+    parser.add_argument('--expected-cli-sha256', default=None, help='64-hex expected candidate hub.pyz SHA-256 for deploy-gate bootstrap')
+    parser.add_argument('--expected-updater-sha256', default=None, help='64-hex expected candidate hub2-self-update.py SHA-256 for deploy-gate bootstrap')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--no-restart', action='store_true', help='Stage initial installation before enrollment')
     mode.add_argument('--check-service-ready', action='store_true', help='Verify the started service is connected with its installed release')
     args = parser.parse_args()
-    if args.check_service_ready and args.install_service:
-        parser.error('--check-service-ready does not install a service')
+    expected_args = (args.expected_host_version, args.expected_cli_sha256, args.expected_updater_sha256)
+    if args.check_service_ready and (args.install_service or any(v is not None for v in expected_args)):
+        parser.error('--check-service-ready does not install a service or accept expected candidate flags')
+    if any(v is not None for v in expected_args):
+        try:
+            validate_expected_tuple(*expected_args)
+        except ValueError as exc:
+            parser.error(str(exc))
     try:
         if args.check_service_ready:
             check_service_ready(args.root / 'current')
@@ -1863,7 +1917,10 @@ def main():
         )
         install(base or 'https://hub.dtcdev.click', args.root.resolve(),
                 install_service=args.install_service, restart=not args.no_restart,
-                scheduled=scheduled)
+                scheduled=scheduled,
+                expected_host_version=args.expected_host_version,
+                expected_cli_sha256=args.expected_cli_sha256,
+                expected_updater_sha256=args.expected_updater_sha256)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
         return 1

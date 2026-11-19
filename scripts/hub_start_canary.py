@@ -4,7 +4,7 @@
 Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
 """
-import argparse, datetime, errno, fcntl, hashlib, ipaddress, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
+import argparse, base64, datetime, errno, fcntl, hashlib, ipaddress, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
 
 ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never orin@
 ALERT_FROM = "alerts@dtcdev.click"
@@ -93,6 +93,53 @@ HOST_UPDATER_TRIGGER_ARGV = (
     "--no-block",
     "agent-hub2-host-update.service",
 )
+# Trusted candidate CLI/updater publication origin.
+# Production is fixed to https://hub.dtcdev.click/cli; HUB_CANARY_CLI_BASE_URL
+# may only override with a loopback literal for hermetic offline tests.
+DEFAULT_CLI_BASE_URL = "https://hub.dtcdev.click/cli"
+CLI_FETCH_TIMEOUT_S = 20.0
+MAX_HOST_RELEASE_MANIFEST_BYTES = 1024 * 1024
+MAX_UPDATER_BYTES = 2 * 1024 * 1024
+CLI_FETCH_REASONS = frozenset(("http_status", "body_too_large", "timeout", "unreachable"))
+# Runs as `python3 -I -S -c CLI_FETCH_CHILD scheme host port req_path budget_s max_bytes`.
+CLI_FETCH_CHILD = r"""
+import base64, http.client, ssl, sys
+scheme, host, port, req_path, budget, max_bytes = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]), int(sys.argv[6])
+)
+def fetch():
+    port_num = int(port) if port else None
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port_num, timeout=budget, context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port_num, timeout=budget)
+    try:
+        conn.request("GET", req_path, headers={"Accept": "application/json, text/x-python", "User-Agent": "hub-start-canary"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None, "http_status"
+        body = b""
+        while len(body) <= max_bytes:
+            chunk = resp.read(max_bytes + 1 - len(body))
+            if not chunk:
+                break
+            body += chunk
+        if len(body) > max_bytes:
+            return None, "body_too_large"
+        return body, None
+    finally:
+        conn.close()
+try:
+    data, err = fetch()
+except TimeoutError:
+    data, err = None, "timeout"
+except Exception:
+    data, err = None, "unreachable"
+if err is not None:
+    sys.stdout.write(f"ERR:{err}\n")
+    sys.exit(1)
+sys.stdout.write(base64.b64encode(data).decode("ascii") + "\n")
+"""
 
 
 class StageFailure(Exception):
@@ -2374,6 +2421,7 @@ class Canary(PhysicalAdmission):
         deploy_gate=False,
         candidate_sha=None,
         candidate_cli_sha256=None,
+        candidate_updater_sha256=None,
         run_token=None,
         expected_helper_sha256=None,
     ):
@@ -2382,6 +2430,7 @@ class Canary(PhysicalAdmission):
         self.deploy_gate = bool(deploy_gate)
         self.candidate_sha = candidate_sha
         self.candidate_cli_sha256 = candidate_cli_sha256
+        self.candidate_updater_sha256 = candidate_updater_sha256
         self.run_token = run_token
         self.expected_helper_sha256 = expected_helper_sha256
         self.durable_pending_enabled = (not self.deploy_gate) or (self.candidate_sha is not None)
@@ -2392,6 +2441,7 @@ class Canary(PhysicalAdmission):
         self.host_updater_triggered = False
         self.host_updater_trigger = "not_needed"
         self.host_updater_trigger_error = None
+        self.host_updater_sha256 = None
         self.pyz_fd = None
         self.bridge_fd = None
         self.admission_hold = None
@@ -2828,10 +2878,137 @@ class Canary(PhysicalAdmission):
             return None, "host_updater_xdg_runtime_dir_not_private"
         return str(candidate), None
 
+    @staticmethod
+    def parse_cli_base_url(raw):
+        """Accept only https://hub.dtcdev.click or loopback-IP origins (offline tests) with path '' or '/cli'."""
+        try:
+            parts = urllib.parse.urlsplit(raw)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return None
+        if not host or parts.username is not None or parts.password is not None:
+            return None
+        if parts.query or parts.fragment or "@" in parts.netloc:
+            return None
+        norm_path = parts.path.rstrip("/")
+        if norm_path not in ("", "/cli"):
+            return None
+        if parts.scheme == "https" and parts.netloc == "hub.dtcdev.click" and port is None:
+            return parts.scheme, host, port, "https://hub.dtcdev.click", "/cli"
+        if parts.scheme not in ("http", "https"):
+            return None
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            return None
+        return parts.scheme, host, port, f"{parts.scheme}://{parts.netloc}", "/cli"
+
+    def fetch_cli_asset(self, target, filename, max_bytes, deadline, *, error_prefix):
+        scheme, host, port, _, cli_prefix = target
+        req_path = f"{cli_prefix}/{filename}"
+        remaining = deadline - time.monotonic()
+        if not self.in_cleanup and self.active_deadline is not None:
+            remaining = min(remaining, self.active_deadline - time.monotonic())
+        budget = min(CLI_FETCH_TIMEOUT_S, remaining)
+        if budget <= 0:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = f"{error_prefix}_timeout"
+            raise StageFailure("host_release", f"{error_prefix}_timeout")
+        argv = [
+            sys.executable, "-I", "-S", "-c", CLI_FETCH_CHILD,
+            scheme, host, "" if port is None else str(port),
+            req_path, f"{budget:.3f}", str(max_bytes),
+        ]
+        rc, out, _ = self.run(argv, timeout=budget, deadline=deadline)
+        if rc == 124:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = f"{error_prefix}_timeout"
+            raise StageFailure("host_release", f"{error_prefix}_timeout")
+        if rc != 0:
+            token = out.strip()
+            reason = token[4:] if token.startswith("ERR:") and token[4:] in CLI_FETCH_REASONS else "unreachable"
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"{error_prefix}_{reason}"
+            raise StageFailure("host_release", f"{error_prefix}_{reason}")
+        try:
+            return base64.b64decode(out.strip(), validate=True)
+        except ValueError:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"{error_prefix}_invalid"
+            raise StageFailure("host_release", f"{error_prefix}_invalid")
+
+    def fetch_and_verify_candidate_updater_manifest(self, target, deadline):
+        raw = self.fetch_cli_asset(
+            target, "host-release.json", MAX_HOST_RELEASE_MANIFEST_BYTES,
+            deadline, error_prefix="candidate_updater_manifest",
+        )
+        try:
+            manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_invalid"
+            raise StageFailure("host_release", "candidate_updater_manifest_invalid")
+        if not isinstance(manifest, dict) or manifest.get("host_version") != self.candidate_sha:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_version_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_version_mismatch")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, dict):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        pyz_rec = artifacts.get("hub.pyz")
+        if (
+            not isinstance(pyz_rec, dict)
+            or not isinstance(pyz_rec.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", pyz_rec["sha256"])
+            or not isinstance(pyz_rec.get("size"), int)
+            or isinstance(pyz_rec.get("size"), bool)
+            or pyz_rec["size"] <= 0
+        ):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        if self.candidate_cli_sha256 is not None and pyz_rec["sha256"] != self.candidate_cli_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_cli_sha_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_cli_sha_mismatch")
+        upd_rec = artifacts.get("hub2-self-update.py")
+        if (
+            not isinstance(upd_rec, dict)
+            or not isinstance(upd_rec.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", upd_rec["sha256"])
+            or not isinstance(upd_rec.get("size"), int)
+            or isinstance(upd_rec.get("size"), bool)
+            or not (1 <= upd_rec["size"] <= MAX_UPDATER_BYTES)
+        ):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        if self.candidate_updater_sha256 is None or upd_rec["sha256"] != self.candidate_updater_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_updater_sha_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_updater_sha_mismatch")
+        return upd_rec["sha256"], upd_rec["size"]
+
+    def read_matching_installed_updater(self, expected_sha, expected_size):
+        try:
+            data = read_regular_nofollow(self.host_release_root / "updater.py", max_bytes=MAX_UPDATER_BYTES)
+        except OSError:
+            return None
+        if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
+            return None
+        return data
+
     def trigger_host_updater(self, deadline):
         if self.host_updater_triggered:
             return
         self.host_updater_triggered = True
+        if not self.candidate_sha or not self.candidate_cli_sha256 or not self.candidate_updater_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_binding_missing"
+            raise StageFailure("host_release", "candidate_updater_binding_missing")
         effective_deadline = deadline
         if not self.in_cleanup and self.active_deadline is not None:
             effective_deadline = min(effective_deadline, self.active_deadline)
@@ -2844,18 +3021,75 @@ class Canary(PhysicalAdmission):
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = xdg_err
             return
+        target = self.parse_cli_base_url(os.environ.get("HUB_CANARY_CLI_BASE_URL") or DEFAULT_CLI_BASE_URL)
+        if target is None:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_url_invalid"
+            raise StageFailure("host_release", "candidate_updater_url_invalid")
+        expected_updater_sha, expected_updater_size = self.fetch_and_verify_candidate_updater_manifest(
+            target, effective_deadline,
+        )
+        self.host_updater_sha256 = expected_updater_sha
         updater_env = dict(os.environ)
         updater_env["XDG_RUNTIME_DIR"] = xdg_dir
-        rc, _, _ = self.run(list(HOST_UPDATER_TRIGGER_ARGV), deadline=deadline, env=updater_env)
+        updater_env.pop("HUB_BASE_URL", None)
+        updater_bytes = self.read_matching_installed_updater(expected_updater_sha, expected_updater_size)
+        if updater_bytes is not None:
+            trigger_mode = "triggered"
+            timeout_token = "host_updater_trigger_timeout"
+            exit_prefix = "host_updater_trigger_exit_"
+        else:
+            # Installed updater is missing or legacy (e.g. pre-unified hub-only): bootstrap
+            # using the verified candidate-approved updater before Host convergence.
+            updater_bytes = self.fetch_cli_asset(
+                target, "hub2-self-update.py", MAX_UPDATER_BYTES,
+                effective_deadline, error_prefix="candidate_updater_fetch",
+            )
+            if len(updater_bytes) != expected_updater_size or hashlib.sha256(updater_bytes).hexdigest() != expected_updater_sha:
+                self.host_updater_trigger = "failed"
+                self.host_updater_trigger_error = "candidate_updater_digest_mismatch"
+                raise StageFailure("host_release", "candidate_updater_digest_mismatch")
+            trigger_mode = "bootstrapped"
+            timeout_token = "candidate_updater_bootstrap_timeout"
+            exit_prefix = "candidate_updater_bootstrap_exit_"
+        try:
+            updater_fd = create_sealed_pyz_fd(updater_bytes)
+        except OSError:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_memfd_failed"
+            raise StageFailure("host_release", "candidate_updater_memfd_failed")
+        base_origin = target[3]
+        try:
+            rc, _, _ = self.run(
+                [
+                    sys.executable, "-I", f"/proc/self/fd/{updater_fd}",
+                    "--base-url", base_origin,
+                    "--root", str(self.host_release_root),
+                    "--install-service",
+                    "--expected-host-version", self.candidate_sha,
+                    "--expected-cli-sha256", self.candidate_cli_sha256,
+                    "--expected-updater-sha256", self.candidate_updater_sha256,
+                ],
+                deadline=effective_deadline,
+                env=updater_env,
+                pass_fd=updater_fd,
+            )
+        finally:
+            try:
+                os.close(updater_fd)
+            except OSError:
+                pass
         if rc == 0:
-            self.host_updater_trigger = "triggered"
+            self.host_updater_trigger = trigger_mode
             self.host_updater_trigger_error = None
         elif rc == 124:
             self.host_updater_trigger = "timeout"
-            self.host_updater_trigger_error = "host_updater_trigger_timeout"
+            self.host_updater_trigger_error = timeout_token
+            raise StageFailure("host_release", f"timeout_{timeout_token}")
         else:
             self.host_updater_trigger = "failed"
-            self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
+            self.host_updater_trigger_error = f"{exit_prefix}{rc}"
+            raise StageFailure("host_release", f"{exit_prefix}{rc}")
 
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
@@ -3730,6 +3964,8 @@ class Canary(PhysicalAdmission):
             result["host_updater_trigger"] = self.host_updater_trigger
             if self.host_updater_trigger_error is not None:
                 result["host_updater_trigger_error"] = self.host_updater_trigger_error
+            if self.host_updater_sha256 is not None:
+                result["host_updater_sha256"] = self.host_updater_sha256
         return result
 
 
@@ -3831,6 +4067,7 @@ def main():
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
     p.add_argument("--candidate-sha", default=None, help="40-hex candidate commit SHA for pre-commit deploy gate")
     p.add_argument("--candidate-cli-sha256", default=None, help="64-hex expected SHA-256 of the candidate hub.pyz")
+    p.add_argument("--candidate-updater-sha256", default=None, help="64-hex expected SHA-256 of the candidate hub2-self-update.py")
     p.add_argument("--run-token", default=None, help="32..64-hex run token binding the pre-commit deploy gate verdict")
     p.add_argument("--helper-sha256", default=None, help="64-hex expected SHA-256 of the installed canary helper bundle")
     p.add_argument("--print-helper-sha256", action="store_true", help="print canonical helper bundle SHA-256 and exit")
@@ -3838,7 +4075,8 @@ def main():
                    help="read-only preview of the physical admission (no quota, no start, no state); never authorizes a start")
     args = p.parse_args()
     if args.physical_admission_check:
-        if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha or args.candidate_cli_sha256
+        if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha
+                or args.candidate_cli_sha256 or args.candidate_updater_sha256
                 or args.run_token or args.helper_sha256):
             p.error("--physical-admission-check takes no other option")
         result = physical_admission_check()
@@ -3847,14 +4085,22 @@ def main():
     if args.print_helper_sha256:
         print(compute_helper_sha256())
         return 0
-    bound_args = (args.candidate_sha, args.candidate_cli_sha256, args.run_token, args.helper_sha256)
+    bound_args = (
+        args.candidate_sha,
+        args.candidate_cli_sha256,
+        args.candidate_updater_sha256,
+        args.run_token,
+        args.helper_sha256,
+    )
     if any(v is not None for v in bound_args):
         if not args.deploy_gate or not all(v is not None for v in bound_args):
-            p.error("--candidate-sha, --candidate-cli-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
+            p.error("--candidate-sha, --candidate-cli-sha256, --candidate-updater-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
         if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
             p.error("--candidate-sha must be a 40-character lowercase hex SHA")
         if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_cli_sha256):
             p.error("--candidate-cli-sha256 must be a 64-character lowercase hex SHA-256")
+        if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_updater_sha256):
+            p.error("--candidate-updater-sha256 must be a 64-character lowercase hex SHA-256")
         if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
             p.error("--run-token must be a 32..64-character lowercase hex token")
         if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
@@ -3867,6 +4113,7 @@ def main():
         deploy_gate=args.deploy_gate,
         candidate_sha=args.candidate_sha,
         candidate_cli_sha256=args.candidate_cli_sha256,
+        candidate_updater_sha256=args.candidate_updater_sha256,
         run_token=args.run_token,
         expected_helper_sha256=args.helper_sha256,
     ).execute()
