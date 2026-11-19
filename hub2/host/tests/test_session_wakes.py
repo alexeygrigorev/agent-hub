@@ -29,7 +29,7 @@ class StrictDiagTools:
         prefix='wake_strict_diag '
         return [json.loads(message[len(prefix):]) for message in records if message.startswith(prefix)]
     def diag(self,event,phase,**fields):
-        return {'event':event,'phase':phase,'status':fields.get('status','absent'),'reason':fields.get('reason','absent'),
+        return {'event':event,'phase':phase,'command':self.command['id'],'status':fields.get('status','absent'),'reason':fields.get('reason','absent'),
                 'mutation':fields.get('mutation','absent'),'landed':fields.get('landed','absent'),
                 'submitted':fields.get('submitted','absent'),'replayed':fields.get('replayed','absent')}
 class SessionWakeTests(unittest.TestCase):
@@ -338,14 +338,19 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         self.bridge.journal.db.execute('UPDATE launches SET interactive=0');self.bridge.journal.db.commit()
         with self.assertRaises(ValueError):self.invoke()
         forbidden=(self.command['text'],'--not-a-flag','--strict',NATIVE,ENVELOPE,self.temp.name,'foreign','untrusted','strict-submit:v1')
-        keys={'event','phase','status','reason','mutation','landed','submitted','replayed'}
+        keys={'event','phase','command','status','reason','mutation','landed','submitted','replayed'}
         count=0
         for message in records:
             self.assertTrue(message.startswith('wake_strict_diag '))
             payload=message[len('wake_strict_diag '):];record=json.loads(payload);count+=1
             self.assertEqual(set(record),keys)
-            for value in record.values():
-                self.assertIsInstance(value,str);self.assertIn(value,CLOSED_DIAG_VALUES)
+            for key,value in record.items():
+                self.assertIsInstance(value,str)
+                if key=='command':
+                    correlation=value==self.command['id'] or value=='unknown' or (len(value)==16 and all(c in '0123456789abcdef' for c in value))
+                    self.assertTrue(correlation)
+                else:
+                    self.assertIn(value,CLOSED_DIAG_VALUES)
             for raw in forbidden:self.assertNotIn(raw,payload)
         self.assertTrue(count>=4)
         events={json.loads(message[len('wake_strict_diag '):])['event'] for message in records}
@@ -354,6 +359,64 @@ print(json.dumps(r));raise SystemExit(0 if r['status']=='submitted_verified' els
         with mock.patch.object(logging.getLogger(wake_send.STRICT_DIAG_LOGGER),'info',side_effect=RuntimeError('sink_broken')):
             self.mode.write_text('busy')
             self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+
+    def test_records_bind_one_attempt_to_one_bounded_command_correlation(self):
+        records=self.capture();self.mode.write_text('busy')
+        self.assertEqual(self.invoke(),{'wake_pending':True,'transport':'strict-submit:v1'})
+        events=self.events(records)
+        self.assertTrue(len(events)>=3)
+        keys={'event','phase','command','status','reason','mutation','landed','submitted','replayed'}
+        for record in events:
+            self.assertEqual(set(record),keys)
+            self.assertEqual(record['command'],self.command['id'])
+            self.assertLessEqual(len(record['command']),36)
+    def test_malformed_command_ids_fall_back_to_stable_closed_digest(self):
+        base={'id':'22222222-3333-4444-8555-666666666666','kind':'send','wake':{'session_id':'s','operation_id':'op','epoch':1,
+              'native_id':NATIVE,'tag':'task-hub2-s','workspace':'/w','created_at_ms':1,'deadline_ms':2,'transport':'strict-submit:v1'}}
+        self.assertEqual(wake_send._strict_diag_correlation(base),base['id'])
+        leak='raw command id and text leak'
+        digest=wake_send._strict_diag_correlation(dict(base,id=leak))
+        self.assertEqual(len(digest),16);self.assertTrue(all(c in '0123456789abcdef' for c in digest))
+        self.assertNotIn('leak',digest)
+        self.assertEqual(digest,wake_send._strict_diag_correlation(dict(base,id=leak)))
+        self.assertNotEqual(digest,wake_send._strict_diag_correlation(dict(base,id='other leak')))
+        self.assertEqual(wake_send._strict_diag_correlation({'id':object(),'wake':base['wake']}),'unknown')
+        nondict=wake_send._strict_diag_correlation('nondict')
+        self.assertEqual(len(nondict),16);self.assertTrue(all(c in '0123456789abcdef' for c in nondict))
+        fallback=wake_send._strict_diag_correlation({'wake':'notadict'})
+        self.assertEqual(len(fallback),16)
+        records=self.capture();self.command['id']='not-a-canonical-uuid leak'
+        with self.assertRaisesRegex(ValueError,'invalid_command_id'):self.invoke()
+        self.assertEqual(self.events(records),[])
+        self.assertEqual(self.calls,[])
+        binding=self.command['wake']
+        direct={'id':'not-a-canonical-uuid leak','session_id':'s','kind':'send','text':'--not-a-flag',
+                'wake':dict(binding,transport='foreign')}
+        expected=hashlib.sha256(json.dumps([direct['id'],direct['kind'],binding['session_id'],binding['operation_id'],
+            binding['epoch'],binding['native_id'],binding['tag'],binding['workspace'],binding['created_at_ms'],
+            binding['deadline_ms'],'foreign'],ensure_ascii=True,separators=(',',':')).encode()).hexdigest()[:16]
+        records=self.capture()
+        with self.assertRaises(ValueError):wake_send.execute_strict(self.bridge,copy.deepcopy(direct),'d')
+        last=self.events(records)[-1]
+        self.assertEqual(last['event'],'validation_refused');self.assertEqual(last['phase'],'entry')
+        self.assertEqual(last['command'],expected)
+        records=self.capture()
+        with self.assertRaises(ValueError):wake_send.execute_strict(self.bridge,copy.deepcopy(direct),'d')
+        self.assertEqual(self.events(records)[-1]['command'],expected)
+    def test_diagnostic_sink_delay_cannot_widen_monotonic_budget(self):
+        records=self.capture();clock={'t':0.0};burned=[]
+        class Slow(logging.Handler):
+            def emit(self,record):
+                if not burned:burned.append(1);clock['t']+=35.0
+        logger=logging.getLogger(wake_send.STRICT_DIAG_LOGGER);slow=Slow();logger.addHandler(slow)
+        self.addCleanup(lambda:logger.removeHandler(slow))
+        with mock.patch.object(wake_send.time,'monotonic',lambda:clock['t']):
+            self.mode.write_text('busy')
+            with self.assertRaisesRegex(RuntimeError,'wake_deadline_exceeded'):self.invoke()
+        self.assertEqual(burned,[1])
+        self.assertEqual(self.calls,[])
+        last=self.events(records)[-1]
+        self.assertEqual(last['event'],'deadline_exceeded');self.assertEqual(last['command'],self.command['id'])
 
 class StrictInboxWakeTests(StrictDiagTools, unittest.TestCase):
     invoke = SessionWakeTests.invoke
@@ -441,6 +504,7 @@ class StrictInboxWakeTests(StrictDiagTools, unittest.TestCase):
         events=self.events(records)
         self.assertEqual([e['event'] for e in events],['attempt_start','mutation_committed','envelope_stored',
             'envelope_verified','submit_attempted','envelope_verified','submit_verified'])
+        self.assertTrue(all(e['command']==self.command['id'] for e in events))
         self.assertEqual(events[-1],self.diag('submit_verified',phase='terminal',status='submitted_verified',
             reason='submission_observed',mutation='true',landed='true',submitted='true'))
         self.assertEqual(result['wake_proof']['kind'],'strict_inbox_notice_v1')
