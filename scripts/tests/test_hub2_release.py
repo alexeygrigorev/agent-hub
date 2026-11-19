@@ -2952,7 +2952,7 @@ class FixtureDiscoveryContractTests(unittest.TestCase):
     every named test stays collected with working addCleanup/assertions,
     and the collected counts stay at the exactly audited numbers."""
 
-    EXPECTED_TEST_COUNTS = {'ReleaseTests': 96, 'HostDropinAlignmentTests': 16}
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 101, 'HostDropinAlignmentTests': 16}
 
     def test_guarded_classes_remain_unittest_test_cases(self):
         for name in self.EXPECTED_TEST_COUNTS:
