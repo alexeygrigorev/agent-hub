@@ -2170,21 +2170,21 @@ export class ProjectDO {
     return depth;
   }
   /** Terminal retry state, written CAS-style so the scan stops selecting the
-   * intake; `alert` escalates to the developer exactly once per intake. */
+   * intake; `alert` escalates to the developer exactly once per intake. All
+   * writes, including the alert's journal events, live in one transaction. */
   private markRetryTerminal(row:FailedRetryRow,state:string,now:number,why:{cause:string;blocker?:TaskBlocker},alert?:string):void{
-    const applied=this.transaction(()=>{
+    this.transaction(()=>{
       const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
-      if(!current||current.status!=='failed'||current.session_id!==row.session_id)return false;
+      if(!current||current.status!=='failed'||current.session_id!==row.session_id)return;
       const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
       const marker=evidence.auto_retry as JsonRecord|undefined;
-      if(marker?.state==='terminal')return true;
-      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+      if(marker?.state==='terminal')return;
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
         JSON.stringify({state:'terminal',reason:state,...(marker?.tries!==undefined?{tries:marker.tries}:{}),...(why.blocker?{blocker_cause:why.blocker.cause}:{})}),now,row.id);
       this.appendEvent(row.id,'retry-terminal:'+row.session_id,RETRY_ACTOR,'task_retry_terminal',
         {session_id:row.session_id,state,...(why.cause?{cause:why.cause}:{}),...(why.blocker?{blocker:why.blocker}:{})},now);
-      return true;
+      if(alert)this.raiseDeveloperAlert(row.id,row.session_id,alert,state,this.retryDepth(row.id),now,why,row.id);
     });
-    if(applied&&alert)this.raiseDeveloperAlert(row.id,row.session_id,alert,state,this.retryDepth(row.id),now,why,row.id);
   }
   /** Bounded, durable retry of failed intakes Hub owns itself, driven by the
    * project alarm: backoff from the failure, route/machine fallback on repeat
@@ -2225,7 +2225,7 @@ export class ProjectDO {
       const marker=(evidence.auto_retry as JsonRecord|undefined)??{};
       if(marker.attempt===attempt&&marker.snapshot_seq!==undefined)return marker;
       const next={...marker,attempt,snapshot_seq:this.latestSeq(row.id)};
-      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
         JSON.stringify(next),now,row.id);
       return next;
     });
@@ -2269,18 +2269,19 @@ export class ProjectDO {
     }
     const tries=Number((fixed as JsonRecord).tries??0)+1,terminal=outcome.state==='refused'||tries>=MAX_RETRY_START_TRIES;
     const terminalReason=outcome.state==='refused'?'retry_start_refused':'retry_start_failed';
-    const alerted=this.transaction(()=>{
+    this.transaction(()=>{
       const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
-      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return false;
+      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return;
       const next={...fixed,tries,...(terminal?{state:'terminal',reason:terminalReason}:{next_action_at:Date.now()+retryDelay(tries),last_reason:(outcome.reason??'retry_start_uncertain').slice(0,100)})};
-      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
         JSON.stringify(next),Date.now(),row.id);
-      if(terminal)this.appendEvent(row.id,'retry-terminal:'+sagaSession,RETRY_ACTOR,'task_retry_terminal',
-        {session_id:sagaSession,state:'terminal',reason:terminalReason,last_reason:outcome.reason??null,tries},Date.now());
-      return true;
+      if(terminal){
+        this.appendEvent(row.id,'retry-terminal:'+sagaSession,RETRY_ACTOR,'task_retry_terminal',
+          {session_id:sagaSession,state:'terminal',reason:terminalReason,last_reason:outcome.reason??null,tries},Date.now());
+        this.raiseDeveloperAlert(row.id,sagaSession,outcome.state==='refused'?'retry_start_refused':'retry_start_failed',
+          outcome.reason??terminalReason,this.retryDepth(row.id),Date.now(),{cause:outcome.reason??terminalReason},row.id);
+      }
     });
-    if(alerted&&terminal)this.raiseDeveloperAlert(row.id,sagaSession,outcome.state==='refused'?'retry_start_refused':'retry_start_failed',
-      outcome.reason??terminalReason,this.retryDepth(row.id),Date.now(),{cause:outcome.reason??terminalReason},row.id);
   }
   private async scheduleHasActiveSession(scheduleId:string):Promise<boolean>{
     return !!this.db.one("SELECT id FROM intakes WHERE schedule_id=? AND status IN ('queued','running') LIMIT 1",scheduleId);

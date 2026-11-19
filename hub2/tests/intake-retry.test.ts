@@ -24,6 +24,7 @@ function fixture(){
   let control:ControlDO,sql:NodeSqlStorage,project:ProjectDO;
   const reservations:any[]=[],mail:any[]=[],pickerDraws:any[]=[];
   const directoryMachines=['m1','m2'],connectedMachines=new Set(['m1','m2']);
+  let capDenials=0;
   const namespace=(handle:(id:string,request:Request)=>Promise<Response>)=>({idFromName:(id:string)=>id,
     get:(id:string)=>({fetch:(input:string|Request,init?:RequestInit)=>handle(id,input instanceof Request?input:new Request(input,init))})});
   const env:any={
@@ -31,6 +32,7 @@ function fixture(){
       const path=new URL(r.url).pathname;
       if(path==='/api/directory')return Response.json({items:directoryMachines.map(id=>({id})),next:null});
       if(path==='/_routing-policy')return Response.json({version:1,candidates});
+      if(path==='/_internal/session-cap/check'&&capDenials>0){capDenials--;return Response.json({error:'active_session_limit'},{status:429});}
       if(path==='/_internal/picker/draw'){pickerDraws.push(await r.clone().json());return control.fetch(r);}
       return Response.json({registered:true,accepted:true});
     }),
@@ -59,6 +61,7 @@ function fixture(){
   const db=()=>(project as any).db;
   return {call,reservations,mail,pickerDraws,db,get project(){return project;},
     setConnected(id:string,on:boolean){if(on)connectedMachines.add(id);else connectedMachines.delete(id);},
+    denyCapacity(n:number){capDenials=n;},
     reopen(){sql.close();open();},close(){sql.close();controlSql.close();rmSync(directory,{recursive:true});}};
 }
 type F=ReturnType<typeof fixture>;
@@ -109,6 +112,8 @@ async function startManaged(f:F,id:string,key:string,engine='codex',model='gpt-6
 
 test('a failed shell session is retried on another machine, bounded, then escalates loudly',async()=>{
   const f=fixture();
+  const alarmErrors:string[]=[],originalConsoleError=console.error;
+  console.error=(...parts:unknown[])=>{const line=parts.map(String).join(' ');alarmErrors.push(line);originalConsoleError(...parts);};
   try{
     const id=await createIntake(f,'shell-retry-bound');
     const started=await startShell(f,id,'k1');
@@ -156,11 +161,15 @@ test('a failed shell session is retried on another machine, bounded, then escala
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='retry_exhausted');
     assert.equal(alerts.length,1,'the escalation is raised exactly once');
     assert.equal(alerts[0].body.session_id,b3.session_id);
+    const owner=events(f,id).filter(e=>e.kind==='intake_context_updated').at(-1);
+    assert.equal(owner?.body.owner,'dev@dtcdev.click','the escalation names the developer owner');
+    assert(alarmErrors.every(line=>!line.includes('project alarm failed')),'the alarm never throws during retries');
+    assert(events(f,id).some(e=>e.kind==='task_retry_terminal'&&e.body.state==='retry_exhausted'));
 
     f.reopen();
     await f.project.alarm();
     assert.equal(sagas(f,id).length,3,'the terminal marker survives a restart');
-  }finally{f.close();}
+  }finally{console.error=originalConsoleError;f.close();}
 });
 
 test('an operator stop is never retried by the retry pass',async()=>{
@@ -293,5 +302,51 @@ test('a legacy uncontrolled failure retries, then falls back to another routing 
     assert.equal(e2?.body.attempt,2);
     assert.equal(e2?.body.route_fallback,true);
     assert.equal(draw2.input.machine_id,undefined,'the fallback attempt stays free to move machines');
+  }finally{f.close();}
+});
+
+test('uncertain retry starts back off and terminate bounded with an alert',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'shell-cap-denied');
+    const started=await startShell(f,id,'k1');
+    assert.equal(started.status,201);
+    const b=await run(f,id);
+    await finish(f,b,2);
+    f.denyCapacity(3);
+    age(f,id,61_000);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'a 429 start is deferred, not refused');
+    assert.equal(evidence(f,id).auto_retry.tries,1);
+    assert.equal(evidence(f,id).auto_retry.last_reason,'active_session_limit');
+    age(f,id,61_000);
+    await f.project.alarm();
+    assert.equal(evidence(f,id).auto_retry.tries,2);
+    age(f,id,241_000);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'no session ever started');
+    const marker=evidence(f,id).auto_retry;
+    assert.equal(marker.state,'terminal');
+    assert.equal(marker.reason,'retry_start_failed');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='retry_start_failed').length,1);
+    const owner=events(f,id).filter(e=>e.kind==='intake_context_updated').at(-1);
+    assert.equal(owner?.body.owner,'dev@dtcdev.click');
+  }finally{f.close();}
+});
+
+test('a shell retry reuses the failed machine when no other host is connected',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'shell-single-host');
+    const started=await startShell(f,id,'k1');
+    assert.equal(started.status,201);
+    const b=await run(f,id);
+    assert.equal(activeSaga(f,id).machine_id,'m1');
+    await finish(f,b,2);
+    f.setConnected('m2',false);
+    age(f,id,61_000);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'the retry still starts');
+    assert.equal(activeSaga(f,id).machine_id,'m1','the only connected host is reused despite the exclusion');
   }finally{f.close();}
 });
