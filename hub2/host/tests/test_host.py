@@ -1753,7 +1753,17 @@ class HostTests(unittest.TestCase):
 
     def test_expired_dispatch_permit_refuses_spawn_and_keeps_uncertain_custody(self):
         self.exact_headroom(4096)
-        with patch.object(resource_admission, 'PERMIT_WINDOW_SECONDS', 0):
+        # The committed permit's original deadline is already past when the
+        # launcher re-checks it: no fresh window starts after the census or
+        # the sample, and the read-only refusal keeps marker-1 custody held.
+        import time as _time
+        real_permit = resource_admission.DispatchPermit
+
+        def expired_permit(operation_id, session_id, epoch, permit_deadline):
+            return real_permit(operation_id, session_id, epoch,
+                               permit_deadline=_time.monotonic() - 1)
+
+        with patch.object(resource_admission, 'DispatchPermit', expired_permit):
             with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
                 self.bridge.offer(self.offer())
         self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
