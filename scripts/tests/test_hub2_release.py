@@ -3641,5 +3641,87 @@ class HostInstallRetirementTests(unittest.TestCase):
         self.assertEqual(keep.read_text(), '#!/bin/sh\necho own tool\n')
 
 
+class UpdaterHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / 'agent-hub2'
+
+    def _manifest(self, updater_bytes):
+        sha = hashlib.sha256(updater_bytes).hexdigest()
+        wheel_name = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
+        return {
+            'schema_version': 1,
+            'host_version': SHA,
+            'protocol_version': 1,
+            'python_requires': '>=3.11',
+            'artifacts': {
+                wheel_name: {'sha256': '0' * 64, 'size': 1},
+                'websockets-16.0-py3-none-any.whl': {'sha256': '0' * 64, 'size': 1},
+                'hub.pyz': {'sha256': '0' * 64, 'size': 1},
+                'hub2-enroll.py': {'sha256': '0' * 64, 'size': 1},
+                'host-install.sh': {'sha256': '0' * 64, 'size': 1},
+                'hub2-self-update.py': {'sha256': sha, 'size': len(updater_bytes)},
+                'agent-hub2-host.service': {'sha256': '0' * 64, 'size': 1},
+                'agent-hub2-host-update.service': {'sha256': '0' * 64, 'size': 1},
+                'agent-hub2-host-update.timer': {'sha256': '0' * 64, 'size': 1},
+            },
+        }
+
+    def test_main_hands_off_to_verified_candidate_updater_before_install(self):
+        candidate_bytes = (
+            b'import json, pathlib, sys\n'
+            b'if "--help" in sys.argv[1:]:\n'
+            b'    raise SystemExit(0)\n'
+            b'out = pathlib.Path(sys.argv[sys.argv.index("--root") + 1]) / "handoff-seen.json"\n'
+            b'out.write_text(json.dumps(sys.argv[1:]))\n'
+        )
+        manifest = self._manifest(candidate_bytes)
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+            'https://example.test/cli/hub2-self-update.py': candidate_bytes,
+        }
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            rc = updater.main(['--base-url', 'https://example.test', '--root', str(self.root), '--no-restart'])
+        self.assertEqual(rc, 0)
+        seen = json.loads((self.root / 'handoff-seen.json').read_text())
+        self.assertEqual(seen, ['--no-handoff', '--base-url', 'https://example.test',
+                                '--root', str(self.root), '--no-restart'])
+        self.assertFalse((self.root / 'updater.py').exists())
+
+    def test_main_skips_handoff_when_updater_matches_or_no_handoff_passed(self):
+        current_bytes = Path(updater.__file__).read_bytes()
+        manifest = self._manifest(current_bytes)
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+        }
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]):
+            self.assertIsNone(updater.maybe_handoff_updater('https://example.test', self.root, ['--no-restart']))
+
+        seen = []
+        def fake_install(*args, **kwargs):
+            seen.append(updater.HANDOFF_ARGV.get())
+        with patch.object(updater, 'install', fake_install), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            self.assertEqual(updater.main(['--no-handoff', '--base-url', 'https://example.test',
+                                           '--root', str(self.root)]), 0)
+        self.assertEqual(seen, [None])
+
+    def test_main_logs_exception_type_on_failure(self):
+        manifest = self._manifest(b'print("candidate")\n')
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+            'https://example.test/cli/hub2-self-update.py': b'tampered\n',
+        }
+        stderr = io.StringIO()
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             contextlib.redirect_stderr(stderr):
+            rc = updater.main(['--base-url', 'https://example.test', '--root', str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertIn('Hub2 release update failed (ValueError)', stderr.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -1681,8 +1681,48 @@ def timer_triggered(env, now):
     return 0 <= now - int(raw) / 1_000_000 <= TIMER_TRIGGER_FRESH_S
 
 
+HANDOFF_ARGV = ContextVar('handoff_argv', default=None)
+
+
+def maybe_handoff_updater(base_url, root, argv):
+    """Run the verified candidate updater before prepare_environment when it differs."""
+    base = base_url.rstrip('/') + '/cli/'
+    manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
+    validate_manifest(manifest)
+    version = manifest['host_version']
+    failures = root / 'failed-releases.json'
+    record = json.loads(failures.read_text()).get(version, {}) if failures.exists() else {}
+    if record.get('retry_at', 0) > time.time():
+        return None
+    current = root / 'current'
+    old = current.resolve(strict=True) if current.is_symlink() else None
+    target = root / 'releases' / version
+    if old == target and (target / 'release.json').is_file():
+        return None
+    updater_record = manifest['artifacts']['hub2-self-update.py']
+    if matches_installed_artifact(Path(__file__), updater_record):
+        return None
+    scratch = root / 'tmp'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='updater-handoff-', dir=scratch) as temporary:
+        candidate = Path(temporary) / 'hub2-self-update.py'
+        candidate.write_bytes(verified_artifact(base, 'hub2-self-update.py', updater_record))
+        candidate.chmod(0o700)
+        command([sys.executable, '-m', 'py_compile', candidate])
+        command([sys.executable, candidate, '--help'])
+        result = subprocess.run([sys.executable, str(candidate), '--no-handoff', *argv])
+        return result.returncode
+
+
 def install(base_url, root, *, install_service=False, restart=True, scheduled=False):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handoff_argv = HANDOFF_ARGV.get()
+    if handoff_argv is not None:
+        handed_off = maybe_handoff_updater(base_url, root, handoff_argv)
+        if handed_off is not None:
+            if handed_off != 0:
+                raise RuntimeError(f'candidate updater exited with status {handed_off}')
+            return
     with update_lock(root):
         base = base_url.rstrip('/') + '/cli/'
         releases = root / 'releases'
@@ -1839,15 +1879,17 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         print('Activated Hub2 release: ' + version)
 
 
-def main():
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', default=os.environ.get('HUB_BASE_URL'))
     parser.add_argument('--root', type=Path, default=Path.home() / '.local/share/agent-hub2')
     parser.add_argument('--install-service', action='store_true', help='Install user units; enable after readiness when restarting')
+    parser.add_argument('--no-handoff', action='store_true', help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--no-restart', action='store_true', help='Stage initial installation before enrollment')
     mode.add_argument('--check-service-ready', action='store_true', help='Verify the started service is connected with its installed release')
-    args = parser.parse_args()
+    args = parser.parse_args(raw_argv)
     if args.check_service_ready and args.install_service:
         parser.error('--check-service-ready does not install a service')
     try:
@@ -1861,11 +1903,16 @@ def main():
             and not args.no_restart
             and timer_triggered(os.environ, time.time())
         )
-        install(base or 'https://hub.dtcdev.click', args.root.resolve(),
-                install_service=args.install_service, restart=not args.no_restart,
-                scheduled=scheduled)
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
-        print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
+        token = HANDOFF_ARGV.set(None if args.no_handoff else raw_argv)
+        try:
+            install(base or 'https://hub.dtcdev.click', args.root.resolve(),
+                    install_service=args.install_service, restart=not args.no_restart,
+                    scheduled=scheduled)
+        finally:
+            HANDOFF_ARGV.reset(token)
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f'Hub2 release update failed ({type(exc).__name__}); inspect the current release and retry. No credentials logged.',
+              file=sys.stderr)
         return 1
     return 0
 
