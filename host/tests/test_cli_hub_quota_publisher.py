@@ -209,6 +209,37 @@ sys.exit(1 if cfg.get('sink_failure') else 0)
         finally:
             if child.poll() is None: child.kill(); child.communicate()
 
+    def test_retired_account_in_state_is_pruned_without_false_alert(self):
+        now = int(time.time() * 1000)
+        self.state.write_text(json.dumps({
+            'version': 1,
+            'accounts': {'gemini': now - 10_000, 'zai-central': now - 10_000, 'codex-orin': 1000},
+            'alerted': ['codex-orin'],
+        }))
+        self.state.chmod(0o600)
+        rc, result = self.invoke(check=True)
+        self.assertEqual(rc, 0, result)
+        self.assertEqual(result['status'], 'fresh')
+        self.assertEqual(result['accounts'], [])
+        self.assertFalse(result['alert_sent'])
+        self.assertEqual(self.alerts(), [])
+        saved = self.read()
+        self.assertNotIn('codex-orin', saved['accounts'])
+        self.assertEqual(saved['alerted'], [])
+        # Publish also preserves active timestamps and prunes retired accounts.
+        self.state.write_text(json.dumps({
+            'version': 1,
+            'accounts': {'gemini': now - 10_000, 'codex-orin': 1000},
+            'alerted': ['codex-orin'],
+        }))
+        self.state.chmod(0o600)
+        self.config(receipt={'published': ['zai-central'], 'skipped': {}})
+        rc, pub = self.invoke()
+        self.assertEqual(rc, 0, pub)
+        saved = self.read()
+        self.assertEqual(set(saved['accounts']), {'gemini', 'zai-central'})
+        self.assertEqual(saved['alerted'], [])
+
     def test_state_symlink_and_nonprivate_state_cannot_claim_freshness(self):
         outside = self.home / 'unrelated-data'
         outside.write_text('SECRET unrelated data')
@@ -674,6 +705,9 @@ class HealthTests(unittest.TestCase):
 
 class ContractTests(unittest.TestCase):
     def test_config_bounds_and_known_default_accounts(self):
+        from agent_hub_host import quota_publish
+        self.assertEqual(helper.ACCOUNTS, frozenset(account for account, _provider in quota_publish.ACCOUNTS.values()))
+        self.assertNotIn('codex-orin', helper.ACCOUNTS)
         self.assertTrue({'gemini', 'zai-central'}.issubset(helper.ACCOUNTS))
         for raw in ('', 'gemini,gemini', 'gemini,unknown', '../bad', 'Gemini'):
             with self.assertRaises(Exception): helper.account_set(raw)
