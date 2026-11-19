@@ -360,6 +360,35 @@ def _process_cwd(pid):
         return None
 
 
+_SESSION_ENV_ENTRY = b'APLEXER_SESSION_ID='
+_ENVIRON_MAX_BYTES = 65536
+
+
+def _process_session_binding(pid, native_id, read=None):
+    """Exact bound incarnation anchor: the pid carries THIS native session id.
+
+    The workload pid's kernel environment must contain the exact
+    APLEXER_SESSION_ID entry equal to the bound native UUID, so a recycled
+    pid can never inherit another attempt's credit. Oversized, unreadable or
+    missing evidence refuses the binding (no tolerance, no inference); the
+    Linux-only anchor conservatively holds on platforms without it."""
+    if sys.platform == 'win32':
+        return False  # no exact pid-environment anchor: conservative hold
+    if read is None:
+        read = _bounded_read
+    try:
+        raw = read(f'/proc/{pid}/environ')
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > _ENVIRON_MAX_BYTES:
+        return False
+    expected = _SESSION_ENV_ENTRY + native_id.strip().lower().encode('ascii')
+    for entry in bytes(raw).split(b'\0'):
+        if entry.startswith(_SESSION_ENV_ENTRY):
+            return entry == expected
+    return False
+
+
 def _process_alive(pid):
     """Liveness revalidation at the final boundary; failures refuse."""
     if sys.platform == 'win32':
@@ -505,6 +534,7 @@ def _mature_resident(row, residents, credited, now_ms, read=None):
     if (not isinstance(kernel_birth, int)
             or abs(kernel_birth - birth) > MATURE_BIRTH_TOLERANCE_MS
             or not _process_cwd_is_bound(pid, row['workspace'])
+            or not _process_session_binding(pid, native_id)
             or _process_alive(pid) is not True):
         return False
     credited.add(key)
