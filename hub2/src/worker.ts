@@ -93,6 +93,10 @@ const router = {
         return control.fetch(await forwardRequest(request, CONTROL + '/_auth/me'));
       }
       if (path === '/api/resource-settings') return resourceSettings(request, env, actor);
+      // GrokBot <1% quota export (intake 408b585e): Control enforces read-any /
+      // admin-write on the sanitized per-account evidence.
+      if (/^\/api\/quota\/[a-z][a-z0-9_-]{0,63}$/.test(path))
+        return control.fetch(await forwardRequest(request, CONTROL + path, actor));
       if (path === '/api/quota' && request.method === 'GET')
         return quotaProjection(request, env, actor);
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
@@ -102,6 +106,7 @@ const router = {
         /^\/api\/deployment-credentials\/deployment:[0-9a-f-]+\/revoke$/.test(path) ||
         path === '/api/named-agents' ||
         /^\/api\/named-agents\/[^/]+\/grants$/.test(path) ||
+        /^\/api\/named-agents\/[^/]+\/(?:sticky|claim)$/.test(path) ||
         path === '/api/directory' ||
         path.startsWith('/api/routes/')
       )

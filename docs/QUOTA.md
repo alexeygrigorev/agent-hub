@@ -1,5 +1,15 @@
 # Account Quota and Host Snapshot API
 
+## Reported quota evidence export (GrokBot fallback)
+
+Beyond the provider-account probes below, Hub2 stores sanitized
+reported-quota evidence per account label (ControlDO `quota_reports`): any
+authenticated credential reads `GET /api/quota/<account>` and only an
+operator admin records `PUT /api/quota/<account>`. The response carries a
+Hub-computed `below_threshold` flag that fails closed on stale or unknown
+evidence; see [GROKBOT-FALLBACK.md](GROKBOT-FALLBACK.md) for the contract
+and the `hub quota check|report` CLI verbs.
+
 ## Hub2 quota path
 
 Hub2 exposes sanitized account quota through `hub quota --json`; the current
