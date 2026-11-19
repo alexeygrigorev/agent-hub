@@ -10,6 +10,14 @@ dependencies = ["websockets==16.0"]
 
 [project.scripts]
 hub = "agent_hub_host.wheel_cli:main"
+# Transitional (CLI unification rollout): enrolled hosts still run release
+# updaters published before the unification, and those updaters prepare a
+# release environment and probe daemon readiness through the legacy daemon
+# entry. Without it they fail every post-unification release in about one
+# second and the whole fleet deadlocks on its update backoff. Remove only in
+# a reviewed retirement once every enrolled host runs a post-unification
+# updater (which hands off to the release's own updater instead).
+hub2 = "agent_hub_host.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["agent_hub_host*"]
