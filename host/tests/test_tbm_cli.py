@@ -58,9 +58,12 @@ class TbmParserTests(unittest.TestCase):
         self.assertTrue(args.json)
 
     def test_kill_switch_choices_enforced(self):
+        # The optional positional doubles as the report/check account label, so
+        # on|off is enforced at dispatch instead of by argparse choices.
         parser = make_parser()
-        with self.assertRaises(SystemExit):
-            parser.parse_args(["quota", "kill-switch", "maybe"])
+        args = parser.parse_args(["quota", "kill-switch", "maybe"])
+        with self.assertRaises(ValueError):
+            quota_cli.execute(args)
 
 
 class TbmDispatchTests(unittest.TestCase):

@@ -14,6 +14,15 @@ import { credentialKey, openCredential, sealCredential } from './credential-cryp
 import { actorFrom, bodyObject, boundedString, boundedText, error, forbiddenScope, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
+
+/** GrokBot <1% fallback (intake 408b585e): sanitized quota-evidence export,
+ * sticky-agent machine pins and forward grants. The statements are idempotent
+ * so the fresh SCHEMA and the version 8 migration share them verbatim. */
+const STICKY_QUOTA_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS quota_reports(account TEXT PRIMARY KEY,remaining REAL NOT NULL,threshold REAL NOT NULL DEFAULT 1,captured_at INTEGER NOT NULL,valid_until INTEGER NOT NULL,reset_at INTEGER,source TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS named_agent_pins(agent_id TEXT PRIMARY KEY,machine TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS agent_forward_grants(agent_id TEXT NOT NULL,family_id TEXT NOT NULL,enabled INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(agent_id,family_id)) WITHOUT ROWID',
+];
 import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from './claude-oauth';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -71,6 +80,7 @@ const SCHEMA = [
     alias TEXT PRIMARY KEY, canonical_name TEXT NOT NULL REFERENCES repos(canonical_name)
   )`,
   'CREATE INDEX repo_aliases_owner_alias ON repo_aliases(canonical_name, alias)',
+  ...STICKY_QUOTA_SCHEMA,
 ];
 
 const ONCALL_SCHEMA = [
@@ -129,14 +139,14 @@ export class ControlDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 7, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA],async()=>{
+    this.ready=initializeSchema(ctx, this.db, 8, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA],async()=>{
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
         catch{this.invalidatePickerCoverage();}
       }
       await this.scheduleWake();
-    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,7));
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,8));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
@@ -176,6 +186,12 @@ export class ControlDO {
       if (url.pathname === '/api/named-agents') return await this.namedAgents(request);
       const grantMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/grants$/);
       if(grantMatch) return await this.agentGrants(request,decodeURIComponent(grantMatch[1]));
+      const stickyMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/sticky$/);
+      if(stickyMatch) return await this.agentSticky(request,decodeURIComponent(stickyMatch[1]));
+      const claimMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/claim$/);
+      if(claimMatch) return await this.agentClaim(request,decodeURIComponent(claimMatch[1]));
+      const quotaReportMatch=url.pathname.match(/^\/api\/quota\/([a-z][a-z0-9_-]{0,63})$/);
+      if(quotaReportMatch) return await this.quotaReports(request,decodeURIComponent(quotaReportMatch[1]));
       if (url.pathname === '/_verify' && request.method === 'POST') return await this.verify(request);
       if (url.pathname === '/_authorize' && request.method === 'POST') return await this.authorizeCurrent(request);
       if (url.pathname === '/api/enrollments/pair' && request.method === 'POST') return await this.createPairing(request);
@@ -1254,12 +1270,23 @@ export class ControlDO {
     const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
     if(request.method==='GET'){
       const after=new URL(request.url).searchParams.get('after')||'';
-      const rows=this.db.all<{id:string}>('SELECT id,display_name,forward_session,enabled FROM named_agents WHERE id>? ORDER BY id LIMIT 51',after);
+      const v8=this.db.schemaVersion>=8;
+      const rows=this.db.all<{id:string;machine?:string|null}>(
+        v8
+          ?'SELECT n.id, n.display_name, n.forward_session, n.enabled, p.machine FROM named_agents n LEFT JOIN named_agent_pins p ON p.agent_id=n.id WHERE n.id>? ORDER BY n.id LIMIT 51'
+          :'SELECT id, display_name, forward_session, enabled, NULL AS machine FROM named_agents WHERE id>? ORDER BY id LIMIT 51',after);
       return json({items:rows.slice(0,50),next:rows.length>50?rows[49].id:null});
     }
     if(request.method!=='POST')return error('not_found',404);const b=await bodyObject(request,4096);
     const name=typeof b.name==='string'?b.name.replace(/^agent:/,''):'';
     if(!/^[a-z][a-z0-9_-]{0,63}$/.test(name)||!boundedString(b.display_name,120)||(b.enabled!==undefined&&typeof b.enabled!=='boolean'))return error('invalid_named_agent',400);
+    let machine:unknown=undefined;
+    if(b.machine!==undefined){
+      if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+      if(b.machine===null)machine=null;
+      else if(typeof b.machine==='string'&&/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine))machine=b.machine;
+      else return error('invalid_named_agent',400);
+    }
     const forward=b.forward_session??null;
     if(forward!==null&&(!boundedString(forward,120)||!this.db.one('SELECT id FROM object_routes WHERE kind=? AND id=?','session',forward)))return error('forward_session_not_found',400);
     const id='agent:'+name;
@@ -1267,9 +1294,14 @@ export class ControlDO {
       const prior=this.db.one<{forward_session:string|null;enabled:number}>('SELECT forward_session,enabled FROM named_agents WHERE id=?',id);
       this.db.run('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,forward_session=excluded.forward_session,enabled=excluded.enabled',id,b.display_name,forward,Number(b.enabled!==false));
       if(forward&&b.enabled!==false&&(!prior||prior.forward_session!==forward||!prior.enabled))this.db.run("INSERT INTO mailbox_wakes(owner,revision,after_id,next_attempt) VALUES(?,1,'',?) ON CONFLICT(owner) DO UPDATE SET revision=revision+1,after_id='',next_attempt=excluded.next_attempt,attempt=0",id,Date.now());
+      if(machine!==undefined){
+        if(machine===null)this.db.run('DELETE FROM named_agent_pins WHERE agent_id=?',id);
+        else this.db.run('INSERT INTO named_agent_pins(agent_id,machine,updated_at) VALUES(?,?,?) ON CONFLICT(agent_id) DO UPDATE SET machine=excluded.machine,updated_at=excluded.updated_at',id,machine,Date.now());
+      }
     });
     await this.scheduleWake();
-    return json({agent:{id,display_name:b.display_name,forward_session:forward,enabled:b.enabled!==false}});
+    const v8=this.db.schemaVersion>=8;
+    return json({agent:{id,display_name:b.display_name,forward_session:forward,enabled:b.enabled!==false,machine:machine===undefined?(v8?this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id)?.machine??null:null):machine}});
   }
   private async agentGrants(request:Request,name:string):Promise<Response>{
     const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
@@ -1281,6 +1313,109 @@ export class ControlDO {
     const prior=this.db.one('SELECT agent_id FROM agent_grants WHERE agent_id=? AND family_id=? AND client_id=?',id,b.family_id,client);
     if(!prior&&this.db.all('SELECT family_id FROM agent_grants WHERE agent_id=? LIMIT 101',id).length>=100)return error('grant_capacity',409);
     this.db.run('INSERT INTO agent_grants(agent_id,family_id,client_id,can_send,can_read,enabled) VALUES(?,?,?,?,?,?) ON CONFLICT(agent_id,family_id,client_id) DO UPDATE SET can_send=excluded.can_send,can_read=excluded.can_read,enabled=excluded.enabled',id,b.family_id,client,Number(b.can_send),Number(b.can_read),Number(b.enabled));return json({recorded:true});
+  }
+  /** Sticky-session administration (intake 408b585e AC2): an operator sets the
+   * machine pin and per-family forward grants for a named agent. */
+  private async agentSticky(request:Request,name:string):Promise<Response>{
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    const id=name.startsWith('agent:')?name:'agent:'+name;
+    if(!this.db.one('SELECT id FROM named_agents WHERE id=?',id))return error('named_agent_not_found',404);
+    const b=await bodyObject(request,4096);
+    let machine:unknown=undefined;
+    if(b.machine!==undefined){
+      if(b.machine===null)machine=null;
+      else if(typeof b.machine==='string'&&/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine))machine=b.machine;
+      else return error('invalid_sticky_config',400);
+    }
+    const family=typeof b.family_id==='string'&&boundedString(b.family_id,180)?b.family_id:undefined;
+    if(b.family_id!==undefined&&!family)return error('invalid_sticky_config',400);
+    if((b.revoke!==undefined&&typeof b.revoke!=='boolean')||(b.enabled!==undefined&&typeof b.enabled!=='boolean'))return error('invalid_sticky_config',400);
+    if(machine===undefined&&family===undefined)return error('invalid_sticky_config',400);
+    this.db.transaction(this.ctx,()=>{
+      if(machine!==undefined){
+        if(machine===null)this.db.run('DELETE FROM named_agent_pins WHERE agent_id=?',id);
+        else this.db.run('INSERT INTO named_agent_pins(agent_id,machine,updated_at) VALUES(?,?,?) ON CONFLICT(agent_id) DO UPDATE SET machine=excluded.machine,updated_at=excluded.updated_at',id,machine,Date.now());
+      }
+      if(family!==undefined){
+        if(b.revoke)this.db.run('DELETE FROM agent_forward_grants WHERE agent_id=? AND family_id=?',id,family);
+        else this.db.run('INSERT INTO agent_forward_grants(agent_id,family_id,enabled,updated_at) VALUES(?,?,?,?) ON CONFLICT(agent_id,family_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at',id,family,Number(b.enabled!==false),Date.now());
+      }
+    });
+    return json({agent:this.agentView(id)});
+  }
+  /** A sticky session claims its own named agent (intake 408b585e AC2). Only a
+   * current session worker holding an explicit forward-grant family qualifies;
+   * a configured machine pin must match the session's owning machine. The typed
+   * forward_grant_required refusal carries the caller's family so the operator
+   * can grant exactly that subject. */
+  private async agentClaim(request:Request,name:string):Promise<Response>{
+    const actor=actorFrom(request);if(!actor)return error('unauthorized',401);
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    if(actor.kind!=='agent'||!/^session:[0-9a-f-]{36}$/i.test(actor.id)||!boundedString(actor.resource_id,180))return error('worker_session_required',403);
+    const id=name.startsWith('agent:')?name:'agent:'+name;
+    const agent=this.db.one<{id:string}>('SELECT id FROM named_agents WHERE id=? AND enabled=1',id);
+    if(!agent)return error('named_agent_not_found',404);
+    const family=(actor as CredentialActor).family_id;
+    if(!boundedString(family,180))return error('forward_grant_required',403);
+    const grant=this.db.one<{enabled:number}>('SELECT enabled FROM agent_forward_grants WHERE agent_id=? AND family_id=?',id,family);
+    if(!grant||!grant.enabled)return json({error:'forward_grant_required',family_id:family},403);
+    const pin=this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id);
+    if(pin){
+      const route=this.db.one<{owner:string}>('SELECT owner FROM object_routes WHERE kind=? AND id=?','session',actor.id.slice(8));
+      if(!route||route.owner!==pin.machine)return json({error:'sticky_machine_mismatch',required_machine:pin.machine},403);
+    }
+    const session=actor.id.slice(8);
+    this.db.transaction(this.ctx,()=>{
+      this.db.run('UPDATE named_agents SET forward_session=? WHERE id=? AND enabled=1',session,id);
+      this.db.run("INSERT INTO mailbox_wakes(owner,revision,after_id,next_attempt) VALUES(?,1,'',?) ON CONFLICT(owner) DO UPDATE SET revision=revision+1,after_id='',next_attempt=excluded.next_attempt,attempt=0",id,Date.now());
+    });
+    await this.scheduleWake();
+    // Trimmed view: the claimant learns its own routing facts, not the agent's
+    // other forward-grant families.
+    const view=this.agentView(id);
+    return json({agent:{id:view.id,display_name:view.display_name,forward_session:session,enabled:view.enabled,machine:view.machine}});
+  }
+  /** GrokBot <1% quota export (intake 408b585e AC1). Any authenticated actor may
+   * read the sanitized evidence; stale or unknown evidence never reports
+   * below_threshold=true, so consumers can fail closed on that single flag.
+   * Only an operator admin records evidence; replayed/stale evidence is refused. */
+  private async quotaReports(request:Request,account:string):Promise<Response>{
+    const actor=actorFrom(request);if(!actor)return error('unauthorized',401);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    if(request.method==='GET'){
+      const row=this.db.one<{remaining:number;threshold:number;captured_at:number;valid_until:number;reset_at:number|null;source:string;updated_at:number}>('SELECT remaining,threshold,captured_at,valid_until,reset_at,source,updated_at FROM quota_reports WHERE account=?',account);
+      if(!row)return json({account,provider:'unknown',remaining_percent:null,threshold_percent:1,below_threshold:false,fresh:false,state:'unknown',observed_at:null,reset_at:null,source:null,updated_at:null});
+      const fresh=row.valid_until>Date.now();
+      return json({account,provider:account==='grokbot'?'grok':'unknown',remaining_percent:row.remaining,threshold_percent:row.threshold,below_threshold:fresh&&row.remaining<row.threshold,fresh,
+        state:!fresh?'stale':row.remaining<=row.threshold?'exhausted':'fresh',
+        observed_at:new Date(row.captured_at).toISOString(),reset_at:row.reset_at!==null?new Date(row.reset_at).toISOString():null,source:row.source,updated_at:row.updated_at});
+    }
+    if(request.method!=='PUT')return error('method_not_allowed',405);
+    if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const b=await bodyObject(request,4096),now=Date.now();
+    const isPercent=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=100;
+    const captured=typeof b.captured_at==='number'&&Number.isSafeInteger(b.captured_at)?b.captured_at:undefined;
+    const validFor=typeof b.valid_for_ms==='number'&&Number.isSafeInteger(b.valid_for_ms)?b.valid_for_ms:undefined;
+    const resetAt=b.reset_at===undefined||b.reset_at===null?null:typeof b.reset_at==='number'&&Number.isSafeInteger(b.reset_at)?b.reset_at:undefined;
+    if(!isPercent(b.remaining)||captured===undefined||captured>now+5000||!boundedString(b.source,120))return error('invalid_quota_report',400);
+    if(resetAt===undefined&&b.reset_at!==null&&b.reset_at!==undefined)return error('invalid_quota_report',400);
+    if(b.threshold!==undefined&&!isPercent(b.threshold))return error('invalid_quota_report',400);
+    if(b.valid_for_ms!==undefined&&(validFor===undefined||validFor<1000||validFor>3600000))return error('invalid_quota_report',400);
+    const prior=this.db.one<{captured_at:number;threshold:number}>('SELECT captured_at,threshold FROM quota_reports WHERE account=?',account);
+    if(prior&&captured<prior.captured_at)return error('stale_quota_evidence',409);
+    const threshold=b.threshold??prior?.threshold??1,validUntil=captured+(validFor??300000);
+    this.db.run('INSERT INTO quota_reports(account,remaining,threshold,captured_at,valid_until,reset_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account) DO UPDATE SET remaining=excluded.remaining,threshold=excluded.threshold,captured_at=excluded.captured_at,valid_until=excluded.valid_until,reset_at=excluded.reset_at,source=excluded.source,updated_at=excluded.updated_at',
+      account,b.remaining,threshold,captured,validUntil,resetAt,b.source,now);
+    return json({recorded:true,account,remaining_percent:b.remaining,threshold_percent:threshold,fresh:validUntil>now,valid_until:validUntil});
+  }
+  private agentView(id:string):JsonRecord{
+    const agent=this.db.one<{id:string;display_name:string;forward_session:string|null;enabled:number}>('SELECT id,display_name,forward_session,enabled FROM named_agents WHERE id=?',id);
+    const pin=this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id);
+    const grants=this.db.all<{family_id:string;enabled:number;updated_at:number}>('SELECT family_id,enabled,updated_at FROM agent_forward_grants WHERE agent_id=? ORDER BY family_id LIMIT 101',id);
+    return {id:agent?.id??id,display_name:agent?.display_name??'',forward_session:agent?.forward_session??null,enabled:!!agent?.enabled,machine:pin?.machine??null,forward_grants:grants};
   }
   private grant(actor:CredentialActor,id:string):{can_send:number;can_read:number}|undefined{
     if(!actor.family_id)return undefined;
