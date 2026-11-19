@@ -1,4 +1,4 @@
-"""Dedicated entry and CLI runner for the staged same-process quota dispatcher."""
+"""Maintained entries for staged quota dispatch and the natural quota Host."""
 import argparse
 import hashlib
 import json
@@ -369,6 +369,18 @@ def run_primary_prelude(argv):
 
 def main(argv=None):
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "natural-host":
+        # The preparer must drop all privilege before loading the Host package.
+        ram.require(os.getuid() > 0 and os.geteuid() > 0)
+        from .cli import main as host_main
+        return host_main(raw_argv[1:])
+    if raw_argv and raw_argv[0] == "natural-primary":
+        started_ns = time.monotonic_ns()
+        from .quota_natural_primary import run_primary, archive_payloads
+        if len(raw_argv) != 4:
+            raise ValueError('natural_selection_arguments')
+        return run_primary(*raw_argv[1:], started_ns=started_ns,
+                           payloads=archive_payloads())
     if raw_argv and raw_argv[0] == "primary-prelude":
         return run_primary_prelude(raw_argv[1:])
     parser = argparse.ArgumentParser(prog="agent-hub-quota-dispatcher")
