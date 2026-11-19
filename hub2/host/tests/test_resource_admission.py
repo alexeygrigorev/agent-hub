@@ -59,14 +59,17 @@ def observation(rows, collected_offset=0.0):
     return (tuple(rows), time.monotonic() - collected_offset)
 
 
-def os_proof(self, births=None, cwds=None, alive=True):
+def os_proof(self, births=None, cwds=None, alive=True, sessions=None):
     """Deterministic positive OS incarnation proof seams for fake pids."""
     births = births or {}
     cwds = cwds or {}
+    sessions = sessions if sessions is not None else {}
     patches = [patch.object(resource_admission, '_process_birth_ms',
                             side_effect=lambda pid, read=None: births.get(pid)),
                patch.object(resource_admission, '_process_cwd',
                             side_effect=lambda pid: cwds.get(pid)),
+               patch.object(resource_admission, '_process_session_binding',
+                            side_effect=lambda pid, native_id: sessions.get(pid, True)),
                patch.object(resource_admission, '_process_alive',
                             side_effect=lambda pid: alive)]
     for item in patches:
@@ -481,6 +484,31 @@ class ConcurrentAdmissionTests(unittest.TestCase):
                                                   {'memory_mb': 1500, 'pids': 256}, census=None,
                                                   sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
 
+    def test_deadline_expiry_during_database_phase_refuses_before_state_work(self):
+        # The ONE original deadline is re-checked inside the transaction after
+        # BEGIN IMMEDIATE and after the charges: a budget consumed while the
+        # DB phase holds the write lock refuses fail-closed before the sample,
+        # the marker or the reservation.
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
+        calls = {'n': 0}
+        entry = time.monotonic()
+
+        def staged():
+            calls['n'] += 1
+            return entry if calls['n'] <= 3 else entry + resource_admission.ADMISSION_WINDOW_SECONDS + 1
+
+        with patch.object(resource_admission, 'time',
+                          SimpleNamespace(monotonic=staged, time=lambda: 0.0)):
+            with self.assertRaisesRegex(RuntimeError, 'host_operation_failed'):
+                resource_admission.admit_dispatch(
+                    admit_bridge(self.journal), 'operation-a', 'session-a', 1,
+                    {'memory_mb': 1500, 'pids': 256}, census=(), sample=lambda deadline: FLOOR + ALLOWANCE)
+        row = self.journal.db.execute(
+            "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()
+        self.assertEqual(row[0], 0)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
+
     def test_active_bound_overrun_refuses_admission(self):
         with self.journal.db as db:
             for index in range(1001):
@@ -600,6 +628,34 @@ class ResidentCreditTests(unittest.TestCase):
         self.assertEqual(self.charges(observation([row])), ALLOWANCE)
         os_proof(self, births={4500: self.now - 400_000}, cwds={4500: '/owned'}, alive=False)  # died at the boundary
         self.assertEqual(self.charges(observation([row])), ALLOWANCE)
+
+    def test_pid_reuse_without_exact_session_anchor_is_never_credited(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        # A recycled pid with matching kernel birth and cwd but the WRONG
+        # APLEXER_SESSION_ID entry earns no credit: full charge.
+        os_proof(self, births={4900: self.now - 400_000}, cwds={4900: '/owned'},
+                 sessions={4900: False})
+        self.assertEqual(self.charges(observation([resident(native, pid=4900)])), ALLOWANCE)
+
+    def test_exact_session_anchor_entry_rules(self):
+        env = b'X=1\x00APLEXER_SESSION_ID=1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d\x00Y=2\x00'
+        read = lambda path: env
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        self.assertTrue(resource_admission._process_session_binding(42, native, read=read))
+        self.assertTrue(resource_admission._process_session_binding(42, native.upper(), read=read))
+        self.assertFalse(resource_admission._process_session_binding(
+            42, '9f059843-b8ce-5309-a8e0-03cab1dc17e3', read=read))  # recycled pid, other session
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native + 'x', read=read))  # prefix-extended identity is not exact
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: b'X=1\x00Y=2\x00'))  # entry missing
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: b'\0' * 65537))  # oversized environment
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: (_ for _ in ()).throw(OSError(1, 'denied'))))
+
 
     def test_duplicate_incarnation_credits_exactly_once(self):
         native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
@@ -954,6 +1010,31 @@ class ConcurrentAdmissionTests(unittest.TestCase):
                                                   {'memory_mb': 1500, 'pids': 256}, census=None,
                                                   sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
 
+    def test_deadline_expiry_during_database_phase_refuses_before_state_work(self):
+        # The ONE original deadline is re-checked inside the transaction after
+        # BEGIN IMMEDIATE and after the charges: a budget consumed while the
+        # DB phase holds the write lock refuses fail-closed before the sample,
+        # the marker or the reservation.
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
+        calls = {'n': 0}
+        entry = time.monotonic()
+
+        def staged():
+            calls['n'] += 1
+            return entry if calls['n'] <= 3 else entry + resource_admission.ADMISSION_WINDOW_SECONDS + 1
+
+        with patch.object(resource_admission, 'time',
+                          SimpleNamespace(monotonic=staged, time=lambda: 0.0)):
+            with self.assertRaisesRegex(RuntimeError, 'host_operation_failed'):
+                resource_admission.admit_dispatch(
+                    admit_bridge(self.journal), 'operation-a', 'session-a', 1,
+                    {'memory_mb': 1500, 'pids': 256}, census=(), sample=lambda deadline: FLOOR + ALLOWANCE)
+        row = self.journal.db.execute(
+            "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()
+        self.assertEqual(row[0], 0)
+        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
+
     def test_active_bound_overrun_refuses_admission(self):
         with self.journal.db as db:
             for index in range(1001):
@@ -1073,6 +1154,34 @@ class ResidentCreditTests(unittest.TestCase):
         self.assertEqual(self.charges(observation([row])), ALLOWANCE)
         os_proof(self, births={4500: self.now - 400_000}, cwds={4500: '/owned'}, alive=False)  # died at the boundary
         self.assertEqual(self.charges(observation([row])), ALLOWANCE)
+
+    def test_pid_reuse_without_exact_session_anchor_is_never_credited(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        # A recycled pid with matching kernel birth and cwd but the WRONG
+        # APLEXER_SESSION_ID entry earns no credit: full charge.
+        os_proof(self, births={4900: self.now - 400_000}, cwds={4900: '/owned'},
+                 sessions={4900: False})
+        self.assertEqual(self.charges(observation([resident(native, pid=4900)])), ALLOWANCE)
+
+    def test_exact_session_anchor_entry_rules(self):
+        env = b'X=1\x00APLEXER_SESSION_ID=1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d\x00Y=2\x00'
+        read = lambda path: env
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        self.assertTrue(resource_admission._process_session_binding(42, native, read=read))
+        self.assertTrue(resource_admission._process_session_binding(42, native.upper(), read=read))
+        self.assertFalse(resource_admission._process_session_binding(
+            42, '9f059843-b8ce-5309-a8e0-03cab1dc17e3', read=read))  # recycled pid, other session
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native + 'x', read=read))  # prefix-extended identity is not exact
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: b'X=1\x00Y=2\x00'))  # entry missing
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: b'\0' * 65537))  # oversized environment
+        self.assertFalse(resource_admission._process_session_binding(
+            42, native, read=lambda path: (_ for _ in ()).throw(OSError(1, 'denied'))))
+
 
     def test_duplicate_incarnation_credits_exactly_once(self):
         native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
