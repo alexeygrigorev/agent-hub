@@ -1692,9 +1692,9 @@ class HostTests(unittest.TestCase):
 
     def quiet_census(self):
         # Registry observation stays synthetic-empty so admission mechanics
-        # tests make no census-related native calls of their own.
-        from types import SimpleNamespace
-        self.bridge.launcher.inventory = lambda: SimpleNamespace(fresh=lambda: True, rows=())
+        # tests make no census-related native calls of their own and every
+        # other attempt keeps its full conservative allowance.
+        self.bridge.launcher.raw_census_response = lambda: '[]'
 
     def test_admission_samples_physical_ram_and_binds_reservation_before_dispatch(self):
         self.exact_headroom(4096)  # exactly floor + one allowance + spare passes

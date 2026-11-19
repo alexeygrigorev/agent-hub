@@ -778,6 +778,16 @@ class NativeLauncher:
         return collect_native_inventory(lambda: self.native('list', '--all', '--json',
             timeout=CENSUS_TIMEOUT_SECONDS, output_limit=MAX_CENSUS_BYTES))
 
+    def raw_census_response(self):
+        """Bounded raw `list --all` stdout for the admission module's private parser.
+
+        The public completeness parser and publication schema stay untouched:
+        resource admission needs the workload process coordinate that the public
+        projection deliberately strips, and parses it privately and strictly."""
+        from .native_inventory import CENSUS_TIMEOUT_SECONDS, MAX_CENSUS_BYTES
+        return self.native('list', '--all', '--json',
+                           timeout=CENSUS_TIMEOUT_SECONDS, output_limit=MAX_CENSUS_BYTES).stdout
+
     def status(self, selector, workspace=None, *, timeout=30):
         result = self.native("status", selector, "--json", allow_failure=True, workspace=workspace, timeout=timeout)
         if result.returncode:
