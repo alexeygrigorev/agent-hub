@@ -15,11 +15,15 @@ uncertain custody, crash rows and missing OS/inflight/identity proof are
 charged conservatively or refuse truthfully, never fabricated to zero.
 """
 import ctypes
+import json
 import os
 import re
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+from .native_inventory import MAX_CENSUS_AGE_SECONDS
 
 # Fixed user policy floor for native dispatch, deliberately not the weaker
 # configurable resource-management default and not operator-tunable here.
@@ -36,12 +40,21 @@ ADMISSION_WINDOW_SECONDS = 10
 # it immediately before the runner and never renews it.
 PERMIT_WINDOW_SECONDS = 30
 # A resident worker is credited as mature only with positive same-incarnation
-# liveness evidence (fresh census, exact bound native id/tag/workspace, live
-# worker, running phase/state) and a birth older than this fixed window; its
-# current usage is then already inside the physical sample. Anything younger
-# or unproven keeps the full conservative allowance.
+# OS evidence: exact bound native UUID from a fresh private raw census, live
+# worker, running phase/state, a workload pid whose kernel birth (Linux
+# /proc starttime versus btime; Windows GetProcessTimes creation time) matches
+# the observed birth within tolerance, and a cwd bound to the exact workspace.
+# Every step revalidates at the final transaction boundary right before the
+# physical sample; any absent/malformed/mismatched proof keeps the full
+# conservative allowance. Historical rows and release timestamps never credit.
 MATURE_RESIDENT_AGE_MS = 300_000
+MATURE_BIRTH_TOLERANCE_MS = 5_000
 MAX_INFLIGHT_ROWS = 1000
+MAX_CENSUS_ROWS = 5000
+_CENSUS_MAX_BYTES = 16 * 1024 * 1024
+PROC_ENTRY_MAX_BYTES = 16384
+_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WINDOWS_EPOCH_FILETIME_MS = 11644473600000
 _MEMINFO_MAX_BYTES = 65536
 _MEMINFO_NUMBER = re.compile(r'[0-9]+')
 _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
@@ -90,8 +103,10 @@ def validate_worker_caps(memory_mb, pids):
 def parse_linux_meminfo(raw):
     """Strict bounded /proc/meminfo parse: MemAvailable/MemTotal integer kB.
 
-    Duplicates, absence, malformed or negative values, available>total and
-    oversized responses refuse; nothing is defaulted or extrapolated."""
+    Any second occurrence of a known field refuses, whatever its shape, and a
+    known field with wrong units or token counts refuses; absence, malformed
+    or negative values, available>total and oversized responses refuse too.
+    Nothing is defaulted or extrapolated."""
     if not isinstance(raw, (bytes, bytearray)) or len(raw) > _MEMINFO_MAX_BYTES:
         raise _unqualified()
     try:
@@ -101,9 +116,11 @@ def parse_linux_meminfo(raw):
     fields = {}
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) != 3 or parts[0] not in ('MemAvailable:', 'MemTotal:') or parts[2] != 'kB':
+        if not parts or parts[0] not in ('MemAvailable:', 'MemTotal:'):
             continue
-        if parts[0] in fields or not _MEMINFO_NUMBER.fullmatch(parts[1]):
+        if parts[0] in fields:
+            raise _unqualified()
+        if len(parts) != 3 or parts[2] != 'kB' or not _MEMINFO_NUMBER.fullmatch(parts[1]):
             raise _unqualified()
         fields[parts[0]] = int(parts[1]) * 1024
     if 'MemAvailable:' not in fields or 'MemTotal:' not in fields:
@@ -233,21 +250,184 @@ def verify_permit(permit, journal=None):
         raise RuntimeError('native_start_uncertain')
 
 
-def _current_census(bridge):
-    """One bounded private fresh registry census, or None.
+def _unique_object(pairs):
+    """Duplicate keys in a raw observation row refuse; nothing is last-wins."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _unqualified()
+        result[key] = value
+    return result
 
-    The collection is admission-private: it never reads, warms or publishes
-    the launch reaper's shared census cache, because a census taken before
-    this attempt spawned must never be applied later as expiry evidence for
-    that same attempt. Absence stays conservative: without resident evidence
-    every current attempt keeps its full allowance."""
-    inventory = getattr(getattr(bridge, 'launcher', None), 'inventory', None)
-    if not callable(inventory):
+
+def _bounded_read(path):
+    """One bounded byte read of a kernel/proc file; failures refuse."""
+    with open(path, 'rb') as stream:
+        raw = stream.read(PROC_ENTRY_MAX_BYTES + 1)
+    if len(raw) > PROC_ENTRY_MAX_BYTES:
+        raise _unqualified()
+    return raw
+
+
+def _linux_birth_ms(pid, read=None):
+    """Kernel birth time of one pid in wall-clock ms, or None.
+
+    Derived from /proc/<pid>/stat field 22 (starttime, clock ticks since boot)
+    against /proc/stat btime; both kernel-sourced, so the derivation carries
+    only the btime second-granularity, bounded by the fixed tolerance. Absent,
+    malformed or unbounded evidence refuses (None), never guesses."""
+    if read is None:
+        if sys.platform != 'linux':
+            return None
+        read = _bounded_read
+    try:
+        stat_raw = read(f'/proc/{pid}/stat')
+        boot_raw = read('/proc/stat')
+        clock_ticks = os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(clock_ticks, int) or clock_ticks <= 0:
         return None
     try:
-        return inventory()
-    except _CENSUS_ERRORS:
+        text = stat_raw.decode('ascii', errors='strict')
+        tail = text[text.rindex(')') + 2:].split()
+        start_ticks = int(tail[22 - 3])  # field 22, with fields 3.. after the comm
+        boot = None
+        for line in boot_raw.decode('ascii', errors='strict').splitlines():
+            parts = line.split()
+            if parts[:1] == ['btime']:
+                if len(parts) != 2 or not _MEMINFO_NUMBER.fullmatch(parts[1]):
+                    return None
+                boot = int(parts[1])
+        if boot is None:
+            return None
+    except (ValueError, IndexError):
         return None
+    return boot * 1000 + (start_ticks * 1000) // clock_ticks
+
+
+def _windows_birth_ms(pid):
+    """Kernel creation time of one pid via OpenProcess/GetProcessTimes, or None.
+
+    Same-user pids only; an unavailable process handle or times structure
+    conservatively holds the credit (None) instead of pretending."""
+    if sys.platform != 'win32':
+        return None
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation, exit_code, kernel, user = (ctypes.c_ulonglong(),) * 4
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation),
+                                        ctypes.byref(exit_code), ctypes.byref(kernel),
+                                        ctypes.byref(user)):
+            return None
+        return creation.value // 10000 - _WINDOWS_EPOCH_FILETIME_MS
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_birth_ms(pid, read=None):
+    """Positive OS birth evidence in wall-clock ms; None when unprovable."""
+    if sys.platform == 'win32':
+        return _windows_birth_ms(pid)
+    return _linux_birth_ms(pid, read=read)
+
+
+def _process_cwd(pid):
+    """Exact bound workspace of one pid's kernel cwd, or None."""
+    try:
+        return os.readlink(f'/proc/{pid}/cwd')
+    except (OSError, ValueError):
+        return None
+
+
+def _process_alive(pid):
+    """Liveness revalidation at the final boundary; failures refuse."""
+    if sys.platform == 'win32':
+        return _windows_birth_ms(pid) is not None
+    try:
+        return os.kill(pid, 0) is None
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None  # Permission ambiguity is not liveness proof.
+
+
+
+def parse_raw_census(raw):
+    """Strict private parse of one bounded raw `list --all` response.
+
+    Mirrors the public parser's completeness strictness (array bounds, exact
+    UUID identities, duplicates refuse, phase/state vocabularies, timestamp
+    ranges) but additionally retains the workload pid coordinate the public
+    projection deliberately strips. Any malformed row refuses the whole
+    observation; the caller then charges every attempt in full."""
+    if not isinstance(raw, str) or len(raw.encode('utf-8')) > _CENSUS_MAX_BYTES:
+        raise _unqualified()
+    try:
+        rows = json.loads(raw, object_pairs_hook=_unique_object)
+    except (ValueError, TypeError):
+        raise _unqualified() from None
+    if not isinstance(rows, list) or len(rows) > MAX_CENSUS_ROWS:
+        raise _unqualified()
+    parsed, seen = [], set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise _unqualified()
+        native_id, tag, workspace = row.get('id'), row.get('tag'), row.get('workspace')
+        if (not isinstance(native_id, str) or not _UUID_RE.fullmatch(native_id)
+                or native_id.lower() in seen
+                or not isinstance(tag, str) or not tag or '\0' in tag or len(tag.encode('utf-8')) > 512
+                or not isinstance(workspace, str) or not Path(workspace).is_absolute()
+                or '\0' in workspace or len(workspace.encode('utf-8')) > 8192
+                or type(row.get('schema_version')) is not int or row['schema_version'] < 1):
+            raise _unqualified()
+        seen.add(native_id.lower())
+        phase = row.get('phase')
+        if phase is not None and phase not in ('starting', 'running', 'exiting', 'stopping', 'exited', 'failed', 'unknown'):
+            raise _unqualified()
+        state = row.get('state')
+        if state is not None and state not in ('starting', 'running', 'exiting', 'exited', 'failed', 'broken', 'unknown'):
+            raise _unqualified()
+        alive = row.get('worker_alive')
+        if alive is not None and type(alive) is not bool:
+            raise _unqualified()
+        parsed_row = {'id': native_id.lower(), 'tag': tag, 'workspace': workspace,
+                      'phase': phase or 'unknown', 'state': state or 'unknown',
+                      'worker_alive': alive}
+        for field in ('created_at_ms', 'workload_pid'):
+            value = row.get(field)
+            if value is not None and (type(value) is not int or not 0 < value <= 9007199254740991):
+                raise _unqualified()
+            parsed_row[field] = value
+        parsed.append(parsed_row)
+    return tuple(parsed)
+
+
+def _raw_census_rows(bridge):
+    """One bounded private raw registry observation with its collection clock.
+
+    Returns (rows, collected_monotonic), or (( ), None) when the collection is
+    unavailable. The collection stays admission-private: it never reads,
+    warms or publishes the launch reaper's shared census cache, because a
+    census taken before this attempt spawned must never be applied later as
+    expiry evidence for that same attempt. Unavailable observations stay
+    conservative: every current attempt then keeps its full allowance."""
+    query = getattr(getattr(bridge, 'launcher', None), 'raw_census_response', None)
+    if not callable(query):
+        return (), None
+    try:
+        return parse_raw_census(query()), time.monotonic()
+    except (RuntimeError, OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return (), None
 
 
 def _same_workspace(left, right):
@@ -259,24 +439,44 @@ def _same_workspace(left, right):
         return False
 
 
-def _resident_rows(census):
-    if census is None or not census.fresh():
+def _resident_rows(observation, now_ms):
+    """Mature candidates from the fresh private raw observation.
+
+    Freshness is enforced here, at the final transaction boundary, against
+    the observation's own collection clock: an observation collected after
+    the transaction began never renews the original budget, and one that went
+    stale before this boundary credits nothing. Each exact UUID appears once."""
+    if not observation:
+        return {}
+    raw_rows, collected = observation
+    if not raw_rows or collected is None or time.monotonic() - collected > MAX_CENSUS_AGE_SECONDS:
         return {}
     residents = {}
-    for row in getattr(census, 'rows', ()):
-        if isinstance(row, dict) and isinstance(row.get('id'), str):
-            residents[row['id'].lower()] = row
+    for row in raw_rows:
+        if not isinstance(row, dict) or not isinstance(row.get('id'), str):
+            continue
+        birth = row.get('created_at_ms')
+        if (row.get('worker_alive') is not True or row.get('phase') != 'running'
+                or row.get('state') != 'running'
+                or type(birth) is not int or birth <= 0 or now_ms - birth < MATURE_RESIDENT_AGE_MS
+                or type(row.get('workload_pid')) is not int):
+            continue
+        residents.setdefault(row['id'].lower(), row)
     return residents
 
 
-def _mature_resident(row, residents, credited, now_ms):
-    """Positive same-incarnation liveness proof for one bound attempt.
+def _mature_resident(row, residents, credited, now_ms, read=None):
+    """Positive same-incarnation OS proof for one bound attempt.
 
-    Requires the exact bound native UUID, its fresh census row with running
-    phase/state, live worker, matching tag/workspace and a birth older than
-    the fixed maturity window. Each census row credits at most one reservation;
-    birth/tag/workspace mismatch or absence conservatively retains the full
-    young allowance. Historical rows and release timestamps never credit."""
+    Requires the exact bound native UUID in the fresh private observation,
+    matching tag/workspace, and a workload pid whose kernel birth matches the
+    observed birth within the fixed tolerance and whose kernel cwd resolves
+    to the exact bound workspace (Linux; Windows proves kernel birth and
+    conservatively holds when cwd/process proof is unavailable). Liveness is
+    revalidated here at the final boundary, immediately before the physical
+    sample. Each census row credits at most one reservation. Any absent,
+    malformed or mismatched step keeps the full conservative allowance;
+    missing proof never becomes zero."""
     native_id = row['native_id']
     if not isinstance(native_id, str) or not _UUID_RE.fullmatch(native_id):
         return False
@@ -286,25 +486,38 @@ def _mature_resident(row, residents, credited, now_ms):
     resident = residents.get(key)
     if resident is None:
         return False
+    if resident.get('tag') != row['tag'] or not _same_workspace(resident.get('workspace'), row['workspace']):
+        return False
+    pid = resident.get('workload_pid')
     birth = resident.get('created_at_ms')
-    if (resident.get('worker_alive') is not True
-            or resident.get('phase') != 'running' or resident.get('state') != 'running'
-            or type(birth) is not int or birth <= 0 or now_ms - birth < MATURE_RESIDENT_AGE_MS
-            or resident.get('tag') != row['tag']
-            or not _same_workspace(resident.get('workspace'), row['workspace'])):
+    kernel_birth = _process_birth_ms(pid, read=read)
+    if (not isinstance(kernel_birth, int)
+            or abs(kernel_birth - birth) > MATURE_BIRTH_TOLERANCE_MS
+            or not _process_cwd_is_bound(pid, row['workspace'])
+            or _process_alive(pid) is not True):
         return False
     credited.add(key)
     return True
 
 
-def _uncovered_charges(db, census, exclude_operation, now_ms):
+def _process_cwd_is_bound(pid, workspace):
+    if sys.platform == 'win32':
+        # Windows cwd/job binding is not read here; birth proof alone holds
+        # the credit only when present, and absence conservatively refuses.
+        return _process_birth_ms(pid) is not None
+    cwd = _process_cwd(pid)
+    return cwd is not None and _same_workspace(cwd, workspace)
+
+
+def _uncovered_charges(db, raw_rows, exclude_operation, now_ms):
     """Conservative uncovered RAM charge of the current known-inflight set.
 
     Active dispatched attempts (marker=1, live states) are charged their
     reservation allowance, or the fixed conservative default when unreserved
-    (upgrade/crash rows). Proven mature residents charge zero: their usage is
-    already inside the physical sample. Undispatched pending/preparation rows
-    hold no reservation and cannot spawn without passing this same serialized
+    (upgrade/crash rows). Attempts with complete positive same-incarnation OS
+    proof at the final boundary charge zero: their usage is already inside
+    the physical sample. Undispatched pending/preparation rows hold no
+    reservation and cannot spawn without passing this same serialized
     admission. Terminal history is never scanned and never poisons the gate."""
     rows = db.execute(
         'SELECT l.operation_id AS operation_id, l.tag AS tag, l.workspace AS workspace, '
@@ -314,7 +527,7 @@ def _uncovered_charges(db, census, exclude_operation, now_ms):
         'AND l.operation_id<>? LIMIT ?', (exclude_operation, MAX_INFLIGHT_ROWS + 1)).fetchall()
     if len(rows) > MAX_INFLIGHT_ROWS:
         raise RuntimeError('active_native_bound_exceeded')
-    residents = _resident_rows(census)
+    residents = _resident_rows(raw_rows, now_ms)
     credited = set()
     total = 0
     for row in rows:
@@ -345,7 +558,7 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         caps = validate_worker_caps((launcher_config or {}).get('memory_mb', None),
                                     (launcher_config or {}).get('pids', None))
     allowance = validate_worker_caps(caps.get('memory_mb'), caps.get('pids'))['memory_mb'] * 1024 * 1024
-    census = _current_census(bridge) if census is None else census
+    observation = _raw_census_rows(bridge) if census is None else census
     deadline = time.monotonic() + ADMISSION_WINDOW_SECONDS
     if now_ms is None:
         now_ms = int(time.time() * 1000)
@@ -365,7 +578,12 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         if db.execute('SELECT 1 FROM resource_reservations WHERE operation_id=?', (operation,)).fetchone():
             raise RuntimeError('native_dispatch_fence_conflict')
         digest, attempt = row['digest'], bridge.attempt_label(session, operation, epoch)
-        charged = _uncovered_charges(db, census, operation, now_ms)
+        # Inside the transaction, at the final boundary: the private raw
+        # observation must still be fresh on its own collection clock, OS
+        # proof revalidates per candidate, and the physical sample is taken
+        # last against the pre-transaction monotonic deadline. The permit is
+        # anchored only at the sample monotonic and is never re-anchored.
+        charged = _uncovered_charges(db, observation, operation, now_ms)
         sampled = time.monotonic()
         available = sampler(deadline)  # the physical sample is always taken last
         if available - (charged + allowance) < RESERVED_FLOOR_BYTES:
