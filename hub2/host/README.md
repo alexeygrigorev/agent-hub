@@ -10,17 +10,19 @@ Run `python hub2/host/bootstrap.py` to install the host into its private user
 environment; bootstrap uses the current interpreter and reinstalls the current
 package so an update replaces an already installed release. It supports Windows
 and Linux. Enrollment and CLI requests default to `https://hub.dtcdev.click`;
-`--server` selects another Hub explicitly. The `hub2` entry point provides
+`--server` selects another Hub explicitly. `hub host` (the daemon module; there is no separate `hub2` command) provides
 enrollment, serving, typed repository/intake/session/message/quota/schedule
 commands and a bounded `request METHOD /api/path --body-file input.json` escape
 hatch.
 
-Human CLI authentication uses `hub2 --server https://hub.example auth login`.
-It opens a public device approval page, polls the one-use device code and saves
-private access/refresh credentials. `--no-browser` prints only the approval URL
-and user code. Expiring CLI access is refreshed before requests; `auth refresh`
-and `auth logout` perform server rotation/revocation. A lost refresh reply stays
-uncertain rather than replaying a single-use refresh token.
+Human CLI authentication uses the operator CLI, not this daemon namespace:
+`hub auth login --url https://hub.example` (the zipapp `hub`; human credentials
+are stored in a separate human `cli.json`). Login prints a public approval URL
+and one-use user code; expiring human access is refreshed automatically with
+server-side rotation, and `hub auth status` / `hub auth logout` report or
+revoke the human session. Do not run human login through `hub host auth ...`:
+those commands operate on the machine enrollment profile
+(`~/.config/agent-hub/v2.json`) and would modify machine credentials.
 
 Machine enrollment takes a one-use code from `HUB2_PAIRING_CODE` or a hidden
 prompt. Its private configuration records the enrolled machine, workspace roots,
@@ -43,7 +45,7 @@ assigned intake and use its own claims/mailbox; it cannot start work or edit
 project/admin state. Verified completion durably revokes it before forwarding
 finish.
 
-`hub2 --config private/v2.json serve` maintains an authenticated WebSocket with
+`hub host --config private/v2.json serve` maintains an authenticated WebSocket with
 bounded frames, no idle application polling or pings. Reconnection drains
 durable offers, commands and mail. Local launch/command intents precede native
 effects; ambiguous effects are never blindly retried. Unix modes and Windows

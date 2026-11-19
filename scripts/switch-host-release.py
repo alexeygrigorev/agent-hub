@@ -66,7 +66,7 @@ def hub2_fleet_cycle_dropin():
     return (MARKER + "[Service]\n"
             "WorkingDirectory=%h\n"
             "ExecStart=\n"
-            "ExecStart=%h/.local/share/agent-hub2/venv/bin/hub2 heartbeat --aplexer a\n"
+            "ExecStart=%h/.local/share/agent-hub2/venv/bin/python -I -m agent_hub_host.cli heartbeat --aplexer a\n"
             "StandardOutput=null\n"
             "TimeoutStartSec=60\n")
 

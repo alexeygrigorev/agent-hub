@@ -25,8 +25,8 @@ def main():
     if result.returncode:
         print('Host installation failed; no working release recorded.',file=sys.stderr)
         return 1
-    command=base/('Scripts/hub2.exe' if os.name=='nt' else 'bin/hub2')
-    subprocess.run([str(command),'--help'],check=True,stdout=subprocess.DEVNULL)
+    command=python
+    subprocess.run([str(command),'-I','-m','agent_hub_host.cli','--help'],check=True,stdout=subprocess.DEVNULL)
     print(command)
     return 0
 

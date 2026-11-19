@@ -45,9 +45,9 @@ routes now serve these installers, so an old Windows host that still runs
 - verifies the published wheel against the manifest and installs it into
   `%LOCALAPPDATA%\agent-hub2\venv` (`hub2 version` prints `host_version`);
 - registers the per-user logon task `AgentHub2Host`, which runs
-  `run-host.ps1`: `hub2 serve --log-file %LOCALAPPDATA%\agent-hub2\serve.log`
+  `run-host.ps1`: `hub host serve --log-file %LOCALAPPDATA%\agent-hub2\serve.log`
   restarts after 30 s on exit and sends an HTTP heartbeat in between;
-- registers the daily `AgentHub2HostUpdate` task (`hub2 self-update`). On
+- registers the daily `AgentHub2HostUpdate` task (`hub host self-update`). On
   Windows that downloads the verified installer and runs it detached in update
   mode, so it can stop and restart `AgentHub2Host`;
 - retires the legacy supervisor: it writes `replace-pending` and the permanent
@@ -69,7 +69,7 @@ without a socket, or live sessions. `hub routing-machines` shows the
 `host_alert`, and `scripts/hub-intake-recovery-alerts.py` mails it to the
 developer once per disconnect episode.
 
-The host user unit runs `~/.local/share/agent-hub2/current/bin/hub2 serve`.
+The host user unit runs `~/.local/share/agent-hub2/current/bin/hub host serve`.
 Its update timer checks every five minutes. Automatic activation is batched at
 least six hours after the last activation. Once eligible, it waits for the
 managed-launch journal to become idle, for at most two more hours. Newer
@@ -107,9 +107,18 @@ protocol. No existing
 environment, legacy CLI or unrelated service is replaced. The full CLI from
 the same commit is `current/hub.pyz`, exposed as `current/bin/hub` in an
 activated release shell. `hub --version` and `hub sessions list` use that
-operator CLI; `hub2` remains the host administration command. Same-version
+operator CLI. There is no `hub2` command: host administration is `hub host ...`
+(enroll, serve, heartbeat, configure-host, credential-mode, version, request,
+self-update), which runs the release venv's daemon module. The daemon's
+`~/.config/agent-hub/v2.json` is the host (machine) profile of that one CLI;
+it is deliberately not merged into the human `cli.json` login. Same-version
 updater checks repair older wheel-generated `bin/hub` entry points after
-verifying the zipapp against the installed release receipt.
+verifying the zipapp against the installed release receipt. The daemon entry
+contract follows the selected release, not the updater: a retained release
+whose verified wheel still declares the private `bin/hub2` launcher keeps it
+(its unit ExecStart names it and its zipapp has no `host` command). The wheel
+console `hub` entry exposes only the `hub host ...` namespace by re-running
+the daemon module in isolated mode; the full operator CLI remains the zipapp.
 
 The transport wheel is downloaded in CI with `--require-hashes` against the
 reviewed root `uv.lock`; installs have no package-index access. Artifact trust

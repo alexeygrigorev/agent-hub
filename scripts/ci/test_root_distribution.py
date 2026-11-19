@@ -1,6 +1,6 @@
 """Build/install the root wheel with no source-tree imports."""
 from pathlib import Path
-import os, shutil, subprocess, tempfile, zipfile
+import json, os, shutil, subprocess, tempfile, zipfile
 ROOT = Path(__file__).resolve().parents[2]
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
@@ -38,17 +38,39 @@ d=m.distribution('agent-hub-host')
 assert d.version=='2.0.0'
 assert d.requires==['websockets==16.0'], d.requires
 assert 'site-packages' in agent_hub_host.__file__
-assert {e.name for e in d.entry_points}=={'hub','hub2'}
+assert {e.name for e in d.entry_points}=={'hub'}, d.entry_points  # no hub2 console script
+assert {e.value for e in d.entry_points}=={'agent_hub_host.wheel_cli:main'}, d.entry_points
 for old in ('quse','aplexer-client'):
     try: m.distribution(old)
     except m.PackageNotFoundError: pass
     else: raise AssertionError(old)
 """
         run(str(python), "-I", "-c", probe, cwd=home, env=child)
-        for command in ("hub", "hub2"):
-            executable = binary / (command + ".exe" if os.name == "nt" else command)
-            result = run(str(executable), "--help", cwd=home, env=child, capture_output=True)
-            assert "usage:" in result.stdout.lower()
-        print("PASS root wheel: isolated import, hub/hub2 help, only websockets16")
+        assert not (binary / ("hub2.exe" if os.name == "nt" else "hub2")).exists()
+        executable = binary / ("hub.exe" if os.name == "nt" else "hub")
+        # The wheel console `hub` is the host namespace, not a relabeled daemon
+        # parser and not the operator zipapp.
+        guide = run(str(executable), "--help", cwd=home, env=child, capture_output=True)
+        assert guide.returncode == 0
+        assert "wheel console entry" in guide.stdout and "hub host" in guide.stdout
+        refused = subprocess.run([str(executable), "sessions", "list"], cwd=home, env=child,
+                                 capture_output=True, text=True)
+        assert refused.returncode == 2 and "hub host" in refused.stderr, refused
+        host_help = run(str(executable), "host", "--help", cwd=home, env=child, capture_output=True)
+        assert "usage:" in host_help.stdout.lower() and "serve" in host_help.stdout, host_help
+        config = home / "v2.json"
+        config.write_text('{"machine_id": "wheel-probe"}')
+        version = run(str(executable), "host", "--config", str(config), "version",
+                      cwd=home, env=child, capture_output=True)
+        payload = json.loads(version.stdout)
+        assert payload["machine_id"] == "wheel-probe" and payload["credential_mode"] == "local", payload
+        # Isolated direct module invocation stays the internal daemon surface.
+        module_help = run(str(python), "-I", "-m", "agent_hub_host.cli", "--help",
+                          cwd=home, env=child, capture_output=True)
+        assert "usage:" in module_help.stdout.lower(), module_help
+        with zipfile.ZipFile(wheel) as archive:
+            entry_points = [n for n in archive.namelist() if n.endswith(".dist-info/entry_points.txt")]
+            assert entry_points and "wheel_cli" in archive.read(entry_points[0]).decode()
+        print("PASS root wheel: isolated import, wheel hub host namespace, no hub2, only websockets16")
 if __name__ == "__main__":
     main()
