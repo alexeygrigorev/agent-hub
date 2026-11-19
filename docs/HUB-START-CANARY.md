@@ -68,6 +68,10 @@ state. Exit 1 prints the JSON verdict on stdout and stderr, e.g.
 Allow ~7 min worst case, including bounded failure cleanup. Note the VM that runs deploy needs the `hub`/`a` logins; the canary must run on a host with
 `a` (Hetzner), e.g. over SSH.
 
+### Candidate-approved updater bootstrap
+
+When `--candidate-sha` / `--candidate-cli-sha256` / `--candidate-updater-sha256` is not yet converged on the Host, `verify_candidate_host_release` validates `XDG_RUNTIME_DIR` and fetches `host-release.json` from the fixed `https://hub.dtcdev.click/cli` origin (or loopback `HUB_CANARY_CLI_BASE_URL` in offline tests; arbitrary HTTPS/HTTP origins are rejected without network) in an isolated `-I -S` child with no redirects or credentials under the single finite convergence/active deadline. It requires `host_version == candidate_sha`, `artifacts["hub.pyz"].sha256 == candidate_cli_sha256`, and `artifacts["hub2-self-update.py"].sha256 == candidate_updater_sha256` before reading or executing any updater bytes. Whether installed `updater.py` (regular nofollow) already matches `candidate_updater_sha256` (`host_updater_trigger: "triggered"`) or is missing/differs (`host_updater_trigger: "bootstrapped"`, fetched and verified against exact byte length and SHA-256), the helper seals the verified updater bytes in an anonymous memfd and executes `python3 -I /proc/self/fd/<fd> --base-url <origin> --root <host_release_root> --install-service --expected-host-version <sha> --expected-cli-sha256 <cli_sha> --expected-updater-sha256 <updater_sha>` under the same single finite deadline. `hub2-self-update.py` validates the expected tuple under `update.lock` before `recover()` or any release/unit/config/updater mutation, re-checks full manifest consistency before activation, and preserves failed-release backoff, `--aplexer` selector, rollback-to-old, and `KillMode=process`. Any untrusted URL, missing/mismatched binding, changed publication, non-zero exit, or timeout fails closed at stage `host_release`.
+
 ## Install
 
 `sudo bash scripts/install-hub-start-canary.sh [--user NAME]` (idempotent; installs scripts to

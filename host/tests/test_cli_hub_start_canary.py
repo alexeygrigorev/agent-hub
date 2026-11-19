@@ -265,6 +265,70 @@ class FakeHealthServer:
         self.thread.join(5)
 
 
+class FakeCliServer:
+    """Loopback /cli/ release server for offline candidate-bootstrap tests."""
+
+    def __init__(self):
+        import hashlib
+        self.manifest_bytes = b"{}"
+        self.updater_bytes = b"#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        self.updater_sha256 = hashlib.sha256(self.updater_bytes).hexdigest()
+        self.manifest_status = 200
+        self.updater_status = 200
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/cli/host-release.json":
+                    body = outer.manifest_bytes
+                    status = outer.manifest_status
+                    ctype = "application/json"
+                elif self.path == "/cli/hub2-self-update.py":
+                    body = outer.updater_bytes
+                    status = outer.updater_status
+                    ctype = "text/x-python"
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.origin = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.url = f"{self.origin}/cli"
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        self.thread.start()
+
+    def configure(self, sha, pyz_sha, pyz_size, *, updater_bytes=None):
+        import hashlib
+        if updater_bytes is not None:
+            self.updater_bytes = updater_bytes
+        self.updater_sha256 = hashlib.sha256(self.updater_bytes).hexdigest()
+        manifest = {
+            "host_version": sha,
+            "protocol_version": 1,
+            "schema_version": 1,
+            "artifacts": {
+                "hub.pyz": {"sha256": pyz_sha, "size": pyz_size},
+                "hub2-self-update.py": {"sha256": self.updater_sha256, "size": len(self.updater_bytes)},
+            },
+        }
+        self.manifest_bytes = json.dumps(manifest).encode("utf-8")
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
 
 # Test-only admission collector shim, appended to a COPY of the helper (never to
 # the shipped file). The admission arithmetic, workspace-config reader, quota
@@ -354,7 +418,12 @@ class CanaryTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.health = FakeHealthServer()
         self.addCleanup(self.health.close)
-        env_patch = mock.patch.dict(os.environ, {"HUB_CANARY_HEALTH_URL": self.health.url})
+        self.cli_server = FakeCliServer()
+        self.addCleanup(self.cli_server.close)
+        env_patch = mock.patch.dict(os.environ, {
+            "HUB_CANARY_HEALTH_URL": self.health.url,
+            "HUB_CANARY_CLI_BASE_URL": self.cli_server.url,
+        })
         env_patch.start()
         self.addCleanup(env_patch.stop)
         (self.tmp / "fake_hub.py").write_text(FAKE_HUB)
@@ -408,6 +477,7 @@ class CanaryTest(unittest.TestCase):
             HUB_CANARY_RUNNING_TIMEOUT_S=running_timeout, HUB_CANARY_CAPTURE_TIMEOUT_S=capture_timeout,
             HUB_CANARY_STOP_TIMEOUT_S=stop_timeout, HUB_CANARY_CLEANUP_BUDGET_S=cleanup_budget,
             HUB_CANARY_CMD_TIMEOUT_S="10", HUB_CANARY_HEALTH_URL=self.health.url,
+            HUB_CANARY_CLI_BASE_URL=self.cli_server.url,
         )
         env["FAKE_PROMPT"] = mode_prompt or ("Reply CANARY-OK and exit" if ("full" in args or "--deploy-gate" in args) else "printf CANARY-OK; sleep 30")
         env.update(extra)
@@ -939,7 +1009,7 @@ class CanaryTest(unittest.TestCase):
         # command line only, even with the marker inside it, must fail
         self.assert_stage("capture_prompt_only", "capture", "no_output_beyond_prompt")
 
-    def prepare_candidate_release(self, sha, *, converge=True, tamper_pyz=False):
+    def prepare_candidate_release(self, sha, *, converge=True, tamper_pyz=False, write_matching_updater=True):
         root = self.tmp / "host-releases"
         rel = root / "releases" / sha
         rel.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1018,9 @@ class CanaryTest(unittest.TestCase):
         pyz.write_bytes(pyz_bytes)
         import hashlib
         digest = hashlib.sha256(pyz_bytes).hexdigest()
+        self.cli_server.configure(sha, digest, len(pyz_bytes))
+        if write_matching_updater:
+            (root / "updater.py").write_bytes(self.cli_server.updater_bytes)
         if tamper_pyz:
             pyz.write_bytes(pyz_bytes + b"\n# tampered\n")
         meta = {
@@ -985,6 +1058,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1014,6 +1088,7 @@ class CanaryTest(unittest.TestCase):
         return (
             "--deploy-gate", "--mode", "full",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
         )
 
@@ -1096,6 +1171,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", "0" * 64,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
@@ -1113,6 +1189,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
@@ -1123,6 +1200,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
@@ -1133,6 +1211,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", "f" * 64,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
@@ -1143,6 +1222,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.5",
@@ -1159,6 +1239,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "post_hash_swap", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1183,6 +1264,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "archive_update_fail", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1204,6 +1286,7 @@ class CanaryTest(unittest.TestCase):
         r_sym, v_sym = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_STATE_DIR=str(symlink_state),
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1216,6 +1299,7 @@ class CanaryTest(unittest.TestCase):
         r_open, v_open = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_STATE_DIR=str(open_state),
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1231,6 +1315,7 @@ class CanaryTest(unittest.TestCase):
         r_lock_sym, v_lock_sym = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_STATE_DIR=str(priv_state),
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1244,6 +1329,7 @@ class CanaryTest(unittest.TestCase):
         r_preserve, v_preserve = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_STATE_DIR=str(priv_state),
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
@@ -1261,6 +1347,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "sigterm_on_start", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1306,6 +1393,7 @@ class CanaryTest(unittest.TestCase):
         r, v = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1365,7 +1453,7 @@ class CanaryTest(unittest.TestCase):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         before = lock.stat()
         child = subprocess.Popen([str(lib / "hub-deploy-gate-forced.sh")],
-            env={"SSH_ORIGINAL_COMMAND": f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
+            env={"SSH_ORIGINAL_COMMAND": f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --candidate-updater-sha256 {self.cli_server.updater_sha256} --run-token {token} --helper-sha256 {helper_sha}",
                  "HUB_CANARY_LOCK_WAIT_S": "0", "DEPLOY_GATE_LOCK_WAIT_S": "0"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         started = time.monotonic()
@@ -1427,14 +1515,17 @@ class CanaryTest(unittest.TestCase):
             f'HUB_CANARY_STOP_TIMEOUT_S="1.5" HUB_CANARY_CLEANUP_BUDGET_S="1.5" '
             f'HUB_CANARY_HEALTH_URL="{self.health.url}")\n'
         )
+        upd_sha = self.cli_server.updater_sha256
         forced = str(lib / "hub-deploy-gate-forced.sh")
         for bad_cmd in (
             "",
             "hub-deploy-gate",
             f"hub-deploy-gate --candidate-sha {sha} --run-token {token}",
             f"hub-deploy-gate --candidate-sha {sha} --run-token {token} --helper-sha256 {helper_sha}",
-            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}; id",
-            f"hub-deploy-gate --candidate-sha NOT_HEX --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --candidate-updater-sha256 NOT_HEX --run-token {token} --helper-sha256 {helper_sha}",
+            f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} --candidate-updater-sha256 {upd_sha} --run-token {token} --helper-sha256 {helper_sha}; id",
+            f"hub-deploy-gate --candidate-sha NOT_HEX --candidate-cli-sha256 {pyz_sha} --candidate-updater-sha256 {upd_sha} --run-token {token} --helper-sha256 {helper_sha}",
         ):
             r = subprocess.run([forced], env={"SSH_ORIGINAL_COMMAND": bad_cmd}, capture_output=True, text=True, timeout=10)
             self.assertEqual(r.returncode, 2, bad_cmd)
@@ -1443,7 +1534,7 @@ class CanaryTest(unittest.TestCase):
 
         valid_cmd = (
             f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} "
-            f"--run-token {token} --helper-sha256 {helper_sha}"
+            f"--candidate-updater-sha256 {upd_sha} --run-token {token} --helper-sha256 {helper_sha}"
         )
         r_pos = subprocess.run(
             [forced, "extra"],
@@ -1502,6 +1593,7 @@ class CanaryTest(unittest.TestCase):
         r_name, v_name = self.run_canary(
             "same_name_unrelated_key", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1522,6 +1614,7 @@ class CanaryTest(unittest.TestCase):
         r_ck, v_ck = self.run_canary(
             "client_key_only_recovery", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1540,6 +1633,7 @@ class CanaryTest(unittest.TestCase):
         r_conf, v_conf = self.run_canary(
             "conflicting_key_rows", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -1961,36 +2055,59 @@ class CanaryTest(unittest.TestCase):
         staged_rel = self.tmp / "staged-release" / sha
         shutil.copytree(staged_root / "releases" / sha, staged_rel)
 
-        # Start with empty host-releases root so candidate release is not yet installed.
+        # Start with empty host-releases root (with matching updater.py) so candidate release is not yet installed.
+        # Even when installed updater.py matches, candidate-bound mode executes the verified updater directly
+        # with the expected tuple rather than calling `systemctl --user start` (which cannot carry expected args).
         empty_root = self.tmp / "empty-host-releases"
         empty_root.mkdir()
+        argv_log = self.tmp / "triggered_updater_argv.jsonl"
+        matching_converge_updater = (
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, shutil, sys\n"
+            f"pathlib.Path({str(argv_log)!r}).write_text(json.dumps(sys.argv[1:]) + '\\n')\n"
+            f"rel = pathlib.Path({str(empty_root / 'releases' / sha)!r})\n"
+            "rel.parent.mkdir(parents=True, exist_ok=True)\n"
+            f"shutil.copytree({str(staged_rel)!r}, rel)\n"
+            f"cur = pathlib.Path({str(empty_root / 'current')!r})\n"
+            "if cur.exists() or cur.is_symlink(): cur.unlink()\n"
+            "cur.symlink_to(rel)\n"
+        ).encode("utf-8")
+        pyz_bytes = (staged_rel / "hub.pyz").read_bytes()
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=matching_converge_updater)
+        (empty_root / "updater.py").write_bytes(matching_converge_updater)
         r_conv, v_conv = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_BIN="/nonexistent/global-hub-must-not-be-used",
             HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
             FAKE_HOST_VERSION=sha,
-            FAKE_SYSTEMCTL_ACTION="converge_from_staged",
-            FAKE_STAGED_RELEASE_DIR=str(staged_rel),
         )
         self.assertEqual(r_conv.returncode, 0, r_conv.stderr)
         self.assertTrue(v_conv["ok"])
         self.assertEqual(v_conv["host_updater_trigger"], "triggered")
         self.assertNotIn("host_updater_trigger_error", v_conv)
-        sctl = self.systemctl_calls()
-        self.assertEqual(len(sctl), 1)
+        self.assertEqual(self.systemctl_calls(), [])
+        recorded_argv = json.loads(argv_log.read_text().strip())
         self.assertEqual(
-            sctl[0]["argv"],
-            ["--user", "start", "--no-block", "agent-hub2-host-update.service"],
+            recorded_argv,
+            [
+                "--base-url", self.cli_server.origin,
+                "--root", str(empty_root),
+                "--install-service",
+                "--expected-host-version", sha,
+                "--expected-cli-sha256", pyz_sha,
+                "--expected-updater-sha256", self.cli_server.updater_sha256,
+            ],
         )
-        self.assertEqual(sctl[0]["xdg_runtime_dir"], str(self.xdg_runtime))
 
         # Already converged on first check -> updater not triggered.
         r_already, v_already = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(empty_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",
@@ -2000,20 +2117,30 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(v_already["host_updater_trigger"], "not_needed")
         self.assertEqual(self.systemctl_calls(), [])
 
-        # Unconverged release + multiple poll loops -> updater still triggered AT MOST ONCE.
-        unconv_root, _ = self.prepare_candidate_release(sha, converge=False)
+        # Unconverged release + multiple poll loops -> matching updater still triggered AT MOST ONCE.
+        once_log = self.tmp / "once_updater_runs.txt"
+        noop_updater = (
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"p = pathlib.Path({str(once_log)!r})\n"
+            "p.write_text((p.read_text() if p.exists() else '') + 'run\\n')\n"
+        ).encode("utf-8")
+        unconv_root, _ = self.prepare_candidate_release(sha, converge=False, write_matching_updater=False)
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=noop_updater)
+        (unconv_root / "updater.py").write_bytes(noop_updater)
         r_once, v_once = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.4",
             HUB_CANARY_POLL_S="0.01",
-            FAKE_SYSTEMCTL_ACTION="noop",
         )
         self.assertEqual(r_once.returncode, 1)
         self.assertEqual(v_once["host_updater_trigger"], "triggered")
-        self.assertEqual(len(self.systemctl_calls()), 1)
+        self.assertEqual(len(once_log.read_text().splitlines()), 1)
+        self.assertEqual(self.systemctl_calls(), [])
 
         # Reject symlink, non-private, or missing XDG_RUNTIME_DIR with typed trigger error and never call systemctl.
         sym_xdg = self.tmp / "sym-xdg"
@@ -2021,6 +2148,7 @@ class CanaryTest(unittest.TestCase):
         r_sym, v_sym = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
@@ -2038,6 +2166,7 @@ class CanaryTest(unittest.TestCase):
         r_open, v_open = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
             HUB_CANARY_CONVERGE_TIMEOUT_S="0.05",
@@ -2048,20 +2177,190 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(v_open["host_updater_trigger_error"], "host_updater_xdg_runtime_dir_not_private")
         self.assertEqual(self.systemctl_calls(), [])
 
-        # Observe the fake command's non-zero exit, rather than timing out its startup.
+        # Observe the matching updater's non-zero exit fail-closed without calling systemctl.
+        fail_updater = b"#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n"
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=fail_updater)
+        (unconv_root / "updater.py").write_bytes(fail_updater)
         r_fail, v_fail = self.run_canary(
             "ok", "--deploy-gate", "--mode", "shell",
             "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.3",
-            FAKE_SYSTEMCTL_ACTION="fail_exit_1",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.5",
         )
         self.assertEqual(r_fail.returncode, 1)
         self.assertEqual(v_fail["host_updater_trigger"], "failed")
         self.assertEqual(v_fail["host_updater_trigger_error"], "host_updater_trigger_exit_1")
         self.assertIn("host_updater_trigger_exit_1", v_fail["reason"])
-        self.assertEqual(len(self.systemctl_calls()), 1)
+        self.assertEqual(self.systemctl_calls(), [])
+
+    def test_precommit_deploy_gate_bootstrap_transport_and_memfd_argv_contract(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        staged_root, pyz_sha = self.prepare_candidate_release(sha, converge=True)
+        staged_rel = self.tmp / "staged-bootstrap-release" / sha
+        shutil.copytree(staged_root / "releases" / sha, staged_rel)
+
+        # Transport/memfd/argv fixture: when installed updater.py differs from candidate updater,
+        # helper fetches, verifies, seals in memfd, and passes the expected candidate tuple.
+        # (Maintained updater lock/fetch/dropin semantics are covered in scripts/tests/test_hub2_release.py.)
+        host_root = self.tmp / "legacy-host-root"
+        host_root.mkdir()
+        (host_root / "updater.py").write_bytes(b"#!/usr/bin/env python3\nraise SystemExit(1)\n")
+
+        candidate_updater = (
+            "#!/usr/bin/env python3\n"
+            "import argparse, pathlib, shutil, sys\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--base-url', required=True)\n"
+            "p.add_argument('--root', required=True)\n"
+            "p.add_argument('--install-service', action='store_true', required=True)\n"
+            "p.add_argument('--expected-host-version', required=True)\n"
+            "p.add_argument('--expected-cli-sha256', required=True)\n"
+            "p.add_argument('--expected-updater-sha256', required=True)\n"
+            "args = p.parse_args()\n"
+            f"assert args.base_url == {self.cli_server.origin!r}, args.base_url\n"
+            f"assert args.root == {str(host_root)!r}, args.root\n"
+            f"assert args.expected_host_version == {sha!r}, args.expected_host_version\n"
+            f"assert args.expected_cli_sha256 == {pyz_sha!r}, args.expected_cli_sha256\n"
+            "root = pathlib.Path(args.root)\n"
+            "rel = root / 'releases' / " + repr(sha) + "\n"
+            "rel.parent.mkdir(parents=True, exist_ok=True)\n"
+            "shutil.copytree(" + repr(str(staged_rel)) + ", rel)\n"
+            "cur = root / 'current'\n"
+            "if cur.exists() or cur.is_symlink(): cur.unlink()\n"
+            "cur.symlink_to(rel)\n"
+            "assert sys.argv[0].startswith('/proc/self/fd/'), sys.argv[0]\n"
+            "(root / 'updater.py').write_bytes(pathlib.Path(sys.argv[0]).read_bytes())\n"
+        ).encode("utf-8")
+        pyz_bytes = (staged_rel / "hub.pyz").read_bytes()
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=candidate_updater)
+
+        r, v = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_BIN="/nonexistent/global-hub-must-not-be-used",
+            HUB_CANARY_HOST_RELEASE_ROOT=str(host_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="3.0",
+            FAKE_HOST_VERSION=sha,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"])
+        self.assertEqual(v["host_updater_trigger"], "bootstrapped")
+        self.assertEqual(v["host_updater_sha256"], self.cli_server.updater_sha256)
+        self.assertEqual(self.systemctl_calls(), [])
+        self.assertEqual((host_root / "updater.py").read_bytes(), candidate_updater)
+
+    def test_precommit_deploy_gate_bootstrap_refuses_mismatch_untrusted_changed_and_unknown(self):
+        sha = "3f7fb75992856cbc0792c7ee8ea4cb8ac7354ce7"
+        other_sha = "ad0b8a0b2276303c2b13762a614fe49a63514ae7"
+        token = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        helper_sha = self.helper_sha256()
+        unconv_root, pyz_sha = self.prepare_candidate_release(sha, converge=False, write_matching_updater=False)
+        pyz_bytes = (unconv_root / "releases" / sha / "hub.pyz").read_bytes()
+
+        # 1. Untrusted / arbitrary HTTPS / non-loopback HTTP CLI base URL refuses before any network or updater execution.
+        for bad_url in (
+            "http://example.com/cli",
+            "https://evil.example/cli",
+            "https://hub.dtcdev.click:8443/cli",
+            "https://user@hub.dtcdev.click/cli",
+            f"{self.cli_server.origin}/other",
+        ):
+            r, v = self.run_canary(
+                "ok", "--deploy-gate", "--mode", "shell",
+                "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+                "--candidate-updater-sha256", self.cli_server.updater_sha256,
+                "--run-token", token, "--helper-sha256", helper_sha,
+                HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+                HUB_CANARY_CLI_BASE_URL=bad_url,
+            )
+            self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "candidate_updater_url_invalid"))
+            self.assertEqual(v["host_updater_trigger"], "failed")
+            self.assertEqual(self.systemctl_calls(), [])
+
+        # 1b. Wrong --candidate-updater-sha256 (otherwise matching candidate SHA & CLI SHA) executes ZERO updater bytes.
+        exec_marker = self.tmp / "untrusted_updater_executed"
+        marked_updater = (
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"pathlib.Path({str(exec_marker)!r}).write_text('ran')\n"
+        ).encode("utf-8")
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=marked_updater)
+        r_upd, v_upd = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", "0" * 64,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+        )
+        self.assertEqual((r_upd.returncode, v_upd["stage"], v_upd["reason"]), (1, "host_release", "candidate_updater_manifest_updater_sha_mismatch"))
+        self.assertFalse(exec_marker.exists())
+        self.assertEqual(self.systemctl_calls(), [])
+
+        # 2. Manifest host_version mismatch (stale publication) refuses fail-closed.
+        self.cli_server.configure(other_sha, pyz_sha, len(pyz_bytes))
+        r_ver, v_ver = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+        )
+        self.assertEqual((r_ver.returncode, v_ver["stage"], v_ver["reason"]), (1, "host_release", "candidate_updater_manifest_version_mismatch"))
+
+        # 3. Manifest hub.pyz digest mismatch (changed publication) refuses fail-closed.
+        self.cli_server.configure(sha, "f" * 64, len(pyz_bytes))
+        r_cli, v_cli = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+        )
+        self.assertEqual((r_cli.returncode, v_cli["stage"], v_cli["reason"]), (1, "host_release", "candidate_updater_manifest_cli_sha_mismatch"))
+
+        # 4. Updater bytes changed between manifest and fetch (digest mismatch) refuses fail-closed.
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=b"#!/usr/bin/env python3\nraise SystemExit(0)\n")
+        self.cli_server.updater_bytes = b"#!/usr/bin/env python3\n# tampered after manifest\n"
+        r_dig, v_dig = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+        )
+        self.assertEqual((r_dig.returncode, v_dig["stage"], v_dig["reason"]), (1, "host_release", "candidate_updater_digest_mismatch"))
+
+        # 5. Candidate updater non-zero exit (e.g. backoff or lock busy) refuses fail-closed.
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=b"#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n")
+        r_ex, v_ex = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+        )
+        self.assertEqual((r_ex.returncode, v_ex["stage"], v_ex["reason"]), (1, "host_release", "candidate_updater_bootstrap_exit_1"))
+        self.assertEqual(v_ex["host_updater_trigger"], "failed")
+
+        # 6. Candidate updater exceeding single finite converge deadline times out fail-closed.
+        self.cli_server.configure(sha, pyz_sha, len(pyz_bytes), updater_bytes=b"#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n")
+        r_to, v_to = self.run_canary(
+            "ok", "--deploy-gate", "--mode", "shell",
+            "--candidate-sha", sha, "--candidate-cli-sha256", pyz_sha,
+            "--candidate-updater-sha256", self.cli_server.updater_sha256,
+            "--run-token", token, "--helper-sha256", helper_sha,
+            HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
+            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+        )
+        self.assertEqual((r_to.returncode, v_to["stage"], v_to["reason"]), (1, "host_release", "timeout_candidate_updater_bootstrap_timeout"))
+        self.assertEqual(v_to["host_updater_trigger"], "timeout")
+        self.assertEqual(self.systemctl_calls(), [])
 
     def test_periodic_mode_serializes_pending_state_archives_intake_and_ignores_lock_busy_for_alerts(self):
         import fcntl
@@ -4142,6 +4441,7 @@ class AdmissionTests(unittest.TestCase):
             f'HUB_CANARY_CLEANUP_BUDGET_S="1.5" HUB_CANARY_HEALTH_URL="{self.health.url}")\n'
         )
         command = (f"hub-deploy-gate --candidate-sha {sha} --candidate-cli-sha256 {pyz_sha} "
+                   f"--candidate-updater-sha256 {self.cli_server.updater_sha256} "
                    f"--run-token {token} --helper-sha256 {helper_sha}")
         r = subprocess.run([str(lib / "hub-deploy-gate-forced.sh")], env={"SSH_ORIGINAL_COMMAND": command},
                            capture_output=True, text=True, timeout=30)

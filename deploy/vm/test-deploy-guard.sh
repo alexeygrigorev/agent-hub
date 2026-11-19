@@ -58,15 +58,18 @@ if not (verify_idx < canary_idx < finalize_idx < rollback_idx):
 canary_block = text[canary_idx:finalize_idx]
 for required in (
     "if: (inputs.release_mode || 'active') == 'active'",
+    "test -f \"$BUNDLE_DIR/hub2-self-update.py\"",
+    "updater_sha256=\"$(python3 -I -S - \"$BUNDLE_DIR/hub2-self-update.py\"",
     "--print-helper-sha256",
     "StrictHostKeyChecking=yes",
     "UserKnownHostsFile=\"$canary_known_hosts\"",
-    "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --run-token $run_token --helper-sha256 $helper_sha256",
+    "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --candidate-updater-sha256 $updater_sha256 --run-token $run_token --helper-sha256 $helper_sha256",
     "verdict.get(\"mode\") != \"full\"",
     "verdict.get(\"candidate_sha\") != deploy_sha or verdict.get(\"host_version\") != deploy_sha",
     "verdict.get(\"run_token\") != run_token",
     "verdict.get(\"helper_sha256\") != helper_sha256",
     "verdict.get(\"hub_pyz_sha256\") != cli_sha256",
+    "if trigger in (\"triggered\", \"bootstrapped\") and verdict.get(\"host_updater_sha256\") != updater_sha256:",
     "verdict.get(\"intake_archived\") is not True",
 ):
     if required not in canary_block:

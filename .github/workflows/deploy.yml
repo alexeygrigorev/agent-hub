@@ -519,6 +519,7 @@ jobs:
           set -euo pipefail
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
           test -f "$BUNDLE_DIR/hub.pyz" || { echo "verified CLI bundle hub.pyz is missing" >&2; exit 2; }
+          test -f "$BUNDLE_DIR/hub2-self-update.py" || { echo "verified CLI bundle hub2-self-update.py is missing" >&2; exit 2; }
           test -n "${CANARY_SSH_KEY:-}" || { echo "Hetzner canary SSH key is not configured" >&2; exit 2; }
           [[ "${CANARY_SSH_TARGET:-}" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] \
             || { echo "Hetzner canary SSH target is not configured" >&2; exit 2; }
@@ -540,6 +541,12 @@ jobs:
           PY
           )"
           [[ "$cli_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid candidate hub.pyz digest" >&2; exit 2; }
+          updater_sha256="$(python3 -I -S - "$BUNDLE_DIR/hub2-self-update.py" <<'PY'
+          import hashlib, pathlib, sys
+          print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+          PY
+          )"
+          [[ "$updater_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid candidate hub2-self-update.py digest" >&2; exit 2; }
           helper_sha256="$(python3 -I -S scripts/hub_start_canary.py --print-helper-sha256)"
           [[ "$helper_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid canary helper digest" >&2; exit 2; }
           run_token="$(python3 -I -S -c 'import secrets; print(secrets.token_hex(16))')"
@@ -553,9 +560,9 @@ jobs:
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
             "$CANARY_SSH_TARGET" \
-            "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --run-token $run_token --helper-sha256 $helper_sha256" \
+            "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --candidate-updater-sha256 $updater_sha256 --run-token $run_token --helper-sha256 $helper_sha256" \
             > "$verdict_file"
-          python3 -I -S - "$verdict_file" "$DEPLOY_SHA" "$run_token" "$helper_sha256" "$cli_sha256" <<'PY'
+          python3 -I -S - "$verdict_file" "$DEPLOY_SHA" "$run_token" "$helper_sha256" "$cli_sha256" "$updater_sha256" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -564,7 +571,7 @@ jobs:
           if len(lines) != 1:
               raise SystemExit(f"expected single-line JSON verdict from pre-commit canary, got {len(lines)} lines")
           verdict = json.loads(lines[0])
-          deploy_sha, run_token, helper_sha256, cli_sha256 = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+          deploy_sha, run_token, helper_sha256, cli_sha256, updater_sha256 = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
           if verdict.get("ok") is not True or verdict.get("deploy_gate") is not True:
               raise SystemExit(f"pre-commit full canary did not pass: {lines[0]}")
           if verdict.get("mode") != "full" or verdict.get("stage") is not None or verdict.get("reason") is not None:
@@ -577,6 +584,11 @@ jobs:
               raise SystemExit(f"pre-commit canary helper digest mismatch: {lines[0]}")
           if verdict.get("hub_pyz_sha256") != cli_sha256:
               raise SystemExit(f"pre-commit canary hub.pyz digest mismatch: {lines[0]}")
+          trigger = verdict.get("host_updater_trigger")
+          if trigger not in ("not_needed", "triggered", "bootstrapped"):
+              raise SystemExit(f"pre-commit canary unexpected host_updater_trigger: {lines[0]}")
+          if trigger in ("triggered", "bootstrapped") and verdict.get("host_updater_sha256") != updater_sha256:
+              raise SystemExit(f"pre-commit canary host_updater_sha256 mismatch: {lines[0]}")
           if verdict.get("intake_archived") is not True or verdict.get("cleanup") != "not_needed":
               raise SystemExit(f"pre-commit canary cleanup/intake archival incomplete: {lines[0]}")
           print(f"Pre-commit live full canary passed on Hetzner for {deploy_sha} (session {verdict.get('session_id')})")
