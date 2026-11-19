@@ -1,4 +1,5 @@
 """Targeted release safety checks; no network, live service or live venv writes."""
+import ast
 from collections.abc import Mapping
 import contextlib
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ import time
 import threading
 import unittest
 import venv
+import zipapp
 import zipfile
 from unittest.mock import patch
 
@@ -42,6 +44,36 @@ OLD_SHA = 'b' * 40
 MACHINE = 'release-test-machine'
 STATUS_PATH = '/api/fleet/routing/self'
 HOST = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
+
+# Provenance: cached pre-unification commit 0cc47732c0d496973f49abf53bbe21458f5f2787,
+# scripts/hub2-self-update.py lines 902-922
+# (full file sha256: 21850e1c353f72611a66765383498f4c55c144b21d9b84111de8dd8225c287dc,
+#  snippet sha256:   826e90bb8174e3bf1c8894535cc1b7fcdf93799cdb03196200617393a702e3b4).
+# This is cached pre-unification source evidence of the real failure mechanism,
+# not a claim these exact bytes were installed on a specific historical host.
+LEGACY_PREPARE_ENVIRONMENT_SOURCE = """\
+def prepare_environment(target, download, manifest, host_wheel):
+    python = target / 'bin/python'
+    uv = shutil.which('uv')
+    if uv:
+        command([uv, 'venv', '--allow-existing', '--python', sys.executable, target])
+        installer = [uv, 'pip', 'install', '--python', python]
+    else:
+        command([sys.executable, '-m', 'venv', target])
+        installer = [python, '-m', 'pip', 'install']
+    command([*installer, '--no-index', '--no-deps',
+             download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
+    check_host_package(target, manifest)
+    command([target / 'bin/hub2', '--help'])
+    shutil.copyfile(download / 'hub.pyz', target / 'hub.pyz')
+    shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
+    if ALERT_CLIENT in manifest['artifacts']:
+        retain_alert_client(target, manifest, (download / ALERT_CLIENT).read_bytes())
+    (target / 'hub.pyz').chmod(0o755)
+    command([python, target / 'hub.pyz', '--help'])
+    install_operator_cli(target, manifest)
+    write_json(target / 'release.json', manifest)
+"""
 
 
 @dataclass(frozen=True)
@@ -2627,6 +2659,230 @@ elif event in ('start', 'routing', 'enable'):
         self.assertFalse((self.root / 'retained-switch.json').exists())
         self.assertTrue((self.root / 'releases' / SHA / 'release.json').is_file())
 
+    def test_legacy_updater_fails_on_unified_candidate_and_trusted_bootstrap_converges(self):
+        # 1. Provenance-pinned historical prepare_environment (exact 21 lines, AST-loaded in isolation).
+        self.assertEqual(
+            hashlib.sha256(LEGACY_PREPARE_ENVIRONMENT_SOURCE.encode()).hexdigest(),
+            '826e90bb8174e3bf1c8894535cc1b7fcdf93799cdb03196200617393a702e3b4',
+        )
+        parsed = ast.parse(LEGACY_PREPARE_ENVIRONMENT_SOURCE)
+        self.assertEqual(len(parsed.body), 1)
+        self.assertIsInstance(parsed.body[0], ast.FunctionDef)
+        self.assertEqual(parsed.body[0].name, 'prepare_environment')
+
+        # 2. One shared synthetic unified-only candidate (declares hub only, no bin/hub2).
+        wheel_buf = io.BytesIO()
+        with zipfile.ZipFile(wheel_buf, 'w') as archive:
+            archive.writestr('agent_hub_host/__init__.py', '')
+            archive.writestr('agent_hub_host/_release.py',
+                             f'HOST_VERSION = {SHA!r}\nPROTOCOL_VERSION = 1\n')
+            archive.writestr('agent_hub_host/client.py',
+                             'class Client:\n    def heartbeat(self, native_sessions=None):\n        pass\n')
+            archive.writestr('agent_hub_host/cli.py',
+                             'import sys\n'
+                             'def main(argv=None):\n'
+                             '    args = sys.argv[1:] if argv is None else argv\n'
+                             '    if "--help" in args:\n'
+                             '        print("unified candidate module cli help")\n'
+                             '        return 0\n'
+                             '    return 2\n'
+                             'if __name__ == "__main__":\n'
+                             '    raise SystemExit(main())\n')
+            archive.writestr('agent_hub_host-2.0.0.dist-info/entry_points.txt',
+                             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n')
+        self.files[HOST] = wheel_buf.getvalue()
+
+        pyz_src = Path(self.temporary.name) / 'pyz-src'
+        pyz_src.mkdir()
+        (pyz_src / '__main__.py').write_text(
+            'import sys\n'
+            'if any(flag in sys.argv[1:] for flag in ("--help", "--version")):\n'
+            '    print("unified hub.pyz help")\n'
+            '    raise SystemExit(0)\n'
+            'raise SystemExit(2)\n'
+        )
+        pyz_buf = io.BytesIO()
+        zipapp.create_archive(pyz_src, pyz_buf)
+        self.files['hub.pyz'] = pyz_buf.getvalue()
+        self.files['hub2-self-update.py'] = Path(updater.__file__).read_bytes()
+        self.manifest = {
+            **self.manifest,
+            'artifacts': {
+                name: {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+                for name, data in self.files.items()
+            },
+        }
+        download = Path(self.temporary.name) / 'staged-unified-download'
+        download.mkdir()
+        for name, data in self.files.items():
+            (download / name).write_bytes(data)
+
+        executed_probes = []
+        add_legacy_entry = False
+        guarded_run = subprocess.run
+
+        def run_bounded_command(args):
+            args = [str(value) for value in args]
+            if not self._owned_command_executable(args[0]):
+                raise AssertionError('install test reached an external command: ' + args[0])
+            self.calls.append(args)
+            if args[0] == 'systemctl':
+                return
+            if args[:3] == [sys.executable, '-m', 'venv']:
+                self.release_venv(Path(args[3]))
+                return
+            if (len(args) >= 6 and Path(args[0]).name == 'python'
+                    and args[1:5] == ['-m', 'pip', 'install', '--no-index']):
+                target_env = Path(args[0]).parents[1]
+                site = target_env / 'lib' / ('python%d.%d' % sys.version_info[:2]) / 'site-packages'
+                with zipfile.ZipFile(args[-1]) as zf:
+                    zf.extractall(site)
+                if add_legacy_entry:
+                    launcher = target_env / 'bin/hub2'
+                    launcher_bytes = self.pip_launcher_bytes(target_env)
+                    shebang = launcher_bytes.splitlines(True)[0].rstrip(b'\n')
+                    if len(shebang) <= 255:
+                        launcher.write_bytes(launcher_bytes)
+                    else:
+                        launcher.write_text(
+                            f'#!/bin/sh\nexec "{target_env / "bin/python"}" -I -m agent_hub_host.cli "$@"\n'
+                        )
+                    launcher.chmod(0o755)
+                return
+            probe_env = self.owned_child_env()
+            with self.owned_child(
+                lambda argv, kwargs: argv == args
+                and kwargs.get('cwd') == str(self.temporary.name)
+                and kwargs.get('env') == probe_env
+                and sorted(kwargs) == ['capture_output', 'cwd', 'env', 'text', 'timeout']
+            ):
+                result = guarded_run(
+                    args, cwd=str(self.temporary.name), env=probe_env,
+                    capture_output=True, text=True, timeout=30,
+                )
+            executed_probes.append((args, result.returncode, result.stdout))
+            if result.returncode:
+                raise RuntimeError('release command failed: ' + Path(args[0]).name)
+
+        legacy_ns = {
+            'Path': Path,
+            'shutil': shutil,
+            'sys': sys,
+            'command': run_bounded_command,
+            'check_host_package': updater.check_host_package,
+            'ALERT_CLIENT': updater.ALERT_CLIENT,
+            'retain_alert_client': updater.retain_alert_client,
+            'install_operator_cli': updater.install_operator_cli,
+            'write_json': updater.write_json,
+        }
+        exec(compile(parsed, '<legacy-prepare-environment-0cc47732>', 'exec'), legacy_ns)
+        legacy_prepare = legacy_ns['prepare_environment']
+
+        # Pre-existing legacy host state, units, drop-in, and native a00d selector.
+        old = self.old_release()
+        legacy_updater_bytes = b'# legacy pre-unification updater\n'
+        (self.root / 'updater.py').write_bytes(legacy_updater_bytes)
+        units_dir = Path(self.temporary.name) / '.config/systemd/user'
+        units_dir.mkdir(parents=True, exist_ok=True)
+        legacy_unit_bytes = f'[Service]\nExecStart=%h/host/current/bin/hub2 serve\n'.encode()
+        (units_dir / updater.UNITS[0]).write_bytes(legacy_unit_bytes)
+        a00d = '/home/alexey/.local/lib/aplexer/releases/a00d4bdb69d1793a9738b893fb21f0001d4acc12/bin/aplexer'
+        dropin_dir = units_dir / (updater.UNITS[0] + '.d')
+        dropin_dir.mkdir(parents=True, exist_ok=True)
+        dropin = dropin_dir / 'override.conf'
+        legacy_dropin_text = (
+            f'[Service]\n# keep-comment\nEnvironment=FOO=bar\nExecStart=\n'
+            f'ExecStart=%h/host/current/bin/hub2 serve --aplexer {a00d}\n'
+        )
+        dropin.write_text(legacy_dropin_text)
+        foreign_dropin = dropin_dir / 'foreign.conf'
+        foreign_text = f'[Service]\nExecStart=\nExecStart=/foreign/root/current/bin/hub2 serve --aplexer {a00d}\n'
+        foreign_dropin.write_text(foreign_text)
+        native_selector = Path(os.environ['APLEXER_CONFIG'])
+        native_selector.parent.mkdir(parents=True, exist_ok=True)
+        native_selector_text = 'default_profile = "native-a00d"\n'
+        native_selector.write_text(native_selector_text)
+
+        # Arm 1 (Negative): legacy prepare_environment passes check_host_package then fails on missing bin/hub2.
+        legacy_target = self.root / 'releases' / ('legacy-' + SHA)
+        with patch.object(updater, 'command', run_bounded_command), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            with self.assertRaises(FileNotFoundError) as exc_info:
+                legacy_prepare(legacy_target, download, self.manifest, HOST)
+        self.assertEqual(Path(exc_info.exception.filename), legacy_target / 'bin/hub2')
+        self.assertTrue(any(
+            argv[0] == str(legacy_target / 'bin/python') and argv[1:3] == ['-I', '-c'] and rc == 0
+            for argv, rc, _ in executed_probes
+        ))
+        self.assertFalse((legacy_target / 'release.json').exists())
+        self.assertEqual((self.root / 'current').resolve(), old.resolve())
+        self.assertEqual((self.root / 'updater.py').read_bytes(), legacy_updater_bytes)
+        self.assertEqual((units_dir / updater.UNITS[0]).read_bytes(), legacy_unit_bytes)
+        self.assertEqual(dropin.read_text(), legacy_dropin_text)
+        self.assertEqual(native_selector.read_text(), native_selector_text)
+
+        # Arm 2 (Positive legacy-entry control): adding owned bin/hub2 makes the exact legacy function succeed.
+        executed_probes.clear()
+        add_legacy_entry = True
+        control_target = self.root / 'releases' / ('control-' + SHA)
+        with patch.object(updater, 'command', run_bounded_command), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            legacy_prepare(control_target, download, self.manifest, HOST)
+        self.assertTrue((control_target / 'release.json').is_file())
+        self.assertTrue(any(
+            argv == [str(control_target / 'bin/hub2'), '--help']
+            and rc == 0 and 'unified candidate module cli help' in out
+            for argv, rc, out in executed_probes
+        ))
+
+        # Arm 3 (Fail-closed negative): mismatched expected candidate tuple cannot reach preparation/convergence.
+        add_legacy_entry = False
+        executed_probes.clear()
+        tuple_kwargs = self._expected_tuple()
+        bad_tuple = {**tuple_kwargs, 'expected_cli_sha256': '0' * 64}
+        with patch.object(updater, 'fetch', self.fetch), \
+             patch.object(updater, 'command', run_bounded_command), \
+             patch.object(updater.time, 'sleep'), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.subprocess, 'run', self.status_command):
+            with self.assertRaisesRegex(ValueError, 'expected candidate tuple'):
+                updater.install('https://example.invalid', self.root, install_service=True, **bad_tuple)
+        self.assertEqual(executed_probes, [])
+        self.assertEqual((self.root / 'current').resolve(), old.resolve())
+        self.assertEqual((self.root / 'updater.py').read_bytes(), legacy_updater_bytes)
+        self.assertEqual(dropin.read_text(), legacy_dropin_text)
+        self.assertEqual(native_selector.read_text(), native_selector_text)
+
+        # Arm 4 (Convergence): current trusted bootstrap (expected_tuple + update_lock) succeeds on same candidate.
+        target = self.root / 'releases' / SHA
+        with patch.object(updater, 'fetch', self.fetch), \
+             patch.object(updater, 'command', run_bounded_command), \
+             patch.object(updater.time, 'sleep'), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.object(updater.subprocess, 'run', self.status_command), \
+             patch.object(updater, 'update_lock', wraps=updater.update_lock) as lock_spy, \
+             patch.object(updater, 'validate_expected_manifest', wraps=updater.validate_expected_manifest) as manifest_spy:
+            updater.install('https://example.invalid', self.root, install_service=True, **tuple_kwargs)
+        self.assertTrue(lock_spy.called)
+        self.assertTrue(manifest_spy.called)
+        self.assertTrue(any(
+            argv == [str(target / 'bin/python'), '-I', '-m', 'agent_hub_host.cli', '--help']
+            and rc == 0 and 'unified candidate module cli help' in out
+            for argv, rc, out in executed_probes
+        ))
+        self.assertFalse((target / 'bin/hub2').exists())
+        self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
+        self.assertEqual((self.root / 'current').resolve(), target.resolve())
+        self.assertEqual((self.root / 'previous').resolve(), old.resolve())
+        self.assertEqual((self.root / 'updater.py').read_bytes(), self.files['hub2-self-update.py'])
+        self.assertEqual(
+            dropin.read_text(),
+            f'[Service]\n# keep-comment\nEnvironment=FOO=bar\nExecStart=\n'
+            f'ExecStart=%h/host/current/bin/hub host serve --aplexer {a00d}\n',
+        )
+        self.assertEqual(foreign_dropin.read_text(), foreign_text)
+        self.assertEqual(native_selector.read_text(), native_selector_text)
+
 
 def publication_bundle(directory, commit, label='fixture'):
     directory.mkdir()
@@ -3052,7 +3308,7 @@ class FixtureDiscoveryContractTests(unittest.TestCase):
     every named test stays collected with working addCleanup/assertions,
     and the collected counts stay at the exactly audited numbers."""
 
-    EXPECTED_TEST_COUNTS = {'ReleaseTests': 101, 'HostDropinAlignmentTests': 18}
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 102, 'HostDropinAlignmentTests': 18}
 
     def test_guarded_classes_remain_unittest_test_cases(self):
         for name in self.EXPECTED_TEST_COUNTS:
