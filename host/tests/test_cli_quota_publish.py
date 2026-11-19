@@ -113,6 +113,29 @@ class QuotaPublishTests(unittest.TestCase):
         patch = [b for m, b in calls if m == 'PATCH'][0]
         self.assertEqual((patch['capacity'], patch['enabled'], patch['min_remaining']), (qp.DEFAULT_CAPACITY, False, 5))
 
+    def test_assistant_only_go_orin_and_grok_publish_quota_but_stay_disabled(self):
+        for key, account, provider in (('go-orin', 'go-orin', 'go'), ('grok', 'grok', 'grok')):
+            with self.subTest(key=key):
+                calls = []
+                def req_new(method, path, body=None):
+                    calls.append((method, path, body)); return {}
+                quse = {key: {'status': 'ok', 'windows': {'5h': {'percent_remaining': 88.0, 'reset_at': None}}}}
+                out = qp.publish(quse=quse, request=req_new, now_ms=5, enable=True)
+                self.assertEqual(out['published'], [account])
+                self.assertEqual([c[0] for c in calls], ['GET', 'PATCH', 'PUT'])
+                self.assertEqual(calls[1][2]['provider'], provider)
+                self.assertFalse(calls[1][2]['enabled'])
+                self.assertEqual(calls[2][2]['remaining'], 88.0)
+
+                # Even if an existing assistant-only account was somehow enabled, publish disables it.
+                calls.clear()
+                def req_enabled(method, path, body=None):
+                    calls.append((method, path, body))
+                    return {'account': {'enabled': 1, 'capacity': 8, 'min_remaining': 0}} if method == 'GET' else {}
+                qp.publish(quse=quse, request=req_enabled, now_ms=5, enable=True)
+                self.assertEqual([c[0] for c in calls], ['GET', 'PATCH', 'PUT'])
+                self.assertFalse(calls[1][2]['enabled'])
+
 
 if __name__ == '__main__':
     unittest.main()

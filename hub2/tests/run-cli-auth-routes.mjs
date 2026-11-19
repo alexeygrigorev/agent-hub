@@ -91,6 +91,14 @@ try {
   assert.deepEqual((await (await call('/api/quota?provider=claude')).json()).pools, []);
   assert.equal((await call('/api/quota?host_id=b-full')).status, 400);
   assert.equal((await fixture.fetch('/api/quota')).status, 401);
+  // Assistant-only go-orin is visible in /api/quota with routing=disabled and excluded from model-policy.
+  assert.equal((await call('/api/accounts/go-orin/api/account', 'PATCH', { provider: 'go', enabled: false })).status, 200);
+  assert.equal((await call('/api/accounts/go-orin/api/account/quota', 'PUT', { remaining: 64, captured_at: now, valid_until: now + 60000, source: 'quse' })).status, 200);
+  pools = (await (await call('/api/quota?view=fleet&provider=go&engine=opencode&account=go-orin')).json()).pools;
+  assert.equal(pools.length, 1);
+  assert.deepEqual({ provider: pools[0].provider, account: pools[0].account, engines: pools[0].engines, routing: pools[0].routing, state: pools[0].state, remaining_percent: pools[0].remaining_percent },
+    { provider: 'go', account: 'go-orin', engines: ['opencode'], routing: 'disabled', state: 'fresh', remaining_percent: 64 });
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'go-orin-route', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin', weight: 1, capabilities: [], enabled: true }] })).status, 400);
 
   // Empty first host must still return a cursor to the populated second host.
   const first = await (await call('/api/sessions?limit=1')).json();

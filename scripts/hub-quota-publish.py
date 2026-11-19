@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 
-ACCOUNTS = frozenset(('claude', 'codex', 'gemini', 'grok', 'copilot', 'shared-go', 'zai-central'))
+ACCOUNTS = frozenset(('claude', 'codex', 'gemini', 'grok', 'copilot', 'shared-go', 'go-orin', 'zai-central'))
 RECIPIENT = 'dev@dtcdev.click'
 MAX_STATE_BYTES = 65536
 DEFAULT_STALE_SECONDS = 840  # 14m + independent 5m cadence + bounded sink < 20m
