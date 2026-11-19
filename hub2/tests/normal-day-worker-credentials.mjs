@@ -85,11 +85,23 @@ export async function prepareWorkerProof(c){
   await finish(rotated);
   const expiring=await newJob('worker-expiry',2);expect(await api('/api/intakes/'+expiring.task.id,'GET',undefined,expiring.g.token),200,'worker cached credential before expiry');expect(await fixture('control','global','clock',{offset:65000}),200,'advance actual authorization clock');try{expect(await api('/api/intakes/'+expiring.task.id,'GET',undefined,expiring.g.token),401,'worker expiry checked despite cached SQL row');}finally{expect(await fixture('control','global','clock',{offset:0}),200,'restore isolated fixture clock');}await finish(expiring);
   const raced=await newJob('worker-revoke-race',3,true);await finish(raced);
+  const dueJob=await newJob('worker-due-headless',4);
+  const dueAt=new Date(Date.now()+1500).toISOString(),dueWakePath='/api/sessions/'+dueJob.s.id+'/wake',dueWakesPath='/api/sessions/'+dueJob.s.id+'/wakes';
+  const dueCreated=expect(await api(dueWakePath,'POST',{key:'worker-due-self-wake',at:dueAt,prompt:'Isolated public worker headless due wake'},dueJob.g.token),201,'isolated worker schedules due wake');
+  assert.equal(dueCreated.wake_state,'pending');assert(!('prompt' in dueCreated),'isolated wake create stays private');
+  expect(await fixture('control','global','clock',{offset:1600}),200,'advance fixture clock past isolated worker wake due');
+  try{expect(await fixture('machine',target,'alarm',{}),200,'run isolated worker wake due sweep on headless fixture session');}
+  finally{expect(await fixture('control','global','clock',{offset:0}),200,'restore fixture clock after isolated wake sweep');}
+  const dueHistory=expect(await api(dueWakesPath,'GET',undefined,dueJob.g.token),200,'isolated worker reads own due wake outcome');
+  assert.equal(dueHistory.wakes[0].wake_state,'missed');assert.equal(dueHistory.wakes[0].reason,'headless_send_refused');assert(dueHistory.wakes.every(w=>!('prompt' in w)),'isolated due history stays private');
+  const workerWakeHeadlessTruthful=dueHistory.wakes[0]?.wake_state==='missed'&&dueHistory.wakes[0]?.reason==='headless_send_refused'&&dueHistory.wakes.every(w=>!('prompt' in w));
+  expect(await fixture('machine',target,'alarm',{}),200,'settle isolated missed wake notification delivery');
+  await finish(dueJob);
   expect(await api('/api/account/quota'),200,'child completion leaves quota view available');
   expect(await fixture('control','global','clock',{offset:31000}),200,'advance clock for missed wake notification retry');
   try{expect(await fixture('machine',machine,'alarm',{}),200,'settle worker wake missed notification');}
   finally{expect(await fixture('control','global','clock',{offset:0}),200,'restore clock after wake notification');}
-  const credentialsProof={actual_host_context:!!process.env.HUB2_CORE_WORKER_CONTEXT,actual_provider_context:!!process.env.HUB2_CORE_PROVISION,quota_outage_does_not_gate_launch:!!process.env.HUB2_CORE_PROVISION,issued_idempotently:true,single_authoritative_grant:true,lost_issuer_reply_replayed:true,lost_revocation_reply_replayed:true,wrong_machine_refused:true,review_refused:true,assigned_intake_only:true,append_only:true,foreign_claims_refused:true,no_admin_or_start:true,completion_revoked:true,reenroll_revoked:true,late_issue_after_absent_revoke_fenced:true,expiry_rechecked_on_cached_row:true,worker_self_wake:true,worker_wake_replay_stable:true,worker_wake_headless_truthful:true,cross_session_wake_refused:true};
+  const credentialsProof={actual_host_context:!!process.env.HUB2_CORE_WORKER_CONTEXT,actual_provider_context:!!process.env.HUB2_CORE_PROVISION,quota_outage_does_not_gate_launch:!!process.env.HUB2_CORE_PROVISION,issued_idempotently:true,single_authoritative_grant:true,lost_issuer_reply_replayed:true,lost_revocation_reply_replayed:true,wrong_machine_refused:true,review_refused:true,assigned_intake_only:true,append_only:true,foreign_claims_refused:true,no_admin_or_start:true,completion_revoked:true,reenroll_revoked:true,late_issue_after_absent_revoke_fenced:true,expiry_rechecked_on_cached_row:true,worker_self_wake:true,worker_wake_replay_stable:true,worker_wake_headless_truthful:workerWakeHeadlessTruthful,cross_session_wake_refused:true};
   // Positive requirement: when this fixture runs, every fixed proof flag must be
   // true or the lane fails — a sentinel-only false green is not acceptable.
   for(const key of ['issued_idempotently','single_authoritative_grant','lost_issuer_reply_replayed','lost_revocation_reply_replayed','wrong_machine_refused','review_refused','assigned_intake_only','append_only','foreign_claims_refused','no_admin_or_start','completion_revoked','reenroll_revoked','late_issue_after_absent_revoke_fenced','expiry_rechecked_on_cached_row','worker_self_wake','worker_wake_replay_stable','worker_wake_headless_truthful','cross_session_wake_refused'])assert.equal(credentialsProof[key],true,'worker credential proof flag must be positively true: '+key);
