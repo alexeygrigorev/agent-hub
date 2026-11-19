@@ -60,12 +60,15 @@ def observation(rows, collected_offset=0.0):
 
 
 def os_proof(self, births=None, cwds=None, alive=True, sessions=None):
-    """Deterministic positive OS incarnation proof seams for fake pids."""
+    """Deterministic positive OS incarnation proof seams for fake pids.
+
+    `births` accepts either a {pid: birth_ms} map or a callable
+    (pid, read) -> birth_ms for multi-read incarnation scenarios."""
     births = births or {}
+    birth_seam = births if callable(births) else (lambda pid, read=None: births.get(pid))
     cwds = cwds or {}
     sessions = sessions if sessions is not None else {}
-    patches = [patch.object(resource_admission, '_process_birth_ms',
-                            side_effect=lambda pid, read=None: births.get(pid)),
+    patches = [patch.object(resource_admission, '_process_birth_ms', side_effect=birth_seam),
                patch.object(resource_admission, '_process_cwd',
                             side_effect=lambda pid: cwds.get(pid)),
                patch.object(resource_admission, '_process_session_binding',
@@ -271,23 +274,32 @@ class OsIncarnationProofTests(unittest.TestCase):
 
     def test_synthetic_windows_identity_protocol_control(self):
         calls = []
+        seen = {}
         def open_process(flag, inherit, pid):
             calls.append(('open', flag, pid))
             return 7 if pid == 4242 else 0
         def get_times(handle, creation, exit_time, kernel_time, user_time):
+            # The real API writes all four outputs through their own distinct
+            # addresses; the helper must hand it four independent objects.
+            seen['addresses'] = {id(value._obj) for value in
+                                 (creation, exit_time, kernel_time, user_time)}
             creation._obj.value = (1_700_000_000_000 + resource_admission._WINDOWS_EPOCH_FILETIME_MS) * 10000
+            exit_time._obj.value = 1
+            kernel_time._obj.value = 2
+            user_time._obj.value = 3
             calls.append(('times', handle))
             return 1
         def close_handle(handle):
             calls.append(('close', handle))
             return 1
         birth = resource_admission._windows_creation_ms(open_process, get_times, close_handle, 4242)
-        self.assertEqual(birth, 1_700_000_000_000)
-        self.assertEqual(calls, [('open', 0x1000, 4242), ('times', 7), ('close', 7)])
+        self.assertEqual(birth, 1_700_000_000_000)  # correct creation conversion
+        self.assertEqual(calls, [('open', 0x1000, 4242), ('times', 7), ('close', 7)])  # close exactly once
+        self.assertEqual(len(seen['addresses']), 4)  # four independent output objects
         calls.clear()
         self.assertIsNone(resource_admission._windows_creation_ms(lambda *args: 0, get_times, close_handle, 1))
         self.assertIsNone(resource_admission._windows_creation_ms(open_process, lambda *args: 0, close_handle, 4242))
-        self.assertEqual(calls, [('open', 0x1000, 4242), ('close', 7)])
+        self.assertEqual(calls, [('open', 0x1000, 4242), ('close', 7)])  # failures stay conservative
 
     def test_windows_birth_path_is_platform_gated(self):
         if sys.platform == 'win32':
@@ -520,531 +532,53 @@ class ConcurrentAdmissionTests(unittest.TestCase):
                                               {'memory_mb': 1500, 'pids': 256}, census=None,
                                               sample=lambda deadline: FLOOR + 100 * ALLOWANCE)
 
-
-class ResidentCreditTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.journal = Journal(Path(self.temp.name) / 'journal.sqlite')
-        self.addCleanup(self.journal.db.close)
-        self.now = int(time.time() * 1000)
-
-    def charges(self, observation, exclude='operation-new', attempt_label=None):
-        return resource_admission._uncovered_charges(self.journal.db, observation, exclude, self.now,
-                                                     attempt_label=attempt_label)
-
-    def test_many_legacy_terminal_null_rows_never_poison_or_migrate(self):
+    def test_census_expiry_during_proofs_recharges_and_keeps_floor_safe(self):
+        # A proven mature resident is credited while the census is fresh, so
+        # exactly one new account fits above the floor. When the census
+        # expires while the OS incarnation proofs run, the recomputed full
+        # charge must push the same admission below the floor instead of
+        # silently keeping the stale credit.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
         with self.journal.db as db:
-            for index in range(200):
-                db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,'
-                           "state,interactive,native_dispatch_started,legacy_failure_json) "
-                           "VALUES(?,?,?,?,?,?,NULL,'exited',0,NULL,?)",
-                           (f'legacy{index}', f'old{index}', 1, 'digest', '/gone', f'task-hub2-old{index}',
-                            json.dumps({'operation_id': f'legacy{index}', 'epoch': 1})))
-        os_proof(self, )
-        self.assertEqual(self.charges(observation([])), 0)
-        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
-
-    def proven(self, native, pid, tag='task-hub2-session-1', birth_ms=None):
-        """Raw observation row plus matching positive OS proof seams."""
-        birth_ms = self.now - 400_000 if birth_ms is None else birth_ms
-        os_proof(self, births={pid: birth_ms}, cwds={pid: '/owned'})
-        return observation([resident(native, tag=tag, birth_ms=birth_ms, pid=pid)])
-
-    def test_mature_os_proven_resident_is_not_double_charged(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native)
-        self.assertEqual(self.charges(self.proven(native, 4200)), 0)
-
-    def test_unreserved_mature_resident_upgrade_row_is_credited_with_os_proof(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        self.assertEqual(self.charges(self.proven(native, 4300)), 0)
-
-    def test_young_resident_keeps_full_conservative_allowance(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native)
-        self.assertEqual(self.charges(self.proven(native, 4400, birth_ms=self.now - 10_000)), ALLOWANCE)
-
-    def test_retained_expired_unconfirmed_reservation_keeps_its_charge(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        # Terminal-looking custody: the row settled expired_unconfirmed but the
-        # guard-owned reservation was never released, so the charge remains.
-        launching_row(self.journal, state='expired_unconfirmed', marker=1, native=native)
-        reserve(self.journal, native=native)
-        self.assertEqual(self.charges(observation([])), ALLOWANCE)
-        self.assertEqual(self.charges(((), None)), ALLOWANCE)
-
-    def test_active_legacy_null_marker_row_is_charged_and_can_be_os_proven(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=None, native=native)  # pre-feature legacy row
-        self.assertEqual(self.charges(observation([])), ALLOWANCE)
-        self.assertEqual(self.charges(self.proven(native, 4800)), 0)
-
-    def test_invalid_or_orphaned_reservation_tuple_is_unknown_never_zero(self):
-        launching_row(self.journal, state='running', marker=1,
-                      native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d')
-        # A reduced allowance distinguishes validated charges from the
-        # conservative unknown default.
-        reserve(self.journal, digest='mismatched-digest', native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d',
-                allowance=100 * 1024 * 1024)
-        self.assertEqual(self.charges(observation([])), DEFAULT)  # digest mismatch -> unknown
-        reserve(self.journal, 'operation-orphan', 'session-orphan', 2, allowance=100 * 1024 * 1024)
+            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")  # only one sibling account
+        launching_row(self.journal, 'operation-old', 'session-old', state='running', marker=1, native=native,
+                      tag='task-hub2-session-old')
+        birth = int(time.time() * 1000) - 400_000
+        clock = {'value': time.monotonic()}
+        reads = []
+        def births(pid, read=None):
+            reads.append(pid)
+            if len(reads) % 2 == 0:  # every final re-read consumes the census budget
+                clock['value'] += resource_admission.MAX_CENSUS_AGE_SECONDS + 1
+            return birth
+        os_proof(self, births=births, cwds={5500: '/owned'})
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        sample = lambda deadline: FLOOR + ALLOWANCE + 4096
+        caps = {'memory_mb': 1500, 'pids': 256}
+        bridge = admit_bridge(self.journal, sample=sample)
+        reserve(self.journal, 'operation-old', 'session-old', native=native,
+                attempt=bridge.attempt_label('session-old', 'operation-old', 1))
+        # Expiry pass first: the witness read runs on a fresh census and the
+        # final incarnation re-read pushes the collection clock past its age,
+        # so the end-of-charges freshness recheck withdraws the credit and
+        # the recomputed full charge pushes the same admission below the floor.
+        census = observation([resident(native, tag='task-hub2-session-old', pid=5500)])
+        with patch.object(resource_admission, 'time', fake_time):
+            with self.assertRaisesRegex(RuntimeError, 'host_launch_queue_full'):
+                resource_admission.admit_dispatch(bridge, 'operation-a', 'session-a', 1, caps, census=census)
+        self.assertEqual(reads, [5500, 5500])  # witness bound fresh, re-read expired the census
+        self.assertFalse(self.journal.db.execute(
+            "SELECT 1 FROM resource_reservations WHERE operation_id='operation-a'").fetchone())
+        # Fresh-census control: the same admission credits the proven mature
+        # resident, so exactly one new account fits above the floor.
         with self.journal.db as db:
-            db.execute("DELETE FROM launches WHERE operation_id='operation-orphan'")
-        self.assertEqual(self.charges(observation([])), DEFAULT + DEFAULT)  # orphaned -> unknown, never zero
-
-    def test_attempt_label_proof_validated_when_derivable(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native, allowance=100 * 1024 * 1024)
-        ok = lambda session, operation, epoch: 'attempt'
-        self.assertEqual(self.charges(observation([]), attempt_label=ok), 100 * 1024 * 1024)
-        bad = lambda session, operation, epoch: 'different'
-        self.assertEqual(self.charges(observation([]), attempt_label=bad), DEFAULT)
-
-    def test_unknown_current_inflight_keeps_full_allowance(self):
-        launching_row(self.journal, marker=1)  # dispatched, unbound, no observation row
-        self.assertEqual(self.charges(observation([])), ALLOWANCE)
-        self.assertEqual(self.charges(((), None)), ALLOWANCE)
-        self.assertEqual(self.charges(None), ALLOWANCE)
-
-    def test_sdk_projection_without_positive_os_proof_is_never_zero(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native)
-        row = resident(native, pid=4500)
-        # Matching tag/workspace/alive/birth/age from the observation alone,
-        # but every positive OS step missing or contradictory: full charge.
-        os_proof(self, )  # no kernel birth, no cwd, not alive
-        self.assertEqual(self.charges(observation([row])), ALLOWANCE)
-        os_proof(self, births={4500: self.now - 400_000})  # birth ok, no cwd
-        self.assertEqual(self.charges(observation([row])), ALLOWANCE)
-        os_proof(self, births={4500: self.now - 400_000}, cwds={4500: '/elsewhere'})
-        self.assertEqual(self.charges(observation([row])), ALLOWANCE)
-        os_proof(self, births={4500: self.now - 400_000 - 60_000}, cwds={4500: '/owned'})  # birth beyond tolerance
-        self.assertEqual(self.charges(observation([row])), ALLOWANCE)
-        os_proof(self, births={4500: self.now - 400_000}, cwds={4500: '/owned'}, alive=False)  # died at the boundary
-        self.assertEqual(self.charges(observation([row])), ALLOWANCE)
-
-    def test_pid_reuse_without_exact_session_anchor_is_never_credited(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native)
-        # A recycled pid with matching kernel birth and cwd but the WRONG
-        # APLEXER_SESSION_ID entry earns no credit: full charge.
-        os_proof(self, births={4900: self.now - 400_000}, cwds={4900: '/owned'},
-                 sessions={4900: False})
-        self.assertEqual(self.charges(observation([resident(native, pid=4900)])), ALLOWANCE)
-
-    def test_exact_session_anchor_entry_rules(self):
-        env = b'X=1\x00APLEXER_SESSION_ID=1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d\x00Y=2\x00'
-        read = lambda path: env
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        self.assertTrue(resource_admission._process_session_binding(42, native, read=read))
-        self.assertTrue(resource_admission._process_session_binding(42, native.upper(), read=read))
-        self.assertFalse(resource_admission._process_session_binding(
-            42, '9f059843-b8ce-5309-a8e0-03cab1dc17e3', read=read))  # recycled pid, other session
-        self.assertFalse(resource_admission._process_session_binding(
-            42, native + 'x', read=read))  # prefix-extended identity is not exact
-        self.assertFalse(resource_admission._process_session_binding(
-            42, native, read=lambda path: b'X=1\x00Y=2\x00'))  # entry missing
-        self.assertFalse(resource_admission._process_session_binding(
-            42, native, read=lambda path: b'\0' * 65537))  # oversized environment
-        self.assertFalse(resource_admission._process_session_binding(
-            42, native, read=lambda path: (_ for _ in ()).throw(OSError(1, 'denied'))))
-
-
-    def test_duplicate_incarnation_credits_exactly_once(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, 'operation-a', 'session-a', state='running', marker=1,
-                      native=native, tag='task-hub2-shared')
-        launching_row(self.journal, 'operation-b', 'session-b', state='running', marker=1,
-                      native=native, tag='task-hub2-shared')
-        reserve(self.journal, 'operation-a', 'session-a', native=native)
-        reserve(self.journal, 'operation-b', 'session-b', native=native)
-        self.assertEqual(self.charges(self.proven(native, 4600, tag='task-hub2-shared')), ALLOWANCE)
-
-    def test_identity_or_stage_mismatch_earns_no_credit(self):
-        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
-        launching_row(self.journal, state='running', marker=1, native=native)
-        reserve(self.journal, native=native)
-        os_proof(self, births={4700: self.now - 400_000}, cwds={4700: '/owned'})
-        for rows in (observation([resident(native, tag='task-hub2-other', pid=4700)]),
-                     observation([resident(native, workspace='/elsewhere', pid=4700)]),
-                     observation([resident(native, birth_ms=self.now + 5_000, pid=4700)]),
-                     observation([resident(native, alive=False, pid=4700)]),
-                     observation([resident(native, alive=None, pid=4700)]),
-                     observation([resident(native, phase='exited', pid=4700)]),
-                     observation([resident(native, state='starting', pid=4700)]),
-                     observation([resident(native, pid=None)]),
-                     observation([], collected_offset=30.0)):  # stale at the final boundary
-            self.assertEqual(self.charges(rows), ALLOWANCE, msg=str(rows))
-
-
-class PermitTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.journal = Journal(Path(self.temp.name) / 'journal.sqlite')
-        self.addCleanup(self.journal.db.close)
-
-    def test_no_permit_verifies_trivially(self):
-        self.assertIsNone(resource_admission.verify_permit(None, journal=self.journal))
-
-    def test_expired_permit_refuses_without_renewing_the_clock(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
-                                                   permit_deadline=time.monotonic() - 1)
-        self.assertTrue(permit.expired())
-        with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
-            resource_admission.verify_permit(permit, journal=self.journal)
-        time.sleep(0.01)
-        with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
-            resource_admission.verify_permit(permit, journal=self.journal)  # never renewed
-
-    def test_fresh_permit_requires_unfenced_launching_row(self):
-        launching_row(self.journal)
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
-                                                   permit_deadline=time.monotonic() + 30)
-        self.assertIsNone(resource_admission.verify_permit(permit, journal=self.journal))
-        with self.journal.db as db:
-            db.execute("UPDATE launches SET state='stopped_before_dispatch'")
-        with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
-            resource_admission.verify_permit(permit, journal=self.journal)
-        with self.journal.db as db:
-            db.execute("UPDATE launches SET state='launching'")
-            db.execute('INSERT INTO stop_fences VALUES(?,?)', ('session-1', 1))
-        with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
-            resource_admission.verify_permit(permit, journal=self.journal)
-
-    def test_permit_without_journal_checks_age_only(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
-                                                   permit_deadline=time.monotonic() + 30)
-        self.assertIsNone(resource_admission.verify_permit(permit, journal=None))
-
-
-class ReleaseCustodyTests(unittest.TestCase):
-    """Release only in evidence-qualified terminal transactions; uncertain
-    custody (aborting, expired, unknown) never refunds a reservation."""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.journal = Journal(Path(self.temp.name) / 'journal.sqlite')
-        self.addCleanup(self.journal.db.close)
-
-    def reservations(self):
-        return {row[0] for row in self.journal.db.execute('SELECT operation_id FROM resource_reservations')}
-
-    def test_exact_key_release_only(self):
-        reserve(self.journal, 'operation-a', 'session-a')
-        reserve(self.journal, 'operation-b', 'session-b')
-        resource_admission.release_reservation(self.journal.db, 'operation-a', 'session-a', 1)
-        self.journal.db.commit()
-        self.assertEqual(self.reservations(), {'operation-b'})
-        resource_admission.release_reservation(self.journal.db, 'operation-a', 'session-x', 1)
-        self.journal.db.commit()
-        self.assertEqual(self.reservations(), {'operation-b'})
-
-    def test_settled_no_dispatch_releases_exactly_and_keeps_other_attempts(self):
-        fixture = test_host.HostTests('runTest')
-        fixture.setUp()
-        self.addCleanup(fixture.tearDown)
-        launching_row(self.journal, 'operation-orphan', 'session-orphan', 7, marker=0)
-        reserve(self.journal, 'operation-orphan', 'session-orphan', 7)
-        reserve(self.journal, 'operation-held', 'session-held', 3)
-        row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id='operation-orphan'").fetchone()
-        fixture.journal = self.journal
-        fixture.bridge.journal = self.journal
-        fixture.bridge.settle_undispatched_launch(row)
-        settled = self.journal.db.execute(
-            "SELECT state FROM launches WHERE operation_id='operation-orphan'").fetchone()[0]
-        self.assertEqual(settled, 'stopped_before_dispatch')
-        self.assertEqual(self.reservations(), {'operation-held'})
-        payloads = self.journal.db.execute('SELECT payload FROM outbox').fetchall()
-        self.assertEqual(len(payloads), 1)
-        self.assertTrue(json.loads(payloads[0][0])['no_dispatch'])
-
-    def test_stop_fenced_before_dispatch_releases_exactly(self):
-        fixture = test_host.HostTests('runTest')
-        fixture.setUp()
-        self.addCleanup(fixture.tearDown)
-        fixture.journal = self.journal
-        fixture.bridge.journal = self.journal
-        launching_row(self.journal, marker=0)
-        reserve(self.journal)
-        reserve(self.journal, 'operation-held', 'session-held', 3)
-        result = fixture.bridge.command({'id': 'stop-1', 'session_id': 'session-1',
-                                         'epoch': 1, 'kind': 'stop'})
-        self.assertEqual(result, {'stopped': True, 'evidence': 'dispatch_fenced'})
-        self.assertEqual(self.reservations(), {'operation-held'})
-
-
-if __name__ == '__main__':
-    unittest.main()
-
-    def status_call(self, load=42, total=32 * 1024**3, available=20 * 1024**3,
-                    result=1, break_length=False):
-        def call(pointer):
-            status = pointer._obj  # byref carrier of the exact struct
-            status.dwMemoryLoad = load
-            status.ullTotalPhys = total
-            status.ullAvailPhys = available
-            if break_length:
-                status.dwLength = 48
-            return result
-        return call
-
-    def test_exact_struct_layout(self):
-        self.assertEqual(ctypes.sizeof(resource_admission.MemoryStatusEx), 64)
-
-    def test_success_and_range_boundaries(self):
-        self.assertEqual(resource_admission.sample_windows(self.status_call()), 20 * 1024**3)
-        self.assertEqual(resource_admission.sample_windows(
-            self.status_call(total=10, available=10)), 10)
-        self.assertEqual(resource_admission.sample_windows(
-            self.status_call(total=10, available=0)), 0)
-        for broken in (self.status_call(result=0),
-                       self.status_call(break_length=True),
-                       self.status_call(load=101),
-                       self.status_call(load=-1),
-                       self.status_call(total=0),
-                       self.status_call(total=10, available=11)):
-            with self.assertRaises(RuntimeError):
-                resource_admission.sample_windows(broken)
-
-    def test_non_windows_kernel_call_refuses(self):
-        if sys.platform == 'win32':
-            self.skipTest('real win32 platform')
-        with self.assertRaises(RuntimeError):
-            resource_admission.sample_windows()
-
-
-class PlatformSampleDispatchTests(unittest.TestCase):
-    def test_unknown_platform_refuses(self):
-        with self.assertRaises(RuntimeError):
-            resource_admission.sample_available_bytes(platform='sunos')
-
-    def test_deadline_refuses_before_and_after_sampling(self):
-        expired = time.monotonic() - 1
-        with self.assertRaises(RuntimeError):
-            resource_admission.sample_available_bytes(deadline=expired, platform='sunos')
-        slow = lambda: (time.sleep(0.05), 5 * 1024**3)[1]
-        with patch.object(resource_admission, 'sample_linux', side_effect=slow):
-            with self.assertRaises(RuntimeError):
-                resource_admission.sample_available_bytes(deadline=time.monotonic() + 0.01,
-                                                          platform='linux')
-
-    @unittest.skipUnless(sys.platform == 'linux', 'real Linux sample dispatch')
-    def test_linux_dispatch_samples(self):
-        self.assertGreater(resource_admission.sample_available_bytes(), 0)
-
-    def test_forced_windows_branch_off_windows_refuses(self):
-        if sys.platform == 'win32':
-            self.skipTest('real win32 platform')
-        with self.assertRaises(RuntimeError):
-            resource_admission.sample_available_bytes(platform='win32')
-
-
-class WorkerCapsTests(unittest.TestCase):
-    def test_defaults_apply_only_when_missing(self):
-        self.assertEqual(resource_admission.validate_worker_caps(None, None),
-                         {'memory_mb': 1500, 'pids': 256})
-
-    def test_valid_boundaries(self):
-        self.assertEqual(resource_admission.validate_worker_caps(1500, 256),
-                         {'memory_mb': 1500, 'pids': 256})
-        self.assertEqual(resource_admission.validate_worker_caps(1, 1),
-                         {'memory_mb': 1, 'pids': 1})
-
-    def test_malformed_and_oversized_refuse_without_clamping(self):
-        for memory, pids in ((1501, 256), (1500, 257), (0, 256), (1500, 0), (-1, 256),
-                             (True, 256), ('1500', 256), (1500, True), (1500, '256'),
-                             (1.5, 256), (1500, 2.0)):
-            with self.assertRaises(ValueError):
-                resource_admission.validate_worker_caps(memory, pids)
-
-
-class ConcurrentAdmissionTests(unittest.TestCase):
-    """Two real SQLite connections on ONE journal file; admission must
-    serialize on BEGIN IMMEDIATE so simultaneous starts cannot overspend."""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / 'journal.sqlite'
-        self.journal = Journal(self.path)
-        self.addCleanup(self.journal.db.close)
-        launching_row(self.journal, 'operation-a', 'session-a')
-        launching_row(self.journal, 'operation-b', 'session-b')
-
-    def admit(self, bridge, operation, session, results, barrier):
-        barrier.wait(5)
-        try:
-            results[operation] = resource_admission.admit_dispatch(
-                bridge, operation, session, 1,
-                {'memory_mb': 1500, 'pids': 256},
-                census=None, sample=lambda deadline: self.available)
-        except Exception as error:
-            results[operation] = error
-
-    def test_simultaneous_preparations_serialize_and_cannot_double_spend(self):
-        # Each unreserved preparer is conservatively charged (plan: undispatched
-        # pending preparation is reserved while it can launch concurrently), so
-        # the sample covers exactly the two accounts; the serialized commits
-        # land both without spending any account twice.
-        self.available = FLOOR + 2 * ALLOWANCE + 4096
-        bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
-        bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
-        results, barrier = {}, threading.Barrier(2)
-        threads = [threading.Thread(target=self.admit, args=(bridge, operation, session, results, barrier))
-                   for bridge, operation, session in ((bridge_a, 'operation-a', 'session-a'),
-                                                      (bridge_b, 'operation-b', 'session-b'))]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(10)
-            self.assertFalse(thread.is_alive())
-        admitted = [key for key, value in results.items() if isinstance(value, resource_admission.DispatchPermit)]
-        self.assertEqual(sorted(admitted), ['operation-a', 'operation-b'])
-        rows = {row['operation_id']: row['native_dispatch_started']
-                for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
-        # Either thread may win the serialized transaction; both commit exactly
-        # once and no account is spent twice.
-        self.assertEqual(sorted(rows.values()), [1, 1])
-        reservations = self.journal.db.execute('SELECT operation_id,session_id,epoch,allowance_bytes '
-                                               'FROM resource_reservations ORDER BY operation_id').fetchall()
-        self.assertEqual([(row['operation_id'], row['session_id'], row['epoch'], row['allowance_bytes'])
-                          for row in reservations],
-                         [('operation-a', 'session-a', 1, ALLOWANCE), ('operation-b', 'session-b', 1, ALLOWANCE)])
-
-    def test_serial_admissions_fit_individually_but_never_together(self):
-        # One new account of headroom: the first dispatch commits its own
-        # reservation; the second sees that charge (plus its own) and refuses
-        # with the typed capacity code - exactly one native effect is possible.
-        with self.journal.db as db:
-            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
-        self.available = FLOOR + ALLOWANCE + 4096
-        bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
-        bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
-        permit = resource_admission.admit_dispatch(bridge_a, 'operation-a', 'session-a', 1,
-                                                   {'memory_mb': 1500, 'pids': 256},
-                                                   census=None, sample=lambda deadline: self.available)
-        self.assertIsInstance(permit, resource_admission.DispatchPermit)
-        # The second attempt arrives as a fresh prepared row afterwards.
-        launching_row(self.journal, 'operation-b', 'session-b')
-        with self.assertRaisesRegex(RuntimeError, 'host_launch_queue_full'):
-            resource_admission.admit_dispatch(bridge_b, 'operation-b', 'session-b', 1,
-                                              {'memory_mb': 1500, 'pids': 256},
-                                              census=None, sample=lambda deadline: self.available)
-        rows = {row['operation_id']: row['native_dispatch_started']
-                for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
-        self.assertEqual(rows, {'operation-a': 1, 'operation-b': 0})
-        self.assertEqual(self.journal.db.execute(
-            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
-
-    def test_reservation_is_durable_across_restart_and_private_per_journal(self):
-        self.available = FLOOR + 2 * ALLOWANCE + 4096  # sibling preparer is conservatively charged
+            db.execute("UPDATE launches SET state='launching', native_dispatch_started=0, native_id=NULL "
+                       "WHERE operation_id='operation-a'")
         permit = resource_admission.admit_dispatch(
-            admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-            {'memory_mb': 1500, 'pids': 256}, census=None, sample=lambda deadline: self.available)
-        self.assertIsInstance(permit, resource_admission.DispatchPermit)
-        self.journal.close_thread()
-        self.journal.db.close()
-        reopened = Journal(self.path)
-        try:
-            row = reopened.db.execute('SELECT operation_id,allowance_bytes FROM resource_reservations').fetchone()
-            self.assertEqual((row['operation_id'], row['allowance_bytes']), ('operation-a', ALLOWANCE))
-            self.assertEqual(reopened.db.execute(
-                "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()[0], 1)
-            other = Journal(Path(self.temp.name) / 'other.sqlite')
-            try:
-                self.assertFalse(other.db.execute('SELECT 1 FROM resource_reservations').fetchone())
-            finally:
-                other.db.close()
-        finally:
-            reopened.close_thread()
-            reopened.db.close()
-
-    def test_stop_fenced_admission_refuses_before_marker_or_reservation(self):
-        with self.journal.db as db:
-            db.execute('INSERT INTO stop_fences VALUES(?,?)', ('session-a', 1))
-        with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
-            resource_admission.admit_dispatch(
-                admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                {'memory_mb': 1500, 'pids': 256}, census=None,
-                sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
-        self.assertEqual(self.journal.db.execute(
-            "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()[0], 0)
-        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
-
-    def test_sampler_failure_rolls_back_cleanly(self):
-        def broken(deadline):
-            raise RuntimeError('host_operation_failed')
-        with self.assertRaisesRegex(RuntimeError, 'host_operation_failed'):
-            resource_admission.admit_dispatch(
-                admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                {'memory_mb': 1500, 'pids': 256}, census=None, sample=broken)
-        self.assertEqual(self.journal.db.execute(
-            "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()[0], 0)
-        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
-
-    def test_replayed_admission_never_reserves_twice(self):
-        sample = lambda deadline: FLOOR + 2 * ALLOWANCE + 4096
-        resource_admission.admit_dispatch(admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                                          {'memory_mb': 1500, 'pids': 256}, census=None, sample=sample)
-        with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
-            resource_admission.admit_dispatch(admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                                              {'memory_mb': 1500, 'pids': 256}, census=None, sample=sample)
-        self.assertEqual(self.journal.db.execute(
-            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
-
-    def test_mismatched_attempt_identity_refuses(self):
-        for operation, session, epoch in (('operation-x', 'session-a', 1),
-                                          ('operation-a', 'session-x', 1),
-                                          ('operation-a', 'session-a', 2)):
-            with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
-                resource_admission.admit_dispatch(admit_bridge(self.journal), operation, session, epoch,
-                                                  {'memory_mb': 1500, 'pids': 256}, census=None,
-                                                  sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
-
-    def test_deadline_expiry_during_database_phase_refuses_before_state_work(self):
-        # The ONE original deadline is re-checked inside the transaction after
-        # BEGIN IMMEDIATE and after the charges: a budget consumed while the
-        # DB phase holds the write lock refuses fail-closed before the sample,
-        # the marker or the reservation.
-        with self.journal.db as db:
-            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
-        calls = {'n': 0}
-        entry = time.monotonic()
-
-        def staged():
-            calls['n'] += 1
-            return entry if calls['n'] <= 3 else entry + resource_admission.ADMISSION_WINDOW_SECONDS + 1
-
-        with patch.object(resource_admission, 'time',
-                          SimpleNamespace(monotonic=staged, time=lambda: 0.0)):
-            with self.assertRaisesRegex(RuntimeError, 'host_operation_failed'):
-                resource_admission.admit_dispatch(
-                    admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                    {'memory_mb': 1500, 'pids': 256}, census=(), sample=lambda deadline: FLOOR + ALLOWANCE)
-        row = self.journal.db.execute(
-            "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()
-        self.assertEqual(row[0], 0)
-        self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
-
-    def test_active_bound_overrun_refuses_admission(self):
-        with self.journal.db as db:
-            for index in range(1001):
-                db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,'
-                           "state,interactive,native_dispatch_started) VALUES(?,?,?,?,?,?,NULL,'running',0,1)",
-                           (f'op{index}', f'session{index}', 1, 'digest', '/owned', f'task-hub2-session{index}'))
-        with self.assertRaisesRegex(RuntimeError, 'active_native_bound_exceeded'):
-            resource_admission.admit_dispatch(admit_bridge(self.journal), 'operation-a', 'session-a', 1,
-                                              {'memory_mb': 1500, 'pids': 256}, census=None,
-                                              sample=lambda deadline: FLOOR + 100 * ALLOWANCE)
+            bridge, 'operation-a', 'session-a', 1, caps,
+            census=observation([resident(native, tag='task-hub2-session-old', pid=5500)]))
+        self.assertEqual(permit.operation_id, 'operation-a')
+        self.assertEqual(reads, [5500, 5500, 5500, 5500])  # witness + re-read in both passes
 
 
 class ResidentCreditTests(unittest.TestCase):
@@ -1082,6 +616,51 @@ class ResidentCreditTests(unittest.TestCase):
         launching_row(self.journal, state='running', marker=1, native=native)
         reserve(self.journal, native=native)
         self.assertEqual(self.charges(self.proven(native, 4200)), 0)
+
+    def test_pid_reused_after_witness_birth_is_never_credited(self):
+        # The first kernel birth read binds the incarnation witness; when the
+        # pid dies and is reused after genuine witness/cwd/stamp reads, the
+        # exact final re-read withdraws the credit: full charge, never zero.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        birth = self.now - 400_000
+        reads = []
+        def reused(pid, read=None):
+            reads.append(pid)
+            return birth if len(reads) == 1 else birth + 400_000
+        os_proof(self, births=reused, cwds={5200: '/owned'})
+        self.assertEqual(self.charges(observation([resident(native, pid=5200)])), ALLOWANCE)
+
+    def test_final_birth_recheck_is_exact_not_tolerance(self):
+        # A final re-read that lands within the initial 5 s tolerance still
+        # names a different incarnation: refused, never a five-second
+        # final equivalence.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        birth = self.now - 400_000
+        reads = []
+        def shifted(pid, read=None):
+            reads.append(pid)
+            return birth if len(reads) == 1 else birth + 3_000
+        os_proof(self, births=shifted, cwds={5250: '/owned'})
+        self.assertEqual(self.charges(observation([resident(native, pid=5250)])), ALLOWANCE)
+
+    def test_stable_incarnation_credits_with_witness_and_exact_reread(self):
+        # The positive path: one witness read, one exact final re-read, and
+        # the proven mature resident keeps its no-double-charge.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        birth = self.now - 400_000
+        reads = []
+        def stable(pid, read=None):
+            reads.append(pid)
+            return birth
+        os_proof(self, births=stable, cwds={5300: '/owned'})
+        self.assertEqual(self.charges(observation([resident(native, pid=5300)])), 0)
+        self.assertEqual(reads, [5300, 5300])  # witness bound, then re-read at the credit boundary
 
     def test_unreserved_mature_resident_upgrade_row_is_credited_with_os_proof(self):
         native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
@@ -1130,6 +709,41 @@ class ResidentCreditTests(unittest.TestCase):
         self.assertEqual(self.charges(observation([]), attempt_label=ok), 100 * 1024 * 1024)
         bad = lambda session, operation, epoch: 'different'
         self.assertEqual(self.charges(observation([]), attempt_label=bad), DEFAULT)
+
+    def test_invalid_attempt_or_allowance_never_zeroes_with_mature_proof(self):
+        # The complete stored tuple is validated BEFORE any maturity
+        # zero-credit: a wrong attempt label or an insane stored allowance
+        # keeps the known full conservative allowance even with complete
+        # positive OS proof for the same incarnation.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native, allowance=100 * 1024 * 1024)
+        os_proof(self, births={5400: self.now - 400_000}, cwds={5400: '/owned'})
+        rows = observation([resident(native, pid=5400)])
+        ok = lambda session, operation, epoch: 'attempt'
+        bad = lambda session, operation, epoch: 'different'
+        self.assertEqual(self.charges(rows, attempt_label=bad), DEFAULT)  # wrong attempt
+        for allowance in (0, -1, 2 * ALLOWANCE, 1.5):
+            with self.journal.db as db:
+                db.execute("UPDATE resource_reservations SET allowance_bytes=? "
+                           "WHERE operation_id='operation-1'", (allowance,))
+            self.assertEqual(self.charges(rows, attempt_label=ok), DEFAULT, msg=repr(allowance))
+        # Type-level malformed allowances refuse at the record validator too.
+        for malformed in (True, 1.5, None, object(), '1500'):
+            reservation = {'allowance_bytes': malformed, 'session_id': 's', 'operation_id': 'o',
+                           'epoch': 1, 'attempt': 'attempt'}
+            self.assertFalse(resource_admission._reservation_record_valid(reservation, ok),
+                             msg=repr(malformed))
+
+    def test_valid_reduced_allowance_with_mature_proof_still_zeroes(self):
+        # A fully valid reservation keeps its no-double-charge: valid reduced
+        # allowance plus derivable attempt label plus proven mature resident.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native, allowance=100 * 1024 * 1024)
+        os_proof(self, births={5450: self.now - 400_000}, cwds={5450: '/owned'})
+        ok = lambda session, operation, epoch: 'attempt'
+        self.assertEqual(self.charges(observation([resident(native, pid=5450)]), attempt_label=ok), 0)
 
     def test_unknown_current_inflight_keeps_full_allowance(self):
         launching_row(self.journal, marker=1)  # dispatched, unbound, no observation row
@@ -1193,6 +807,22 @@ class ResidentCreditTests(unittest.TestCase):
         reserve(self.journal, 'operation-b', 'session-b', native=native)
         self.assertEqual(self.charges(self.proven(native, 4600, tag='task-hub2-shared')), ALLOWANCE)
 
+    def test_census_changed_during_process_proofs_recharges_conservatively(self):
+        # The private observation is freshness-rechecked after the per-row OS
+        # proofs: when it no longer holds at that final boundary (rows
+        # changed or the collection clock expired), every credit is withdrawn
+        # and the whole charge recomputes conservatively.
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native)
+        os_proof(self, births={5350: self.now - 400_000}, cwds={5350: '/owned'})
+        row = resident(native, pid=5350)
+        residents = {native: row}
+        with patch.object(resource_admission, '_resident_rows',
+                          side_effect=[residents, {}]) as rechecked:
+            self.assertEqual(self.charges(observation([row])), ALLOWANCE)
+        self.assertEqual(rechecked.call_count, 2)  # initial view plus final freshness recheck
+
     def test_identity_or_stage_mismatch_earns_no_credit(self):
         native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
         launching_row(self.journal, state='running', marker=1, native=native)
@@ -1244,6 +874,50 @@ class PermitTests(unittest.TestCase):
             db.execute('INSERT INTO stop_fences VALUES(?,?)', ('session-1', 1))
         with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
             resource_admission.verify_permit(permit, journal=self.journal)
+
+    def crossing_journal(self, clock, fire_sql, advance=131.0):
+        """Journal whose matching SELECT consumes the remaining budget."""
+        class CrossingDB:
+            def execute(self, sql, *args):
+                if sql.startswith(fire_sql):
+                    clock['value'] = advance
+                if sql.startswith('SELECT state FROM launches'):
+                    return SimpleNamespace(fetchone=lambda: {'state': 'launching'})
+                return SimpleNamespace(fetchone=lambda: None)
+        return SimpleNamespace(db=CrossingDB())
+
+    def test_expiry_after_final_state_sql_read_refuses(self):
+        # Entry at 100 with deadline 130 passes; the state SELECT itself
+        # consumes the budget (131) and no fence row exists - the final
+        # post-SQL check must refuse what the entry check let through.
+        clock = {'value': 100.0}
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, permit_deadline=130.0)
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        with patch.object(resource_admission, 'time', fake_time):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                resource_admission.verify_permit(
+                    permit, journal=self.crossing_journal(clock, 'SELECT state FROM launches'))
+
+    def test_expiry_after_stop_fence_sql_read_refuses(self):
+        # Same crossing on the STOP fence read: the fence query consumes the
+        # budget and returns no row, and the final check still refuses.
+        clock = {'value': 100.0}
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, permit_deadline=130.0)
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        with patch.object(resource_admission, 'time', fake_time):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                resource_admission.verify_permit(
+                    permit, journal=self.crossing_journal(clock, 'SELECT 1 FROM stop_fences'))
+
+    def test_post_sql_reads_within_deadline_still_verify(self):
+        # The final boundary fires only on actual expiry: consuming part of
+        # the budget without crossing the deadline still verifies.
+        clock = {'value': 100.0}
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, permit_deadline=130.0)
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        with patch.object(resource_admission, 'time', fake_time):
+            self.assertIsNone(resource_admission.verify_permit(
+                permit, journal=self.crossing_journal(clock, 'SELECT state FROM launches', advance=129.5)))
 
     def test_permit_without_journal_checks_age_only(self):
         permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,

@@ -1260,8 +1260,11 @@ class NativeLauncher:
         # read-only and never renews the sample clock or resets the marker.
         permit = before_dispatch() if before_dispatch else None
         try:
-            # The durable dispatch marker may have consumed the remaining budget.
-            # Time-only: the callback legitimately changed dispatch_started to 1.
+            # The admission's one original deadline may already be consumed by
+            # the committed admission or by verify_permit's own final state/
+            # STOP journal reads, which re-check expiry immediately before the
+            # runner. Time-only: the callback legitimately changed
+            # dispatch_started to 1.
             if diagnostic is not None:
                 diagnostic.check()
             resource_admission.verify_permit(permit, journal=self.journal)

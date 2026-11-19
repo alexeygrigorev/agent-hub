@@ -232,10 +232,12 @@ def release_reservation(db, operation, session, epoch):
 def verify_permit(permit, journal=None):
     """Read-only freshness/fence re-check immediately before the runner.
 
-    Age is measured against the original sample clock; a STOP fence or a
-    changed launch row refuses the spawn. The durable marker is never
-    re-checked towards 0 and the reservation is never refunded here: refusal
-    after commit keeps launch custody uncertain."""
+    Age is measured against the original sample clock at entry and AGAIN
+    after the final launch-row and STOP-fence reads: the one original
+    deadline is never renewed, so a permit that expires while those SQL
+    reads run still refuses the spawn. The durable marker is never re-checked
+    towards 0 and the reservation is never refunded here: refusal after
+    commit keeps launch custody uncertain, never re-dispatched."""
     if permit is None:
         return
     if permit.expired():
@@ -249,6 +251,10 @@ def verify_permit(permit, journal=None):
         raise RuntimeError('native_start_uncertain')
     if db.execute('SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?',
                   (permit.session_id, permit.epoch)).fetchone():
+        raise RuntimeError('native_start_uncertain')
+    # Final boundary AFTER all journal reads, immediately before the runner:
+    # the state or fence SELECT may have consumed the remaining budget.
+    if permit.expired():
         raise RuntimeError('native_start_uncertain')
 
 
@@ -317,8 +323,13 @@ def _windows_creation_ms(open_process, get_times, close_handle, pid):
     handle = open_process(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return None
+    # Four independent output objects: aliased addresses would let one
+    # overwritten field masquerade as the creation time.
+    creation = ctypes.c_ulonglong()
+    exit_time = ctypes.c_ulonglong()
+    kernel_time = ctypes.c_ulonglong()
+    user_time = ctypes.c_ulonglong()
     try:
-        creation, exit_time, kernel_time, user_time = (ctypes.c_ulonglong(),) * 4
         if not get_times(handle, ctypes.byref(creation), ctypes.byref(exit_time),
                          ctypes.byref(kernel_time), ctypes.byref(user_time)):
             return None
@@ -367,11 +378,14 @@ _ENVIRON_MAX_BYTES = 65536
 def _process_session_binding(pid, native_id, read=None):
     """Exact bound incarnation anchor: the pid carries THIS native session id.
 
-    The workload pid's kernel environment must contain the exact
+    The workload pid's kernel environment must carry exactly ONE
     APLEXER_SESSION_ID entry equal to the bound native UUID, so a recycled
-    pid can never inherit another attempt's credit. Oversized, unreadable or
+    pid can never inherit another attempt's credit and a contradictory
+    duplicate stamp refuses the whole binding. Oversized, unreadable or
     missing evidence refuses the binding (no tolerance, no inference); the
-    Linux-only anchor conservatively holds on platforms without it."""
+    Linux-only anchor conservatively holds on platforms without it. The raw
+    environment is read into a local bounded buffer and only a bool leaves
+    this function: nothing is logged or persisted."""
     if sys.platform == 'win32':
         return False  # no exact pid-environment anchor: conservative hold
     if read is None:
@@ -383,10 +397,13 @@ def _process_session_binding(pid, native_id, read=None):
     if not isinstance(raw, (bytes, bytearray)) or len(raw) > _ENVIRON_MAX_BYTES:
         return False
     expected = _SESSION_ENV_ENTRY + native_id.strip().lower().encode('ascii')
+    stamp = None
     for entry in bytes(raw).split(b'\0'):
         if entry.startswith(_SESSION_ENV_ENTRY):
-            return entry == expected
-    return False
+            if stamp is not None:
+                return False  # contradictory duplicate stamp: refuse, never pick one
+            stamp = entry
+    return stamp == expected
 
 
 def _process_alive(pid):
@@ -512,11 +529,15 @@ def _mature_resident(row, residents, credited, now_ms, read=None):
     matching tag/workspace, and a workload pid whose kernel birth matches the
     observed birth within the fixed tolerance and whose kernel cwd resolves
     to the exact bound workspace (Linux; Windows proves kernel birth and
-    conservatively holds when cwd/process proof is unavailable). Liveness is
-    revalidated here at the final boundary, immediately before the physical
-    sample. Each census row credits at most one reservation. Any absent,
-    malformed or mismatched step keeps the full conservative allowance;
-    missing proof never becomes zero."""
+    conservatively holds when cwd/process proof is unavailable). The first
+    kernel birth read binds the OS process incarnation witness; every later
+    proof step (cwd, exact unique session stamp, liveness) runs only after
+    it, and the kernel birth is re-read at the very end: credit survives
+    only when the final read names the EXACT same incarnation (strict
+    equality, no tolerance), so a pid that exits and is reused after the
+    witness read withdraws the credit. Each census row credits at most one
+    reservation. Any absent, malformed or mismatched step keeps the full
+    conservative allowance; missing proof never becomes zero."""
     native_id = row['native_id']
     if not isinstance(native_id, str) or not _UUID_RE.fullmatch(native_id):
         return False
@@ -530,12 +551,16 @@ def _mature_resident(row, residents, credited, now_ms, read=None):
         return False
     pid = resident.get('workload_pid')
     birth = resident.get('created_at_ms')
-    kernel_birth = _process_birth_ms(pid, read=read)
-    if (not isinstance(kernel_birth, int)
-            or abs(kernel_birth - birth) > MATURE_BIRTH_TOLERANCE_MS
-            or not _process_cwd_is_bound(pid, row['workspace'])
+    witness_birth = _process_birth_ms(pid, read=read)
+    if not isinstance(witness_birth, int) or abs(witness_birth - birth) > MATURE_BIRTH_TOLERANCE_MS:
+        return False
+    if (not _process_cwd_is_bound(pid, row['workspace'])
             or not _process_session_binding(pid, native_id)
             or _process_alive(pid) is not True):
+        return False
+    # Final incarnation re-read at the credit boundary: the witness stays
+    # bound only if the kernel still names the same birth for this pid.
+    if _process_birth_ms(pid, read=read) != witness_birth:
         return False
     credited.add(key)
     return True
@@ -550,26 +575,37 @@ def _process_cwd_is_bound(pid, workspace):
     return cwd is not None and _same_workspace(cwd, workspace)
 
 
-def _validated_reservation_allowance(reservation, attempt_label):
-    """Sane allowance plus attempt-label proof for one reservation.
+def _reservation_record_valid(reservation, attempt_label):
+    """Complete stored reservation tuple validity: sane allowance plus
+    attempt-label proof re-derived from the exact (session, operation, epoch).
 
     Identity equality against the launches row is enforced by the caller's
-    bound check; here the stored attempt label must re-derive from the exact
-    (session, operation, epoch) and the allowance must be a sane positive int
-    within the fixed cap. Any failure is unknown current inflight: the full
+    bound check; here the stored allowance must be a sane positive int within
+    the fixed cap and the stored attempt label must re-derive exactly. Any
+    failure makes the record an unknown current inflight: the full
     conservative default, never zero, never dropped or migrated."""
     allowance = reservation['allowance_bytes']
     if not (type(allowance) is int and 0 < allowance <= DEFAULT_ALLOWANCE_BYTES):
-        return DEFAULT_ALLOWANCE_BYTES
+        return False
     if attempt_label is not None:
         try:
             expected = attempt_label(reservation['session_id'], reservation['operation_id'],
                                      reservation['epoch'])
         except (TypeError, ValueError):
-            return DEFAULT_ALLOWANCE_BYTES
+            return False
         if reservation['attempt'] != expected:
-            return DEFAULT_ALLOWANCE_BYTES
-    return allowance
+            return False
+    return True
+
+
+def _validated_reservation_allowance(reservation, attempt_label):
+    """Sane allowance plus attempt-label proof for one reservation.
+
+    Returns the stored allowance only for a fully valid record; every other
+    shape collapses to the conservative default."""
+    if not _reservation_record_valid(reservation, attempt_label):
+        return DEFAULT_ALLOWANCE_BYTES
+    return reservation['allowance_bytes']
 
 
 def _uncovered_charges(db, observation, exclude_operation, now_ms, attempt_label=None):
@@ -579,13 +615,31 @@ def _uncovered_charges(db, observation, exclude_operation, now_ms, attempt_label
     qualified release - regardless of any terminal-looking launches state, so
     a retained expired_unconfirmed custody keeps its charge - plus every
     active launches attempt without a reservation (legacy marker-NULL rows
-    included). A candidate charges zero only with complete positive
+    included). The complete reservation tuple (identity, digest, epoch,
+    attempt label, native binding, allowance) is validated BEFORE any
+    maturity zero-credit: an invalid, orphan or ambiguous current record
+    charges the full conservative default even when OS proof exists. A fully
+    valid candidate charges zero only with complete positive
     same-incarnation OS proof at this final boundary; unknown, unbound or
     invalid identities charge the full conservative default and never zero.
-    Undispatched pending/preparation rows hold no reservation and cannot
-    spawn without passing this same serialized admission. Terminal history is
-    never scanned and never poisons the gate."""
+    The observation is freshness-rechecked after the per-candidate process
+    proofs: if the census changed or went stale while they ran, every credit
+    is withdrawn and the charge recomputes conservatively, so the reserve
+    and floor decision stay safe. Undispatched pending/preparation rows hold
+    no reservation and cannot spawn without passing this same serialized
+    admission. Terminal history is never scanned and never poisons the gate."""
     residents = _resident_rows(observation, now_ms)
+    total = _current_charges(db, residents, exclude_operation, now_ms, attempt_label)
+    if _resident_rows(observation, now_ms) != residents:
+        # The private observation no longer holds at this final boundary
+        # (expired collection clock or changed rows during the slow OS
+        # reads): no census row may release its allowance now.
+        total = _current_charges(db, {}, exclude_operation, now_ms, attempt_label)
+    return total
+
+
+def _current_charges(db, residents, exclude_operation, now_ms, attempt_label=None):
+    """One charge pass against one fixed census view; no credit re-derivation."""
     credited = set()
     total = 0
     charged = set()
@@ -607,9 +661,10 @@ def _uncovered_charges(db, observation, exclude_operation, now_ms, attempt_label
                  and isinstance(reservation['native_id'], str)
                  and (reservation['reserved_native_id'] is None
                       or reservation['reserved_native_id'] == reservation['native_id']))
-        if not bound:
-            # Unresolvable or mismatched identity: unknown current inflight
-            # keeps the full conservative default, never the stored allowance.
+        if not bound or not _reservation_record_valid(reservation, attempt_label):
+            # Unresolvable identity or an invalid stored tuple (bad allowance,
+            # wrong attempt label): unknown current inflight keeps the full
+            # conservative default BEFORE any maturity credit can apply.
             total += DEFAULT_ALLOWANCE_BYTES
             continue
         if _mature_resident(reservation, residents, credited, now_ms):
