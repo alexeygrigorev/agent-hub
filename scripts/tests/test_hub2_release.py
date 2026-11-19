@@ -1,9 +1,13 @@
 """Targeted release safety checks; no network, live service or live venv writes."""
+from collections.abc import Mapping
+import contextlib
+from dataclasses import dataclass
 import fcntl
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -16,6 +20,7 @@ import tempfile
 import time
 import threading
 import unittest
+import venv
 import zipfile
 from unittest.mock import patch
 
@@ -39,7 +44,192 @@ STATUS_PATH = '/api/fleet/routing/self'
 HOST = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
 
 
-class ReleaseTests(unittest.TestCase):
+@dataclass(frozen=True)
+class _RunSpawnPermit:
+    token: int
+    thread_id: int
+    argv: tuple[str, ...]
+    popen_kwargs: tuple[tuple[str, object], ...]
+
+
+class HermeticProcessFixture:
+    """Fixture-lifetime default deny for process effects.
+
+    Any updater.command, subprocess.run or subprocess.Popen call that the
+    running test has not explicitly allowed fails closed instead of reaching
+    the real host (incident cli681-c6-runtime-incident-v1: unmocked updater
+    runtime restarted the live service). A test that genuinely needs a child
+    registers its complete expected argv/cwd/env/kwargs contract through
+    owned_child(); scoped synthetic patches such as install()'s status
+    command mock stack on top of this guard and never widen it. Children run
+    under owned_child_env(): import (PYTHON*), Hub/credential (HUB*) and
+    aplexer/profile (APLEXER*) selectors from the worker environment are
+    removed and HOME points at the owned temporary, so an owned child can
+    import only the fixture packages it was given, never worker source,
+    credentials, Hub state or profiles.
+    """
+
+    # Worker-environment selector prefixes that must never leak into an
+    # owned child: import injection, Hub/credential routing and aplexer/
+    # profile worker state. Exceeds the production REPIN_ENV_DROP vocabulary.
+    AMBIENT_CHILD_ENV_DROP_PREFIXES = ('PYTHON', 'HUB', 'APLEXER')
+
+    def install_process_guard(self):
+        self._child_allowances = []
+        self._run_spawn_permits = []
+        self._run_permit_lock = threading.Lock()
+        self._run_permit_tokens = itertools.count(1)
+        self._real_subprocess_run = subprocess.run
+        self._real_subprocess_popen = subprocess.Popen
+        deny_command = patch.object(updater, 'command', self._deny_command)
+        deny_command.start()
+        self.addCleanup(deny_command.stop)
+        guarded_run = patch.object(subprocess, 'run', self._guarded_run)
+        guarded_run.start()
+        self.addCleanup(guarded_run.stop)
+        guarded_popen = patch.object(subprocess, 'Popen', self._guarded_popen)
+        guarded_popen.start()
+        self.addCleanup(guarded_popen.stop)
+
+    def _deny_command(self, args, *rest, **kwargs):
+        raise AssertionError('release test reached updater.command outside an explicit allowance: '
+                             + repr([str(value) for value in args])[:160])
+
+    @classmethod
+    def _freeze_contract_value(cls, value):
+        if value is None or isinstance(value, (bool, int, float, str, bytes)):
+            return value
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        if isinstance(value, Mapping):
+            return ('dict', tuple(sorted(
+                (cls._freeze_contract_value(k), cls._freeze_contract_value(v))
+                for k, v in value.items()
+            )))
+        if isinstance(value, (list, tuple)):
+            return ('seq', tuple(cls._freeze_contract_value(item) for item in value))
+        if isinstance(value, (set, frozenset)):
+            items = [cls._freeze_contract_value(item) for item in value]
+            return ('set', tuple(sorted(((repr(item), item) for item in items), key=lambda pair: pair[0])))
+        return ('obj', value)
+
+    @classmethod
+    def _freeze_popen_kwargs(cls, kwargs):
+        return tuple(sorted(
+            (key, cls._freeze_contract_value(value))
+            for key, value in kwargs.items()
+        ))
+
+    @staticmethod
+    def _expected_popen_kwargs(run_kwargs):
+        popen_kwargs = dict(run_kwargs)
+        run_input = popen_kwargs.pop('input', None)
+        capture_output = popen_kwargs.pop('capture_output', False)
+        popen_kwargs.pop('timeout', None)
+        popen_kwargs.pop('check', None)
+        if run_input is not None:
+            if popen_kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            popen_kwargs['stdin'] = subprocess.PIPE
+        if capture_output:
+            if popen_kwargs.get('stdout') is not None or popen_kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used with capture_output.')
+            popen_kwargs['stdout'] = subprocess.PIPE
+            popen_kwargs['stderr'] = subprocess.PIPE
+        return popen_kwargs
+
+    def _check_allowance(self, argv, kwargs):
+        argv = [value if isinstance(value, str) else str(value) for value in argv]
+        if not any(matcher(argv, kwargs) for matcher in self._child_allowances):
+            raise AssertionError('release test reached an unallowed real process: ' + repr(argv)[:160])
+        return argv
+
+    def _guarded_run(self, argv, *args, **kwargs):
+        if args:
+            raise AssertionError('guarded subprocess.run permits no positional arguments beyond the command; '
+                                 'bind every option as a keyword argument: ' + repr(args)[:80])
+        norm_argv = self._check_allowance(argv, kwargs)
+        expected_popen_kwargs = self._expected_popen_kwargs(kwargs)
+        # The saved real run resolves subprocess.Popen from the patched module
+        # globals, so the Popen guard stays installed for the whole blocking
+        # call and re-enters for this one child. The validated call receives
+        # an exact one-shot permit bound to its owning thread, unique call
+        # token, and immutable normalized argv + Popen kwargs/env/cwd snapshot;
+        # the guarded Popen consumes it atomically before any wait, and every
+        # mismatch or cross-thread attempt fails closed without spending it.
+        with self._run_permit_lock:
+            permit = _RunSpawnPermit(
+                token=next(self._run_permit_tokens),
+                thread_id=threading.get_ident(),
+                argv=tuple(norm_argv),
+                popen_kwargs=self._freeze_popen_kwargs(expected_popen_kwargs),
+            )
+            self._run_spawn_permits.append(permit)
+        try:
+            return self._real_subprocess_run(list(norm_argv), **kwargs)
+        finally:
+            with self._run_permit_lock:
+                if permit in self._run_spawn_permits:
+                    self._run_spawn_permits.remove(permit)
+
+    def _guarded_popen(self, argv, *args, **kwargs):
+        if args:
+            raise AssertionError('guarded subprocess.Popen permits no positional arguments beyond the command; '
+                                 'bind bufsize/executable etc. as keyword arguments: ' + repr(args)[:80])
+        norm_argv = [value if isinstance(value, str) else str(value) for value in argv]
+        argv_tuple = tuple(norm_argv)
+        frozen_kwargs = self._freeze_popen_kwargs(kwargs)
+        caller_thread = threading.get_ident()
+        with self._run_permit_lock:
+            if self._run_spawn_permits:
+                match_index = next(
+                    (idx for idx, permit in enumerate(self._run_spawn_permits)
+                     if permit.thread_id == caller_thread
+                     and permit.argv == argv_tuple
+                     and permit.popen_kwargs == frozen_kwargs),
+                    None,
+                )
+                if match_index is None:
+                    raise AssertionError(
+                        'release test reached a real process other than the pending validated '
+                        'run child contract: ' + repr(norm_argv)[:160]
+                    )
+                self._run_spawn_permits.pop(match_index)
+                consumed_permit = True
+            else:
+                consumed_permit = False
+        if consumed_permit:
+            return self._real_subprocess_popen(norm_argv, **kwargs)
+        norm_argv = self._check_allowance(norm_argv, kwargs)
+        return self._real_subprocess_popen(norm_argv, **kwargs)
+
+    @contextlib.contextmanager
+    def owned_child(self, matcher):
+        """The one explicit fixture-scoped real-child allowance: while the
+        context is open, the guard executes only the complete argv/cwd/env/
+        kwargs contract the matcher validates, and nothing else."""
+        self._child_allowances.append(matcher)
+        try:
+            yield
+        finally:
+            self._child_allowances.remove(matcher)
+
+    def owned_child_env(self, **overrides):
+        """Sanitized environment for a fixture-owned real child.
+
+        Import (PYTHON*), Hub/credential (HUB*) and aplexer/profile
+        (APLEXER*) worker selectors are removed, HOME is bound to the owned
+        temporary, and overrides re-add exactly what one synthetic test
+        needs. The whole returned mapping is what every allowance must bind
+        exactly."""
+        sanitized = {key: value for key, value in os.environ.items()
+                     if not key.startswith(self.AMBIENT_CHILD_ENV_DROP_PREFIXES)}
+        sanitized['HOME'] = str(Path(self.temporary.name))
+        sanitized.update(overrides)
+        return sanitized
+
+
+class ReleaseTests(HermeticProcessFixture, unittest.TestCase):
     def test_native_self_update_bypasses_config_and_propagates_exit(self):
         code = '''
 from types import SimpleNamespace
@@ -50,9 +240,14 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     args = run.call_args.args[0]
     assert args[1] == '/isolated/root/updater.py' and '--no-restart' in args
 '''
-        subprocess.run([sys.executable, '-c', code], check=True,
-                       env=dict(os.environ, PYTHONPATH=str(REPO / 'hub2/host')),
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess_argv = [sys.executable, '-c', code]
+        child_env = self.owned_child_env(PYTHONPATH=str(REPO / 'hub2/host'))
+        with self.owned_child(lambda argv, kwargs: argv == subprocess_argv
+                              and kwargs.get('check') is True and kwargs.get('cwd') is None
+                              and kwargs.get('env') == child_env
+                              and sorted(kwargs) == ['check', 'env', 'stderr', 'stdout']):
+            subprocess.run(subprocess_argv, check=True, env=child_env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     def setUp(self):
         (REPO / '.local/tmp').mkdir(parents=True, exist_ok=True)
@@ -77,14 +272,45 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.status_rc = 0
         self.status_output = None
         self.status_timeout = False
+        # Hermetic profile/config selectors: the updater honors absolute
+        # ambient selectors (APLEXER_CONFIG, XDG_CONFIG_HOME), so every test
+        # binds HOME and all of them to this disposable owned root before any
+        # install/recovery/repin path runs. Real profile files are never read.
+        owned = Path(self.temporary.name)
+        selectors = {'HOME': str(owned), 'USERPROFILE': str(owned),
+                     'XDG_CONFIG_HOME': str(owned / '.config'),
+                     'APPDATA': str(owned / 'AppData' / 'Roaming'),
+                     'APLEXER_CONFIG': str(owned / '.config' / 'aplexer' / 'config.toml')}
+        profiles = patch.dict(os.environ, selectors)
+        profiles.start()
+        self.addCleanup(profiles.stop)
+        # Default deny holds for every test in this class, not only for the
+        # ones that remember to patch: an omitted per-test mock cannot reach
+        # the real service tool or spawn an unregistered process.
+        self.install_process_guard()
 
     def fetch(self, url, limit):
         name = url.rsplit('/', 1)[1]
         self.downloads.append(name)
         return json.dumps(self.manifest).encode() if name == 'host-release.json' else self.files[name]
 
+    def _owned_command_executable(self, executable):
+        # Fail closed on any external command: only the mocked service tool,
+        # the standard venv/uv provisioning tools and binaries inside the
+        # owned temporary root are accepted.
+        if executable in ('systemctl', 'uv'):
+            return True
+        path = Path(executable)
+        if path == Path(sys.executable):
+            return True
+        return (path.is_absolute()
+                and os.path.commonpath((str(path), self.temporary.name)) == self.temporary.name)
+
     def command(self, args):
-        self.calls.append([str(value) for value in args])
+        args = [str(value) for value in args]
+        if not self._owned_command_executable(args[0]):
+            raise AssertionError('install test reached an external command: ' + args[0])
+        self.calls.append(args)
 
     def status_command(self, args, *, stdout, stderr, timeout):
         self.calls.append(args)
@@ -555,10 +781,18 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
     def test_activated_shell_uses_operator_zipapp_with_host_package_present(self):
         target = self.root / 'releases' / SHA
         target.parent.mkdir(parents=True)
-        subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(target)], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        venv_argv = [sys.executable, '-m', 'venv', '--without-pip', str(target)]
+        venv_env = self.owned_child_env()
+        with self.owned_child(lambda argv, kwargs: argv == venv_argv
+                              and kwargs.get('check') is True and kwargs.get('cwd') is None
+                              and kwargs.get('env') == venv_env
+                              and sorted(kwargs) == ['check', 'env', 'stderr', 'stdout']):
+            subprocess.run(venv_argv, check=True, env=venv_env,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # Build the real operator CLI, then reproduce the host wheel's entry
-        # points. PYTHONPATH supplies the actual host package to this venv.
+        # points. The host package is installed only into this venv's
+        # site-packages; the sanitized child environment keeps the activated
+        # shell from resolving any worker source instead.
         with patch('sys.stdout', new=io.StringIO()):
             module('build-hub-cli').build(target, '0.2.0')
         entry = target / 'bin/hub'
@@ -570,7 +804,8 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         data = (target / 'hub.pyz').read_bytes()
         manifest = {'artifacts': {'hub.pyz': {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}}}
-        updater.install_operator_cli(target, manifest)
+        with patch.object(updater, 'command', self.command):
+            updater.install_operator_cli(target, manifest)
         (self.root / 'current').symlink_to(target)
         requests = []
 
@@ -595,13 +830,18 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
             profile = Path(self.temporary.name) / 'operator.json'
             profile.write_text('{}')
             profile.chmod(0o600)
-            env = dict(os.environ, HOME=self.temporary.name, HUB_CONFIG_FILE=str(profile),
-                       HUB_URL=f'http://127.0.0.1:{server.server_port}', HUB_TOKEN='synthetic-operator-token',
-                       PYTHONPATH=str(REPO / 'hub2/host'))
-            result = subprocess.run(['/bin/sh', '-ec',
-                                     '. "$1/bin/activate"; command -v hub; hub --version; hub sessions list; hub host --help',
-                                     'activated-shell', str(self.root / 'current')],
-                                    env=env, capture_output=True, text=True, timeout=30)
+            env = self.owned_child_env(HOME=self.temporary.name,
+                                       HUB_CONFIG_FILE=str(profile),
+                                       HUB_URL=f'http://127.0.0.1:{server.server_port}',
+                                       HUB_TOKEN='synthetic-operator-token')
+            shell_argv = ['/bin/sh', '-ec',
+                          '. "$1/bin/activate"; command -v hub; hub --version; hub sessions list; hub host --help',
+                          'activated-shell', str(self.root / 'current')]
+            with self.owned_child(lambda argv, kwargs: argv == shell_argv
+                                  and kwargs.get('cwd') is None
+                                  and kwargs.get('env') == env
+                                  and sorted(kwargs) == ['capture_output', 'env', 'text', 'timeout']):
+                result = subprocess.run(shell_argv, env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(str(target / 'bin/hub'), result.stdout)
             self.assertIn('hub 0.2.0', result.stdout)
@@ -716,8 +956,69 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
                                    for name, data in files.items()})
         return wheel_name, files, manifest
 
+    def release_venv(self, target):
+        """A real isolated release venv with an explicitly symlinked
+        bin/python (stdlib EnvBuilder defaults to copying), so the lexical
+        venv path and the resolved interpreter genuinely differ, as in a
+        pip-installed release environment."""
+        target.mkdir(parents=True, exist_ok=True)
+        venv.create(str(target), with_pip=False, system_site_packages=False, symlinks=True)
+        python = target / 'bin/python'
+        self.assertTrue(python.is_symlink())
+        self.assertNotEqual(os.path.realpath(python), os.path.abspath(python))
+        return target
+
+    def venv_only_host_package(self, target):
+        """A minimal owned agent_hub_host package installed only in this
+        venv's site-packages. The base interpreter the launcher's bin/python
+        links to cannot import it, so a launcher that runs and imports it
+        proves the lexical venv prefix resolved."""
+        site = target / 'lib' / ('python%d.%d' % sys.version_info[:2]) / 'site-packages'
+        package = site / 'agent_hub_host'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('')
+        (package / 'cli.py').write_text(
+            'import sys\n'
+            'def main(*args):\n'
+            '    print(sys.prefix)\n'
+            '    print(__file__)\n'
+            '    return 0\n')
+        return package
+
+    def run_owned_launcher(self, argv):
+        """Execute a release launcher under an exact owned-child allowance.
+
+        The synthetic main in venv_only_host_package prints its interpreter
+        prefix and module path and exits; no service, provider or network is
+        reachable from that child. The sanitized environment is bound in
+        full: ambient PYTHONPATH/PYTHONHOME cannot pull the worker's real
+        source package into the launcher's interpreter, so a proven run
+        imports the venv-only fixture package, not source."""
+        launcher_env = self.owned_child_env()
+        with self.owned_child(lambda a, kwargs: a == [str(value) for value in argv]
+                              and kwargs.get('cwd') == str(self.temporary.name)
+                              and kwargs.get('env') == launcher_env
+                              and sorted(kwargs) == ['capture_output', 'cwd', 'env', 'text', 'timeout']):
+            return subprocess.run([str(value) for value in argv], cwd=str(self.temporary.name),
+                                  env=launcher_env, capture_output=True, text=True, timeout=60)
+
     def pip_launcher_bytes(self, target):
-        return ('#!' + os.path.realpath(target / 'bin/python') + '\n'
+        """The genuine pip console-script form: the shebang names the lexical
+        release venv interpreter, never the base interpreter it links to."""
+        return ('#!' + os.path.abspath(target / 'bin/python') + '\n'
+                '# -*- coding: utf-8 -*-\n'
+                'import re\n'
+                'import sys\n'
+                'from agent_hub_host.cli import main\n'
+                "if __name__ == '__main__':\n"
+                "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+                '    sys.exit(main())\n').encode()
+
+    def rebuilt_launcher_bytes(self, target):
+        """The minimal lexical-venv daemon launcher written when the legacy
+        bin/hub2 entry is absent and rebuilt from the release's declared
+        metadata."""
+        return ('#!' + os.path.abspath(target / 'bin/python') + '\n'
                 'import sys\n'
                 'from agent_hub_host.cli import main\n'
                 "if __name__ == '__main__':\n"
@@ -727,6 +1028,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         wheel_name, files, manifest = self.legacy_bundle()
         target = self.root / 'releases' / OLD_SHA
         target.mkdir(parents=True)
+        self.release_venv(target)
         download = Path(self.temporary.name) / 'download-legacy'
         download.mkdir()
         for name, data in files.items():
@@ -739,9 +1041,12 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         with patch.object(updater, 'command', self.command), \
              patch.object(Path, 'home', return_value=Path(self.temporary.name)):
             updater.prepare_environment(target, download, manifest, wheel_name)
-            # The verified old wheel declares the private daemon entry: it is kept.
+            # The verified old wheel declares the private daemon entry: when
+            # absent from the mocked install, the minimal lexical-venv
+            # launcher is rebuilt.
             launcher = target / 'bin/hub2'
-            self.assertEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+            self.assertEqual(launcher.read_bytes(), self.rebuilt_launcher_bytes(target))
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
             self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
             # restart selection: the legacy release keeps the hub2 drop-in form.
             current.symlink_to(target)
@@ -777,7 +1082,7 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.install(install_service=True)
         legacy = (self.root / 'current').resolve()
         self.assertEqual(legacy.name, OLD_SHA)
-        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.pip_launcher_bytes(legacy))
+        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.rebuilt_launcher_bytes(legacy))
         # A newer unified release becomes current; the legacy release is retained.
         self.files, self.manifest = default_files, default_manifest
         del self.status_command
@@ -795,14 +1100,14 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.status_command = tolerant_probe
         self.install()
         self.assertEqual((self.root / 'current').resolve(), legacy)
-        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.pip_launcher_bytes(legacy))
+        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.rebuilt_launcher_bytes(legacy))
         self.assertEqual(os.readlink(legacy / 'bin/hub'), '../hub.pyz')
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), files[updater.UNITS[0]])
         self.assertIn(f'{self.root}/current/bin/hub2 serve', dropin.read_text())
 
     def test_same_version_repair_keeps_declared_legacy_launcher(self):
         target = self.root / 'releases' / OLD_SHA
-        (target / 'bin').mkdir(parents=True)
+        self.release_venv(target)
         (target / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
         launcher = target / 'bin/hub2'
         launcher.write_bytes(self.pip_launcher_bytes(target))
@@ -821,7 +1126,8 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         launcher.unlink()
         with patch.object(updater, 'command', self.command):
             updater.install_operator_cli(target, manifest)
-        self.assertEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+        self.assertEqual(launcher.read_bytes(), self.rebuilt_launcher_bytes(target))
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
         # An unmanaged launcher path is refused, never replaced.
         launcher.unlink()
         launcher.symlink_to('/etc/passwd')
@@ -829,6 +1135,259 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
             with self.assertRaisesRegex(ValueError, 'unmanaged legacy hub2 launcher'):
                 updater.install_operator_cli(target, manifest)
         self.assertTrue(launcher.is_symlink())
+
+    def test_resolved_base_interpreter_shebang_is_refused(self):
+        # A launcher written by the old buggy repair names the base interpreter
+        # that bin/python links to; executing it would leave the release venv
+        # where the retained wheel is not installed. That is an unrecognized
+        # contract: refused, never rewritten in place.
+        target = self.root / 'releases' / OLD_SHA
+        self.release_venv(target)
+        (target / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        record = {'sha256': hashlib.sha256(b'artifact:hub.pyz').hexdigest(), 'size': len(b'artifact:hub.pyz')}
+        manifest = {'artifacts': {'hub.pyz': record}}
+        entry_points = target / 'lib/python3.11/site-packages/agent_hub_host_v2-2.0.0.dist-info/entry_points.txt'
+        entry_points.parent.mkdir(parents=True)
+        entry_points.write_text('[console_scripts]\nhub2 = agent_hub_host.cli:main\n')
+        launcher = target / 'bin/hub2'
+        resolved = os.path.realpath(target / 'bin/python')
+        self.assertNotEqual(resolved, os.path.abspath(target / 'bin/python'))
+        launcher.write_bytes(('#!' + resolved + '\n'
+                              'import sys\n'
+                              'from agent_hub_host.cli import main\n'
+                              "if __name__ == '__main__':\n"
+                              '    sys.exit(main())\n').encode())
+        with patch.object(updater, 'command', self.command):
+            with self.assertRaisesRegex(ValueError, 'unrecognized legacy hub2 launcher'):
+                updater.install_operator_cli(target, manifest)
+        self.assertTrue(launcher.read_text().startswith('#!' + resolved))
+
+    def assert_launcher_runs_in_its_venv(self, target, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prefix, module_file, *rest = result.stdout.splitlines()
+        self.assertEqual(rest, [])
+        self.assertEqual(Path(prefix).resolve(), target.resolve())
+        self.assertTrue(Path(module_file).resolve().is_relative_to(target.resolve()))
+
+    def test_pip_form_launcher_runs_inside_its_venv(self):
+        # The genuine pip console-script launcher executes inside the release
+        # venv: the shebang names the lexical venv interpreter and the only
+        # agent_hub_host package is installed in that venv's site-packages,
+        # so a successful run proves the prefix, not the base interpreter.
+        target = self.release_venv(self.root / 'releases' / OLD_SHA)
+        self.venv_only_host_package(target)
+        launcher = target / 'bin/hub2'
+        launcher.write_bytes(self.pip_launcher_bytes(target))
+        launcher.chmod(0o755)
+        probe = 'import agent_hub_host; print(agent_hub_host.__file__)'
+        probe_argv = [sys.executable, '-I', '-c', probe]
+        probe_env = self.owned_child_env()
+        with self.owned_child(lambda argv, kwargs: argv == probe_argv
+                              and kwargs.get('cwd') == str(self.temporary.name)
+                              and kwargs.get('env') == probe_env
+                              and sorted(kwargs) == ['capture_output', 'cwd', 'env', 'text']):
+            base = subprocess.run(probe_argv, cwd=str(self.temporary.name), env=probe_env,
+                                  capture_output=True, text=True)
+        self.assertFalse(base.returncode == 0
+                         and Path(base.stdout.strip()).is_relative_to(target.resolve()),
+                         base.stdout)
+        self.assert_launcher_runs_in_its_venv(
+            target, self.run_owned_launcher([target / 'bin/python', launcher]))
+
+    def test_launcher_shebang_executes_release_venv_python(self):
+        # The strongest form: the kernel itself resolves the launcher's
+        # shebang to the lexical release venv interpreter. The kernel refuses
+        # shebang lines over 255 bytes, so checkouts whose absolute path is
+        # too long skip this proof (the venv-prefix contract is still proven
+        # by the explicit-interpreter execution tests and the shebang
+        # content by the byte-identity and refusal tests); short checkouts,
+        # including CI, run it for real.
+        target = self.release_venv(self.root / 'releases' / OLD_SHA)
+        self.venv_only_host_package(target)
+        launcher = target / 'bin/hub2'
+        launcher.write_bytes(self.pip_launcher_bytes(target))
+        launcher.chmod(0o755)
+        shebang = launcher.read_bytes().splitlines(True)[0].rstrip(b'\n')
+        if len(shebang) > 255:
+            self.skipTest('kernel shebang limit (255 bytes) exceeded by this checkout path: '
+                          + len(shebang).__str__())
+        self.assert_launcher_runs_in_its_venv(target, self.run_owned_launcher([launcher]))
+
+    def test_rebuilt_legacy_launcher_runs_inside_its_venv(self):
+        # The launcher regenerated by the repair path from the release's own
+        # declared metadata executes with the same venv-prefix guarantee.
+        target = self.release_venv(self.root / 'releases' / OLD_SHA)
+        self.venv_only_host_package(target)
+        (target / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        record = {'sha256': hashlib.sha256(b'artifact:hub.pyz').hexdigest(), 'size': len(b'artifact:hub.pyz')}
+        manifest = {'artifacts': {'hub.pyz': record}}
+        entry_points = target / 'lib' / ('python%d.%d' % sys.version_info[:2]) / 'site-packages' / \
+            'agent_hub_host_v2-2.0.0.dist-info' / 'entry_points.txt'
+        entry_points.parent.mkdir(parents=True)
+        entry_points.write_text('[console_scripts]\nhub2 = agent_hub_host.cli:main\n')
+        with patch.object(updater, 'command', self.command):
+            updater.install_operator_cli(target, manifest)
+        launcher = target / 'bin/hub2'
+        # The regenerated simple form differs from the pip console-script
+        # bytes and still runs inside the venv.
+        self.assertNotEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+        self.assert_launcher_runs_in_its_venv(
+            target, self.run_owned_launcher([target / 'bin/python', launcher]))
+        self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
+
+    def test_fixture_default_deny_blocks_unpatched_process_effects(self):
+        # Harmless guard control: with no per-test patch at all, the runtime
+        # paths that restarted the live Host in the incident fail closed on
+        # the fixture command deny, and an unregistered child is refused
+        # outright. Nothing here spawns or touches a service.
+        self.old_release()
+        with self.assertRaises(AssertionError):
+            updater.restart_host(self.root)
+        self.assertEqual(self.calls, [])
+        with self.assertRaises(AssertionError):
+            subprocess.run([str(self.root / 'releases' / SHA / 'bin/python'), '--version'])
+
+    def test_fixture_guard_adapter_executes_exactly_the_registered_children(self):
+        # Guard controls under corrected discovery: an allowed run reaches
+        # the real spawn through the guarded adapter via an exact one-shot
+        # permit, an allowed direct Popen passes the guarded path with its
+        # declared capture, a deviation from the registered contract is
+        # refused before spawn, and an unregistered child stays denied even
+        # while the adapter is active. Children are disposable interpreters
+        # in the owned root under the sanitized child environment; nothing
+        # here touches a service, provider or network.
+        self.root.mkdir(parents=True)
+        env = self.owned_child_env()
+        argv = [sys.executable, '-I', '-c', "print('guard-ok')"]
+        with self.owned_child(lambda a, kwargs: a == argv and kwargs.get('cwd') is None
+                              and kwargs.get('env') == env
+                              and sorted(kwargs) == ['capture_output', 'env', 'text']):
+            result = subprocess.run(argv, env=env, capture_output=True, text=True)
+            # staticv3 review R1: the run-child permit is one-shot. While the
+            # run allowance is still open, the same argv cannot spawn again
+            # through the spent permit: the direct-Popen path re-checks the
+            # allowance, whose contract binds only the run call shape.
+            with self.assertRaisesRegex(AssertionError, 'unallowed real process'):
+                subprocess.Popen(argv, env=env)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, 'guard-ok'))
+        with self.owned_child(lambda a, kwargs: a == argv and kwargs.get('cwd') is None
+                              and kwargs.get('env') == env and sorted(kwargs) == ['env', 'stdout']):
+            with subprocess.Popen(argv, env=env, stdout=subprocess.PIPE) as process:
+                stdout, _ = process.communicate(timeout=30)
+        self.assertEqual((process.returncode, stdout.decode().strip()), (0, 'guard-ok'))
+        # A contract deviation (run-level kwargs the allowance does not bind)
+        # is refused by the guard before any spawn.
+        with self.owned_child(lambda a, kwargs: a == argv and kwargs.get('cwd') is None
+                              and kwargs.get('env') == env and sorted(kwargs) == ['env']):
+            with self.assertRaises(AssertionError):
+                subprocess.run(argv, env=env, capture_output=True, text=True)
+        # staticv3 review R2: positional overrides (bufsize/executable/...)
+        # are refused outright before any allowance matching, so an approved
+        # argv can never be paired with a different positional executable.
+        with self.assertRaisesRegex(AssertionError, 'positional arguments beyond the command'):
+            subprocess.run(argv, None, env=env)
+        with self.assertRaisesRegex(AssertionError, 'positional arguments beyond the command'):
+            subprocess.Popen(argv, -1, env=env)
+        # staticv4 review R1 causal controls: exercise the actual guarded
+        # subprocess.run -> _guarded_run -> _guarded_popen path with harmless
+        # fake lower-level hooks (no real children). Different argv, same argv
+        # with altered executable/shell/env/cwd, and another thread stealing
+        # the exact same argv+kwargs are all refused without consuming the
+        # permit; the intended spawn consumes it once BEFORE wait, and
+        # unregistered spawns during wait or after consumption fail closed.
+        other_argv = [sys.executable, '-I', '-c', "print('must-not-run')"]
+        alt_env = dict(env, EXTRA_VAR='tampered')
+        alt_cwd = str(self.root)
+        spawned_calls = []
+        during_wait_errors = []
+        other_thread_errors = []
+        permit_counts_at_spawn = []
+
+        class FakeProcess:
+            def __init__(self, cmd, **kw):
+                self.cmd = cmd
+                self.kw = kw
+                self.returncode = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def communicate(self, input=None, timeout=None):
+                for label, call_argv, call_kw in (
+                    ('same-argv-during-wait', argv, {'env': env, 'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True}),
+                    ('other-argv-during-wait', other_argv, {'env': env}),
+                ):
+                    try:
+                        subprocess.Popen(call_argv, **call_kw)
+                    except AssertionError as exc:
+                        during_wait_errors.append((label, str(exc)))
+                    else:
+                        raise AssertionError(f'{label} unexpectedly succeeded during wait')
+                return (b'fake-ok\n', b'')
+
+            def poll(self):
+                return self.returncode
+
+        def fake_real_popen(cmd, **kw):
+            permit_counts_at_spawn.append(len(self._run_spawn_permits))
+            spawned_calls.append((list(cmd), dict(kw)))
+            return FakeProcess(cmd, **kw)
+
+        def fake_real_run(cmd, **kw):
+            popen_kw = self._expected_popen_kwargs(kw)
+            self.assertEqual(len(self._run_spawn_permits), 1)
+            with self.assertRaisesRegex(AssertionError, 'pending validated'):
+                subprocess.Popen(other_argv, **popen_kw)
+            self.assertEqual(len(self._run_spawn_permits), 1)
+            for tampered_kw in (
+                dict(popen_kw, executable='/bin/sh'),
+                dict(popen_kw, shell=True),
+                dict(popen_kw, env=alt_env),
+                dict(popen_kw, cwd=alt_cwd),
+            ):
+                with self.assertRaisesRegex(AssertionError, 'pending validated'):
+                    subprocess.Popen(cmd, **tampered_kw)
+                self.assertEqual(len(self._run_spawn_permits), 1)
+
+            def steal_from_other_thread():
+                try:
+                    subprocess.Popen(cmd, **popen_kw)
+                except AssertionError as exc:
+                    other_thread_errors.append(str(exc))
+
+            thief = threading.Thread(target=steal_from_other_thread)
+            thief.start()
+            thief.join(timeout=5)
+            self.assertFalse(thief.is_alive())
+            self.assertEqual(len(other_thread_errors), 1)
+            self.assertIn('pending validated', other_thread_errors[0])
+            self.assertEqual(len(self._run_spawn_permits), 1)
+
+            with subprocess.Popen(cmd, **popen_kw) as proc:
+                out, err = proc.communicate(timeout=30)
+            with self.assertRaisesRegex(AssertionError, 'unallowed real process'):
+                subprocess.Popen(cmd, **popen_kw)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout=out, stderr=err)
+
+        with patch.object(self, '_real_subprocess_run', fake_real_run), \
+             patch.object(self, '_real_subprocess_popen', fake_real_popen), \
+             self.owned_child(lambda a, kwargs: a == argv and kwargs.get('cwd') is None
+                              and kwargs.get('env') == env
+                              and sorted(kwargs) == ['capture_output', 'env', 'text']):
+            fake_result = subprocess.run(argv, env=env, capture_output=True, text=True)
+        self.assertEqual((fake_result.returncode, fake_result.stdout), (0, b'fake-ok\n'))
+        self.assertEqual(permit_counts_at_spawn, [0])
+        self.assertEqual(len(spawned_calls), 1)
+        self.assertEqual(spawned_calls[0][0], argv)
+        self.assertEqual(len(during_wait_errors), 2)
+        self.assertEqual(self._run_spawn_permits, [])
+        # An unregistered child stays denied outright.
+        with self.assertRaises(AssertionError):
+            subprocess.run([sys.executable, '-I', '-c', "print('refused')"],
+                           env=env, capture_output=True, text=True)
 
     def test_unified_wheel_retires_stale_hub2_launcher(self):
         wheel_name = HOST
@@ -1006,22 +1565,30 @@ api = runpy.run_path(sys.argv[1])
 with api['update_lock'](Path(sys.argv[2])):
     api['command']([sys.executable, '-c', sys.argv[3], *sys.argv[4:]])
 """
-        with subprocess.Popen([sys.executable, '-c', parent, str(REPO / 'scripts/hub2-self-update.py'),
-                               str(self.root), child, str(started), str(release)]) as process:
-            try:
-                deadline = time.monotonic() + 5
-                while not started.exists() and process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(.02)
-                self.assertTrue(started.exists())
-                process.kill()
-                process.wait(timeout=5)
-                with self.assertRaises(BlockingIOError), updater.update_lock(self.root):
-                    self.fail('orphan installer did not hold the update lock')
-            finally:
-                release.touch()
-                if process.poll() is None:
+        lock_argv = [sys.executable, '-c', parent, str(REPO / 'scripts/hub2-self-update.py'),
+                     str(self.root), child, str(started), str(release)]
+        # The allowance binds the whole direct Popen contract; the lock
+        # parent's own grandchild (the sleeping child script) is spawned
+        # inside that owned interpreter, inherits the same sanitized
+        # environment and only touches the owned started/release markers.
+        lock_env = self.owned_child_env()
+        with self.owned_child(lambda argv, kwargs: argv == lock_argv and kwargs.get('cwd') is None
+                              and kwargs.get('env') == lock_env and sorted(kwargs) == ['env']):
+            with subprocess.Popen(lock_argv, env=lock_env) as process:
+                try:
+                    deadline = time.monotonic() + 5
+                    while not started.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(started.exists())
                     process.kill()
-                process.wait(timeout=5)
+                    process.wait(timeout=5)
+                    with self.assertRaises(BlockingIOError), updater.update_lock(self.root):
+                        self.fail('orphan installer did not hold the update lock')
+                finally:
+                    release.touch()
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -1061,10 +1628,11 @@ with api['update_lock'](Path(sys.argv[2])):
         self.assertEqual((units / updater.UNITS[0]).read_bytes(), b'active service unit')
 
     def test_existing_uv_creates_venv_without_system_ensurepip(self):
-        with patch.object(updater.shutil, 'which', return_value='/mock/uv'):
+        mock_uv = str(Path(self.temporary.name) / 'mock-uv')
+        with patch.object(updater.shutil, 'which', return_value=mock_uv):
             self.install()
-        self.assertTrue(any(args[:3] == ['/mock/uv', 'venv', '--allow-existing'] for args in self.calls))
-        self.assertTrue(any(args[:3] == ['/mock/uv', 'pip', 'install'] and '--no-index' in args for args in self.calls))
+        self.assertTrue(any(args[:3] == [mock_uv, 'venv', '--allow-existing'] for args in self.calls))
+        self.assertTrue(any(args[:3] == [mock_uv, 'pip', 'install'] and '--no-index' in args for args in self.calls))
 
     def test_stdlib_fallback_when_uv_unavailable(self):
         with patch.object(updater.shutil, 'which', return_value=None):
@@ -1686,12 +2254,20 @@ elif event in ('start', 'routing', 'enable'):
                 (fake_bin / 'python3').symlink_to(sys.executable)
                 (current_bin / 'python').symlink_to(stub)
                 (current / 'hub2-enroll.py').symlink_to(stub)
-                result = subprocess.run(['/bin/sh', str(REPO / 'deploy/host-install.sh')],
-                                        env={**os.environ, 'HOME': str(home), 'PATH': str(fake_bin)+':/usr/bin:/bin',
-                                             'HUB_BASE_URL': 'https://example.invalid', 'HUB_WORKSPACE_ROOT': str(home),
-                                             'HUB2_TOKEN': 'synthetic-override-token', 'INSTALL_TEST_LOG': str(log), 'INSTALL_TEST_CONFIG': str(config),
-                                             'INSTALL_TEST_UPDATER': str(shim), 'INSTALL_TEST_FAIL': failure},
-                                        capture_output=True, text=True, timeout=10)
+                install_env = self.owned_child_env(HOME=str(home),
+                                                   PATH=str(fake_bin) + ':/usr/bin:/bin',
+                                                   HUB_BASE_URL='https://example.invalid',
+                                                   HUB_WORKSPACE_ROOT=str(home),
+                                                   HUB2_TOKEN='synthetic-override-token',
+                                                   INSTALL_TEST_LOG=str(log), INSTALL_TEST_CONFIG=str(config),
+                                                   INSTALL_TEST_UPDATER=str(shim), INSTALL_TEST_FAIL=failure)
+                install_argv = ['/bin/sh', str(REPO / 'deploy/host-install.sh')]
+                with self.owned_child(lambda argv, kwargs: argv == install_argv
+                                      and kwargs.get('cwd') is None
+                                      and kwargs.get('env') == install_env
+                                      and sorted(kwargs) == ['capture_output', 'env', 'text', 'timeout']):
+                    result = subprocess.run(install_argv, env=install_env,
+                                            capture_output=True, text=True, timeout=10)
                 commands = [json.loads(line) for line in log.read_text().splitlines()]
                 events = [args[0] for args in commands]
                 if enrolled:
@@ -1793,7 +2369,7 @@ def publication_bundle(directory, commit, label='fixture'):
 
 
 
-class HostDropinAlignmentTests(unittest.TestCase):
+class HostDropinAlignmentTests(HermeticProcessFixture, unittest.TestCase):
     """Hand-made host drop-ins follow the entry point of the release that will run."""
 
     def setUp(self):
@@ -1807,6 +2383,8 @@ class HostDropinAlignmentTests(unittest.TestCase):
                        % self.root)
         self.dropin.write_text(self.legacy)
         self.calls = []
+        # Default deny first; the recorder below stacks on top of it.
+        self.install_process_guard()
         patcher = patch.multiple(updater, command=lambda args: self.calls.append([str(a) for a in args]))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1823,6 +2401,25 @@ class HostDropinAlignmentTests(unittest.TestCase):
         link = self.root / 'current'
         link.unlink(missing_ok=True)
         link.symlink_to(release)
+
+    def declare_entry_metadata(self, release, *, declared):
+        """Installed dist-info entry-point metadata of a pinned release."""
+        dist_info = release / 'lib/python3.12/site-packages' / 'agent_hub_host_v2-2.0.0.dist-info'
+        dist_info.mkdir(parents=True, exist_ok=True)
+        (dist_info / 'entry_points.txt').write_text(
+            '[console_scripts]\nhub2 = agent_hub_host.cli:main\n' if declared else
+            '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n')
+
+    def recognized_launcher_bytes(self, release):
+        """The genuine pip console-script launcher form for this release venv."""
+        return ('#!' + os.path.abspath(release / 'bin/python') + '\n'
+                '# -*- coding: utf-8 -*-\n'
+                'import re\n'
+                'import sys\n'
+                'from agent_hub_host.cli import main\n'
+                "if __name__ == '__main__':\n"
+                "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+                '    sys.exit(main())\n').encode()
 
     def test_release_without_hub2_gets_hub_host_and_reverts_for_a_legacy_release(self):
         self.current(legacy=False)
@@ -1903,12 +2500,238 @@ class HostDropinAlignmentTests(unittest.TestCase):
         self.assertEqual(self.dropin.read_bytes(), original)
         self.assertEqual(self.calls, [])
 
-    def test_owned_release_pin_form_follows_current_capability(self):
+    def test_owned_release_pin_keeps_its_verified_legacy_entry(self):
         pinned = self.dropin.with_name('80-pinned.conf')
         pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+        old_release = self.root / 'releases' / OLD_SHA
+        (old_release / 'bin').mkdir(parents=True)
+        (old_release / 'bin/python').symlink_to(sys.executable)
+        (old_release / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        (old_release / 'bin/hub').symlink_to('../hub.pyz')
+        self.declare_entry_metadata(old_release, declared=True)
+        (old_release / 'bin/hub2').write_bytes(self.recognized_launcher_bytes(old_release))
+        self.current(legacy=False)  # the unified current capability cannot rewrite the pin
+        updater.restart_host(self.root)
+        self.assertEqual(pinned.read_text(),
+                         f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+
+    def test_owned_release_pin_follows_its_own_verified_capability(self):
+        pin = 'c' * 40
+        release = self.root / 'releases' / pin
+        (release / 'bin').mkdir(parents=True)
+        (release / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        (release / 'bin/hub').symlink_to('../hub.pyz')  # the recognized unified operator launcher
+        self.declare_entry_metadata(release, declared=False)  # its own metadata: no hub2 entry
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub2 serve\n')
+        self.current(legacy=True)  # the legacy current capability cannot fix the pin either
+        updater.restart_host(self.root)
+        self.assertEqual(pinned.read_text(),
+                         f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub host serve\n')
+
+    def test_pinned_unified_declaration_requires_positive_host_metadata(self):
+        # staticv2 review R4: merely readable metadata never declares "no
+        # hub2 entry". Empty, malformed, target-less, ambiguous or unrelated
+        # dist-info content is an unknown contract, so a pinned release that
+        # lost bin/hub2 but keeps the legacy `bin/hub -> ../hub.pyz` operator
+        # launcher is refused unchanged instead of being misread as a
+        # unified capability. Only the release's own positive `hub =
+        # agent_hub_host.wheel_cli:main` host declaration proves the pin.
+        pin = 'd' * 40
+        release = self.root / 'releases' / pin
+        (release / 'bin').mkdir(parents=True)
+        (release / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        (release / 'bin/hub').symlink_to('../hub.pyz')  # legacy releases ship this launcher too
+        dist_root = release / 'lib/python3.12/site-packages'
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=True)  # neither current capability may be borrowed onto the pin
+        for case, dist_name, content in [
+            ('empty host metadata', 'agent_hub_host_v2-2.0.0.dist-info', ''),
+            ('no console_scripts section', 'agent_hub_host_v2-2.0.0.dist-info',
+             '[metadata]\nname = agent_hub_host_v2\n'),
+            ('malformed console_scripts', 'agent_hub_host_v2-2.0.0.dist-info',
+             '[console_scripts]\nhub agent_hub_host.wheel_cli:main\n'),
+            ('unsupported entry target', 'agent_hub_host_v2-2.0.0.dist-info',
+             '[console_scripts]\nhub = agent_hub_host.cli:main\n'),
+            ('ambiguous declarations', 'agent_hub_host_v2-2.0.0.dist-info',
+             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\nhub2 = agent_hub_host.cli:main\n'),
+            ('unrelated distribution', 'websockets-16.0.dist-info',
+             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n'),
+        ]:
+            if dist_root.exists():
+                shutil.rmtree(dist_root)
+            dist_info = dist_root / dist_name
+            dist_info.mkdir(parents=True)
+            (dist_info / 'entry_points.txt').write_text(content)
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+                    updater.restart_host(self.root)
+                self.assertEqual(pinned.read_bytes(), original)
+                self.assertEqual(self.calls, [])
+        # The genuinely recognized unified declaration is exactly what
+        # turns these refusals into a verified capability (the unrelated
+        # distribution beside it proves nothing and stays ignored).
+        dist_info = dist_root / 'agent_hub_host_v2-2.0.0.dist-info'
+        dist_info.mkdir(parents=True)
+        (dist_info / 'entry_points.txt').write_text(
+            '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n')
+        updater.restart_host(self.root)
+        self.assertEqual(pinned.read_text(),
+                         f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub host serve\n')
+
+    def test_pinned_duplicate_entry_declarations_are_unknown_contracts(self):
+        # staticv3 review R4: duplicated declarations are ambiguous metadata
+        # and never resolve by last-wins. A foreign target followed by the
+        # genuine unified target, the reverse order, a repeated identical
+        # key, a repeated legacy key or a repeated console_scripts section
+        # all leave the pinned contract unknown: the pin bytes stay exactly
+        # unchanged with no service effect, and the single genuine unified
+        # declaration remains the one contract that verifies the pin.
+        pin = 'e' * 40
+        release = self.root / 'releases' / pin
+        (release / 'bin').mkdir(parents=True)
+        (release / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        (release / 'bin/hub').symlink_to('../hub.pyz')
+        dist_root = release / 'lib/python3.12/site-packages'
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=True)  # neither current capability may be borrowed onto the pin
+        for case, content in [
+            ('duplicate conflicting targets, foreign first',
+             '[console_scripts]\nhub = foreign_module:main\nhub = agent_hub_host.wheel_cli:main\n'),
+            ('duplicate conflicting targets, unified first',
+             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\nhub = foreign_module:main\n'),
+            ('duplicate identical unified key',
+             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\nhub = agent_hub_host.wheel_cli:main\n'),
+            ('duplicate legacy key',
+             '[console_scripts]\nhub2 = agent_hub_host.cli:main\nhub2 = agent_hub_host.cli:main\n'),
+            ('repeated console_scripts sections',
+             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n'
+             '[metadata]\nname = agent_hub_host_v2\n'
+             '[console_scripts]\nhub2 = agent_hub_host.cli:main\n'),
+        ]:
+            if dist_root.exists():
+                shutil.rmtree(dist_root)
+            dist_info = dist_root / 'agent_hub_host_v2-2.0.0.dist-info'
+            dist_info.mkdir(parents=True)
+            (dist_info / 'entry_points.txt').write_text(content)
+            with self.subTest(case=case):
+                with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+                    updater.restart_host(self.root)
+                self.assertEqual(pinned.read_bytes(), original)
+                self.assertEqual(self.calls, [])
+        # The unambiguous single genuine declaration is exactly what turns
+        # the same pin into a verified unified capability.
+        if dist_root.exists():
+            shutil.rmtree(dist_root)
+        dist_info = dist_root / 'agent_hub_host_v2-2.0.0.dist-info'
+        dist_info.mkdir(parents=True)
+        (dist_info / 'entry_points.txt').write_text(
+            '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n')
+        updater.restart_host(self.root)
+        self.assertEqual(pinned.read_text(),
+                         f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub host serve\n')
+
+    def test_pinned_legacy_declaration_without_its_launcher_is_refused_unchanged(self):
+        # The causal recovery case: a retained legacy release lost bin/hub2
+        # and only its old `bin/hub -> hub.pyz` zipapp remains, without a
+        # host command. bin/hub presence never proves a unified capability,
+        # and the current release's capability is never borrowed: the pin
+        # contract is unknown and the drop-in is refused unchanged.
+        pin = OLD_SHA
+        release = self.root / 'releases' / pin
+        (release / 'bin').mkdir(parents=True)
+        (release / 'hub.pyz').write_bytes(b'old-archive:hub.pyz')
+        (release / 'bin/hub').symlink_to('../hub.pyz')
+        self.declare_entry_metadata(release, declared=True)
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{pin}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=False)
+        with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+            updater.restart_host(self.root)
+        self.assertEqual(pinned.read_bytes(), original)
+        self.assertEqual(self.calls, [])  # refused before reload or restart
+
+    def test_pinned_unrecognized_hub2_file_is_never_a_verified_legacy_entry(self):
+        # An empty placeholder bin/hub2 (the old broken repair's shape) is
+        # not the managed launcher even when the release metadata declares
+        # the entry; the pin is refused unchanged, never declared legacy.
+        release = self.root / 'releases' / OLD_SHA
+        (release / 'bin').mkdir(parents=True)
+        (release / 'bin/python').symlink_to(sys.executable)
+        self.declare_entry_metadata(release, declared=True)
+        (release / 'bin/hub2').write_text('')
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=False)
+        with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+            updater.restart_host(self.root)
+        self.assertEqual(pinned.read_bytes(), original)
+        self.assertEqual(self.calls, [])  # refused before reload or restart
+
+    def test_pinned_entry_without_installed_metadata_is_refused_unchanged(self):
+        # A launcher-shaped bin/hub2 without the release's own installed
+        # entry-point metadata is an unknown contract, not a verified
+        # legacy capability.
+        release = self.root / 'releases' / OLD_SHA
+        (release / 'bin').mkdir(parents=True)
+        (release / 'bin/python').symlink_to(sys.executable)
+        (release / 'bin/hub2').write_bytes(self.recognized_launcher_bytes(release))
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=False)
+        with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+            updater.restart_host(self.root)
+        self.assertEqual(pinned.read_bytes(), original)
+        self.assertEqual(self.calls, [])  # refused before reload or restart
+
+    def test_unverifiable_release_pin_is_refused_unchanged(self):
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+        original = pinned.read_bytes()
+        self.current(legacy=False)  # no releases/OLD_SHA directory: contract unknown
+        with self.assertRaisesRegex(ValueError, 'unverifiable pinned release entry contract'):
+            updater.restart_host(self.root)
+        self.assertEqual(pinned.read_bytes(), original)
+        self.assertEqual(self.calls, [])  # refused before reload or restart
+
+    def test_owned_path_in_a_foreign_program_argument_is_never_rewritten(self):
+        other = self.dropin.with_name('10-foreign-arg.conf')
+        text = (f'[Service]\n'
+                f'ExecStart=/usr/bin/printf {self.root}/current/bin/hub2 %s\\n\n'
+                f'ExecStartPost=/bin/cat {self.root}/venv/bin/hub host\n')
+        other.write_text(text)
         self.current(legacy=False)
         updater.restart_host(self.root)
-        self.assertEqual(pinned.read_text(), f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub host serve\n')
+        self.assertEqual(other.read_text(), text)
+
+
+class FixtureDiscoveryContractTests(unittest.TestCase):
+    """Discovery contract for the two guarded classes (staticv2 review R1):
+    a shared fixture must only ever be mixed into unittest.TestCase, so
+    every named test stays collected with working addCleanup/assertions,
+    and the collected counts stay at the exactly audited numbers."""
+
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 95, 'HostDropinAlignmentTests': 16}
+
+    def test_guarded_classes_remain_unittest_test_cases(self):
+        for name in self.EXPECTED_TEST_COUNTS:
+            cls = globals()[name]
+            with self.subTest(cls=name):
+                self.assertTrue(issubclass(cls, unittest.TestCase), name)
+                self.assertIn(unittest.TestCase, cls.__mro__)
+
+    def test_guarded_classes_collect_their_exact_named_tests(self):
+        for name, expected in self.EXPECTED_TEST_COUNTS.items():
+            with self.subTest(cls=name):
+                discovered = unittest.defaultTestLoader.loadTestsFromTestCase(globals()[name])
+                self.assertEqual(discovered.countTestCases(), expected)
 
 
 class AlertClientPackagingTests(unittest.TestCase):

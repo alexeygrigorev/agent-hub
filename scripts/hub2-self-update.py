@@ -293,10 +293,13 @@ def _wheel_hub2_declared(wheel):
     return declared
 
 
+_ENTRY_POINTS_PATTERNS = ('lib/python3.*/site-packages/*.dist-info/entry_points.txt',
+                          'lib/site-packages/*.dist-info/entry_points.txt',
+                          'Lib/site-packages/*.dist-info/entry_points.txt')
+
+
 def _installed_hub2_declared(target):
-    for pattern in ('lib/python3.*/site-packages/*.dist-info/entry_points.txt',
-                    'lib/site-packages/*.dist-info/entry_points.txt',
-                    'Lib/site-packages/*.dist-info/entry_points.txt'):
+    for pattern in _ENTRY_POINTS_PATTERNS:
         for path in sorted(target.glob(pattern)):
             try:
                 text = path.read_text(errors='replace')
@@ -305,6 +308,120 @@ def _installed_hub2_declared(target):
             if _hub2_entry_declared(text):
                 return True
     return False
+
+
+# The pinned HOST distribution and the two supported console-entry targets:
+# the private legacy daemon entry and the unified operator entry that
+# replaced it. Anything else proves nothing about a release's entry contract.
+_HOST_DIST_INFO_PREFIX = 'agent_hub_host_v2-'
+_LEGACY_HUB2_ENTRY_TARGET = 'agent_hub_host.cli:main'
+_UNIFIED_HUB_ENTRY_TARGET = 'agent_hub_host.wheel_cli:main'
+
+
+def _console_scripts_entries(entry_points):
+    """Parsed console_scripts entries of an entry_points.txt text.
+
+    Returns the declared name -> target mapping, or None when no
+    console_scripts section exists, a line inside one is malformed, a name
+    is declared twice, or the console_scripts section itself repeats:
+    duplicated declarations are ambiguous metadata and never resolve by
+    last-wins."""
+    section = None
+    seen_console_section = False
+    seen_entry = False
+    entries = {}
+    for line in entry_points.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip().lower().replace('_', ' ')
+            if section == 'console scripts':
+                if seen_console_section:
+                    return None  # repeated section: ambiguous merge, never last-wins
+                seen_console_section = True
+            continue
+        if section != 'console scripts' or not stripped:
+            continue
+        name_part, separator, target_part = stripped.partition('=')
+        if not separator or not name_part.strip() or not target_part.strip():
+            return None
+        name = name_part.strip()
+        if name in entries:
+            return None  # duplicate declaration: ambiguous, never last-wins
+        seen_entry = True
+        entries[name] = target_part.strip()
+    return entries if seen_entry else None
+
+
+def _entry_declaration_of_entries(entries):
+    """Legacy (True) / unified (False) declaration of one entry_points file.
+
+    Legacy requires the `hub2` entry with the supported legacy target; the
+    unified contract requires `hub` with the `wheel_cli` target and `hub2`
+    absent — a merely readable or unrelated file declares nothing. None is
+    the unknown contract: empty or foreign metadata, a hub2 entry with an
+    unsupported target, or a contradictory mix of both contracts."""
+    declared = None
+    if entries.get('hub2') == _LEGACY_HUB2_ENTRY_TARGET:
+        declared = True
+    elif 'hub2' in entries:
+        return None
+    if entries.get('hub') == _UNIFIED_HUB_ENTRY_TARGET:
+        if declared:
+            return None
+        declared = False
+    return declared
+
+
+def _release_entry_declaration(release_directory):
+    """Three-state console-entry declaration of a release's own HOST
+    dist-info metadata.
+
+    True when the release's own `agent_hub_host_v2-*` dist-info positively
+    declares the private legacy `hub2` console entry with the supported
+    `agent_hub_host.cli:main` target, False when it positively declares the
+    unified `hub` entry with the `agent_hub_host.wheel_cli:main` target and
+    no `hub2` entry, and None whenever that exact contract is not proven:
+    no host dist-info, an unreadable, empty, unrelated, malformed or
+    target-less entry_points file, or two host dist-infos with conflicting
+    declarations. An unknown contract is never a capability."""
+    declaration = None
+    for pattern in _ENTRY_POINTS_PATTERNS:
+        for path in sorted(release_directory.glob(pattern)):
+            if not path.parent.name.startswith(_HOST_DIST_INFO_PREFIX):
+                continue  # an unrelated distribution never proves this release's contract
+            try:
+                text = path.read_text(errors='replace')
+            except OSError:
+                return None
+            declared = _entry_declaration_of_entries(_console_scripts_entries(text) or {})
+            if declared is None:
+                return None
+            if declaration is not None and declaration != declared:
+                return None  # two host dist-infos disagree: ambiguous
+            declaration = declared
+    return declaration
+
+
+def _recognized_legacy_hub2_launcher(launcher, python):
+    """Read-only recognition of the managed legacy daemon launcher.
+
+    The same contract _ensure_legacy_hub2_launcher keeps and rebuilds: a
+    regular file whose shebang names the lexical release venv interpreter
+    and whose body imports the host CLI main. An empty or foreign
+    placeholder is not a legacy capability.
+    """
+    if launcher.is_symlink() or not launcher.is_file():
+        return False
+    if os.name == 'nt':
+        return launcher.suffix == '.exe'
+    try:
+        body = launcher.read_text(errors='replace')
+    except OSError:
+        return False
+    shebang = body.splitlines(True)[:1]
+    expected = '#!' + os.path.abspath(python)
+    return bool(shebang) and shebang[0].rstrip('\n') == expected \
+        and 'agent_hub_host.cli' in body and 'main' in body
 
 
 def _ensure_legacy_hub2_launcher(target):
@@ -320,22 +437,18 @@ def _ensure_legacy_hub2_launcher(target):
     if launcher.exists() or launcher.is_symlink():
         if launcher.is_symlink() or not launcher.is_file():
             raise ValueError('refusing to keep an unmanaged legacy hub2 launcher')
-        if os.name == 'nt':
-            if launcher.suffix != '.exe':
-                raise ValueError('unrecognized legacy hub2 launcher')
-            return
-        shebang = launcher.read_text(errors='replace').splitlines(True)[:1]
-        expected = '#!' + os.path.realpath(python)
-        body = launcher.read_text(errors='replace')
-        if (not shebang or shebang[0].rstrip('\n') != expected
-                or 'agent_hub_host.cli' not in body or 'main' not in body):
+        if not _recognized_legacy_hub2_launcher(launcher, python):
+            # The pip console launcher names the lexical release venv
+            # interpreter; bin/python is typically a symlink to the base
+            # interpreter, and resolving it would select the base
+            # prefix/site-packages where the retained wheel is not installed.
             raise ValueError('unrecognized legacy hub2 launcher')
         return
     if os.name == 'nt':
         raise ValueError('legacy hub2 launcher missing from the release environment')
     launcher.parent.mkdir(exist_ok=True)
     launcher.write_text(
-        '#!' + os.path.realpath(python) + '\n'
+        '#!' + os.path.abspath(python) + '\n'
         'import sys\n'
         'from agent_hub_host.cli import main\n'
         "if __name__ == '__main__':\n"
@@ -1044,7 +1157,12 @@ def replace_units(units, files):
 
 
 def _owned_host_entry_pattern(root):
-    """Exact ExecStart program token for this root's owned entry layouts."""
+    """Exact owned ExecStart program-token forms for this root.
+
+    The pattern is applied only at the start of the ExecStart program token
+    (see _execstart_program_token); owned forms anywhere else on the line are
+    argument data and never match.
+    """
     root_norm = os.path.normpath(str(root))
     forms = [re.escape(root_norm.rstrip(os.sep))]
     home = os.path.normpath(str(Path.home()))
@@ -1053,20 +1171,78 @@ def _owned_host_entry_pattern(root):
         forms.append(re.escape('%h/') + re.escape(relative.as_posix()))
     except ValueError:
         pass
-    return re.compile(r'(?:' + '|'.join(forms) + r')'
-                      r'/(?:current|venv|releases/[0-9a-f]{40})/(?:bin|Scripts)/'
-                      r'(?:hub2(?=\s|$)|hub host(?=\s|$))')
+    return re.compile(r'(?P<root>(?:' + '|'.join(forms) + r'))'
+                      r'/(?P<layout>current|venv|releases/(?P<pin>[0-9a-f]{40}))'
+                      r'/(?:bin|Scripts)/'
+                      r'(?P<entry>hub2|hub host)(?=\s|$)')
+
+
+# The program token follows the marker and its optional systemd prefixes
+# (`+`, `!`, `-`; `!!` is covered by the repeated `!`).
+_EXECSTART_PROGRAM = re.compile(r'ExecStart=[+!-]*')
+
+
+def _execstart_program_token(line, pattern):
+    """The owned entry match at the ExecStart program-token position, or None."""
+    anchor = _EXECSTART_PROGRAM.match(line)
+    if anchor is None:
+        return None
+    return pattern.match(line, anchor.end())
+
+
+def _verified_pinned_entry(release_directory):
+    """The verified legacy-entry flag of a pinned release, or None.
+
+    The contract is derived positively from the pinned release's own
+    installed metadata and launcher, never from the current release. It is
+    legacy only when that release's own host dist-info declares the private
+    `hub2` console entry with the supported target and `bin/hub2` is the
+    recognized managed launcher; it is unified only when that dist-info
+    positively declares the supported unified `hub` entry (with the
+    `wheel_cli` target), `bin/hub2` is absent, and `bin/hub -> ../hub.pyz`
+    is the recognized operator launcher (a legacy release ships `bin/hub`
+    too, so its presence alone proves nothing, and a lost legacy launcher
+    must not become a unified capability). Anything else — missing,
+    unreadable, empty, unrelated, malformed or ambiguous metadata, a lost,
+    empty or foreign launcher — is an unknown contract and is refused
+    unchanged.
+    """
+    try:
+        require_release_directory(release_directory)
+    except ValueError:
+        return None
+    launcher = release_directory / 'bin/hub2'
+    if launcher.is_symlink():
+        return None
+    if launcher.exists():
+        # A launcher file only counts as the legacy entry when the release's
+        # own wheel metadata declares the entry it runs and the file matches
+        # the managed launcher contract.
+        if (_release_entry_declaration(release_directory) is True
+                and _recognized_legacy_hub2_launcher(launcher, release_directory / 'bin/python')):
+            return True
+        return None
+    entry = release_directory / 'bin/hub'
+    if (_release_entry_declaration(release_directory) is False
+            and entry.is_symlink() and os.readlink(entry) == '../hub.pyz'
+            and (release_directory / 'hub.pyz').is_file()):
+        return False
+    return None
 
 
 def align_host_dropins(root):
-    """Point hand-made host drop-ins at the entry point the current release has.
+    """Point hand-made host drop-ins at the entry point the running release has.
 
     Releases without `bin/hub2` run the daemon as `hub host`; an older retained
-    release (rollback/reactivation) still ships `bin/hub2`. Only the owned Host
-    ExecStart program token of this root is rewritten: the remaining argv, all
-    other directives, comments and foreign paths stay byte-identical, and a
-    drop-in with multiple or multiline execution definitions is refused rather
-    than guessed at.
+    release (rollback/reactivation) still ships `bin/hub2`. Only the ExecStart
+    program token directly following the marker and its optional systemd
+    prefixes is rewritten — never a path in a foreign program or an argument.
+    The remaining argv, all other directives, comments and foreign paths stay
+    byte-identical, and a drop-in with multiple or multiline owned execution
+    definitions is refused rather than guessed at. A pinned `releases/<id>`
+    command follows the verified entry capability of that exact release and
+    keeps its pin; the current release's capability is never inferred onto a
+    pin, and a pin whose contract cannot be verified is refused unchanged.
     """
     release = (root / 'current').resolve()
     legacy_running = (release / 'bin/hub2').exists()
@@ -1081,25 +1257,29 @@ def align_host_dropins(root):
         for index, line in enumerate(lines):
             if not line.startswith('ExecStart='):
                 continue
-            if line.rstrip('\r\n').endswith('\\'):
-                if pattern.search(line):
-                    raise ValueError('multiline host ExecStart in ' + path.name)
+            found = _execstart_program_token(line, pattern)
+            if found is None:
                 continue
-            found = list(pattern.finditer(line))
-            if found:
-                matches.append((index, found))
-        if sum(len(found) for _, found in matches) > 1:
+            if line.rstrip('\r\n').endswith('\\'):
+                raise ValueError('multiline host ExecStart in ' + path.name)
+            matches.append((index, found))
+        if len(matches) > 1:
             raise ValueError('ambiguous host ExecStart definitions in ' + path.name)
         updates = []
-        for index, found in matches:
-            matched = found[0]
-            token = matched.group(0)
-            is_legacy = token.endswith('hub2')
-            if is_legacy == legacy_running:
+        for index, matched in matches:
+            is_legacy = matched.group('entry') == 'hub2'
+            pin = matched.group('pin')
+            if pin is None:
+                wanted_legacy = legacy_running
+            else:
+                wanted_legacy = _verified_pinned_entry(root / 'releases' / pin)
+                if wanted_legacy is None:
+                    raise ValueError('unverifiable pinned release entry contract in ' + path.name)
+            if is_legacy == wanted_legacy:
                 continue
-            base = token[:-(len('hub2') if is_legacy else len('hub host'))]
+            base = matched.group(0)[:-(len('hub2') if is_legacy else len('hub host'))]
             updates.append((index, matched.start(), matched.end(),
-                            base + ('hub2' if legacy_running else 'hub host')))
+                            base + ('hub2' if wanted_legacy else 'hub host')))
         if not updates:
             continue
         for index, start, end, replacement in reversed(updates):
