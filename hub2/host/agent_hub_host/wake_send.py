@@ -13,8 +13,12 @@ import time
 import uuid
 
 # Closed private strict-attempt diagnostics: fixed record schema, whitelisted
-# vocabulary, unknown values collapse to 'unrecognized'. Records go only to
-# the Host process log; logging never authorizes, retries or alters effects.
+# vocabulary, unknown values collapse to 'unrecognized'. Each record carries a
+# bounded opaque command correlation computed once per attempt, and the
+# monotonic budget is captured before any emission, so diagnostic sink delay
+# or failure is spent inside the original budget, never widens it. Records go
+# only to the Host process log; logging never authorizes, retries or alters
+# effects.
 STRICT_DIAG_LOGGER='agent_hub_host.wake_send.strict_diag'
 _STRICT_DIAG=logging.getLogger(STRICT_DIAG_LOGGER)
 _STRICT_DIAG.addHandler(logging.NullHandler())
@@ -41,9 +45,28 @@ def _strict_diag_unit(value,whitelist):
     if value is None:return 'absent'
     return value if isinstance(value,str) and value in whitelist else 'unrecognized'
 
-def _strict_diag_record(category,phase,status=None,reason=None,mutation=None,landed=None,submitted=None,replayed=None):
+def _strict_diag_correlation(command):
+    'Bounded opaque correlation for one strict attempt: the canonical command UUID when valid, else a truncated SHA256 over closed identity fields only. Never payload text, paths, environment or receipt content.'
+    value=command.get('id') if isinstance(command,dict) else None
+    if isinstance(value,str):
+        try:
+            if str(uuid.UUID(value))==value:return value
+        except ValueError:pass
+    binding=command.get('wake') if isinstance(command,dict) and isinstance(command.get('wake'),dict) else {}
+    try:
+        canonical=json.dumps([value,command.get('kind') if isinstance(command,dict) else None,
+            binding.get('session_id'),binding.get('operation_id'),binding.get('epoch'),
+            binding.get('native_id'),binding.get('tag'),binding.get('workspace'),
+            binding.get('created_at_ms'),binding.get('deadline_ms'),binding.get('transport')],
+            ensure_ascii=True,separators=(',',':'))
+    except (TypeError,ValueError):
+        return 'unknown'
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
+
+def _strict_diag_record(command,category,phase,status=None,reason=None,mutation=None,landed=None,submitted=None,replayed=None):
     record={'event':category if category in _STRICT_DIAG_EVENTS else 'unrecognized',
             'phase':phase if phase in _STRICT_DIAG_PHASES else 'unrecognized',
+            'command':command,
             'status':_strict_diag_unit(status,_STRICT_DIAG_STATUSES),
             'reason':_strict_diag_unit(reason,_STRICT_DIAG_REASONS),
             'mutation':_strict_diag_unit(mutation,()),'landed':_strict_diag_unit(landed,()),
@@ -166,18 +189,23 @@ def execute(bridge, command, digest):
 
 def execute_strict(bridge, command, digest):
     """A native once-ID guards retries; no mailbox or sender impersonation."""
+    # One monotonic budget and one correlation per attempt, both fixed before
+    # the first diagnostic emission: sink delay consumes the original budget
+    # and every record binds to the same original command.
+    start = time.monotonic()
+    correlation = _strict_diag_correlation(command)
     phases=['entry']
     try:
-        return _execute_strict_locked(bridge,command,digest,phases)
+        return _execute_strict_locked(bridge,command,digest,phases,correlation,start)
     except Exception as error:
         reason=str(error)
-        _strict_diag_record(_STRICT_DIAG_RAISED.get(reason,'unrecognized'),phases[0],
+        _strict_diag_record(correlation,_STRICT_DIAG_RAISED.get(reason,'unrecognized'),phases[0],
                             reason=reason if reason in _STRICT_DIAG_REASONS else 'unrecognized')
         raise
 
-def _execute_strict_locked(bridge,command,digest,phases):
+def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
     """Strict attempt body; phases[0] carries the closed diagnostic phase."""
-    def diag(category,**fields):_strict_diag_record(category,phases[0],**fields)
+    def diag(category,**fields):_strict_diag_record(correlation,category,phases[0],**fields)
     diag('attempt_start')
     inbox = command.get('wake', {}).get('transport') == 'strict-inbox:v1'
     db = bridge.journal.db
@@ -199,7 +227,6 @@ def _execute_strict_locked(bridge,command,digest,phases):
     if not isinstance(text,str) or not text.strip() or len(text.encode()) > 8192:
         raise ValueError('invalid_wake_command')
     phases[0]='validated'
-    start = time.monotonic()
     def remaining():
         left = min(30-(time.monotonic()-start), (binding['deadline_ms']-time.time()*1000)/1000)
         if left <= 0:
