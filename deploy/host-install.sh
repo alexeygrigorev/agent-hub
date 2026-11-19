@@ -23,9 +23,13 @@ else
     fi
 fi
 # There is one CLI, `hub`; host administration is `hub host ...`. An existing
-# `hub` is left untouched. A hub2 link from an earlier install is retired.
-if [ -L "$HOME/.local/bin/hub2" ] && case "$(readlink "$HOME/.local/bin/hub2")" in */agent-hub2/*) true ;; *) false ;; esac; then
-    rm -f "$HOME/.local/bin/hub2"
+# `hub` is left untouched. Only the hub2 links this maintained installer could
+# have created (exact maintained ROOT, current/venv entry layout) are retired;
+# any other hub2 link belongs to someone else and stays untouched.
+if [ -L "$HOME/.local/bin/hub2" ]; then
+    case "$(readlink "$HOME/.local/bin/hub2")" in
+        "$ROOT/current/bin/hub2"|"$ROOT/venv/bin/hub2") rm -f "$HOME/.local/bin/hub2" ;;
+    esac
 fi
 if [ ! -e "$HOME/.local/bin/hub" ] && [ ! -L "$HOME/.local/bin/hub" ]; then
     ln -s "$ROOT/current/hub.pyz" "$HOME/.local/bin/hub"

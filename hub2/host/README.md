@@ -15,12 +15,14 @@ enrollment, serving, typed repository/intake/session/message/quota/schedule
 commands and a bounded `request METHOD /api/path --body-file input.json` escape
 hatch.
 
-Human CLI authentication uses `hub host --server https://hub.example auth login`.
-It opens a public device approval page, polls the one-use device code and saves
-private access/refresh credentials. `--no-browser` prints only the approval URL
-and user code. Expiring CLI access is refreshed before requests; `auth refresh`
-and `auth logout` perform server rotation/revocation. A lost refresh reply stays
-uncertain rather than replaying a single-use refresh token.
+Human CLI authentication uses the operator CLI, not this daemon namespace:
+`hub auth login --url https://hub.example` (the zipapp `hub`; human credentials
+are stored in a separate human `cli.json`). Login prints a public approval URL
+and one-use user code; expiring human access is refreshed automatically with
+server-side rotation, and `hub auth status` / `hub auth logout` report or
+revoke the human session. Do not run human login through `hub host auth ...`:
+those commands operate on the machine enrollment profile
+(`~/.config/agent-hub/v2.json`) and would modify machine credentials.
 
 Machine enrollment takes a one-use code from `HUB2_PAIRING_CODE` or a hidden
 prompt. Its private configuration records the enrolled machine, workspace roots,

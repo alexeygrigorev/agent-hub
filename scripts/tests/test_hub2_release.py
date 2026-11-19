@@ -699,6 +699,185 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         self.assertFalse((self.root / 'retained-switch.json').exists())
         self.assertIn(SHA, json.loads((self.root / 'failed-releases.json').read_text()))
 
+    def legacy_bundle(self):
+        """A verified pre-unification release: its wheel declares the private hub2 entry."""
+        wheel_name = f'agent_hub_host_v2-2.0.0+g{OLD_SHA}-py3-none-any.whl'
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {OLD_SHA!r}\nPROTOCOL_VERSION = 1\n')
+            archive.writestr('agent_hub_host_v2-2.0.0.dist-info/entry_points.txt',
+                             '[console_scripts]\nhub2 = agent_hub_host.cli:main\nhub = agent_hub_host.cli:main\n')
+        unit = f'[Service]\nExecStart={self.root}/current/bin/hub2 serve\n'
+        files = {name: data for name, data in self.files.items() if name != HOST}
+        files[wheel_name] = buffer.getvalue()
+        files[updater.UNITS[0]] = unit.encode()
+        manifest = dict(self.manifest, host_version=OLD_SHA,
+                        artifacts={name: {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+                                   for name, data in files.items()})
+        return wheel_name, files, manifest
+
+    def pip_launcher_bytes(self, target):
+        return ('#!' + os.path.realpath(target / 'bin/python') + '\n'
+                'import sys\n'
+                'from agent_hub_host.cli import main\n'
+                "if __name__ == '__main__':\n"
+                '    sys.exit(main())\n').encode()
+
+    def test_legacy_wheel_prepares_hub2_launcher_and_restart_selection(self):
+        wheel_name, files, manifest = self.legacy_bundle()
+        target = self.root / 'releases' / OLD_SHA
+        target.mkdir(parents=True)
+        download = Path(self.temporary.name) / 'download-legacy'
+        download.mkdir()
+        for name, data in files.items():
+            (download / name).write_bytes(data)
+        dropin = Path(self.temporary.name) / '.config/systemd/user' / (updater.UNITS[0] + '.d') / '90-host.conf'
+        dropin.parent.mkdir(parents=True)
+        legacy_dropin = f'[Service]\nExecStart={self.root}/current/bin/hub2 serve --aplexer /x/a\n'
+        dropin.write_text(legacy_dropin)
+        current = self.root / 'current'
+        with patch.object(updater, 'command', self.command), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            updater.prepare_environment(target, download, manifest, wheel_name)
+            # The verified old wheel declares the private daemon entry: it is kept.
+            launcher = target / 'bin/hub2'
+            self.assertEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+            self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
+            # restart selection: the legacy release keeps the hub2 drop-in form.
+            current.symlink_to(target)
+            updater.restart_host(self.root)
+            self.assertEqual(dropin.read_text(), legacy_dropin)
+            # Inverse compatibility: a unified current release flips the drop-in.
+            other = self.root / 'releases' / SHA
+            (other / 'bin').mkdir(parents=True)
+            current.unlink()
+            current.symlink_to(other)
+            updater.restart_host(self.root)
+            self.assertIn(f'{self.root}/current/bin/hub host serve --aplexer /x/a', dropin.read_text())
+            self.assertNotIn('/bin/hub2', dropin.read_text())
+            # ...and a rollback to the retained legacy release flips it back.
+            current.unlink()
+            current.symlink_to(target)
+            updater.restart_host(self.root)
+            self.assertEqual(dropin.read_text(), legacy_dropin)
+
+    def test_retained_reactivation_rebuilds_legacy_launcher_and_selection(self):
+        wheel_name, files, manifest = self.legacy_bundle()
+        default_files, default_manifest = self.files, self.manifest
+        self.files, self.manifest = files, manifest
+        # The readiness probe runs against whichever release is activating.
+        def tolerant_probe(args, *, stdout, stderr, timeout):
+            version = Path(args[0]).parents[1].name
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(dict(self.status, host_version=version)).encode())
+        self.status_command = tolerant_probe
+        # CI-equivalent environment: no managed Claude profile is configured.
+        self.repin_gate = patch.object(updater, 'managed_claude_configured', return_value=False)
+        self.repin_gate.start()
+        self.addCleanup(self.repin_gate.stop)
+        self.install(install_service=True)
+        legacy = (self.root / 'current').resolve()
+        self.assertEqual(legacy.name, OLD_SHA)
+        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.pip_launcher_bytes(legacy))
+        # A newer unified release becomes current; the legacy release is retained.
+        self.files, self.manifest = default_files, default_manifest
+        del self.status_command
+        self.install()
+        self.assertEqual((self.root / 'current').resolve().name, SHA)
+        self.assertEqual((self.root / 'previous').resolve(), legacy)
+        dropin = Path(self.temporary.name) / '.config/systemd/user' / (updater.UNITS[0] + '.d') / '90-host.conf'
+        dropin.parent.mkdir(parents=True)
+        dropin.write_text(f'[Service]\nExecStart={self.root}/current/bin/hub host serve\n')
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        self.assertNotIn(b'/bin/hub2', (units / updater.UNITS[0]).read_bytes())
+        # Reactivating the retained release rebuilds it from its verified old
+        # wheel and restores the hub2 launcher, unit and drop-in contract.
+        self.files, self.manifest = files, manifest
+        self.status_command = tolerant_probe
+        self.install()
+        self.assertEqual((self.root / 'current').resolve(), legacy)
+        self.assertEqual((legacy / 'bin/hub2').read_bytes(), self.pip_launcher_bytes(legacy))
+        self.assertEqual(os.readlink(legacy / 'bin/hub'), '../hub.pyz')
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), files[updater.UNITS[0]])
+        self.assertIn(f'{self.root}/current/bin/hub2 serve', dropin.read_text())
+
+    def test_same_version_repair_keeps_declared_legacy_launcher(self):
+        target = self.root / 'releases' / OLD_SHA
+        (target / 'bin').mkdir(parents=True)
+        (target / 'hub.pyz').write_bytes(b'artifact:hub.pyz')
+        launcher = target / 'bin/hub2'
+        launcher.write_bytes(self.pip_launcher_bytes(target))
+        record = {'sha256': hashlib.sha256(b'artifact:hub.pyz').hexdigest(), 'size': len(b'artifact:hub.pyz')}
+        manifest = {'artifacts': {'hub.pyz': record}}
+        # The installed environment declares the legacy entry (dist-info of the
+        # old wheel), so repair must keep the launcher byte-identical.
+        entry_points = target / 'lib/python3.11/site-packages/agent_hub_host_v2-2.0.0.dist-info/entry_points.txt'
+        entry_points.parent.mkdir(parents=True)
+        entry_points.write_text('[console_scripts]\nhub2 = agent_hub_host.cli:main\n')
+        with patch.object(updater, 'command', self.command):
+            updater.install_operator_cli(target, manifest)
+        self.assertEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+        self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
+        # A launcher lost to an older buggy repair is rebuilt, not left missing.
+        launcher.unlink()
+        with patch.object(updater, 'command', self.command):
+            updater.install_operator_cli(target, manifest)
+        self.assertEqual(launcher.read_bytes(), self.pip_launcher_bytes(target))
+        # An unmanaged launcher path is refused, never replaced.
+        launcher.unlink()
+        launcher.symlink_to('/etc/passwd')
+        with patch.object(updater, 'command', self.command):
+            with self.assertRaisesRegex(ValueError, 'unmanaged legacy hub2 launcher'):
+                updater.install_operator_cli(target, manifest)
+        self.assertTrue(launcher.is_symlink())
+
+    def test_unified_wheel_retires_stale_hub2_launcher(self):
+        wheel_name = HOST
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {SHA!r}\nPROTOCOL_VERSION = 1\n')
+            archive.writestr('agent_hub_host-2.0.0.dist-info/entry_points.txt',
+                             '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\n')
+        files = dict(self.files)
+        files[wheel_name] = buffer.getvalue()
+        manifest = dict(self.manifest,
+                        artifacts={name: {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+                                   for name, data in files.items()})
+        target = self.root / 'releases' / SHA
+        (target / 'bin').mkdir(parents=True)
+        stale = target / 'bin/hub2'
+        stale.write_text('#!/bin/sh\nrm -rf ~\n')
+        download = Path(self.temporary.name) / 'download-unified'
+        download.mkdir()
+        for name, data in files.items():
+            (download / name).write_bytes(data)
+        with patch.object(updater, 'command', self.command), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            updater.prepare_environment(target, download, manifest, wheel_name)
+        self.assertFalse(stale.exists())
+        self.assertEqual(os.readlink(target / 'bin/hub'), '../hub.pyz')
+
+    def test_failed_new_activation_restores_legacy_units_and_launcher(self):
+        wheel_name, files, _ = self.legacy_bundle()
+        old = self.old_release()
+        (old / 'bin').mkdir()
+        old_launcher = old / 'bin/hub2'
+        old_launcher.write_bytes(self.pip_launcher_bytes(old))
+        units = Path(self.temporary.name) / '.config/systemd/user'
+        units.mkdir(parents=True)
+        legacy_unit = f'[Service]\nExecStart={self.root}/current/bin/hub2 serve\n'.encode()
+        (units / updater.UNITS[0]).write_bytes(legacy_unit)
+        dropin = units / (updater.UNITS[0] + '.d') / '90-host.conf'
+        dropin.parent.mkdir()
+        legacy_dropin = f'[Service]\nExecStart={self.root}/current/bin/hub2 serve --aplexer /x/a\n'
+        dropin.write_text(legacy_dropin)
+        self.status_rc = 1  # the new unified release fails its readiness probe
+        with self.assertRaisesRegex(RuntimeError, 'host daemon connection not verified'):
+            self.install()
+        self.assertEqual((self.root / 'current').resolve(), old)
+        self.assertEqual(old_launcher.read_bytes(), self.pip_launcher_bytes(old))
+        self.assertEqual((units / updater.UNITS[0]).read_bytes(), legacy_unit)
+        self.assertEqual(dropin.read_text(), legacy_dropin)
+
     def test_interrupted_retained_switch_recovers_even_when_manifest_is_unavailable(self):
         current, retained, units = self.prepare_retained_switch()
         journal = self.root / 'retained-switch.json'
@@ -1676,6 +1855,61 @@ class HostDropinAlignmentTests(unittest.TestCase):
         updater.restart_host(self.root)
         self.assertEqual(other.read_text(), '[Service]\nExecStart=/usr/bin/hub2 serve\nEnvironment=X=/agent-hub2/current/bin/hub2x\n')
 
+    def test_only_the_execstart_program_token_is_rewritten(self):
+        owned = f'{self.root}/current'
+        text = ('[Service]\n'
+                f'Environment=HUB2_PROBE={owned}/bin/hub2\n'
+                f'ExecStartPre={owned}/bin/python -c "assert 1"\n'
+                f'# comment mentioning {owned}/bin/hub host\n'
+                f'ExecStart={owned}/bin/hub2 serve --aplexer /x/a --extra\n')
+        self.dropin.write_text(text)
+        self.current(legacy=False)
+        updater.restart_host(self.root)
+        # Only the ExecStart program token changed; argv tail and every other
+        # line, including exact owned-form strings elsewhere, stay identical.
+        self.assertEqual(self.dropin.read_text(), (
+            '[Service]\n'
+            f'Environment=HUB2_PROBE={owned}/bin/hub2\n'
+            f'ExecStartPre={owned}/bin/python -c "assert 1"\n'
+            f'# comment mentioning {owned}/bin/hub host\n'
+            f'ExecStart={owned}/bin/hub host serve --aplexer /x/a --extra\n'))
+
+    def test_foreign_root_execstart_is_never_rewritten(self):
+        other = self.dropin.with_name('10-foreign.conf')
+        other.write_text(f'[Service]\nExecStart=/opt/other/agent-hub2/current/bin/hub2 serve\n'
+                         f'Environment=Y=/opt/other/agent-hub2/venv/bin/hub host\n')
+        self.current(legacy=False)
+        updater.restart_host(self.root)
+        self.assertEqual(other.read_text(), '[Service]\nExecStart=/opt/other/agent-hub2/current/bin/hub2 serve\n'
+                         'Environment=Y=/opt/other/agent-hub2/venv/bin/hub host\n')
+
+    def test_multiple_owned_execstart_definitions_are_refused(self):
+        self.dropin.write_text(f'[Service]\nExecStart={self.root}/current/bin/hub2 serve\n'
+                               f'ExecStart={self.root}/venv/bin/hub host serve\n')
+        original = self.dropin.read_bytes()
+        self.current(legacy=False)
+        with self.assertRaisesRegex(ValueError, 'ambiguous host ExecStart'):
+            updater.restart_host(self.root)
+        self.assertEqual(self.dropin.read_bytes(), original)
+        self.assertEqual(self.calls, [])  # refused before reload or restart
+
+    def test_multiline_owned_execstart_is_refused(self):
+        self.dropin.write_text(f'[Service]\nExecStart={self.root}/current/bin/hub2 serve \\\n'
+                               '  --aplexer /x/a\n')
+        original = self.dropin.read_bytes()
+        self.current(legacy=False)
+        with self.assertRaisesRegex(ValueError, 'multiline host ExecStart'):
+            updater.restart_host(self.root)
+        self.assertEqual(self.dropin.read_bytes(), original)
+        self.assertEqual(self.calls, [])
+
+    def test_owned_release_pin_form_follows_current_capability(self):
+        pinned = self.dropin.with_name('80-pinned.conf')
+        pinned.write_text(f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub2 serve\n')
+        self.current(legacy=False)
+        updater.restart_host(self.root)
+        self.assertEqual(pinned.read_text(), f'[Service]\nExecStart={self.root}/releases/{OLD_SHA}/bin/hub host serve\n')
+
 
 class AlertClientPackagingTests(unittest.TestCase):
     def setUp(self):
@@ -2412,6 +2646,114 @@ class WindowsReaderClosureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 builder.prepare_windows_reader(package, host)
             self.assertEqual((package / '_credential_artifact_binding.py').read_bytes(), before)
+
+
+class WheelHubEntryTests(unittest.TestCase):
+    """The wheel-installed `hub` exposes the host namespace through the daemon seam."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            'agent-hub-host-wheel-cli', REPO / 'hub2/host/agent_hub_host/wheel_cli.py')
+        self.wheel_cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.wheel_cli)
+
+    def test_host_namespace_reexecutes_the_isolated_daemon_module(self):
+        seen = {}
+        def fake_execv(path, argv):
+            seen['argv'] = argv
+            raise SystemExit(0)
+        with patch.object(self.wheel_cli.os, 'execv', fake_execv), \
+             patch.object(self.wheel_cli.sys, 'executable', '/venv/bin/python'):
+            with self.assertRaises(SystemExit):
+                self.wheel_cli.main(['host', 'serve', '--once'])
+        self.assertEqual(seen['argv'], ['/venv/bin/python', '-I', '-m', 'agent_hub_host.cli', 'serve', '--once'])
+
+    def test_windows_launcher_returns_the_daemon_exit_code(self):
+        recorded = []
+        def fake_run(command):
+            recorded.append(command)
+            return subprocess.CompletedProcess(command, 7)
+        with patch.object(self.wheel_cli.os, 'name', 'nt'), \
+             patch.object(self.wheel_cli.subprocess, 'run', fake_run), \
+             patch.object(self.wheel_cli.sys, 'executable', r'C:\venv\Scripts\python.exe'):
+            self.assertEqual(self.wheel_cli.main(['host', 'version']), 7)
+        self.assertEqual(recorded, [[r'C:\venv\Scripts\python.exe', '-I', '-m', 'agent_hub_host.cli', 'version']])
+
+    def test_non_host_commands_refuse_with_operator_guidance(self):
+        with patch.object(self.wheel_cli.sys, 'executable', '/venv/bin/python'):
+            for argv in (['sessions', 'list'], ['enroll', '--root', '/tmp/x'], []):
+                captured = io.StringIO()
+                with patch.object(self.wheel_cli.sys, 'stderr', captured):
+                    self.assertEqual(self.wheel_cli.main(argv), 2)
+                self.assertIn('hub host', captured.getvalue())
+            captured = io.StringIO()
+            with patch.object(self.wheel_cli.sys, 'stdout', captured):
+                self.assertEqual(self.wheel_cli.main(['--help']), 0)
+            self.assertIn('wheel console entry', captured.getvalue())
+            self.assertIn('hub host --help', captured.getvalue())
+
+
+class HostInstallRetirementTests(unittest.TestCase):
+    """Only hub2 links the maintained installer created are retired; others stay."""
+
+    def setUp(self):
+        scratch = REPO / '.local/tmp'
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=scratch, prefix='test-installer-links-')
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.root = self.home / '.local/share/agent-hub2'
+
+    def retire_block(self):
+        text = (REPO / 'deploy/host-install.sh').read_text()
+        lines = text.splitlines()
+        start = lines.index('if [ -L "$HOME/.local/bin/hub2" ]; then')
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == 'fi')
+        return '\n'.join(lines[start:end + 1])
+
+    def run_block(self, target=None, *, clear=True):
+        binary = self.home / '.local/bin'
+        binary.mkdir(parents=True, exist_ok=True)
+        link = binary / 'hub2'
+        if clear:
+            if link.is_symlink():
+                link.unlink()
+            elif link.exists():
+                raise AssertionError('refusing to clear a non-link hub2 entry')
+        if target is not None:
+            link.symlink_to(target)
+        env = dict(os.environ, HOME=str(self.home), ROOT=str(self.root))
+        result = subprocess.run(['sh', '-c', self.retire_block()], env=env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return link
+
+    def test_script_and_block_parse(self):
+        subprocess.run(['sh', '-n', str(REPO / 'deploy/host-install.sh')], check=True, timeout=10)
+        block = self.retire_block()
+        self.assertNotIn('*/agent-hub2/*', block)  # the broad pattern is gone
+        subprocess.run(['sh', '-n', '-c', block], check=True, timeout=10)
+
+    def test_exact_owned_current_and_venv_targets_are_retired(self):
+        for entry in ('current/bin/hub2', 'venv/bin/hub2'):
+            link = self.run_block(str(self.root / entry))
+            self.assertFalse(link.is_symlink() or link.exists(), entry)
+
+    def test_foreign_and_unrelated_targets_are_preserved(self):
+        for target in ('/opt/other/agent-hub2/current/bin/hub2', '/usr/bin/hub2',
+                       str(self.root / 'releases/deadbeef/bin/hub2')):
+            link = self.run_block(target)
+            self.assertTrue(link.is_symlink(), target)
+            self.assertEqual(os.readlink(link), target)
+
+    def test_regular_hub2_file_is_untouched(self):
+        binary = self.home / '.local/bin'
+        binary.mkdir(parents=True)
+        keep = binary / 'hub2'
+        keep.write_text('#!/bin/sh\necho own tool\n')
+        self.run_block(clear=False)
+        self.assertTrue(keep.is_file())
+        self.assertEqual(keep.read_text(), '#!/bin/sh\necho own tool\n')
 
 
 if __name__ == '__main__':

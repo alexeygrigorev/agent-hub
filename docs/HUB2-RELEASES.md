@@ -113,7 +113,12 @@ self-update), which runs the release venv's daemon module. The daemon's
 `~/.config/agent-hub/v2.json` is the host (machine) profile of that one CLI;
 it is deliberately not merged into the human `cli.json` login. Same-version
 updater checks repair older wheel-generated `bin/hub` entry points after
-verifying the zipapp against the installed release receipt.
+verifying the zipapp against the installed release receipt. The daemon entry
+contract follows the selected release, not the updater: a retained release
+whose verified wheel still declares the private `bin/hub2` launcher keeps it
+(its unit ExecStart names it and its zipapp has no `host` command). The wheel
+console `hub` entry exposes only the `hub host ...` namespace by re-running
+the daemon module in isolated mode; the full operator CLI remains the zipapp.
 
 The transport wheel is downloaded in CI with `--require-hashes` against the
 reviewed root `uv.lock`; installs have no package-index access. Artifact trust

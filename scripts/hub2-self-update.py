@@ -23,6 +23,7 @@ import time
 import tomllib
 from urllib.parse import urlsplit
 from urllib.request import urlopen
+import zipfile
 
 UNITS = ('agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer')
 MAX_MANIFEST = 128 * 1024
@@ -263,15 +264,104 @@ def repair_alert_client(base, manifest, installed, target):
     verify_alert_client(target, installed)
 
 
-def install_operator_cli(target, manifest):
+def _hub2_entry_declared(entry_points):
+    """True when a console_scripts section declares the private legacy `hub2` entry."""
+    section = None
+    for line in entry_points.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip().lower().replace('_', ' ')
+            continue
+        if section == 'console scripts' and stripped.split('=', 1)[0].strip() == 'hub2':
+            return True
+    return False
+
+
+def _wheel_hub2_declared(wheel):
+    if wheel is None:
+        return None
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            names = [name for name in archive.namelist()
+                     if name.endswith('.dist-info/entry_points.txt')]
+            declared = any(_hub2_entry_declared(archive.read(name).decode('utf-8', 'replace'))
+                           for name in names)
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        # Unreadable/placeholder wheel bytes: fall back to the installed
+        # environment instead of guessing the entry contract.
+        return None
+    return declared
+
+
+def _installed_hub2_declared(target):
+    for pattern in ('lib/python3.*/site-packages/*.dist-info/entry_points.txt',
+                    'lib/site-packages/*.dist-info/entry_points.txt',
+                    'Lib/site-packages/*.dist-info/entry_points.txt'):
+        for path in sorted(target.glob(pattern)):
+            try:
+                text = path.read_text(errors='replace')
+            except OSError:
+                continue
+            if _hub2_entry_declared(text):
+                return True
+    return False
+
+
+def _ensure_legacy_hub2_launcher(target):
+    """Keep or rebuild the private legacy daemon launcher the target requires.
+
+    Releases published before CLI unification own a `bin/hub2` daemon console
+    entry and their service unit names it. The public operator zipapp of those
+    releases has no `host` command, so deleting the launcher would strand the
+    release. A symlink or unrecognized file is refused, never replaced.
+    """
+    launcher = target / 'bin/hub2'
+    python = target / 'bin/python'
+    if launcher.exists() or launcher.is_symlink():
+        if launcher.is_symlink() or not launcher.is_file():
+            raise ValueError('refusing to keep an unmanaged legacy hub2 launcher')
+        if os.name == 'nt':
+            if launcher.suffix != '.exe':
+                raise ValueError('unrecognized legacy hub2 launcher')
+            return
+        shebang = launcher.read_text(errors='replace').splitlines(True)[:1]
+        expected = '#!' + os.path.realpath(python)
+        body = launcher.read_text(errors='replace')
+        if (not shebang or shebang[0].rstrip('\n') != expected
+                or 'agent_hub_host.cli' not in body or 'main' not in body):
+            raise ValueError('unrecognized legacy hub2 launcher')
+        return
+    if os.name == 'nt':
+        raise ValueError('legacy hub2 launcher missing from the release environment')
+    launcher.parent.mkdir(exist_ok=True)
+    launcher.write_text(
+        '#!' + os.path.realpath(python) + '\n'
+        'import sys\n'
+        'from agent_hub_host.cli import main\n'
+        "if __name__ == '__main__':\n"
+        '    sys.exit(main())\n')
+    launcher.chmod(0o755)
+
+
+def install_operator_cli(target, manifest, wheel=None):
     # The wheel owns the daemon module run by `hub host`; hub is the full operator
     # zipapp. Both packages use agent_hub_host, so importing the operator CLI
     # through the host venv would select the wrong package.
+    # The daemon entry contract follows the verified target release, not this
+    # updater: releases whose wheel still declares the private `hub2` console
+    # entry keep that launcher (their unit ExecStart names it and their zipapp
+    # has no `host` command); unified releases have no separate hub2 CLI.
     archive = target / 'hub.pyz'
     if not matches_installed_artifact(archive, manifest['artifacts']['hub.pyz']):
         raise ValueError('installed release artifact mismatch: hub.pyz')
-    (target / 'bin/hub2').unlink(missing_ok=True)  # there is no separate hub2 CLI
+    declared = _wheel_hub2_declared(wheel)
+    if declared is None:
+        declared = _installed_hub2_declared(target)
     entry = target / 'bin/hub'
+    if declared:
+        _ensure_legacy_hub2_launcher(target)
+    else:
+        (target / 'bin/hub2').unlink(missing_ok=True)  # there is no separate hub2 CLI
     if entry.is_symlink() and os.readlink(entry) == '../hub.pyz':
         return
     command([target / 'bin/python', archive, '--version'])
@@ -924,7 +1014,7 @@ def prepare_environment(target, download, manifest, host_wheel):
         retain_alert_client(target, manifest, (download / ALERT_CLIENT).read_bytes())
     (target / 'hub.pyz').chmod(0o755)
     command([python, target / 'hub.pyz', '--help'])
-    install_operator_cli(target, manifest)
+    install_operator_cli(target, manifest, download / host_wheel)
     write_json(target / 'release.json', manifest)
 
 
@@ -953,27 +1043,70 @@ def replace_units(units, files):
     command(['systemctl', '--user', 'daemon-reload'])
 
 
-HOST_ENTRY = re.compile(r'(/agent-hub2/(?:current|venv|releases/[0-9a-f]{40})/(?:bin|Scripts)/)(?:hub2|hub host)(?=\s|$)', re.M)
+def _owned_host_entry_pattern(root):
+    """Exact ExecStart program token for this root's owned entry layouts."""
+    root_norm = os.path.normpath(str(root))
+    forms = [re.escape(root_norm.rstrip(os.sep))]
+    home = os.path.normpath(str(Path.home()))
+    try:
+        relative = Path(root_norm).relative_to(home)
+        forms.append(re.escape('%h/') + re.escape(relative.as_posix()))
+    except ValueError:
+        pass
+    return re.compile(r'(?:' + '|'.join(forms) + r')'
+                      r'/(?:current|venv|releases/[0-9a-f]{40})/(?:bin|Scripts)/'
+                      r'(?:hub2(?=\s|$)|hub host(?=\s|$))')
 
 
 def align_host_dropins(root):
     """Point hand-made host drop-ins at the entry point the current release has.
 
     Releases without `bin/hub2` run the daemon as `hub host`; an older retained
-    release (rollback/reactivation) still ships `bin/hub2`.
+    release (rollback/reactivation) still ships `bin/hub2`. Only the owned Host
+    ExecStart program token of this root is rewritten: the remaining argv, all
+    other directives, comments and foreign paths stay byte-identical, and a
+    drop-in with multiple or multiline execution definitions is refused rather
+    than guessed at.
     """
     release = (root / 'current').resolve()
-    replacement = r'\1hub2' if (release / 'bin/hub2').exists() else r'\1hub host'
+    legacy_running = (release / 'bin/hub2').exists()
+    pattern = _owned_host_entry_pattern(root)
     directory = Path.home() / '.config/systemd/user' / (UNITS[0] + '.d')
     changed = False
     for path in sorted(directory.glob('*.conf')) if directory.is_dir() else ():
         if path.is_symlink() or not path.is_file():
             continue
-        text = path.read_text()
-        updated = HOST_ENTRY.sub(replacement, text)
-        if updated != text:
-            durable_write(path, updated.encode(), path.stat().st_mode & 0o777)
-            changed = True
+        lines = path.read_text().splitlines(keepends=True)
+        matches = []
+        for index, line in enumerate(lines):
+            if not line.startswith('ExecStart='):
+                continue
+            if line.rstrip('\r\n').endswith('\\'):
+                if pattern.search(line):
+                    raise ValueError('multiline host ExecStart in ' + path.name)
+                continue
+            found = list(pattern.finditer(line))
+            if found:
+                matches.append((index, found))
+        if sum(len(found) for _, found in matches) > 1:
+            raise ValueError('ambiguous host ExecStart definitions in ' + path.name)
+        updates = []
+        for index, found in matches:
+            matched = found[0]
+            token = matched.group(0)
+            is_legacy = token.endswith('hub2')
+            if is_legacy == legacy_running:
+                continue
+            base = token[:-(len('hub2') if is_legacy else len('hub host'))]
+            updates.append((index, matched.start(), matched.end(),
+                            base + ('hub2' if legacy_running else 'hub host')))
+        if not updates:
+            continue
+        for index, start, end, replacement in reversed(updates):
+            line = lines[index]
+            lines[index] = line[:start] + replacement + line[end:]
+        durable_write(path, ''.join(lines).encode(), path.stat().st_mode & 0o777)
+        changed = True
     if changed:
         command(['systemctl', '--user', 'daemon-reload'])
 
