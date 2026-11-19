@@ -21,6 +21,7 @@ from pathlib import Path
 from .client import private_file
 from . import provider_home
 from . import claude_goal
+from . import resource_admission
 from .provider_home import clean_provider_environment, native_environment, session_binding
 
 FIRST_ACTION_INSTRUCTION = (
@@ -777,6 +778,16 @@ class NativeLauncher:
         return collect_native_inventory(lambda: self.native('list', '--all', '--json',
             timeout=CENSUS_TIMEOUT_SECONDS, output_limit=MAX_CENSUS_BYTES))
 
+    def raw_census_response(self):
+        """Bounded raw `list --all` stdout for the admission module's private parser.
+
+        The public completeness parser and publication schema stay untouched:
+        resource admission needs the workload process coordinate that the public
+        projection deliberately strips, and parses it privately and strictly."""
+        from .native_inventory import CENSUS_TIMEOUT_SECONDS, MAX_CENSUS_BYTES
+        return self.native('list', '--all', '--json',
+                           timeout=CENSUS_TIMEOUT_SECONDS, output_limit=MAX_CENSUS_BYTES).stdout
+
     def status(self, selector, workspace=None, *, timeout=30):
         result = self.native("status", selector, "--json", allow_failure=True, workspace=workspace, timeout=timeout)
         if result.returncode:
@@ -1119,7 +1130,10 @@ class NativeLauncher:
         # Mode/effort/goal capability gating already happened in the Bridge's
         # validate_launch against the same capability table.
         workspace = Path(specification["workspace"])
-        requested_mb = int(self.config.get("memory_mb", 1500))
+        # One validated cap snapshot feeds both the argv below and the admission
+        # transaction; malformed or oversized values refuse instead of clamping.
+        caps = resource_admission.validate_worker_caps(self.config.get("memory_mb"), self.config.get("pids"))
+        specification["admission_caps"] = caps
         goal = specification["prompt"]
         fa_path = workspace / ".local" / f"first-action-{task_id}.json"
         fa_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1206,8 +1220,8 @@ class NativeLauncher:
             child = [resolve_windows_program(child[0]), *child[1:]]
             if provider == 'codex':
                 child = windows_codex_command(child)
-        argv = [self.native_binary, "start", "--json", "--memory", f"{requested_mb}M",
-                "--pids", str(self.config.get("pids", 256)), "--startup-timeout-ms", "30000",
+        argv = [self.native_binary, "start", "--json", "--memory", f"{caps['memory_mb']}M",
+                "--pids", str(caps['pids']), "--startup-timeout-ms", "30000",
                 "--workspace", specification["workspace"], "--cwd", specification["workspace"],
                 "--tag", "task-" + task_id]
         if specification.get("interactive") and not local:
@@ -1241,13 +1255,19 @@ class NativeLauncher:
         before_dispatch = specification.get('before_native_dispatch')
         if diagnostic is not None:
             diagnostic.before_dispatch()
-        if before_dispatch:
-            before_dispatch()
+        # The admission callback commits marker 1 with its reservation and
+        # returns the short original-monotonic permit; the check below is
+        # read-only and never renews the sample clock or resets the marker.
+        permit = before_dispatch() if before_dispatch else None
         try:
-            # The durable dispatch marker may have consumed the remaining budget.
-            # Time-only: the callback legitimately changed dispatch_started to 1.
+            # The admission's one original deadline may already be consumed by
+            # the committed admission or by verify_permit's own final state/
+            # STOP journal reads, which re-check expiry immediately before the
+            # runner. Time-only: the callback legitimately changed
+            # dispatch_started to 1.
             if diagnostic is not None:
                 diagnostic.check()
+            resource_admission.verify_permit(permit, journal=self.journal)
             result = self.runner(argv, text=True, encoding='utf-8', errors='replace', capture_output=True,
                                  timeout=35, check=False,
                                  env=env, cwd=specification["workspace"])

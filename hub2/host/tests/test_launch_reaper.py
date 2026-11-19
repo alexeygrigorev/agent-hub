@@ -235,6 +235,41 @@ class LaunchReaperTests(unittest.TestCase):
     def state_of(self, operation):
         return self.journal.db.execute('SELECT state FROM launches WHERE operation_id=?',(operation,)).fetchone()[0]
 
+    def reserve(self, operation='operation', session='session', epoch=1, native=None):
+        with self.journal.db as db:
+            db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
+                       'native_id,allowance_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)',
+                       (operation, session, epoch, 'digest', 'attempt', native, 1500*1024*1024, int(time.time()*1000)))
+
+    def reservations(self):
+        return {row[0] for row in self.journal.db.execute('SELECT operation_id FROM resource_reservations')}
+
+    def test_no_dispatch_expiry_releases_only_the_exact_reservation(self):
+        self.row('pending_admission')
+        self.reserve()  # defensively present; the qualified no-dispatch expiry releases it
+        self.reserve('operation-held', 'session-held', 3)
+        reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'stopped_before_dispatch')
+        self.assertTrue(self.receipt()['no_dispatch'])
+        self.assertEqual(self.reservations(), {'operation-held'})
+
+    def test_expired_unconfirmed_settlement_never_releases_the_reservation(self):
+        self.row('aborting',deadline=100,native='native',dispatch=1)
+        self.reserve()
+        self.reserve('operation-held', 'session-held', 3)
+        evidence={'source':'aplexer_all_registry_census','complete':True,'match_count':0,'started_at_ms':150,'observed_at_ms':160}
+        self.bridge.launcher=SimpleNamespace(inventory=lambda:SimpleNamespace(fresh=lambda:True,absence_evidence=lambda *_:evidence))
+        self.settle()
+        self.assertEqual(self.state(),'expired_unconfirmed')
+        self.assertEqual(self.reservations(), {'operation','operation-held'})  # uncertain custody stays held
+
+    def test_legacy_reported_replay_writes_no_reservation_rows(self):
+        payload={'operation_id':'operation','epoch':1,'native_outcome':'unconfirmed','evidence':{'frozen':True}}
+        self.row('launch_failed_unconfirmed',deadline=2000,payload=payload)
+        reap_expired_launches(self.bridge,2000)
+        self.assertEqual(self.state(),'launch_failed_reported')
+        self.assertEqual(self.reservations(), set())
+
 
 class BridgeResponsivenessTests(unittest.TestCase):
     def test_reconcile_stays_responsive_while_census_is_blocked_for_many_rows(self):

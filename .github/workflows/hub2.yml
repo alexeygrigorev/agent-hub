@@ -206,6 +206,8 @@ jobs:
       - name: Public worker core e2e on Node runtime
         id: core_node
         continue-on-error: true
+        env:
+          HUB2_CORE_WORKER: "1"
         run: npm run test:core --prefix hub2
 
       - name: Public worker and native mail roundtrip
