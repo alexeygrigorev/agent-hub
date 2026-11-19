@@ -1,4 +1,5 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ControlDO} from '../src/control-do';
+import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage';
 import {pickModelRouteDetailed,simulateModelRoutes} from '../src/model-picker';
 import {setImmediate as nextTurn} from 'node:timers/promises';
 import {spawnSync as pickerAdapterSpawn} from 'node:child_process';
@@ -390,4 +391,126 @@ test('routing-machines allows routing:read and fails loudly with missing_scope w
  const deniedBody=await data(denied);
  assert.equal(deniedBody.missing_scope,'routing:read');
  assert.match(String(deniedBody.detail),/routing:read/);
+});
+
+function strictNodeFixture(){
+ const sql=new NodeSqlStorage(':memory:');
+ const storage=new NodeDurableStorage(sql);
+ const state:any={storage,blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ const env:any={HUB2_CREDENTIAL_KEY:'11'.repeat(32)};
+ const control=new ControlDO(state,env);
+ const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));
+ return {sql,storage,control,call,close:()=>sql.close()};
+}
+
+async function pairHost(call:ReturnType<typeof strictNodeFixture>['call'],machineId:string){
+ const p=await data(await call('/api/enrollments/pair','POST',{machine_id:machineId,alias:machineId}));
+ const res=await call('/api/enrollments/complete','POST',{code:p.pairing_code});
+ return {status:res.status,body:await data(res),code:p.pairing_code};
+}
+
+async function issueWorkerGrant(f:ReturnType<typeof strictNodeFixture>,machineId:string,idx:number,deadline=Date.now()+60_000){
+ const sessionId=`11111111-1111-4111-8111-${String(idx).padStart(12,'0')}`;
+ const intakeId=`22222222-2222-4222-8222-${String(idx).padStart(12,'0')}`;
+ const opId=`op-${machineId}-${idx}`;
+ const gen=String(f.sql.exec('SELECT generation FROM credentials WHERE actor_id=?','machine:'+machineId).toArray()[0].generation);
+ await f.call('/_routes/register','POST',{kind:'session',id:sessionId,owner:machineId,resource_id:'org/a',bound_intake_id:intakeId,epoch:1,participants:[]});
+ const res=await f.call('/_worker/issue','POST',{session_id:sessionId,epoch:1,operation_id:opId,machine_id:machineId,intake_id:intakeId,project_id:'org/a',deadline,machine_generation:gen});
+ assert.equal(res.status,200);
+ return {sessionId,intakeId,opId,grant:await data(res)};
+}
+
+test('machine re-enrollment under production NodeDurableStorage.transactionSync revokes active grants atomically without nesting',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ // Zero active grants: initial enroll and clean rotation both succeed.
+ const first=await pairHost(f.call,'host-rot');assert.equal(first.status,201);
+ const second=await pairHost(f.call,'host-rot');assert.equal(second.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:first.body.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:second.body.token})).status,200);
+
+ // Other machine + multiple active grants + already-revoked + expired rows.
+ const other=await pairHost(f.call,'host-other');assert.equal(other.status,201);
+ const otherGrant=await issueWorkerGrant(f,'host-other',1);
+ const g1=await issueWorkerGrant(f,'host-rot',2);
+ const g2=await issueWorkerGrant(f,'host-rot',3);
+ const alreadyRevoked=await issueWorkerGrant(f,'host-rot',4);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:alreadyRevoked.sessionId,epoch:1,operation_id:alreadyRevoked.opId,machine_id:'host-rot',intake_id:alreadyRevoked.intakeId,project_id:'org/a'})).status,200);
+ const priorRevokedAt=Number(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',alreadyRevoked.sessionId).toArray()[0].revoked_at);
+ const expiredSess='33333333-3333-4333-8333-000000000005';
+ f.sql.exec('INSERT INTO worker_credentials(session_id,epoch,operation_id,machine_id,intake_id,project_id,deadline,sealed_token,revoked_at) VALUES(?,?,?,?,?,?,?,?,NULL)',
+  expiredSess,1,'op-exp','host-rot','44444444-4444-4444-8444-000000000005','org/a',Date.now()-10_000,'sealed');
+
+ assert.equal((await f.call('/_verify','POST',{token:g1.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:g2.grant.token})).status,200);
+
+ // Re-enrollment with active grants must succeed (no nested_transaction_unsupported).
+ const rotated=await pairHost(f.call,'host-rot');assert.equal(rotated.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:second.body.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:rotated.body.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:g1.grant.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:g2.grant.token})).status,401);
+ // Exact machine isolation & untouched already-revoked/expired rows.
+ assert.equal((await f.call('/_verify','POST',{token:otherGrant.grant.token})).status,200);
+ assert.equal(Number(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',alreadyRevoked.sessionId).toArray()[0].revoked_at),priorRevokedAt);
+ assert.equal(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',expiredSess).toArray()[0].revoked_at,null);
+});
+
+test('completePairing outer transaction failure after revokeMachine rolls back worker revocations, old host, and pairing',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ const host=await pairHost(f.call,'host-rb');assert.equal(host.status,201);
+ const grant=await issueWorkerGrant(f,'host-rb',10);
+ const nextPair=await data(await f.call('/api/enrollments/pair','POST',{machine_id:'host-rb',alias:'host-rb-next'}));
+
+ f.sql.exec("CREATE TEMP TRIGGER fail_cred_update BEFORE UPDATE OF token_hash ON credentials WHEN NEW.actor_id='machine:host-rb' BEGIN SELECT RAISE(ABORT,'injected_outer_tx_failure'); END;");
+ const failed=await f.call('/api/enrollments/complete','POST',{code:nextPair.pairing_code});
+ assert.equal(failed.status,500);
+ f.sql.exec('DROP TRIGGER fail_cred_update;');
+
+ // Worker grant, old host token, and pairing code must all remain intact.
+ assert.equal(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',grant.sessionId).toArray()[0].revoked_at,null);
+ assert.equal((await f.call('/_verify','POST',{token:grant.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:host.body.token})).status,200);
+ assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM device_pairings WHERE machine_id='host-rb' AND used_at IS NULL").toArray()[0].n,1);
+
+ // Retrying completePairing after transient failure succeeds and revokes both.
+ const retried=await f.call('/api/enrollments/complete','POST',{code:nextPair.pairing_code});
+ assert.equal(retried.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:grant.grant.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:host.body.token})).status,401);
+});
+
+test('revokeMachine enforces 64-grant success and 65-grant typed 503 with zero mutation, preserving individual revoke contracts',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ // 64 active grants succeed.
+ const h64=await pairHost(f.call,'host-64');assert.equal(h64.status,201);
+ const g64First=await issueWorkerGrant(f,'host-64',100);
+ for(let i=101;i<164;i++)await issueWorkerGrant(f,'host-64',i);
+ const rot64=await pairHost(f.call,'host-64');assert.equal(rot64.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:g64First.grant.token})).status,401);
+
+ // 65 active grants refuse with 503 worker_revocation_bound and mutate nothing.
+ const h65=await pairHost(f.call,'host-65');assert.equal(h65.status,201);
+ const g65First=await issueWorkerGrant(f,'host-65',200);
+ for(let i=201;i<265;i++)await issueWorkerGrant(f,'host-65',i);
+ const pair65=await data(await f.call('/api/enrollments/pair','POST',{machine_id:'host-65',alias:'host-65-2'}));
+ const fail65=await f.call('/api/enrollments/complete','POST',{code:pair65.pairing_code});
+ assert.equal(fail65.status,503);
+ assert.equal((await data(fail65)).error,'worker_revocation_bound');
+ assert.equal(Number(f.sql.exec("SELECT COUNT(*) AS n FROM worker_credentials WHERE machine_id='host-65' AND revoked_at IS NULL").toArray()[0].n),65);
+ assert.equal((await f.call('/_verify','POST',{token:g65First.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:h65.body.token})).status,200);
+ assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM device_pairings WHERE machine_id='host-65' AND used_at IS NULL").toArray()[0].n,1);
+
+ // Individual revoke: idempotent exact binding, 409 mismatch, and absent-grant tombstone fencing.
+ const mismatch=await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'wrong-host',intake_id:g65First.intakeId,project_id:'org/a'});
+ assert.equal(mismatch.status,409);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'host-65',intake_id:g65First.intakeId,project_id:'org/a'})).status,200);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'host-65',intake_id:g65First.intakeId,project_id:'org/a'})).status,200);
+ const absentSess='55555555-5555-4555-8555-000000000001',absentIntake='66666666-6666-4666-8666-000000000001';
+ await f.call('/_routes/register','POST',{kind:'session',id:absentSess,owner:'host-65',resource_id:'org/a',bound_intake_id:absentIntake,epoch:1,participants:[]});
+ const absent=await data(await f.call('/_worker/revoke','POST',{session_id:absentSess,epoch:1,operation_id:'op-absent',machine_id:'host-65',intake_id:absentIntake,project_id:'org/a'}));
+ assert.equal(absent.revoked,true);assert.equal(absent.absent,true);
+ const h65Gen=String(f.sql.exec("SELECT generation FROM credentials WHERE actor_id='machine:host-65'").toArray()[0].generation);
+ const fenced=await f.call('/_worker/issue','POST',{session_id:absentSess,epoch:1,operation_id:'op-absent',machine_id:'host-65',intake_id:absentIntake,project_id:'org/a',deadline:Date.now()+60_000,machine_generation:h65Gen});
+ assert.equal(fenced.status,409);
 });
