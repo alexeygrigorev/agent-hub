@@ -13,7 +13,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from agent_hub_host import zai_diagnostic_selector as selector
+from agent_hub_host import resource_admission, zai_diagnostic_selector as selector
 
 HOST = "2ce62436c565182b0c889e91d87c42d6fabf4ce1"
 SID = "73c0d694-b7f4-5d3c-a407-647387c2f079"
@@ -442,6 +442,9 @@ class ActualLaunchDeadlineTests(unittest.TestCase):
         spec['before_native_dispatch'] = before_native_dispatch
         # Compile the ACTUAL candidate method AST with declared fake globals,
         # never a duplicate dispatch implementation or a real native module import.
+        # resource_admission is the real policy module: every call the launch
+        # body makes on this path is pure cap validation or a no-op None-permit
+        # check, so the actual admission seam runs without any stub.
         source = Path(selector.__file__).resolve().with_name('native_launch.py')
         tree = ast.parse(source.read_bytes())
         cls = next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='NativeLauncher')
@@ -454,7 +457,8 @@ class ActualLaunchDeadlineTests(unittest.TestCase):
                          spawn_environment=lambda central:dict(self.f.env),
                          UUID_RE=re.compile(r'^[0-9a-f-]{36}$'),
                          same_workspace=lambda left,right:left==right,
-                         validate_first_action=lambda *args:False)
+                         validate_first_action=lambda *args:False,
+                         resource_admission=resource_admission)
         exec(compile(ast.Module(body=[method],type_ignores=[]),str(source),'exec'),namespace)
         with patch.object(selector,'time',clock):
             return namespace['launch'](launcher,'hub2-'+SID,spec)
