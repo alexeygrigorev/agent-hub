@@ -228,6 +228,31 @@ class HermeticProcessFixture:
         sanitized.update(overrides)
         return sanitized
 
+    def install_hermetic_tool_discovery(self):
+        """Deterministic hermetic provisioning-tool discovery for release
+        updater lifecycles (CI run 44481800454 at bd7761f74: GitHub runners
+        ship a real uv on PATH; the generic install fixtures discovered
+        /opt/hostedtoolcache/Python/3.12.16/x64/bin/uv and the owned-command
+        guard correctly failed closed on that external binary, while hosts
+        without ambient uv silently took the stdlib fallback — an
+        ambient-dependent fixture contract). Under this scope the updater
+        never resolves uv from ambient PATH, so every provisioning lifecycle
+        takes the deterministic offline stdlib venv/pip fallback; a test
+        that genuinely studies the production uv branch binds its own owned
+        mock with a nested patch, which wins for the duration of its
+        install() call. Provider PATH discovery (PROVIDER_PATH_COMMANDS,
+        including its explicit path= forms) keeps the real shutil.which."""
+        real_which = shutil.which
+
+        def scoped(name, *rest, **kwargs):
+            if name == 'uv':
+                return None
+            return real_which(name, *rest, **kwargs)
+
+        discovery = patch.object(updater.shutil, 'which', scoped)
+        discovery.start()
+        self.addCleanup(discovery.stop)
+
 
 class ReleaseTests(HermeticProcessFixture, unittest.TestCase):
     def test_native_self_update_bypasses_config_and_propagates_exit(self):
@@ -288,6 +313,12 @@ with patch('subprocess.run', return_value=SimpleNamespace(returncode=7)) as run:
         # ones that remember to patch: an omitted per-test mock cannot reach
         # the real service tool or spawn an unregistered process.
         self.install_process_guard()
+        # Hermetic provisioning discovery for every updater lifecycle in this
+        # class (install(), prepare_environment(), install_operator_cli()):
+        # ambient PATH must never decide which provisioning branch runs.
+        # HostDropinAlignmentTests shares this fixture but has no
+        # provisioning lifecycle, so it does not take this scope.
+        self.install_hermetic_tool_discovery()
 
     def fetch(self, url, limit):
         name = url.rsplit('/', 1)[1]
@@ -1639,6 +1670,37 @@ with api['update_lock'](Path(sys.argv[2])):
             self.install()
         self.assertTrue(any(args[1:3] == ['-m', 'venv'] for args in self.calls))
 
+    def test_ambient_uv_on_path_is_never_discovered_or_executed_by_install(self):
+        # Causal regression for CI run 44481800454 at bd7761f74: with a real
+        # uv present on the ambient PATH (GitHub runners preinstall it), the
+        # actual product install path must never discover or execute it and
+        # must keep the deterministic offline stdlib fallback. The marker is
+        # a harmless owned script: discovery that leaked back to ambient
+        # PATH would resolve this exact path and the provisioning commands
+        # below would contain it, and any real execution is refused by the
+        # process guard before spawn and would leave the loud flag file.
+        ambient_bin = Path(self.temporary.name) / 'ambient-uv-bin'
+        ambient_bin.mkdir()
+        marker = ambient_bin / 'uv'
+        executed_flag = Path(self.temporary.name) / 'ambient-uv-executed'
+        marker.write_text('#!/bin/sh\ntouch "$AMBIENT_UV_EXECUTED_FLAG"\nexit 42\n')
+        marker.chmod(0o700)
+        old = self.old_release()
+        with patch.dict(os.environ, PATH=str(ambient_bin) + os.pathsep + os.environ['PATH'],
+                        AMBIENT_UV_EXECUTED_FLAG=str(executed_flag)):
+            self.install()
+        self.assertFalse(executed_flag.exists(), 'the ambient uv marker was executed')
+        self.assertFalse(any(str(marker) in args for args in self.calls),
+                         'ambient PATH leaked into provisioning discovery')
+        self.assertFalse(any(Path(args[0]).name == 'uv' for args in self.calls),
+                         'an external uv command reached the install path')
+        self.assertTrue(any(args[1:3] == ['-m', 'venv'] for args in self.calls))
+        pip = next(args for args in self.calls if 'pip' in args)
+        self.assertIn('--no-index', pip)
+        self.assertIn('--no-deps', pip)
+        self.assertEqual((self.root / 'previous').resolve(), old)
+        self.assertEqual((self.root / 'current').resolve().name, SHA)
+
     def test_corrupt_artifact_never_touches_current_or_installs(self):
         old = self.old_release()
         self.files[HOST] = b'tampered'
@@ -2718,7 +2780,7 @@ class FixtureDiscoveryContractTests(unittest.TestCase):
     every named test stays collected with working addCleanup/assertions,
     and the collected counts stay at the exactly audited numbers."""
 
-    EXPECTED_TEST_COUNTS = {'ReleaseTests': 95, 'HostDropinAlignmentTests': 16}
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 96, 'HostDropinAlignmentTests': 16}
 
     def test_guarded_classes_remain_unittest_test_cases(self):
         for name in self.EXPECTED_TEST_COUNTS:
