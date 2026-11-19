@@ -64,6 +64,40 @@ test('wake actors, malformed payloads and service-command keys remain closed',as
  for(const body of [{key:'b',at:'tomorrow',prompt:'x'},{key:'c',at:'now',prompt:''},{key:'d',at:'now',prompt:'x',wake:{}}])assert.equal((await f.publicCall('/api/sessions/s1/wake',body)).status,400);
  assert.equal((await f.call('/api/sessions/s1/commands','POST',{kind:'send',key:'hub-wake:forged',text:'x'})).status,400);
 });
+function workerGrant(epoch:number,over:Record<string,unknown>={}):any{return{id:'session:s1',kind:'agent',resource_id:'i1',scopes:['intake:read','intake:append','intake:create','session:start','routing:read','claim:read','claim:write','message:read','message:send','mailbox:session:s1','worker_project:p1'],generation:'worker:'+epoch+':op1:0',family_id:'worker:s1:'+epoch,client_id:'native-worker',...over};}
+const workerWake=(f:ReturnType<typeof fixture>,actor:any,body?:any,method='POST')=>f.call('/api/sessions/s1/'+(method==='GET'?'wakes':'wake'),method,method==='GET'?undefined:body??{key:'worker-own',at:'now',prompt:'Worker self wake'},actor);
+test('maintained worker grant schedules and reads only its own current-attempt wake',async()=>{
+ const f=fixture();const epoch=await f.boot();const g=workerGrant(epoch);
+ const first=await workerWake(f,g);assert.equal(first.status,201,await first.text());
+ const replay=await workerWake(f,g);assert.equal(replay.status,200);assert.equal((await replay.json() as any).replay,true);
+ assert.equal((await workerWake(f,g,{key:'worker-own',at:'now',prompt:'changed'})).status,409);
+ const own=await(await workerWake(f,g,undefined,'GET')).json() as any;assert.equal(own.wakes.length,1);assert.ok(own.wakes.every((w:any)=>!('prompt'in w)));
+ assert.equal((await workerWake(f,admin,{key:'admin-path',at:'now',prompt:'x'})).status,201);
+ assert.equal((await workerWake(f,{id:'session:s1',kind:'agent',resource_id:'s1',scopes:['session:send','session:read']},{key:'legacy-self',at:'now',prompt:'x'})).status,201);
+ const readOnly=workerGrant(epoch,{scopes:g.scopes.filter((s:string)=>s!=='intake:append')});
+ const appendOnly=workerGrant(epoch,{scopes:g.scopes.filter((s:string)=>s!=='intake:read')});
+ assert.equal((await workerWake(f,readOnly,{key:'read-only',at:'now',prompt:'x'})).status,404);
+ assert.equal((await workerWake(f,appendOnly,undefined,'GET')).status,404);
+ const mutations:[string,Record<string,unknown>][]=[
+  ['intake binding',{resource_id:'p1'}],['project marker',{scopes:g.scopes.map((s:string)=>s==='worker_project:p1'?'worker_project:other':s)}],
+  ['stale epoch',{generation:'worker:'+(epoch+1)+':op1:0'}],['stale attempt',{generation:'worker:'+epoch+':replaced'}],
+  ['family binding',{family_id:'worker:s1:'+(epoch+1)}],['client binding',{client_id:'other-client'}],
+  ['sibling same intake',{id:'session:99999999-9999-4999-9999-999999999999'}],['machine identity',{kind:'machine'}]];
+ for(const [label,over] of mutations)assert.equal((await workerWake(f,workerGrant(epoch,over),{key:'deny',at:'now',prompt:'x'})).status,404,label);
+ assert.equal((await workerWake(f,workerGrant(epoch,{resource_id:'p1'}),undefined,'GET')).status,404);
+ assert.equal((await workerWake(f,null,{key:'anon',at:'now',prompt:'x'})).status,404);
+ f.edit("UPDATE sessions SET operation_id='replacement',epoch=epoch+1 WHERE id='s1'");
+ assert.equal((await workerWake(f,g,{key:'stale-grant',at:'now',prompt:'x'})).status,404);
+ assert.equal((await workerWake(f,workerGrant(epoch+1,{generation:'worker:'+(epoch+1)+':replacement'}),{key:'moved',at:'now',prompt:'x'})).status,201);
+});
+test('worker-authorized owner keeps truthful headless due refusal and private history',async()=>{
+ const f=fixture();const epoch=await f.boot(false);await publish(f);const g=workerGrant(epoch);
+ assert.equal((await workerWake(f,g,{key:'worker-headless',at:'now',prompt:'Wake me'})).status,201);
+ await (f.machine as any).wakes.sweep();
+ const h=await(await workerWake(f,g,undefined,'GET')).json() as any;
+ assert.equal(h.wakes[0].wake_state,'missed');assert.equal(h.wakes[0].reason,'headless_send_refused');
+ assert.equal(command(f),undefined);
+});
 test('unknown or foreign native proof cannot satisfy a wake and host authority is required',async()=>{
  const f=legacyFixture();await f.boot();await publish(f);await create(f);const c=command(f);await authorize(f,c);const r=proof(c);
  for(const mutation of [{sender_native_id:'99999999-2222-4333-8444-555555555555'},{sender_generation:c.epoch+1},{sender_created_at_ms:2},{sender_workspace:'/foreign'},{status:'queued'},{extra:'untrusted'}])assert.equal((await ack(f,c,{...r,wake_proof:{...r.wake_proof,...mutation}})).status,409);

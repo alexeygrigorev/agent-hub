@@ -2546,10 +2546,23 @@ export class MachineDO {
       for(const phase of new Set(['missed',w.state==='acked'?'resolved':w.missed_at!==null?'missed':w.state]))this.db.run("UPDATE machine_outbox SET state='wake_pending' WHERE id=? AND kind='wake' AND state='pending'",'wake:'+w.id+':'+phase);
     });
   }
+  // A maintained worker grant binds its intake, not the SID, and may never hold
+  // session:send/read scopes: self wake/history therefore re-prove the exact
+  // current attempt at native-worker issuance shape instead of resource scope.
+  private workerSelfWake(actor:Actor,session:WakeSession,read:boolean):boolean{
+    return actor.kind==='agent'
+      &&actor.id==='session:'+session.id
+      &&actor.resource_id===session.intake_id
+      &&actor.scopes.includes(read?'intake:read':'intake:append')
+      &&actor.scopes.includes('worker_project:'+session.project_id)
+      &&actor.generation==='worker:'+session.epoch+':'+session.operation_id
+      &&actor.family_id==='worker:'+session.id+':'+session.epoch
+      &&actor.client_id==='native-worker';
+  }
   private async sessionWake(request:Request,id:string,action:string):Promise<Response>{
     const session=this.wakeSession(id),actor=actorFrom(request);
     const read=request.method==='GET';
-    if(!session||!actor||!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||'')))return error('session_not_found',404);
+    if(!session||!actor||!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))return error('session_not_found',404);
     if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
     if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
     const b=await bodyObject(request,12288);if(Object.keys(b).some(k=>!['key','at','prompt','body'].includes(k)))return error('invalid_wake',400);
