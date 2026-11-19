@@ -17,8 +17,8 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  BLOCKED_WAIT_MS, COMPLETION_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
@@ -43,6 +43,31 @@ const COMPLETION_ELIGIBLE = `(i.status IN ('open','failed','completed-awaiting-r
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
     AND json_extract(s.routing_json,'$.completion_contract')=1)`;
+
+// Failed attempts whose saga carries no completion contract (operator shells,
+// scheduled runs, legacy starts) have no completion loop: Hub retries them
+// itself. The scan joins the completed saga of the current attempt, skips
+// operator stops and completion-owned records, and derives the due time from
+// the durable retry marker, else one first backoff step after the saga
+// completed (which also adopts intakes that failed before this loop existed).
+const FIRST_RETRY_DELAY_MS = 60_000;
+const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id, i.final_evidence_json, i.updated_at,
+    s.updated_at AS saga_updated_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
+    COALESCE(json_extract(i.final_evidence_json,'$.auto_retry.next_action_at'), s.updated_at + ${FIRST_RETRY_DELAY_MS}) AS retry_due
+  FROM intakes i JOIN dispatch_sagas s ON s.session_id=i.session_id AND s.intake_id=i.id AND s.state='complete'
+  WHERE i.status='failed' AND i.schedule_id IS NULL AND i.route_registered=1
+    AND json_extract(i.final_evidence_json,'$.completion.controlled') IS NOT 1
+    AND json_extract(i.final_evidence_json,'$.stop_requested') IS NOT 1
+    AND COALESCE(json_extract(i.final_evidence_json,'$.reason'),'')<>'stop_confirmed'
+    AND json_extract(i.final_evidence_json,'$.auto_retry.state') IS NULL`;
+// The scan keeps the earliest-due candidates; the pass writes terminal
+// markers (bound spent, hard blocker) as soon as a row is scanned, so the
+// due filter only gates starting a new session.
+const FAILED_RETRY_DUE = `SELECT * FROM (${FAILED_RETRY_CANDIDATES}) ORDER BY retry_due, updated_at, id LIMIT 8`;
+type FailedRetryRow = {
+  id: string; project: string; status: string; session_id: string; final_evidence_json: string | null; updated_at: number;
+  saga_updated_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
+};
 
 const SCHEMA = [
   `CREATE TABLE intakes (
@@ -214,6 +239,7 @@ export class ProjectDO {
         if (!await this.dispatchSaga(row.operation_id)) break;
       }
       await this.runCompletionActions(now);
+      await this.runFailedIntakeRetries(now);
     } catch (caught) {
       console.error('[hub2] project alarm failed:', caught);
     } finally {
@@ -702,7 +728,21 @@ export class ProjectDO {
       &&actor?.id!==VERIFICATION_ACTOR)return error('verification_start_forbidden',403);
     if(body.verification_round!==undefined&&verificationRound===undefined)return error('verification_start_stale',409);
     let verificationPrevious:SagaRow|undefined,verificationOriginal:SagaRow|undefined;
+    const retryStart=actor?.id===RETRY_ACTOR;
     let excludedPolicyIds:string[]=[];
+    const rawExclude=body.exclude_policy_ids;
+    if(rawExclude!==undefined){
+      if(actor?.id!==VERIFICATION_ACTOR&&!retryStart)return error('exclude_policy_forbidden',403,'only Hub verifier and retry starts may exclude routing policies');
+      if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_policy_exclusions',400);
+      excludedPolicyIds=[...new Set(rawExclude as string[])];
+    }
+    let excludedMachineIds:string[]|undefined;
+    if(body.exclude_machine_ids!==undefined){
+      if(!retryStart)return error('exclude_machine_forbidden',403,'only Hub retry starts may exclude machines');
+      const raw=body.exclude_machine_ids;
+      if(!Array.isArray(raw)||raw.length>8||raw.some(v=>typeof v!=='string'||!/^[A-Za-z0-9_.-]{1,80}$/.test(v)))return error('invalid_machine_exclusions',400);
+      excludedMachineIds=[...new Set(raw as string[])];
+    }
     if(verificationOf!==undefined){
       if(intake.session_id!==verificationOf||typeof verificationOrigin!=='string'||!Number.isSafeInteger(verificationAttempt)
         ||Number(verificationAttempt)<1||Number(verificationAttempt)>MAX_VERIFICATION_ATTEMPTS)return error('verification_start_stale',409);
@@ -722,9 +762,6 @@ export class ProjectDO {
           ||previousRoute.verification_origin_session_id!==verificationOrigin)))return error('verification_start_stale',409);
       if(intake.status==='completed-awaiting-review'&&!reevaluationStart&&(!this.findCompletionClaim(intake,verificationOriginal)
         ||verificationOf!==verificationOrigin))return error('verification_start_stale',409);
-      const rawExclude=body.exclude_policy_ids??[];
-      if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_verification_exclusions',400);
-      excludedPolicyIds=[...new Set(rawExclude as string[])];
       const originalRoute=(this.parse(verificationOriginal.routing_json??'{}') as JsonRecord|null)??{};
       const originalPicker=(originalRoute.picker as JsonRecord|undefined)??{};
       if(typeof originalPicker.policy_id==='string'&&!excludedPolicyIds.includes(originalPicker.policy_id))return error('verification_model_not_independent',409);
@@ -794,6 +831,8 @@ export class ProjectDO {
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
         verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
+      ...(retryStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
+      ...(excludedMachineIds?{exclude_machine_ids:excludedMachineIds}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     const digest = await sha256Hex(JSON.stringify({
@@ -840,7 +879,12 @@ export class ProjectDO {
         return { machine_id, connected: host.connected === true, last_seen: host.last_seen ?? null,
           age_ms: typeof host.last_seen === 'number' ? Math.max(0, Date.now() - host.last_seen) : null };
       }));
-      const selected = hosts.find(host => host.connected);
+      const connected = hosts.filter(host => host.connected);
+      // A retry prefers any other connected host; the failed machine is only
+      // reused when no alternative is connected at all.
+      const selected = excludedMachineIds?.length
+        ? connected.find(host => !excludedMachineIds!.includes(host.machine_id)) ?? connected[0]
+        : connected[0];
       if (!selected) return error('no_connected_host', 503, JSON.stringify({ machines: hosts }));
       route = {
         machine_id: selected.machine_id, engine: 'shell', model: 'shell', account_id: '', policy_id: 'operator-shell',
@@ -858,6 +902,7 @@ export class ProjectDO {
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           ...(verificationOf!==undefined?{exclude_policy_ids:excludedPolicyIds}:{}),
+          ...(retryStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
           ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
@@ -1038,7 +1083,7 @@ export class ProjectDO {
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=? AND session_id=?',saga.intake_id,saga.session_id);
       const completion=intake&&this.completionControlled(current)?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
-        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id,...(completion?{completion}:{})}),now,saga.intake_id,saga.session_id);
+        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id,...(completion?{completion}:{auto_retry:this.failedRetryMarker(saga.intake_id,now)})}),now,saga.intake_id,saga.session_id);
       this.appendEvent(saga.intake_id,`dispatch-failed:${saga.attempt_operation_id}`, 'hub2-dispatch','session_launch_failed',
         {session_id:saga.session_id,reason},now);
       return true;
@@ -1176,7 +1221,7 @@ export class ProjectDO {
           const completion=active&&intake.session_id===saga.session_id&&this.completionControlled(current)
             ?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
           this.db.run('UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?',active?'failed':intake.status,
-            JSON.stringify({...stripCompletion(previous),...stripCompletion(payload),operation_id:saga.operation_id,...(completion?{completion}:{})}),now,intake.id);
+            JSON.stringify({...stripCompletion(previous),...stripCompletion(payload),operation_id:saga.operation_id,...(completion?{completion}:{...(active?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})})}),now,intake.id);
         }else if(terminalObservation&&intakeMatches){
           const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
           this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
@@ -1257,7 +1302,7 @@ export class ProjectDO {
         JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at,...(nativeAbsent?{native_outcome:'unconfirmed',native_inventory_absence:body.native_inventory_absence}:{})}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped:nativeAbsent?false:reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
-          native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{})}),now,intake.id);
+          native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{...(status==='failed'?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})})}),now,intake.id);
       this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchFailed?'session_launch_failed':lost?'session_lost':reaped?'session_reaped':'session_stopped',
         {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null,
           ...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
@@ -1553,8 +1598,11 @@ export class ProjectDO {
             :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed&&!stopRequested,true,now);
         }
       }
+      // An uncontrolled failed exit is Hub's own retry candidate: schedule its
+      // first (or next, after a Hub retry) bounded attempt with backoff.
+      const retryable=status==='failed'&&!completion;
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
-        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
+        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -2102,6 +2150,138 @@ export class ProjectDO {
       }
     });
   }
+  private failedRetryDueRows():FailedRetryRow[]{
+    return this.db.all<FailedRetryRow>(FAILED_RETRY_DUE);
+  }
+  /** Backoff marker for a fresh uncontrolled failure: the retry pass starts
+   * the next attempt no earlier than one retryDelay step per prior retry. */
+  private failedRetryMarker(intakeId:string,now:number):JsonRecord{
+    return {next_action_at:now+retryDelay(this.retryDepth(intakeId)+1)};
+  }
+  private failedRetryNextDeadline():number|undefined{
+    return this.db.one<{due:number|null}>(`SELECT MIN(retry_due) AS due FROM (${FAILED_RETRY_CANDIDATES})`)?.due??undefined;
+  }
+  /** Consecutive Hub retries of this intake since the last non-retry start. */
+  private retryDepth(intakeId:string):number{
+    let depth=0;
+    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_AUTO_RETRIES+1)){
+      if(row.actor_id!==RETRY_ACTOR)break;depth++;
+    }
+    return depth;
+  }
+  /** Terminal retry state, written CAS-style so the scan stops selecting the
+   * intake; `alert` escalates to the developer exactly once per intake. */
+  private markRetryTerminal(row:FailedRetryRow,state:string,now:number,why:{cause:string;blocker?:TaskBlocker},alert?:string):void{
+    const applied=this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==row.session_id)return false;
+      const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+      const marker=evidence.auto_retry as JsonRecord|undefined;
+      if(marker?.state==='terminal')return true;
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify({state:'terminal',reason:state,...(marker?.tries!==undefined?{tries:marker.tries}:{}),...(why.blocker?{blocker_cause:why.blocker.cause}:{})}),now,row.id);
+      this.appendEvent(row.id,'retry-terminal:'+row.session_id,RETRY_ACTOR,'task_retry_terminal',
+        {session_id:row.session_id,state,...(why.cause?{cause:why.cause}:{}),...(why.blocker?{blocker:why.blocker}:{})},now);
+      return true;
+    });
+    if(applied&&alert)this.raiseDeveloperAlert(row.id,row.session_id,alert,state,this.retryDepth(row.id),now,why,row.id);
+  }
+  /** Bounded, durable retry of failed intakes Hub owns itself, driven by the
+   * project alarm: backoff from the failure, route/machine fallback on repeat
+   * failures, escalation only when the bound is spent or a human is blocking. */
+  private async runFailedIntakeRetries(now:number):Promise<void>{
+    for(const row of this.failedRetryDueRows()){
+      const evidence=(this.parse(row.final_evidence_json??'{}') as JsonRecord|null)??{};
+      // Operator stops (receipt reason or stop_requested finish) are human
+      // decisions; a dead/idle/lost/launch-failed row is Hub's to retry.
+      if((evidence.completion as JsonRecord|undefined)?.controlled===true
+        ||evidence.stop_requested===true||evidence.reason==='stop_confirmed')continue;
+      const reason=String(evidence.reason??(evidence.launch_failed===true?'launch_failed':'failed'));
+      const why=this.unfinishedCause({id:row.id,session_id:row.session_id} as IntakeRow,
+        {session_id:row.session_id,operation_id:row.saga_operation_id} as SagaRow,reason);
+      const hard=!!why.blocker&&HARD_BLOCKERS.includes(why.blocker.cause);
+      const depth=this.retryDepth(row.id);
+      if(hard){this.markRetryTerminal(row,'blocked_'+why.blocker!.cause,now,why,'blocked');continue;}
+      if(depth>=MAX_AUTO_RETRIES){this.markRetryTerminal(row,'retry_exhausted',now,why,'retry_exhausted');continue;}
+      if(row.retry_due>now)continue;
+      await this.startFailedIntakeRetry(row,depth,reason,now);
+    }
+  }
+  /** One durable retry start. The snapshot point and exclusion inputs are
+   * fixed before the first attempt so every resend of the same depth is
+   * byte-identical and the start idempotency key collapses duplicates. */
+  private async startFailedIntakeRetry(row:FailedRetryRow,depth:number,reason:string,now:number):Promise<void>{
+    const attempt=depth+1,sagaSession=row.session_id;
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+    if(!intake||intake.status!=='failed'||intake.session_id!==sagaSession)return;
+    const launch=this.parse(row.launch_spec_json) as JsonRecord;
+    const route=(this.parse(row.routing_json) as JsonRecord|null)??{};
+    const shell=String(launch.engine??'').toLowerCase()==='shell';
+    const timeout=Number(launch.timeout_seconds)||1800;
+    const fixed=this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return undefined;
+      const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+      const marker=(evidence.auto_retry as JsonRecord|undefined)??{};
+      if(marker.attempt===attempt&&marker.snapshot_seq!==undefined)return marker;
+      const next={...marker,attempt,snapshot_seq:this.latestSeq(row.id)};
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify(next),now,row.id);
+      return next;
+    });
+    if(!fixed)return;
+    // The first retry keeps the failed attempt's route (the picker may still
+    // move machines); a second retry falls back to another routing policy,
+    // which cannot also pin that policy's engine and model.
+    const routeFallback=depth>0&&typeof route.policy_id==='string';
+    const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
+      ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+      interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+      purpose:launch.purpose??'implement',override_reason:'hub_failed_intake_retry',
+      ...(Array.isArray(route.required_capabilities)?{required_capabilities:route.required_capabilities}:{}),
+      ...(routeFallback?{exclude_policy_ids:[String(route.policy_id)]}:{}),
+      ...(shell?{exclude_machine_ids:[row.saga_machine_id]}:{}),
+      // A session killed at its deadline gets more time, within the start limit.
+      timeout_seconds:reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout};
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const budget=continuationBudget({...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''} as JsonRecord,row.id,Array.isArray(criteria)?criteria.map(String):[]);
+    body.prompt=retryPrompt(row.id,attempt,MAX_AUTO_RETRIES,sagaSession,reason,basePrompt(String(launch.prompt??''))||intake.text,
+      this.continuationSnapshot(intake,Number(fixed.snapshot_seq)),budget);
+    const actor:Actor={id:RETRY_ACTOR,kind:'agent',resource_id:row.project,
+      scopes:['session:start','intake:read','project:'+row.project,...(shell||launch.managed_credential_label!==undefined?['operator:admin']:[])]};
+    let outcome:{state:'started'|'superseded'|'retry'|'refused';reason?:string;session_id?:string};
+    try{
+      const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(row.id)+'/start',{
+        method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(body)}),row.id);
+      const result=await response.json().catch(()=>({})) as JsonRecord;
+      if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
+      else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
+      else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
+    }catch{outcome={state:'retry',reason:'retry_start_uncertain'};}
+    if(outcome.state==='started'){
+      this.transaction(()=>this.appendEvent(row.id,`retry:${row.saga_operation_id}:${attempt}`,RETRY_ACTOR,'task_retry_started',
+        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:depth>0},Date.now()));
+      return;
+    }
+    if(outcome.state==='superseded'){
+      this.markRetryTerminal(row,'superseded',Date.now(),{cause:outcome.reason??'attempt_replaced'});
+      return;
+    }
+    const tries=Number((fixed as JsonRecord).tries??0)+1,terminal=outcome.state==='refused'||tries>=MAX_RETRY_START_TRIES;
+    const terminalReason=outcome.state==='refused'?'retry_start_refused':'retry_start_failed';
+    const alerted=this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return false;
+      const next={...fixed,tries,...(terminal?{state:'terminal',reason:terminalReason}:{next_action_at:Date.now()+retryDelay(tries),last_reason:(outcome.reason??'retry_start_uncertain').slice(0,100)})};
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(final_evidence_json,'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify(next),Date.now(),row.id);
+      if(terminal)this.appendEvent(row.id,'retry-terminal:'+sagaSession,RETRY_ACTOR,'task_retry_terminal',
+        {session_id:sagaSession,state:'terminal',reason:terminalReason,last_reason:outcome.reason??null,tries},Date.now());
+      return true;
+    });
+    if(alerted&&terminal)this.raiseDeveloperAlert(row.id,sagaSession,outcome.state==='refused'?'retry_start_refused':'retry_start_failed',
+      outcome.reason??terminalReason,this.retryDepth(row.id),Date.now(),{cause:outcome.reason??terminalReason},row.id);
+  }
   private async scheduleHasActiveSession(scheduleId:string):Promise<boolean>{
     return !!this.db.one("SELECT id FROM intakes WHERE schedule_id=? AND status IN ('queued','running') LIMIT 1",scheduleId);
   }
@@ -2139,6 +2319,7 @@ export class ProjectDO {
       this.db.one<{ due: number }>('SELECT route_next_action_at AS due FROM intakes WHERE route_registered=0 ORDER BY route_next_action_at,id LIMIT 1')?.due,
       this.work.nextDeadline() ?? undefined,
       this.completionNextDeadline(),
+      this.failedRetryNextDeadline(),
     ].filter((value): value is number => typeof value === 'number' && Number.isSafeInteger(value));
     const due = deadlines.length ? Math.min(...deadlines) : null;
     this.db.alarmOperation();

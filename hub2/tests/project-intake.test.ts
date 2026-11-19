@@ -360,7 +360,7 @@ test('unconfirmed custody composes real Machine and Project until qualified STOP
  assert.equal(f.capReleases.length,1);assert.equal(f.capReleases[0].session_id,saga.session_id);
 });
 
-test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
+test('an expired unclaimed offer terminates the attempt and schedules a bounded machine-fallback retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
@@ -374,7 +374,9 @@ test('an expired unclaimed offer terminates instead of scheduling an unbounded r
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
  assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).reason,'host_no_response');
  const calls=f.machineCalls.length;
- await f.project.alarm();assert.equal(f.machineCalls.length,calls);assert.equal(f.getAlarm(),null);
+ await f.project.alarm();
+ assert.equal(f.machineCalls.length,calls,'the retry waits for its backoff step instead of reserving at once');
+ assert.notEqual(f.getAlarm(),null,'the failed offer is retried bounded: Hub schedules the retry alarm');
 });
 
 test('session admission checks the current saga without quota or account-capacity reads',async()=>{
