@@ -6,19 +6,30 @@ its native guarded deliver operation (which never creates another envelope).
 No PTY injection, identity override, provider action or headless resume.
 """
 import hashlib
+import itertools
 import os
 import json
 import logging
+import queue
+import threading
 import time
 import uuid
 
-# Closed private strict-attempt diagnostics: fixed record schema, whitelisted
-# vocabulary, unknown values collapse to 'unrecognized'. Each record carries a
-# bounded opaque command correlation computed once per attempt, and the
-# monotonic budget is captured before any emission, so diagnostic sink delay
-# or failure is spent inside the original budget, never widens it. Records go
-# only to the Host process log; logging never authorizes, retries or alters
-# effects.
+# Closed private strict-attempt diagnostics: fixed 10-key record schema with
+# per-field closed vocabularies. Unknown values collapse to 'unrecognized',
+# explicit native nulls to 'unknown', missing flags to 'absent'; booleans are
+# never accepted where a vocabulary string is required. Every record binds one
+# opaque command correlation plus one process-local per-invocation attempt
+# token, so interleaved commands and retries stay attributable without raw
+# request, text, path or environment data. Emission is bounded best-effort and
+# never blocks the native-control path: the record is serialized in the caller,
+# dropped into a bounded in-process queue (drop-on-full) and drained by one
+# lifecycle-contained daemon worker that writes through the existing Host
+# logging sink. A slow or broken sink delays or loses records only. The
+# monotonic budget is captured before the first emission; diagnostics cost
+# microseconds and the original remaining/deadline checks still gate every
+# native effect and finalization, so logging neither widens nor renews the
+# attempt budget. Logging never authorizes, retries or alters effects.
 STRICT_DIAG_LOGGER='agent_hub_host.wake_send.strict_diag'
 _STRICT_DIAG=logging.getLogger(STRICT_DIAG_LOGGER)
 _STRICT_DIAG.addHandler(logging.NullHandler())
@@ -29,8 +40,8 @@ _STRICT_DIAG_RAISED={'invalid_wake_command':'validation_refused','command_id_con
     'wake_deadline_exceeded':'deadline_exceeded','wake_outcome_uncertain':'outcome_uncertain',
     'wake_receipt_unverified':'receipt_unverified','duplicate_receipt_field':'receipt_unverified'}
 _STRICT_DIAG_EVENTS=frozenset(('attempt_start','validation_refused','identity_refused','context_refused',
-    'deadline_exceeded','outcome_uncertain','receipt_unverified','mutation_committed','envelope_stored',
-    'envelope_verified','submit_attempted','submit_pending','submit_verified','done_replay','unrecognized'))
+    'deadline_exceeded','outcome_uncertain','receipt_unverified','command_intent_committed','envelope_stored',
+    'envelope_reread','submit_attempted','submit_pending','submit_verified','done_replay','unrecognized'))
 _STRICT_DIAG_PHASES=frozenset(('entry','validated','identity','context','envelope','submit','receipt','terminal'))
 _STRICT_DIAG_STATUSES=frozenset(('submitted_verified','refused','uncertain'))
 _STRICT_DIAG_REASONS=frozenset(_STRICT_DIAG_RAISED)|frozenset(('submission_observed','preflight_refused',
@@ -38,12 +49,55 @@ _STRICT_DIAG_REASONS=frozenset(_STRICT_DIAG_RAISED)|frozenset(('submission_obser
     'deadline_expired','identity_mismatch','not_idle','input_client_attached','input_not_settled',
     'unknown_layout','unsafe_composer','readiness_changed','paste_uncertain','landing_uncertain',
     'landing_changed','enter_uncertain'))
+_STRICT_DIAG_QUEUE=queue.Queue(maxsize=128)
+_STRICT_DIAG_WORKER_LOCK=threading.Lock()
+_STRICT_DIAG_WORKER_THREAD=[]
+_STRICT_DIAG_ATTEMPTS=itertools.count()
+_ABSENT=object()
 
-def _strict_diag_unit(value,whitelist):
+def _strict_diag_status(value):
+    'Closed status vocabulary; only exact vocabulary strings qualify.'
+    if value is _ABSENT:return 'absent'
+    return value if isinstance(value,str) and value in _STRICT_DIAG_STATUSES else 'unrecognized'
+
+def _strict_diag_reason(value):
+    'Closed reason vocabulary; only exact vocabulary strings qualify.'
+    if value is _ABSENT:return 'absent'
+    return value if isinstance(value,str) and value in _STRICT_DIAG_REASONS else 'unrecognized'
+
+def _strict_diag_flag(value,present):
+    'Native flags: exact bool, explicit null is unknown, missing is absent, any other type is unrecognized.'
+    if not present:return 'absent'
+    if value is None:return 'unknown'
     if value is True:return 'true'
     if value is False:return 'false'
-    if value is None:return 'absent'
-    return value if isinstance(value,str) and value in whitelist else 'unrecognized'
+    return 'unrecognized'
+
+def _strict_diag_receipt_field(receipt,key):
+    'Typed receipt access: distinguishes an explicit native null from an omitted flag.'
+    if isinstance(receipt,dict) and key in receipt:return receipt[key]
+    return _ABSENT
+
+def _strict_diag_worker():
+    'One daemon worker for the whole Host process lifetime: bounded, self-contained, never joined.'
+    while True:
+        try:line=_STRICT_DIAG_QUEUE.get(timeout=5)
+        except Exception:continue
+        try:_STRICT_DIAG.info('%s',line)
+        except Exception:pass  # A diagnostic sink failure never alters the guarded attempt.
+
+def _strict_diag_emit(line):
+    try:
+        if _STRICT_DIAG_QUEUE.full():return  # Drop-on-full keeps the control path free of head-of-line blocking.
+        _STRICT_DIAG_QUEUE.put_nowait(line)
+    except Exception:
+        return
+    if _STRICT_DIAG_WORKER_THREAD:return
+    with _STRICT_DIAG_WORKER_LOCK:
+        if _STRICT_DIAG_WORKER_THREAD:return
+        worker=threading.Thread(target=_strict_diag_worker,name='wake-strict-diag',daemon=True)
+        _STRICT_DIAG_WORKER_THREAD.append(worker)
+        worker.start()
 
 def _strict_diag_correlation(command):
     'Bounded opaque correlation for one strict attempt: the canonical command UUID when valid, else a truncated SHA256 over closed identity fields only. Never payload text, paths, environment or receipt content.'
@@ -63,18 +117,22 @@ def _strict_diag_correlation(command):
         return 'unknown'
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
 
-def _strict_diag_record(command,category,phase,status=None,reason=None,mutation=None,landed=None,submitted=None,replayed=None):
-    record={'event':category if category in _STRICT_DIAG_EVENTS else 'unrecognized',
-            'phase':phase if phase in _STRICT_DIAG_PHASES else 'unrecognized',
-            'command':command,
-            'status':_strict_diag_unit(status,_STRICT_DIAG_STATUSES),
-            'reason':_strict_diag_unit(reason,_STRICT_DIAG_REASONS),
-            'mutation':_strict_diag_unit(mutation,()),'landed':_strict_diag_unit(landed,()),
-            'submitted':_strict_diag_unit(submitted,()),'replayed':_strict_diag_unit(replayed,())}
+def _strict_diag_record(correlation,attempt,category,phase,status=_ABSENT,reason=_ABSENT,
+                        mutation=_ABSENT,landed=_ABSENT,submitted=_ABSENT,replayed=_ABSENT):
     try:
-        _STRICT_DIAG.info('wake_strict_diag %s',json.dumps(record,sort_keys=True,separators=(',',':')))
+        record={'event':category if category in _STRICT_DIAG_EVENTS else 'unrecognized',
+                'phase':phase if phase in _STRICT_DIAG_PHASES else 'unrecognized',
+                'command':correlation,'attempt':attempt,
+                'status':_strict_diag_status(status),
+                'reason':_strict_diag_reason(reason),
+                'mutation':_strict_diag_flag(mutation,mutation is not _ABSENT),
+                'landed':_strict_diag_flag(landed,landed is not _ABSENT),
+                'submitted':_strict_diag_flag(submitted,submitted is not _ABSENT),
+                'replayed':_strict_diag_flag(replayed,replayed is not _ABSENT)}
+        line='wake_strict_diag '+json.dumps(record,sort_keys=True,separators=(',',':'))
     except Exception:
-        pass  # A diagnostic sink failure never alters the guarded attempt.
+        return  # All diagnostic construction is guarded; nothing here can alter the attempt.
+    _strict_diag_emit(line)
 
 
 def execute(bridge, command, digest):
@@ -189,23 +247,40 @@ def execute(bridge, command, digest):
 
 def execute_strict(bridge, command, digest):
     """A native once-ID guards retries; no mailbox or sender impersonation."""
-    # One monotonic budget and one correlation per attempt, both fixed before
-    # the first diagnostic emission: sink delay consumes the original budget
-    # and every record binds to the same original command.
+    # One monotonic budget, one command correlation and one process-local
+    # attempt token, all fixed before the first diagnostic emission. Emission
+    # itself never blocks and cannot widen or renew this budget.
     start = time.monotonic()
-    correlation = _strict_diag_correlation(command)
+    try:
+        correlation = _strict_diag_correlation(command)
+    except Exception:
+        correlation = 'unknown'
+    try:
+        attempt = '%012x' % next(_STRICT_DIAG_ATTEMPTS)
+    except Exception:
+        attempt = 'unknown'
     phases=['entry']
     try:
-        return _execute_strict_locked(bridge,command,digest,phases,correlation,start)
+        return _execute_strict_locked(bridge,command,digest,phases,correlation,attempt,start)
     except Exception as error:
-        reason=str(error)
-        _strict_diag_record(correlation,_STRICT_DIAG_RAISED.get(reason,'unrecognized'),phases[0],
-                            reason=reason if reason in _STRICT_DIAG_REASONS else 'unrecognized')
+        # Typed known-reason extraction only; arbitrary exception formatting
+        # (including __str__) is never invoked, and the exact original object
+        # is always re-raised below.
+        try:
+            reason='unrecognized'
+            if isinstance(error,(ValueError,RuntimeError)):
+                args=error.args
+                if args and type(args[0]) is str and args[0] in _STRICT_DIAG_RAISED:
+                    reason=args[0]
+            _strict_diag_record(correlation,attempt,_STRICT_DIAG_RAISED.get(reason,'unrecognized'),
+                                phases[0],reason=reason)
+        except Exception:
+            pass
         raise
 
-def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
+def _execute_strict_locked(bridge,command,digest,phases,correlation,attempt,start):
     """Strict attempt body; phases[0] carries the closed diagnostic phase."""
-    def diag(category,**fields):_strict_diag_record(correlation,category,phases[0],**fields)
+    def diag(category,**fields):_strict_diag_record(correlation,attempt,category,phases[0],**fields)
     diag('attempt_start')
     inbox = command.get('wake', {}).get('transport') == 'strict-inbox:v1'
     db = bridge.journal.db
@@ -298,8 +373,11 @@ def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
             phases[0]='envelope'
             # A crash/unknown result beyond this committed boundary NEVER
             # creates another envelope. Availability is sacrificed to custody.
+            # command_intent_committed marks the Host begin_command/executing
+            # journal intent only; the native input mutation fact stays the
+            # receipt's own mutation flag.
             with db: bridge.begin_command(identity,digest)
-            diag('mutation_committed')
+            diag('command_intent_committed')
             remaining()
             sent = bridge.native('message','send','--to',binding['tag'],'--kind','hub-wake',
                                  '--data',json.dumps(data,ensure_ascii=False,separators=(',',':')),
@@ -318,13 +396,15 @@ def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
             if validated(decode(result.stdout)) != envelope:
                 raise RuntimeError('wake_receipt_unverified')
             qualified();remaining()
-            diag('envelope_verified')
+            diag('envelope_reread')
         reread()
         wire_text = 'Read inbox message '+envelope['id']
     elif not old:
         phases[0]='submit'
+        # Same Host journal intent boundary as the inbox path; not a native
+        # input mutation fact.
         with db: bridge.begin_command(identity,digest)
-        diag('mutation_committed')
+        diag('command_intent_committed')
     # A repeated CLI RPC uses EXACTLY the same worker-persisted once-ID/digest/
     # original deadline. Uncertain worker fences never write a second input.
     phases[0]='submit'
@@ -364,9 +444,12 @@ def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
             or receipt.get('mutation') is not True or receipt.get('landed') is not True
             or receipt.get('submitted') is not True or receipt.get('consumed') is not None
             or receipt.get('reason') != 'submission_observed'):
-        diag('submit_pending',status=receipt.get('status'),reason=receipt.get('reason'),
-             mutation=receipt.get('mutation'),landed=receipt.get('landed'),
-             submitted=receipt.get('submitted'),replayed=receipt.get('replayed'))
+        diag('submit_pending',status=_strict_diag_receipt_field(receipt,'status'),
+             reason=_strict_diag_receipt_field(receipt,'reason'),
+             mutation=_strict_diag_receipt_field(receipt,'mutation'),
+             landed=_strict_diag_receipt_field(receipt,'landed'),
+             submitted=_strict_diag_receipt_field(receipt,'submitted'),
+             replayed=_strict_diag_receipt_field(receipt,'replayed'))
         return {'wake_pending':True,'transport':binding['transport']}
     result = {'delivery':'native_acknowledged','delivered_at_ms':int(time.time()*1000),
               'wake_proof':{'kind':'strict_submit_v1','epoch':binding['epoch'],
@@ -376,8 +459,11 @@ def _execute_strict_locked(bridge,command,digest,phases,correlation,start):
         result['wake_proof'].update(kind='strict_inbox_notice_v1',
             envelope_id=envelope['id'],body_sha256=hashlib.sha256(text.encode()).hexdigest())
     phases[0]='terminal'
-    diag('submit_verified',status=receipt.get('status'),reason=receipt.get('reason'),
-         mutation=receipt.get('mutation'),landed=receipt.get('landed'),
-         submitted=receipt.get('submitted'),replayed=receipt.get('replayed'))
+    diag('submit_verified',status=_strict_diag_receipt_field(receipt,'status'),
+         reason=_strict_diag_receipt_field(receipt,'reason'),
+         mutation=_strict_diag_receipt_field(receipt,'mutation'),
+         landed=_strict_diag_receipt_field(receipt,'landed'),
+         submitted=_strict_diag_receipt_field(receipt,'submitted'),
+         replayed=_strict_diag_receipt_field(receipt,'replayed'))
     with db: bridge.finish_command(identity,command,result)
     return result
