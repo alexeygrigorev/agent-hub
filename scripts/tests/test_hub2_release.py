@@ -2442,25 +2442,48 @@ elif event in ('start', 'routing', 'enable'):
 
         seen = []
         def fake_install(base_url, root, **kwargs):
-            seen.append((base_url, root, kwargs))
-        with patch.object(updater, 'install', fake_install), \
-             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
-             patch.dict(os.environ, {}, clear=False):
-            os.environ.pop('TRIGGER_UNIT', None)
-            with patch.object(sys, 'argv', ['hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root)]):
-                self.assertEqual(updater.main(), 0)
-            with patch.object(sys, 'argv', [
-                'hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root),
-                '--expected-host-version', tuple_kwargs['expected_host_version'],
-                '--expected-cli-sha256', tuple_kwargs['expected_cli_sha256'],
-                '--expected-updater-sha256', tuple_kwargs['expected_updater_sha256'],
-            ]):
-                self.assertEqual(updater.main(), 0)
+            seen.append((base_url, root, kwargs, updater.HANDOFF_ARGV.get()))
+        sentinel = ['--sentinel']
+        prior_token = updater.HANDOFF_ARGV.set(sentinel)
+        try:
+            with patch.object(updater, 'install', fake_install), \
+                 patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+                 patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('TRIGGER_UNIT', None)
+                with patch.object(sys, 'argv', ['hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root)]):
+                    self.assertEqual(updater.main(), 0)
+                self.assertEqual(updater.HANDOFF_ARGV.get(), sentinel)
+                with patch.object(sys, 'argv', ['hub2-self-update.py', '--no-handoff', '--base-url', 'https://example.invalid', '--root', str(self.root)]):
+                    self.assertEqual(updater.main(), 0)
+                self.assertEqual(updater.HANDOFF_ARGV.get(), sentinel)
+                with patch.object(sys, 'argv', [
+                    'hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root),
+                    '--expected-host-version', tuple_kwargs['expected_host_version'],
+                    '--expected-cli-sha256', tuple_kwargs['expected_cli_sha256'],
+                    '--expected-updater-sha256', tuple_kwargs['expected_updater_sha256'],
+                ]):
+                    self.assertEqual(updater.main(), 0)
+                self.assertEqual(updater.HANDOFF_ARGV.get(), sentinel)
+            with patch.object(updater, 'install', side_effect=RuntimeError('boom')), \
+                 patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+                 patch.dict(os.environ, {}, clear=False), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                os.environ.pop('TRIGGER_UNIT', None)
+                with patch.object(sys, 'argv', ['hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root)]):
+                    self.assertEqual(updater.main(), 1)
+                self.assertEqual(updater.HANDOFF_ARGV.get(), sentinel)
+        finally:
+            updater.HANDOFF_ARGV.reset(prior_token)
         self.assertEqual(seen, [
             ('https://example.invalid', self.root.resolve(),
-             {'install_service': False, 'restart': True, 'scheduled': False}),
+             {'install_service': False, 'restart': True, 'scheduled': False},
+             ['--base-url', 'https://example.invalid', '--root', str(self.root)]),
             ('https://example.invalid', self.root.resolve(),
-             {'install_service': False, 'restart': True, 'scheduled': False, **tuple_kwargs}),
+             {'install_service': False, 'restart': True, 'scheduled': False},
+             None),
+            ('https://example.invalid', self.root.resolve(),
+             {'install_service': False, 'restart': True, 'scheduled': False, **tuple_kwargs},
+             None),
         ])
 
     def test_expected_tuple_under_lock_rejects_changed_manifest_busy_lock_and_backoff(self):
@@ -2489,9 +2512,16 @@ elif event in ('start', 'routing', 'enable'):
         )
         self.manifest = other_manifest
         self.downloads.clear()
-        with patch.object(updater, 'recover', side_effect=AssertionError('recover must not run on mismatch')):
-            with self.assertRaisesRegex(ValueError, 'expected candidate tuple'):
-                self.install(install_service=True, **tuple_kwargs)
+        pending_argv = ['--install-service']
+        handoff_token = updater.HANDOFF_ARGV.set(pending_argv)
+        try:
+            with patch.object(updater, 'maybe_handoff_updater', side_effect=AssertionError('handoff must not run for expected tuple')), \
+                 patch.object(updater, 'recover', side_effect=AssertionError('recover must not run on mismatch')):
+                with self.assertRaisesRegex(ValueError, 'expected candidate tuple'):
+                    self.install(install_service=True, **tuple_kwargs)
+            self.assertEqual(updater.HANDOFF_ARGV.get(), pending_argv)
+        finally:
+            updater.HANDOFF_ARGV.reset(handoff_token)
         self.assertEqual(self.downloads, ['host-release.json'])
         self.assertEqual((self.root / 'current').resolve(), old.resolve())
         self.assertFalse((self.root / 'releases' / SHA).exists())
@@ -2692,15 +2722,62 @@ class HostDropinAlignmentTests(HermeticProcessFixture, unittest.TestCase):
         updater.restart_host(self.root)
         self.assertEqual(self.dropin.read_text(), self.legacy)
 
+    def test_transitional_release_keeps_hub2_dropins_byte_identical(self):
+        # The transition release declares both console entries (unification
+        # rollout, see test_transitional_wheel_entry_contract). Unpinned
+        # drop-ins follow the running release's bin/hub2 launcher, never its
+        # entry metadata: the fleet's hub2-style drop-ins survive the
+        # transition byte-identical and the strict pinned-entry parser is
+        # not involved.
+        release = self.root / 'releases' / SHA
+        self.current(legacy=True)
+        (release / 'bin/hub2').write_bytes(self.recognized_launcher_bytes(release))
+        dist_info = release / 'lib/python3.12/site-packages/agent_hub_host_v2-2.0.0.dist-info'
+        dist_info.mkdir(parents=True)
+        (dist_info / 'entry_points.txt').write_text(
+            '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\nhub2 = agent_hub_host.cli:main\n')
+        updater.restart_host(self.root)
+        self.assertEqual(self.dropin.read_text(), self.legacy)
+        self.assertEqual(self.calls, [['systemctl', '--user', 'restart', updater.UNITS[0]]])
+
     def test_no_hub2_cli_remains_in_packaging_units_or_installers(self):
         import re
         retired = re.compile(r'bin/hub2\b|Scripts.hub2\.exe|^hub2 = |\bhub2 (serve|enroll|heartbeat|self-update|--config)\b', re.M)
-        paths = [REPO / 'pyproject.toml', REPO / 'hub2/host/pyproject.toml', REPO / 'deploy/host-install.ps1',
+        paths = [REPO / 'pyproject.toml', REPO / 'deploy/host-install.ps1',
                  REPO / 'scripts/switch-host-release.py', *sorted((REPO / 'deploy').glob('*.service'))]
         for path in paths:
             self.assertIsNone(retired.search(path.read_text()), str(path))
         # host-install.sh only mentions the old name to retire a stale link.
         self.assertNotIn('ln -s "$ROOT/current/bin/hub2"', (REPO / 'deploy/host-install.sh').read_text())
+        # The host wheel is the one sanctioned exception: the transitional
+        # legacy entry (see test_transitional_wheel_entry_contract) ships
+        # beside the unified entry, so no other retired spelling may appear
+        # in the packaging file either.
+        self.assertIsNone(retired.search((REPO / 'hub2/host/pyproject.toml').read_text().replace(
+            'hub2 = "agent_hub_host.cli:main"', 'hub2 TransitionalEntry')), 'hub2/host/pyproject.toml')
+
+    def test_transitional_wheel_entry_contract(self):
+        # CLI unification rollout (intake b1ba4d6b): the deployed
+        # pre-unification updaters on every enrolled host prepare a release
+        # environment and probe daemon readiness through the legacy daemon
+        # entry. A post-unification wheel without it fails those updaters in
+        # about one second (entry check in their prepare_environment) and
+        # the fleet deadlocks: the feed's newer updater bytes only reach
+        # updater.py after a successful release activation, which never
+        # happens. Both entries are therefore mandatory while the rollout
+        # is in flight; dropping the legacy entry again is a reviewed
+        # retirement for when every host runs a post-unification updater.
+        import re
+        import tomllib
+        packaging = tomllib.loads((REPO / 'hub2/host/pyproject.toml').read_text())
+        self.assertEqual(packaging['project']['scripts'], {
+            'hub': 'agent_hub_host.wheel_cli:main',
+            'hub2': 'agent_hub_host.cli:main',
+        })
+        # The legacy target is exact: the candidate updater recognizes and
+        # keeps only a launcher whose body imports the daemon CLI main.
+        self.assertIsNotNone(re.fullmatch(r'agent_hub_host\.cli:main',
+                                          packaging['project']['scripts']['hub2']))
 
     def test_unrelated_drop_in_commands_are_left_alone(self):
         other = self.dropin.with_name('10-other.conf')
@@ -2975,7 +3052,7 @@ class FixtureDiscoveryContractTests(unittest.TestCase):
     every named test stays collected with working addCleanup/assertions,
     and the collected counts stay at the exactly audited numbers."""
 
-    EXPECTED_TEST_COUNTS = {'ReleaseTests': 101, 'HostDropinAlignmentTests': 16}
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 101, 'HostDropinAlignmentTests': 18}
 
     def test_guarded_classes_remain_unittest_test_cases(self):
         for name in self.EXPECTED_TEST_COUNTS:
@@ -3834,6 +3911,88 @@ class HostInstallRetirementTests(unittest.TestCase):
         self.run_block(clear=False)
         self.assertTrue(keep.is_file())
         self.assertEqual(keep.read_text(), '#!/bin/sh\necho own tool\n')
+
+
+class UpdaterHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name) / 'agent-hub2'
+
+    def _manifest(self, updater_bytes):
+        sha = hashlib.sha256(updater_bytes).hexdigest()
+        wheel_name = f'agent_hub_host_v2-2.0.0+g{SHA}-py3-none-any.whl'
+        return {
+            'schema_version': 1,
+            'host_version': SHA,
+            'protocol_version': 1,
+            'python_requires': '>=3.11',
+            'artifacts': {
+                wheel_name: {'sha256': '0' * 64, 'size': 1},
+                'websockets-16.0-py3-none-any.whl': {'sha256': '0' * 64, 'size': 1},
+                'hub.pyz': {'sha256': '0' * 64, 'size': 1},
+                'hub2-enroll.py': {'sha256': '0' * 64, 'size': 1},
+                'host-install.sh': {'sha256': '0' * 64, 'size': 1},
+                'hub2-self-update.py': {'sha256': sha, 'size': len(updater_bytes)},
+                'agent-hub2-host.service': {'sha256': '0' * 64, 'size': 1},
+                'agent-hub2-host-update.service': {'sha256': '0' * 64, 'size': 1},
+                'agent-hub2-host-update.timer': {'sha256': '0' * 64, 'size': 1},
+            },
+        }
+
+    def test_main_hands_off_to_verified_candidate_updater_before_install(self):
+        candidate_bytes = (
+            b'import json, pathlib, sys\n'
+            b'if "--help" in sys.argv[1:]:\n'
+            b'    raise SystemExit(0)\n'
+            b'out = pathlib.Path(sys.argv[sys.argv.index("--root") + 1]) / "handoff-seen.json"\n'
+            b'out.write_text(json.dumps(sys.argv[1:]))\n'
+        )
+        manifest = self._manifest(candidate_bytes)
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+            'https://example.test/cli/hub2-self-update.py': candidate_bytes,
+        }
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            rc = updater.main(['--base-url', 'https://example.test', '--root', str(self.root), '--no-restart'])
+        self.assertEqual(rc, 0)
+        seen = json.loads((self.root / 'handoff-seen.json').read_text())
+        self.assertEqual(seen, ['--no-handoff', '--base-url', 'https://example.test',
+                                '--root', str(self.root), '--no-restart'])
+        self.assertFalse((self.root / 'updater.py').exists())
+
+    def test_main_skips_handoff_when_updater_matches_or_no_handoff_passed(self):
+        current_bytes = Path(updater.__file__).read_bytes()
+        manifest = self._manifest(current_bytes)
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+        }
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]):
+            self.assertIsNone(updater.maybe_handoff_updater('https://example.test', self.root, ['--no-restart']))
+
+        seen = []
+        def fake_install(*args, **kwargs):
+            seen.append(updater.HANDOFF_ARGV.get())
+        with patch.object(updater, 'install', fake_install), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)):
+            self.assertEqual(updater.main(['--no-handoff', '--base-url', 'https://example.test',
+                                           '--root', str(self.root)]), 0)
+        self.assertEqual(seen, [None])
+
+    def test_main_logs_exception_type_on_failure(self):
+        manifest = self._manifest(b'print("candidate")\n')
+        payloads = {
+            'https://example.test/cli/host-release.json': json.dumps(manifest).encode(),
+            'https://example.test/cli/hub2-self-update.py': b'tampered\n',
+        }
+        stderr = io.StringIO()
+        with patch.object(updater, 'fetch', side_effect=lambda url, limit: payloads[url]), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             contextlib.redirect_stderr(stderr):
+            rc = updater.main(['--base-url', 'https://example.test', '--root', str(self.root)])
+        self.assertEqual(rc, 1)
+        self.assertIn('Hub2 release update failed (ValueError)', stderr.getvalue())
 
 
 if __name__ == '__main__':

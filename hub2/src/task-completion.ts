@@ -5,6 +5,8 @@
 
 export const COMPLETION_ACTOR = 'hub2-completion';
 export const VERIFICATION_ACTOR = 'hub2-verifier';
+/** Hub's automatic retry of a failed intake without a completion contract. */
+export const RETRY_ACTOR = 'hub2-retry';
 export const CONTRACT_MARKER = '\n\n--- Hub task completion contract ---\n';
 // Engines take the prompt as a positional argument (`claude -p … <prompt>`), so
 // a Hub-generated prompt must never begin with '-' or the CLI parses it as an
@@ -15,10 +17,16 @@ export const CONTINUATION_END = '\n=== Original task (historical objective; the 
 const PREVIOUS_CONTINUATIONS = [[CONTINUATION_MARKER, '\n=== Original task ===\n'], ['--- Hub continuation ---\n', '\n--- Original task ---\n']] as const;
 /** Consecutive Hub-started continuations after one requester start. */
 export const MAX_AUTO_CONTINUATIONS = 2;
+/** Consecutive Hub retries of a failed intake whose sessions carry no
+ * completion contract (operator shells and legacy attempts). Controlled
+ * sessions are bounded by MAX_AUTO_CONTINUATIONS instead. */
+export const MAX_AUTO_RETRIES = 2;
 /** Hub developer alerts go here, never to the requester's channels. */
 export const DEVELOPER_ALERT_RECIPIENT = 'dev@dtcdev.click';
 export const MAX_CONTINUATION_TRIES = 3;
 export const MAX_DELIVERY_TRIES = 5;
+/** A retry start that is refused or uncertain is re-attempted only a few times. */
+export const MAX_RETRY_START_TRIES = 3;
 /** Independent acceptance checks get one retry after an incomplete verifier run. */
 export const MAX_VERIFICATION_ATTEMPTS = 2;
 /** A verifier route that is temporarily unavailable is retried only a few times. */
@@ -229,6 +237,26 @@ export function continuationPrompt(intakeId: string, depth: number, previousSess
     + 'Then check the workspace and continue the remaining work; do not redo or repeat steps the current state records as finished or accepted.';
   const truncated = `\n[truncated by Hub; full task: hub intake show ${intakeId}]`;
   // A clipped original keeps exactly one truncation marker across continuations.
+  const clipped = original.endsWith(truncated), task = clipped ? original.slice(0, -truncated.length) : original;
+  const room = Math.min(PROMPT_LIMIT, budget) - jsonBytes(intro + CONTINUATION_END) - jsonBytes(truncated);
+  // The snapshot yields to the original task, but always keeps a useful minimum.
+  const share = Math.min(SNAPSHOT_MAX, Math.max(Math.min(SNAPSHOT_MIN, Math.floor(room / 2)), room - jsonBytes(task)));
+  const state = snapshot && share > 0 ? snapshotText(intakeId, snapshot, share) : '';
+  const body = clip(task, room - jsonBytes(state), jsonBytes, truncated);
+  return intro + state + CONTINUATION_END + body + (clipped && !body.endsWith(truncated) ? truncated : '');
+}
+
+/** Hub retry of a failed attempt without a completion contract: same snapshot
+ * and budget rules as a continuation, but the wording names the failure. */
+export function retryPrompt(intakeId: string, attempt: number, maxAttempts: number, previousSession: string,
+  reason: string, original: string, snapshot?: ContinuationSnapshot, budget = PROMPT_LIMIT): string {
+  const intro = CONTINUATION_MARKER
+    + `Hub retry ${attempt} of at most ${maxAttempts}: Hub started this session automatically because session ${previousSession} failed on intake ${intakeId} (${reason}). `
+    + `Before acting, read the current state: hub intake context ${intakeId} (status, current context and the newest events) and hub intake show ${intakeId} (status and acceptance criteria). `
+    + `hub intake history ${intakeId} pages from the oldest event, so its first page is not the current state. `
+    + 'Then check the workspace, address the recorded failure cause and finish the remaining work; do not redo or repeat steps the current state records as finished or accepted.';
+  const truncated = `\n[truncated by Hub; full task: hub intake show ${intakeId}]`;
+  // A clipped original keeps exactly one truncation marker across retries.
   const clipped = original.endsWith(truncated), task = clipped ? original.slice(0, -truncated.length) : original;
   const room = Math.min(PROMPT_LIMIT, budget) - jsonBytes(intro + CONTINUATION_END) - jsonBytes(truncated);
   // The snapshot yields to the original task, but always keeps a useful minimum.

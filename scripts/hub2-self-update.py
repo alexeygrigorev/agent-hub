@@ -1681,6 +1681,39 @@ def timer_triggered(env, now):
     return 0 <= now - int(raw) / 1_000_000 <= TIMER_TRIGGER_FRESH_S
 
 
+HANDOFF_ARGV = ContextVar('handoff_argv', default=None)
+
+
+def maybe_handoff_updater(base_url, root, argv):
+    """Run the verified candidate updater before prepare_environment when it differs."""
+    base = base_url.rstrip('/') + '/cli/'
+    manifest = json.loads(fetch(base + 'host-release.json', MAX_MANIFEST))
+    validate_manifest(manifest)
+    version = manifest['host_version']
+    failures = root / 'failed-releases.json'
+    record = json.loads(failures.read_text()).get(version, {}) if failures.exists() else {}
+    if record.get('retry_at', 0) > time.time():
+        return None
+    current = root / 'current'
+    old = current.resolve(strict=True) if current.is_symlink() else None
+    target = root / 'releases' / version
+    if old == target and (target / 'release.json').is_file():
+        return None
+    updater_record = manifest['artifacts']['hub2-self-update.py']
+    if matches_installed_artifact(Path(__file__), updater_record):
+        return None
+    scratch = root / 'tmp'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='updater-handoff-', dir=scratch) as temporary:
+        candidate = Path(temporary) / 'hub2-self-update.py'
+        candidate.write_bytes(verified_artifact(base, 'hub2-self-update.py', updater_record))
+        candidate.chmod(0o700)
+        command([sys.executable, '-m', 'py_compile', candidate])
+        command([sys.executable, candidate, '--help'])
+        result = subprocess.run([sys.executable, str(candidate), '--no-handoff', *argv])
+        return result.returncode
+
+
 def validate_expected_tuple(expected_host_version, expected_cli_sha256, expected_updater_sha256):
     values = (expected_host_version, expected_cli_sha256, expected_updater_sha256)
     if all(value is None for value in values):
@@ -1709,6 +1742,13 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         expected_host_version, expected_cli_sha256, expected_updater_sha256,
     )
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handoff_argv = HANDOFF_ARGV.get()
+    if expected_tuple is None and handoff_argv is not None:
+        handed_off = maybe_handoff_updater(base_url, root, handoff_argv)
+        if handed_off is not None:
+            if handed_off != 0:
+                raise RuntimeError(f'candidate updater exited with status {handed_off}')
+            return
     with update_lock(root):
         base = base_url.rstrip('/') + '/cli/'
         releases = root / 'releases'
@@ -1884,7 +1924,8 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
         print('Activated Hub2 release: ' + version)
 
 
-def main():
+def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', default=os.environ.get('HUB_BASE_URL'))
     parser.add_argument('--root', type=Path, default=Path.home() / '.local/share/agent-hub2')
@@ -1892,10 +1933,11 @@ def main():
     parser.add_argument('--expected-host-version', default=None, help='40-hex expected candidate host_version for deploy-gate bootstrap')
     parser.add_argument('--expected-cli-sha256', default=None, help='64-hex expected candidate hub.pyz SHA-256 for deploy-gate bootstrap')
     parser.add_argument('--expected-updater-sha256', default=None, help='64-hex expected candidate hub2-self-update.py SHA-256 for deploy-gate bootstrap')
+    parser.add_argument('--no-handoff', action='store_true', help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--no-restart', action='store_true', help='Stage initial installation before enrollment')
     mode.add_argument('--check-service-ready', action='store_true', help='Verify the started service is connected with its installed release')
-    args = parser.parse_args()
+    args = parser.parse_args(raw_argv)
     expected_args = (args.expected_host_version, args.expected_cli_sha256, args.expected_updater_sha256)
     if args.check_service_ready and (args.install_service or any(v is not None for v in expected_args)):
         parser.error('--check-service-ready does not install a service or accept expected candidate flags')
@@ -1927,9 +1969,14 @@ def main():
                 'expected_cli_sha256': expected_tuple[1],
                 'expected_updater_sha256': expected_tuple[2],
             })
-        install(base or 'https://hub.dtcdev.click', args.root.resolve(), **install_kwargs)
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
-        print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
+        token = HANDOFF_ARGV.set(None if (args.no_handoff or expected_tuple is not None) else raw_argv)
+        try:
+            install(base or 'https://hub.dtcdev.click', args.root.resolve(), **install_kwargs)
+        finally:
+            HANDOFF_ARGV.reset(token)
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f'Hub2 release update failed ({type(exc).__name__}); inspect the current release and retry. No credentials logged.',
+              file=sys.stderr)
         return 1
     return 0
 
