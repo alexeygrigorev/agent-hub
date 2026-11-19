@@ -706,7 +706,8 @@ class HealthTests(unittest.TestCase):
 class ContractTests(unittest.TestCase):
     def test_config_bounds_and_known_default_accounts(self):
         from agent_hub_host import quota_publish
-        self.assertEqual(helper.ACCOUNTS, frozenset(account for account, _provider in quota_publish.ACCOUNTS.values()))
+        self.assertEqual(helper.ACCOUNTS, frozenset(account for account, _provider in quota_publish.ACCOUNTS.values())
+                         | {quota_publish.GROKBOT_REPORT})
         self.assertNotIn('codex-orin', helper.ACCOUNTS)
         self.assertTrue({'gemini', 'zai-central'}.issubset(helper.ACCOUNTS))
         for raw in ('', 'gemini,gemini', 'gemini,unknown', '../bad', 'Gemini'):
