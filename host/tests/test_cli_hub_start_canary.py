@@ -4856,9 +4856,22 @@ class AdmissionTests(unittest.TestCase):
     def test_launcher_defaults_and_selection_match_the_maintained_host_source(self):
         mod = self.mod()
         launch = (ROOT / "hub2/host/agent_hub_host/native_launch.py").read_text()
-        self.assertIn('requested_mb = int(self.config.get("memory_mb", %d))' % mod.LAUNCHER_DEFAULT_MEMORY_MB, launch)
-        self.assertIn('"--pids", str(self.config.get("pids", %d))' % mod.LAUNCHER_DEFAULT_PIDS, launch)
-        self.assertIn('"--memory", f"{requested_mb}M"', launch)
+        # One validated cap snapshot feeds both the admission transaction and
+        # the native argv; the source must show that exact plumbing.
+        self.assertIn('caps = resource_admission.validate_worker_caps(self.config.get("memory_mb"), self.config.get("pids"))', launch)
+        self.assertIn('specification["admission_caps"] = caps', launch)
+        self.assertIn('"--memory", f"{caps[\'memory_mb\']}M"', launch)
+        self.assertIn('"--pids", str(caps[\'pids\'])', launch)
+        # The canary's advertised defaults must equal the maintained strict
+        # validator's defaults AND ceilings: values are refused, never clamped,
+        # so an above-ceiling config can never reach the native argv. Source
+        # text only: the hub2 package shares the legacy import name and stays
+        # out of this process.
+        admission = (ROOT / "hub2/host/agent_hub_host/resource_admission.py").read_text()
+        self.assertIn("DEFAULT_MEMORY_MB = %d" % mod.LAUNCHER_DEFAULT_MEMORY_MB, admission)
+        self.assertIn("DEFAULT_PIDS = %d" % mod.LAUNCHER_DEFAULT_PIDS, admission)
+        self.assertIn("MAX_MEMORY_MB = %d" % mod.LAUNCHER_DEFAULT_MEMORY_MB, admission)
+        self.assertIn("MAX_PIDS = %d" % mod.LAUNCHER_DEFAULT_PIDS, admission)
         cli = (ROOT / "hub2/host/agent_hub_host/cli.py").read_text()
         self.assertIn('default=Path.home() / ".config/agent-hub/v2.json"', cli)
         self.assertEqual(mod.LAUNCHER_CONFIG_RELATIVE, ".config/agent-hub/v2.json")
