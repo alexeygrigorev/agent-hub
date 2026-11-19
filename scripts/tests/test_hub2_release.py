@@ -2497,15 +2497,62 @@ class HostDropinAlignmentTests(HermeticProcessFixture, unittest.TestCase):
         updater.restart_host(self.root)
         self.assertEqual(self.dropin.read_text(), self.legacy)
 
+    def test_transitional_release_keeps_hub2_dropins_byte_identical(self):
+        # The transition release declares both console entries (unification
+        # rollout, see test_transitional_wheel_entry_contract). Unpinned
+        # drop-ins follow the running release's bin/hub2 launcher, never its
+        # entry metadata: the fleet's hub2-style drop-ins survive the
+        # transition byte-identical and the strict pinned-entry parser is
+        # not involved.
+        release = self.root / 'releases' / SHA
+        self.current(legacy=True)
+        (release / 'bin/hub2').write_bytes(self.recognized_launcher_bytes(release))
+        dist_info = release / 'lib/python3.12/site-packages/agent_hub_host_v2-2.0.0.dist-info'
+        dist_info.mkdir(parents=True)
+        (dist_info / 'entry_points.txt').write_text(
+            '[console_scripts]\nhub = agent_hub_host.wheel_cli:main\nhub2 = agent_hub_host.cli:main\n')
+        updater.restart_host(self.root)
+        self.assertEqual(self.dropin.read_text(), self.legacy)
+        self.assertEqual(self.calls, [['systemctl', '--user', 'restart', updater.UNITS[0]]])
+
     def test_no_hub2_cli_remains_in_packaging_units_or_installers(self):
         import re
         retired = re.compile(r'bin/hub2\b|Scripts.hub2\.exe|^hub2 = |\bhub2 (serve|enroll|heartbeat|self-update|--config)\b', re.M)
-        paths = [REPO / 'pyproject.toml', REPO / 'hub2/host/pyproject.toml', REPO / 'deploy/host-install.ps1',
+        paths = [REPO / 'pyproject.toml', REPO / 'deploy/host-install.ps1',
                  REPO / 'scripts/switch-host-release.py', *sorted((REPO / 'deploy').glob('*.service'))]
         for path in paths:
             self.assertIsNone(retired.search(path.read_text()), str(path))
         # host-install.sh only mentions the old name to retire a stale link.
         self.assertNotIn('ln -s "$ROOT/current/bin/hub2"', (REPO / 'deploy/host-install.sh').read_text())
+        # The host wheel is the one sanctioned exception: the transitional
+        # legacy entry (see test_transitional_wheel_entry_contract) ships
+        # beside the unified entry, so no other retired spelling may appear
+        # in the packaging file either.
+        self.assertIsNone(retired.search((REPO / 'hub2/host/pyproject.toml').read_text().replace(
+            'hub2 = "agent_hub_host.cli:main"', 'hub2 TransitionalEntry')), 'hub2/host/pyproject.toml')
+
+    def test_transitional_wheel_entry_contract(self):
+        # CLI unification rollout (intake b1ba4d6b): the deployed
+        # pre-unification updaters on every enrolled host prepare a release
+        # environment and probe daemon readiness through the legacy daemon
+        # entry. A post-unification wheel without it fails those updaters in
+        # about one second (entry check in their prepare_environment) and
+        # the fleet deadlocks: the feed's newer updater bytes only reach
+        # updater.py after a successful release activation, which never
+        # happens. Both entries are therefore mandatory while the rollout
+        # is in flight; dropping the legacy entry again is a reviewed
+        # retirement for when every host runs a post-unification updater.
+        import re
+        import tomllib
+        packaging = tomllib.loads((REPO / 'hub2/host/pyproject.toml').read_text())
+        self.assertEqual(packaging['project']['scripts'], {
+            'hub': 'agent_hub_host.wheel_cli:main',
+            'hub2': 'agent_hub_host.cli:main',
+        })
+        # The legacy target is exact: the candidate updater recognizes and
+        # keeps only a launcher whose body imports the daemon CLI main.
+        self.assertIsNotNone(re.fullmatch(r'agent_hub_host\.cli:main',
+                                          packaging['project']['scripts']['hub2']))
 
     def test_unrelated_drop_in_commands_are_left_alone(self):
         other = self.dropin.with_name('10-other.conf')
@@ -2780,7 +2827,7 @@ class FixtureDiscoveryContractTests(unittest.TestCase):
     every named test stays collected with working addCleanup/assertions,
     and the collected counts stay at the exactly audited numbers."""
 
-    EXPECTED_TEST_COUNTS = {'ReleaseTests': 96, 'HostDropinAlignmentTests': 16}
+    EXPECTED_TEST_COUNTS = {'ReleaseTests': 96, 'HostDropinAlignmentTests': 18}
 
     def test_guarded_classes_remain_unittest_test_cases(self):
         for name in self.EXPECTED_TEST_COUNTS:

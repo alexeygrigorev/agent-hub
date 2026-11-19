@@ -119,6 +119,18 @@ whose verified wheel still declares the private `bin/hub2` launcher keeps it
 (its unit ExecStart names it and its zipapp has no `host` command). The wheel
 console `hub` entry exposes only the `hub host ...` namespace by re-running
 the daemon module in isolated mode; the full operator CLI remains the zipapp.
+During the unification rollout the release wheel additionally declares the
+legacy daemon entry (`hub2 = agent_hub_host.cli:main`) beside the unified
+entry: enrolled hosts still run pre-unification updaters whose release
+preparation entry-checks and daemon readiness probes go through that
+launcher, so retiring it before those updaters have advanced would fail
+every candidate release on every host. Drop-in ExecStart entries that name
+the legacy launcher keep working unchanged (the daemon keeps the `serve`,
+`request` and enrollment surface); a drop-in pinning a transitional release
+by exact `releases/<id>` path is refused unchanged rather than guessed at.
+Retiring the transitional entry again is a reviewed change guarded by the
+release packaging tests, safe only once every enrolled host runs a
+post-unification updater that hands off to the release's own updater.
 
 The transport wheel is downloaded in CI with `--require-hashes` against the
 reviewed root `uv.lock`; installs have no package-index access. Artifact trust
