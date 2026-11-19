@@ -1,8 +1,12 @@
 # Agent Hub
 
-Agent Hub is a Cloudflare control plane for personal agent fleets. One Worker and one SQLite-backed Durable Object hold the registry, authenticated bus, schedules, launch intents and dashboard. Model processes run on enrolled machines through their existing native tools.
+Agent Hub is a Node 24/SQLite control plane for personal agent fleets, deployed
+on the Hub VM with Caddy at the edge. DNS and edge resources are maintained in
+aws-infra. Model processes run on enrolled machines through their existing
+native tools. See [VM deployment](NODE-VM-DEPLOY.md) and
+[host releases](HUB2-RELEASES.md) for the current operating procedure.
 
-The generic fleet endpoints and dashboard are a source increment. Installing a host configuration and verifying its admission adapter are separate from deploying the Worker. Unknown execution support produces a hold, not a simulated launch.
+The generic fleet endpoints and dashboard are a source increment. Installing a host configuration and verifying its admission adapter are separate from deploying the Hub service. Unknown execution support produces a hold, not a simulated launch.
 
 Host releases use the operator's canonical `~/.config/agent-hub/subscriptions.json` and managed-engine directory. A release override must preserve those paths, the existing credential configuration and journal; task recovery files must not replace the subscription source. Absolute workspace starts require a configured `workspace_roots` entry. Add the narrow existing worktrees root needed by the project; labels and absolute paths use the same admission and realpath confinement.
 
@@ -12,7 +16,14 @@ For an existing native Claude or ZAI account, configure `admission_argv` as the 
 
 Claude can report a known unused five-hour window as 100% remaining with an explicit null reset. Admission preserves that inactive-window observation and still requires fresh quota plus a valid timed sibling window. It never synthesizes a reset or accepts an unknown reset for a partly used window or another provider.
 
-## Start work
+## Retained fleet API reference
+
+The commands and fleet contracts below describe the retained generic fleet
+interface. Current Hub2 orchestration uses `hub sessions start`, `send`, `capture`
+and `stop`; see [host releases](HUB2-RELEASES.md). References below to Worker
+variables describe legacy configuration, not a Cloudflare deployment procedure.
+
+### Start work
 
 ```sh
 # Choose a machine and engine; headless is the default.
@@ -150,7 +161,7 @@ Upload it from the dashboard, or `PUT /api/checks`. `POST /api/checks/<name>/run
 
 ## Signing in
 
-The dashboard and every `/api/*` route require authentication. Humans sign in with DTC OIDC (an address in `HUB_ADMINS`) on the origin registered as the Cognito callback, or anywhere with the admin token: set the Worker secret `HUB_ADMIN_TOKEN_SHA256` to the SHA-256 hex of a high-entropy token kept on your machine, then open `/auth/token`. Rotating the secret ends existing token sessions. Hosts and agents pair through the device flow and an admin approves them in the browser.
+The dashboard and every `/api/*` route require authentication. Humans sign in with DTC OIDC (an address in `HUB_ADMINS`) on the origin registered as the Cognito callback, or anywhere with the admin token: configure `HUB_ADMIN_TOKEN_SHA256` through the protected deployment configuration to the SHA-256 hex of a high-entropy token kept on your machine, then open `/auth/token`. Rotating the secret ends existing token sessions. Hosts and agents pair through the device flow and an admin approves them in the browser.
 
 ## Messaging adoption
 
@@ -162,9 +173,18 @@ Within a host, keep using `a message` and advisory `a work` scopes. Avoid SSH te
 
 The standalone repository is `alexeygrigorev/agent-hub`. Historical dashboard, Agent Bus, SSH coordination and role-failover sources remain available. Quota Launcher and aplexer remain execution dependencies during migration; deprecation of their old orchestration entry points does not authorize shutting them down.
 
-The existing DTC OIDC variables in `wrangler.jsonc` identify a deployment, not generic product defaults. Keep provider accounts, machine IDs, workspace paths and role mappings in local/admin configuration. Preserve Worker name `agent-hub`, DO class `Hub` and instance name `hub` when moving the domain. Renaming them can create a different data store.
+Keep provider accounts, machine IDs, workspace paths and role mappings in
+local/admin configuration. Preserve existing credential and storage identities
+through migrations; never create a replacement store by renaming an old Worker
+or Durable Object. Retained `wrangler.jsonc` and [DEPLOY.md](DEPLOY.md) describe
+the historical Cloudflare deployment and do not authorize its redeployment.
 
-Deploy to `https://hub.dtcdev.click` after the DNS zone, Cloudflare access and OIDC callback are configured. Keep `assets.run_worker_first=true` so static assets cannot bypass authentication. See [DEPLOY.md](DEPLOY.md) for the exact domain cutover and rollback steps. Do not change the contest demo's deployment or storage.
+Production is `https://hub.dtcdev.click`. Ship through the current
+[VM CI deployment](NODE-VM-DEPLOY.md#shipping-an-update-cicd-only), with DNS and
+shared edge configuration owned by aws-infra. Hub owns only
+`/etc/caddy/sites/hub.caddy`; the shared Caddyfile import is an aws-infra
+prerequisite. Preserve dashboard/API authentication and the contest demo's
+existing deployment and storage.
 
 ### Intake context inside launched sessions
 
