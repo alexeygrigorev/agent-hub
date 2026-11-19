@@ -19,6 +19,156 @@ function fixture(options:{realMachineRouting?:boolean;machineCapabilities?:strin
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
 
+const scopedModels=[
+ {id:'opus-route',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1e6,capabilities:[],enabled:true},
+ {id:'sonnet-renamed-route',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+];
+const sonnetConstraint={models_by_engine:{claude:['sonnet']},efforts:['medium','unspecified']};
+
+test('operator constraints persist across restart; descendants intersect and unrelated global picks remain unchanged',async()=>{
+ const f=fixture({modelCandidates:scopedModels}),random=Math.random;Math.random=()=>0;
+ try{
+  const rootResponse=await f.call('/api/intakes?project=org/a','POST',{
+   key:'constrained-root',title:'Root',text:'Keep semantic route restrictions',acceptance_criteria:['Result'],model_constraints:sonnetConstraint});
+  assert.equal(rootResponse.status,201);
+  const root=(await body(rootResponse)).intake;
+  assert.deepEqual(root.provenance.model_constraints,sonnetConstraint);
+  const childResponse=await f.call('/api/intakes?project=org/a','POST',{
+   key:'constrained-child',title:'Child',text:'Cannot widen its parent',acceptance_criteria:['Result'],parent_intake_id:root.id,
+   model_constraints:{models_by_engine:{claude:['opus','sonnet']}}});
+  assert.equal(childResponse.status,201);const child=(await body(childResponse)).intake;
+  f.restart();
+  assert.equal((await f.call('/api/intakes/'+child.id,'PATCH',{key:'clear-child-only',model_constraints:null})).status,200);
+  const started=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'scoped-start',workspace:'/owned/scope'});
+  assert.equal(started.status,201,JSON.stringify(await started.clone().json()));
+  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+  assert.equal(JSON.parse(saga.launch_spec_json).model,'sonnet');
+  assert.deepEqual(JSON.parse(saga.routing_json).model_constraint_sources,[{intake_id:root.id,constraint:sonnetConstraint}]);
+  const unrelated=await intake(f,'unrelated');
+  assert.equal((await f.call('/api/intakes/'+unrelated.id+'/start','POST',{key:'global-start',workspace:'/owned/scope'})).status,201);
+  assert.equal(JSON.parse((f.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE intake_id=?').get(unrelated.id) as any).launch_spec_json).model,'opus');
+  const read=(await body(await f.call('/api/intakes/'+root.id))).intake;
+  const changed=await f.call('/api/intakes/'+root.id,'PATCH',{key:'both-metadata',expected_updated_at:read.updated_at,
+   code_task:false,model_constraints:{models_by_engine:{claude:['sonnet']}}});
+  assert.equal(changed.status,200);const source=(await body(changed)).intake.provenance;
+  assert.equal(source.code_task,false);assert.deepEqual(source.model_constraints,{models_by_engine:{claude:['sonnet']}});
+ }finally{Math.random=random;}
+});
+
+test('only operators may change constraints; start bodies and worker metadata cannot override ancestry',async()=>{
+ const f=fixture({modelCandidates:scopedModels}),own=await intake(f,'constraint-authority');
+ const writer={id:'human:writer',kind:'operator',scopes:['intake:read','intake:write','session:start','project:org/a']};
+ assert.equal((await f.call('/api/intakes?project=org/a','POST',{
+  key:'writer-create-plain',title:'Writer',text:'Ordinary project write authority',acceptance_criteria:['Result']},writer)).status,201);
+ for(const actor of [writer,{id:'session:worker',kind:'agent',resource_id:own.id,scopes:['intake:append']}]){
+  assert.equal((await f.call('/api/intakes/'+own.id,'PATCH',{key:'deny-'+actor.id,model_constraints:null},actor)).status,403);
+ }
+ assert.equal((await f.call('/api/intakes?project=org/a','POST',{
+  key:'writer-create',title:'Writer',text:'No authority',acceptance_criteria:['Result'],model_constraints:sonnetConstraint},writer)).status,403);
+ const forged=await f.call('/api/intakes/'+own.id+'/start','POST',{
+  key:'forged-start',workspace:'/owned/scope',model_constraints:[]});
+ assert.equal(forged.status,403);assert.equal((await body(forged)).error,'model_constraints_start_forbidden');
+ for(const [index,rule] of [{},{efforts:[]},{models_by_engine:{claude:[]}}].entries()){
+  const result=await f.call('/api/intakes/'+own.id,'PATCH',{key:'invalid-'+index,model_constraints:rule});
+  assert.equal(result.status,400);assert.equal((await body(result)).error,'invalid_model_constraints');
+ }
+});
+
+test('auth fallback reloads inherited restrictions and never restores a forbidden high-weight model',async()=>{
+ const sol={id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[sol,...scopedModels]}),random=Math.random;Math.random=()=>0;
+ try{
+  const parent=await intake(f,'fallback-parent');
+  const created=await f.call('/api/intakes?project=org/a','POST',{key:'fallback-child',title:'Child',text:'Do work',acceptance_criteria:['Result'],parent_intake_id:parent.id});
+  const child=(await body(created)).intake;
+  assert.equal((await f.call('/api/intakes/'+child.id+'/start','POST',{key:'scoped-fallback',workspace:'/owned/scope'})).status,201);
+  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+  assert.equal(JSON.parse(first.launch_spec_json).model,'gpt-6.1-sol');
+  assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{key:'parent-policy-during-offer',model_constraints:sonnetConstraint})).status,200);
+  const fallback=await f.call('/_internal/auth-fallback','POST',{operation_id:first.operation_id,
+   attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,
+   epoch:first.epoch,reason:'provider_auth_failed'});
+  assert.equal(fallback.status,200,JSON.stringify(await fallback.clone().json()));
+  const next=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+  assert.equal(JSON.parse(next.launch_spec_json).model,'sonnet');
+  assert.deepEqual(JSON.parse(next.routing_json).model_constraint_sources,[{intake_id:parent.id,constraint:sonnetConstraint}]);
+ }finally{Math.random=random;}
+});
+
+test('concurrent parent restriction edit fences a prepared draw before a saga can be persisted',async()=>{
+ let f:ReturnType<typeof fixture>,parentId='',changed=false;
+ f=fixture({modelCandidates:scopedModels,machineFetch:async request=>{
+  if(new URL(request.url).pathname==='/_internal/workspace-preflight'&&!changed){
+   changed=true;
+   assert.equal((await f.call('/api/intakes/'+parentId,'PATCH',{key:'racing-parent',model_constraints:sonnetConstraint})).status,200);
+   return Response.json({checked:true,ok:true});
+  }
+  return Response.json({state:'offered'});
+ }});
+ const parent=await intake(f,'racing-parent');parentId=parent.id;
+ const response=await f.call('/api/intakes?project=org/a','POST',{key:'racing-child',title:'Child',text:'Work',acceptance_criteria:['Result'],parent_intake_id:parent.id});
+ const child=(await body(response)).intake;
+ const result=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'racing-start',workspace:'/owned/scope'});
+ assert.equal(result.status,409);assert.equal((await body(result)).error,'intake_model_constraints_changed');
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any).n,0);
+ assert.equal(f.capReleases.length,1,'capacity reservation released without a launch');
+});
+
+test('normal verifier, pinned continuation and unpinned second retry all enforce current ancestor constraints',async()=>{
+ const sol={id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const random=Math.random;Math.random=()=>0;
+ try{
+  for(const mode of ['verifier','continuation','second-retry']){
+   const f=fixture({modelCandidates:[...scopedModels,sol]}),parent=await intake(f,'auto-parent-'+mode);
+   const created=await f.call('/api/intakes?project=org/a','POST',{
+    key:'auto-child-'+mode,title:'Read-only audit',text:'Read-only source review; no code changes',
+    acceptance_criteria:['Record source findings'],code_task:false,parent_intake_id:parent.id});
+   const child=(await body(created)).intake;
+   if(mode!=='continuation')assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{
+    key:'auto-parent-rule-'+mode,model_constraints:sonnetConstraint})).status,200);
+   const model=mode==='verifier'?'gpt-6.1-sol':mode==='continuation'?'opus':'sonnet';
+   const started=await f.call('/api/intakes/'+child.id+'/start','POST',{
+    key:'auto-start-'+mode,workspace:'/owned/scope',model,effort:'medium'});
+   assert.equal(started.status,201,JSON.stringify(await started.clone().json()));
+   const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+   if(mode==='second-retry'){
+    // A retained legacy attempt has no completion contract. Exercise the real
+    // second-retry builder, which intentionally drops its previous model pin.
+    const route=JSON.parse(first.routing_json);delete route.completion_contract;
+    f.sql.prepare("UPDATE dispatch_sagas SET state='complete',routing_json=? WHERE operation_id=?").run(JSON.stringify(route),first.operation_id);
+    f.sql.prepare("UPDATE intakes SET status='failed',final_evidence_json='{}' WHERE id=?").run(child.id);
+    const row=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(child.id) as any;
+    await (f.project as any).startFailedIntakeRetry({...row,saga_operation_id:first.operation_id,
+     saga_machine_id:first.machine_id,launch_spec_json:first.launch_spec_json,routing_json:JSON.stringify(route)},1,'launch_failed',Date.now());
+   }else{
+    f.sql.prepare("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?").run(first.operation_id);
+    const binding={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
+     session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:crypto.randomUUID()};
+    assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
+    if(mode==='verifier')assert.equal((await f.call('/api/intakes/'+child.id+'/events','POST',{
+     key:'auto-complete',event:{kind:'task_complete',session_id:first.session_id,
+      acceptance:[{status:'met',proof:'Read-only findings recorded in owned audit output'}]}})).status,201);
+    assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:0,native_exit_confirmed:true,
+     evidence:{result:'exit',native_deadline:{exceeded:false}}})).status,200);
+    if(mode==='continuation')assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{
+     key:'auto-parent-rule-'+mode,model_constraints:sonnetConstraint})).status,200);
+    await f.project.alarm();
+   }
+   const sagas=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').all(child.id) as any[];
+   if(mode==='continuation'){
+    assert.equal(sagas.length,1,'a now-forbidden pinned continuation must never launch Opus');
+    const final=JSON.parse((f.sql.prepare('SELECT final_evidence_json FROM intakes WHERE id=?').get(child.id) as any).final_evidence_json);
+    assert.equal(final.completion.continuation.last_reason,'model_policy_unavailable');
+   }else{
+    assert.equal(sagas.length,2,mode);
+    const next=sagas.find(row=>row.session_id!==first.session_id)!;
+    assert.equal(JSON.parse(next.launch_spec_json).model,mode==='verifier'?'sonnet':'gpt-6.1-sol',mode);
+    assert.deepEqual(JSON.parse(next.routing_json).model_constraint_sources,[{intake_id:parent.id,constraint:sonnetConstraint}]);
+   }
+  }
+ }finally{Math.random=random;}
+});
+
 test('real Machine claim carries repo label binding through normal, aborted and legacy terminal paths',async()=>{
  for(const outcome of ['normal','aborted','legacy']){
   const database=new DatabaseSync(':memory:'),sockets:any[]=[];
