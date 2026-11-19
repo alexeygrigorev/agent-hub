@@ -72,6 +72,11 @@ def validate_manifest(manifest):
     return host[0]
 
 
+def host_cli(target):
+    # The host daemon CLI is `hub host`; the release venv runs it directly.
+    return [target / 'bin/python', '-I', '-m', 'agent_hub_host.cli']
+
+
 def command(args):
     lock_fd = UPDATE_LOCK_FD.get()
     result = subprocess.run([str(value) for value in args], stdout=subprocess.DEVNULL,
@@ -145,7 +150,7 @@ def check_service_ready(target):
 
     # The CLI handles authentication; credentials are never command arguments.
     try:
-        result = subprocess.run([str(target / 'bin/hub2'), '--config', str(config), 'request', 'GET', '/api/fleet/routing/self'],
+        result = subprocess.run([*map(str, host_cli(target)), '--config', str(config), 'request', 'GET', '/api/fleet/routing/self'],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
         status = json.loads(result.stdout) if result.returncode == 0 and len(result.stdout) <= 4096 else None
     except (ValueError, OSError, subprocess.TimeoutExpired):
@@ -259,12 +264,13 @@ def repair_alert_client(base, manifest, installed, target):
 
 
 def install_operator_cli(target, manifest):
-    # The wheel owns hub2 (daemon administration); hub is the full operator
+    # The wheel owns the daemon module run by `hub host`; hub is the full operator
     # zipapp. Both packages use agent_hub_host, so importing the operator CLI
     # through the host venv would select the wrong package.
     archive = target / 'hub.pyz'
     if not matches_installed_artifact(archive, manifest['artifacts']['hub.pyz']):
         raise ValueError('installed release artifact mismatch: hub.pyz')
+    (target / 'bin/hub2').unlink(missing_ok=True)  # there is no separate hub2 CLI
     entry = target / 'bin/hub'
     if entry.is_symlink() and os.readlink(entry) == '../hub.pyz':
         return
@@ -328,7 +334,7 @@ def repair_service_files(base, manifest, root, target):
         if not matches_installed_artifact(target / name, installed_artifacts[name]):
             raise ValueError('installed release artifact mismatch: ' + name)
     check_host_package(target, installed)
-    command([target / 'bin/hub2', '--help'])
+    command([*host_cli(target), '--help'])
     replacements = {
         name: verified_artifact(base, name, artifacts[name])
         for name, path in paths.items() if not matches_installed_artifact(path, artifacts[name])
@@ -911,7 +917,7 @@ def prepare_environment(target, download, manifest, host_wheel):
     command([*installer, '--no-index', '--no-deps',
              download / 'websockets-16.0-py3-none-any.whl', download / host_wheel])
     check_host_package(target, manifest)
-    command([target / 'bin/hub2', '--help'])
+    command([*host_cli(target), '--help'])
     shutil.copyfile(download / 'hub.pyz', target / 'hub.pyz')
     shutil.copyfile(download / 'hub2-enroll.py', target / 'hub2-enroll.py')
     if ALERT_CLIENT in manifest['artifacts']:
@@ -945,6 +951,36 @@ def replace_units(units, files):
         durable_write(path, data, 0o600)
     sync_directory(units)
     command(['systemctl', '--user', 'daemon-reload'])
+
+
+HOST_ENTRY = re.compile(r'(/agent-hub2/(?:current|venv|releases/[0-9a-f]{40})/(?:bin|Scripts)/)(?:hub2|hub host)(?=\s|$)', re.M)
+
+
+def align_host_dropins(root):
+    """Point hand-made host drop-ins at the entry point the current release has.
+
+    Releases without `bin/hub2` run the daemon as `hub host`; an older retained
+    release (rollback/reactivation) still ships `bin/hub2`.
+    """
+    release = (root / 'current').resolve()
+    replacement = r'\1hub2' if (release / 'bin/hub2').exists() else r'\1hub host'
+    directory = Path.home() / '.config/systemd/user' / (UNITS[0] + '.d')
+    changed = False
+    for path in sorted(directory.glob('*.conf')) if directory.is_dir() else ():
+        if path.is_symlink() or not path.is_file():
+            continue
+        text = path.read_text()
+        updated = HOST_ENTRY.sub(replacement, text)
+        if updated != text:
+            durable_write(path, updated.encode(), path.stat().st_mode & 0o777)
+            changed = True
+    if changed:
+        command(['systemctl', '--user', 'daemon-reload'])
+
+
+def restart_host(root):
+    align_host_dropins(root)
+    command(['systemctl', '--user', 'restart', UNITS[0]])
 
 
 def restore_retained_switch(root, releases, journal):
@@ -984,7 +1020,7 @@ def restore_retained_switch(root, releases, journal):
     else:
         link(require_release_directory(previous), previous_link)
     replace_units(Path.home() / '.config/systemd/user', files)
-    command(['systemctl', '--user', 'restart', UNITS[0]])
+    restart_host(root)
     failure(root, target.name)
     sync_directory(root)
     journal.unlink()
@@ -1079,7 +1115,7 @@ def reactivate_retained_release(base, manifest, host_wheel, root, releases, old,
             durable_write(journal, json.dumps(state, sort_keys=True).encode(), 0o600)
             sync_directory(root)
             link(target, root / 'current')
-            command(['systemctl', '--user', 'restart', UNITS[0]])
+            restart_host(root)
             check_service_ready(target)
             if json.loads(fetch(base + 'host-release.json', MAX_MANIFEST)) != manifest:
                 raise ValueError('published host release changed during retained activation')
@@ -1137,7 +1173,7 @@ def recover(root, releases):
             previous = root / 'previous'
             if previous.is_symlink() and previous.resolve().is_dir() and previous.resolve() != target:
                 link(previous.resolve(), current)
-                command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
+                restart_host(root)
             else:
                 command(['systemctl', '--user', 'stop', 'agent-hub2-host.service'])
                 current.unlink()
@@ -1371,7 +1407,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
                 if restart:
                     # Explicit setup must load staged/repaired host.env even if
                     # this same release is already running with the old PATH.
-                    command(['systemctl', '--user', 'restart', UNITS[0]])
+                    restart_host(root)
                     check_service_ready(target)
                     record_activation(root, version)
                     enable_service_timer()
@@ -1435,7 +1471,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
                         shutil.copyfile(download / name, units / name)
                     command(['systemctl', '--user', 'daemon-reload'])
                 if restart:
-                    command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
+                    restart_host(root)
                     check_service_ready(target)
                 repin_managed_claude(target, base_url.rstrip('/'), root,
                                      lambda: (download / 'hub2-self-update.py').read_bytes())
@@ -1461,7 +1497,7 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
                     if old:
                         link(old, current)
                         if restart:
-                            command(['systemctl', '--user', 'restart', 'agent-hub2-host.service'])
+                            restart_host(root)
                     else:
                         if restart:
                             with contextlib.suppress(Exception):

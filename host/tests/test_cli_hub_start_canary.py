@@ -4865,7 +4865,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn("launcher_config=config.get(\"launcher\")", cli)
         self.assertIn("NativeLauncher(launcher_config or {}", (ROOT / "hub2/host/agent_hub_host/agent.py").read_text())
         unit = (ROOT / "deploy/agent-hub2-host.service").read_text()
-        self.assertIn("hub2 serve\n", unit)
+        self.assertIn("bin/hub host serve\n", unit)
         self.assertNotIn("--config", unit)
 
     def test_launcher_caps_fail_closed_on_invalid_unsafe_mismatched_or_above_ceiling(self):

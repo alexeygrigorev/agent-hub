@@ -16,7 +16,7 @@ DEFAULT_SERVER = "https://hub.dtcdev.click"
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="hub2")
+    parser = argparse.ArgumentParser(prog="hub host")
     parser.add_argument("--config", type=Path, default=Path.home() / ".config/agent-hub/v2.json")
     parser.add_argument("--server")
     commands = parser.add_subparsers(dest="command", required=True)

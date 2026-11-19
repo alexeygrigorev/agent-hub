@@ -92,7 +92,7 @@ def write_host_wheel(path, namespace, *, host_version=HOST_VERSION,
                             native_sessions=native_sessions, include_client=include_client,
                             invalid_release=invalid_release)
     files[f'{distribution.replace("-", "_")}-{version}.dist-info/entry_points.txt'] = (
-        f'[console_scripts]\nhub2 = {namespace}.cli:main\n'
+        f'[console_scripts]\nhub = {namespace}.cli:main\n'
     ).encode()
     return write_wheel(path, filename=filename, distribution=distribution,
                        version=version, files=files)
@@ -144,9 +144,9 @@ def unpack_wheel(wheel, target, *, replace_namespace=None, replace_distribution=
             if entry.filename.endswith('.dist-info/entry_points.txt'):
                 entry_points = archive.read(entry).decode()
                 for line in entry_points.splitlines():
-                    if line.startswith('hub2 = '):
-                        module, function = line.removeprefix('hub2 = ').split(':', 1)
-                        script = target / 'bin/hub2'
+                    if line.startswith('hub = '):
+                        module, function = line.removeprefix('hub = ').split(':', 1)
+                        script = target / 'bin/hub'
                         script.write_text(console_script_text(target / 'bin/python', module, function))
                         script.chmod(0o755)
 
@@ -217,8 +217,9 @@ class NamespaceTransitionTests(unittest.TestCase):
             if (normalized[0] == str(target / 'bin/python')
                     and normalized[1:3] == ['-I', '-c']):
                 events.append('namespace-check')
-            elif Path(normalized[0]).name == 'hub2':
-                events.append('daemon-help')
+            elif normalized[:4] == [str(target / 'bin/python'), '-I', '-m', 'agent_hub_host.cli']:
+                events.append('daemon-help')  # `hub host --help`: the module run, not a hub2 script
+                return
             if normalized[1:3] == ['-m', 'venv']:
                 real_command([args[0], '-m', 'venv', '--without-pip', args[3]])
                 return
@@ -252,7 +253,7 @@ class NamespaceTransitionTests(unittest.TestCase):
         wheel_dir = self.root / 'long-shebang-wheel'
         wheel = write_host_wheel(wheel_dir, 'hub2_agent_hub_host')
         unpack_wheel(wheel, target)
-        script = target / 'bin/hub2'
+        script = target / 'bin/hub'
         first = script.read_bytes().split(b'\n', 1)[0]
         self.assertEqual(first, b'#!/bin/sh')
         self.assertGreater(len(f'#!{python}'.encode()), 256)

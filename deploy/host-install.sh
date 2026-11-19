@@ -1,5 +1,5 @@
 #!/bin/sh
-# Linux user-service installer. Pairing code is read privately by hub2 enroll.
+# Linux user-service installer. Pairing code is read privately by `hub host enroll`.
 # curl -fsSL https://hub.dtcdev.click/cli/host-install.sh | sh
 set -eu
 umask 077
@@ -22,10 +22,10 @@ else
             --engine codex --engine claude --engine go --engine zai --engine antigravity
     fi
 fi
-# An existing legacy CLI remains untouched. Use hub2 for host administration;
-# the matched full CLI is available as current/hub.pyz.
-if [ ! -e "$HOME/.local/bin/hub2" ] && [ ! -L "$HOME/.local/bin/hub2" ]; then
-    ln -s "$ROOT/current/bin/hub2" "$HOME/.local/bin/hub2"
+# There is one CLI, `hub`; host administration is `hub host ...`. An existing
+# `hub` is left untouched. A hub2 link from an earlier install is retired.
+if [ -L "$HOME/.local/bin/hub2" ] && case "$(readlink "$HOME/.local/bin/hub2")" in */agent-hub2/*) true ;; *) false ;; esac; then
+    rm -f "$HOME/.local/bin/hub2"
 fi
 if [ ! -e "$HOME/.local/bin/hub" ] && [ ! -L "$HOME/.local/bin/hub" ]; then
     ln -s "$ROOT/current/hub.pyz" "$HOME/.local/bin/hub"

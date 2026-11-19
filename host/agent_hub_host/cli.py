@@ -513,10 +513,14 @@ def main():
         from . import intake
         intake.summary_main()
         return
+    if sys.argv[1:2] == ['host']:
+        from . import host_command
+        raise SystemExit(host_command.main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("host", help="Host daemon administration: enroll, serve, heartbeat, configure-host, self-update, credential-mode, version, request (see hub host --help)")
     p_update = sub.add_parser("update", help="Update hub CLI to the latest deployed version or check staleness")
     p_update.add_argument("--url", default=None, help="Release URL (default: HUB_URL/HUB_BASE_URL or https://hub.dtcdev.click; ignores stored profile URL)")
     p_update.add_argument("--check", action="store_true", help="Check for updates without installing")

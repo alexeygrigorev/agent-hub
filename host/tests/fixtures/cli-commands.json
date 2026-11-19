@@ -69,6 +69,7 @@
   "fleet-reservations",
   "handoff",
   "heartbeat",
+  "host",
   "host-goal",
   "host-release",
   "inbox",

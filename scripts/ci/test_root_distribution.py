@@ -38,17 +38,17 @@ d=m.distribution('agent-hub-host')
 assert d.version=='2.0.0'
 assert d.requires==['websockets==16.0'], d.requires
 assert 'site-packages' in agent_hub_host.__file__
-assert {e.name for e in d.entry_points}=={'hub','hub2'}
+assert {e.name for e in d.entry_points}=={'hub'}, d.entry_points  # no hub2 console script
 for old in ('quse','aplexer-client'):
     try: m.distribution(old)
     except m.PackageNotFoundError: pass
     else: raise AssertionError(old)
 """
         run(str(python), "-I", "-c", probe, cwd=home, env=child)
-        for command in ("hub", "hub2"):
-            executable = binary / (command + ".exe" if os.name == "nt" else command)
-            result = run(str(executable), "--help", cwd=home, env=child, capture_output=True)
-            assert "usage:" in result.stdout.lower()
-        print("PASS root wheel: isolated import, hub/hub2 help, only websockets16")
+        assert not (binary / ("hub2.exe" if os.name == "nt" else "hub2")).exists()
+        executable = binary / ("hub.exe" if os.name == "nt" else "hub")
+        result = run(str(executable), "--help", cwd=home, env=child, capture_output=True)
+        assert "usage:" in result.stdout.lower()
+        print("PASS root wheel: isolated import, hub help, no hub2, only websockets16")
 if __name__ == "__main__":
     main()
