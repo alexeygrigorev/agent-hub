@@ -1899,9 +1899,10 @@ def main():
     expected_args = (args.expected_host_version, args.expected_cli_sha256, args.expected_updater_sha256)
     if args.check_service_ready and (args.install_service or any(v is not None for v in expected_args)):
         parser.error('--check-service-ready does not install a service or accept expected candidate flags')
+    expected_tuple = None
     if any(v is not None for v in expected_args):
         try:
-            validate_expected_tuple(*expected_args)
+            expected_tuple = validate_expected_tuple(*expected_args)
         except ValueError as exc:
             parser.error(str(exc))
     try:
@@ -1915,12 +1916,18 @@ def main():
             and not args.no_restart
             and timer_triggered(os.environ, time.time())
         )
-        install(base or 'https://hub.dtcdev.click', args.root.resolve(),
-                install_service=args.install_service, restart=not args.no_restart,
-                scheduled=scheduled,
-                expected_host_version=args.expected_host_version,
-                expected_cli_sha256=args.expected_cli_sha256,
-                expected_updater_sha256=args.expected_updater_sha256)
+        install_kwargs = {
+            'install_service': args.install_service,
+            'restart': not args.no_restart,
+            'scheduled': scheduled,
+        }
+        if expected_tuple is not None:
+            install_kwargs.update({
+                'expected_host_version': expected_tuple[0],
+                'expected_cli_sha256': expected_tuple[1],
+                'expected_updater_sha256': expected_tuple[2],
+            })
+        install(base or 'https://hub.dtcdev.click', args.root.resolve(), **install_kwargs)
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         print('Hub2 release update failed; inspect the current release and retry. No credentials logged.', file=sys.stderr)
         return 1

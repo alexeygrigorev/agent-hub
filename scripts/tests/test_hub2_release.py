@@ -2440,6 +2440,29 @@ elif event in ('start', 'routing', 'enable'):
                     updater.main()
                 self.assertEqual(exc.exception.code, 2)
 
+        seen = []
+        def fake_install(base_url, root, **kwargs):
+            seen.append((base_url, root, kwargs))
+        with patch.object(updater, 'install', fake_install), \
+             patch.object(Path, 'home', return_value=Path(self.temporary.name)), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('TRIGGER_UNIT', None)
+            with patch.object(sys, 'argv', ['hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root)]):
+                self.assertEqual(updater.main(), 0)
+            with patch.object(sys, 'argv', [
+                'hub2-self-update.py', '--base-url', 'https://example.invalid', '--root', str(self.root),
+                '--expected-host-version', tuple_kwargs['expected_host_version'],
+                '--expected-cli-sha256', tuple_kwargs['expected_cli_sha256'],
+                '--expected-updater-sha256', tuple_kwargs['expected_updater_sha256'],
+            ]):
+                self.assertEqual(updater.main(), 0)
+        self.assertEqual(seen, [
+            ('https://example.invalid', self.root.resolve(),
+             {'install_service': False, 'restart': True, 'scheduled': False}),
+            ('https://example.invalid', self.root.resolve(),
+             {'install_service': False, 'restart': True, 'scheduled': False, **tuple_kwargs}),
+        ])
+
     def test_expected_tuple_under_lock_rejects_changed_manifest_busy_lock_and_backoff(self):
         old = self.old_release()
         tuple_kwargs = self._expected_tuple()
