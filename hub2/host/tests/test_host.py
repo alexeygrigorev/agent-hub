@@ -10,6 +10,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
@@ -1770,6 +1771,68 @@ class HostTests(unittest.TestCase):
         row = self.journal.db.execute('SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
         self.assertEqual(tuple(row), ('aborting', 1, None))
         self.assertEqual(len(self.reservations()), 1)  # uncertain custody: held, never refunded
+
+    def permit_expiry_crossing_control(self, fire_sql):
+        # Actual NativeLauncher path under a synthetic resource_admission
+        # clock: admission commits with the original 100+30 deadline, the
+        # entry expiry check passes, and the armed journal proxy consumes the
+        # remaining budget during verify_permit's final state/STOP SQL reads
+        # (never during the in-transaction admission reads). The runner must
+        # not be called; committed marker-1 custody and the reservation stay
+        # held and a replay never blindly re-executes or refunds.
+        clock = {'value': 100.0}
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        real_journal = self.bridge.launcher.journal
+        armed = {'on': False}
+        verify_sql = ('SELECT state FROM launches WHERE operation_id=?'
+                      if 'state' in fire_sql else
+                      'SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?')
+
+        class CrossingJournal:
+            @property
+            def db(self):
+                return self
+
+            def execute(self, sql, *args, **kwargs):
+                if armed['on'] and not real_journal.db.in_transaction and sql.startswith(verify_sql):
+                    clock['value'] = 131.0
+                return real_journal.db.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(real_journal, name)
+
+        self.bridge.launcher.journal = CrossingJournal()
+        self.addCleanup(setattr, self.bridge.launcher, 'journal', real_journal)
+        real_launch = self.bridge.launcher.launch
+
+        def armed_launch(task_id, specification):
+            armed['on'] = True
+            return real_launch(task_id, specification)
+
+        self.exact_headroom(4096)
+        self.quiet_census()
+        offer = self.offer()
+        with patch.object(resource_admission, 'time', fake_time), \
+                patch.object(self.bridge.launcher, 'launch', side_effect=armed_launch):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                self.bridge.offer(offer)
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))  # runner never called
+        row = self.journal.db.execute('SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('aborting', 1, None))  # uncertain custody: marker 1 held
+        self.assertEqual(len(self.reservations()), 1)  # reservation retained, never refunded
+        # Replay: no blind re-execute, no allowance refund - the committed
+        # fence refuses the same offer again with no second spawn.
+        with patch.object(resource_admission, 'time', fake_time):
+            with self.assertRaises(RuntimeError):
+                self.bridge.offer(offer)
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_permit_expiring_after_state_sql_read_refuses_runner(self):
+        self.permit_expiry_crossing_control('SELECT state FROM launches')
+
+    def test_permit_expiring_after_stop_fence_sql_read_refuses_runner(self):
+        self.permit_expiry_crossing_control('SELECT 1 FROM stop_fences')
 
     def test_stop_fenced_midlaunch_admission_refuses_pre_commit(self):
         self.quiet_census()
