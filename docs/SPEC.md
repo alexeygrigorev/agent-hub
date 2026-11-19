@@ -2,6 +2,17 @@
 
 Status: draft v0.1, 11 October 2026. Author: root (Grok Bot 'Cloudflare Root') for Alexey. Owner of implementation: `agent-hub-head`.
 
+## Deployment and process context
+
+This specification retains the original scope, milestones, acceptance criteria
+and §12 migration handoffs. Its October 2026 Cloudflare/free-tier deployment
+and review-process descriptions are historical. Current production uses the
+Node 24/SQLite VM runtime and aws-infra DNS/edge; follow [AGENTS.md](../AGENTS.md),
+[VM deployment](NODE-VM-DEPLOY.md) and [host releases](HUB2-RELEASES.md) for the
+current PR, CI, independent-review and rollout procedure. This context does not
+change the product requirements or authorize retiring a service without its
+acknowledged migration handoff.
+
 ## 1. Why
 
 Root currently polls every 30 minutes from the Grok Bot (and earlier from the Win35 route). That burns model usage just to look at state. The cross-machine plumbing is also spread over several pieces that each solve part of the problem: a JSON machine list, an mTLS bus adapter on Hetzner, a (stood-down) role authority, a file mailbox for the desktop, a supervision shell session, a principal ping timer and a separate dashboard.

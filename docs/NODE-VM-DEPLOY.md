@@ -167,18 +167,20 @@ as the operator).
 
 ## Rollout steps (per revision)
 
-1. Merge to main (full hub2 + distribution CI green).
-2. CI deploy (manual dispatch, `dry_run=false`) or on the VM:
-   `cd /opt/agent-hub && git fetch && git checkout --detach origin/main &&
-   npm ci --omit=dev && sudo bash deploy/vm/install-hub2-node.sh`.
-   The CI path provisions Node24 inside the transaction's deploy lock (the
-   staged provisioner runs before any application mutation); a manual rollout
-   must reach the same state first
-   (`sudo bash deploy/vm/provision-node24.sh` on the VM — the standalone
-   provisioner takes the same transaction lock itself), because both the
-   installer and the transaction refuse to run against a non-Node24 service
-   runtime.
-3. `systemctl status agent-hub-hub2` + `curl -s http://127.0.0.1:8787/health`.
+1. Obtain independent review of the exact PR head and green required CI, then
+   integrate with `gh pr merge --auto --rebase --match-head-commit <reviewed-sha>`.
+2. Every push to `main` starts the production workflow. Its deploy job runs
+   after the required test, Hub2, distribution and Python checks pass. Coordinate
+   integration with the designated deploy owner; pull requests never deploy.
+3. The CI transaction stages an immutable release, provisions Node 24 under
+   its deploy lock before application mutation, applies the accepted release,
+   and checks public readiness and the live start canary. Follow the CI result;
+   a successful health response alone does not establish launch acceptance.
+
+Manual dispatch remains an operator recovery/bootstrap path. Use the same CI
+transaction rather than installing from a working checkout on the VM. See
+[host releases](HUB2-RELEASES.md#automatic-production-deploy-after-green-main-ci-intake-bf07f437)
+for updater and canary behavior.
 
 The CI dispatch `release_mode` choice is passed to the installer. The installer
 updates only `HUB2_RELEASE_MODE` in the VM's existing `.dev.vars`, preserving
@@ -313,13 +315,18 @@ CI deploys over the SSH deploy key, so routine operation needs neither.
 
 ## Shipping an update (CI/CD only)
 
-1. Open a PR against `main`; the `Hub 2 production` and `Hub 2.0 checks`
-   workflows run the full suite. Merge when green (`gh pr merge --auto --rebase`).
-2. Run `gh workflow run deploy.yml --ref main -f dry_run=false
-   -f release_mode=<bootstrap|active>` (workflow "Hub 2 production"). A push to
-   `main` only validates; the `deploy` job runs on `workflow_dispatch` with
-   `dry_run=false`, in the `production` environment.
-3. The job SSHes with `AGENT_HUB_VM_DEPLOY_KEY`, fast-forwards `/opt/agent-hub`,
-   runs `npm ci --omit=dev` and `deploy/vm/install-hub2-node.sh`, and checks
-   `https://hub.dtcdev.click/health`.
-4. Verify from anywhere with `curl https://hub.dtcdev.click/health`.
+1. Open a PR against `main`. Required CI must pass on the exact final head;
+   obtain independent review and enable
+   `gh pr merge --auto --rebase --match-head-commit <reviewed-sha>`.
+2. A push to `main` automatically deploys in active mode after the workflow's
+   required gates pass, in the `production` environment. The deploy owner
+   observes the serialized transaction and its canary; merging documentation
+   also triggers this workflow.
+3. CI uploads and verifies an immutable release bundle, applies it under the
+   deploy lock, checks readiness and the live start canary, and finalizes only
+   after acceptance. Failure follows the protected rollback path above.
+4. For operator-directed recovery/bootstrap, manual dispatch remains available:
+   `gh workflow run deploy.yml --ref main -f dry_run=false -f release_mode=active`.
+   Bootstrap deliberately disables dispatch and requires the workflow's separate
+   confirmation. Keep routine deployment and inspection in the maintained CI
+   path; do not SSH into the VM to install or edit files.

@@ -1,13 +1,71 @@
-# Phase 7 acceptance evidence (V2 interactive native-pane)
+# Phase 7 acceptance evidence
 
 `scripts/hub_acceptance_10.py` (invoked via `scripts/hub-acceptance-10.sh`) is a
 live acceptance driver, not a unit test or an installer. Root owns the actual
-run and intake attachment. Do not run it until Root has verified readiness, the
-exact deployment/canary/CI evidence, unassisted interactive transport
-attestations for every eligible engine, and the real seven-producer alert
-sampler. Source validation alone proves none of those live conditions. This
-change does not enroll an alert producer, supply a zero count, or grant
-runtime GO.
+run and intake attachment. The original acceptance mode is the default;
+`--formal` selects the additional V2 renderer/transport protocol described later
+in this document. Formal transport attestations are not prerequisites for the
+original mode. Neither mode grants runtime GO from source validation alone.
+
+## Original acceptance (default)
+
+Root verifies genuine canary and CI e2e receipts for the same full Hub commit,
+current launch resources and model authority, and continuous complete coverage
+from the real alert producers. An empty recent-alert list is not a zero-alert
+occurrence watermark. Use a new private output directory and the maintained
+public Hub/native installation:
+
+```sh
+HUB_ACCEPTANCE_READY=1 scripts/hub-acceptance-10.sh --live --attach-output \
+  --commit <full-Hub-commit> --workspace <approved-absolute-Hetzner-workspace> \
+  --intake-task-id <Root-parent-intake-UUID> --output-dir <new-private-run-dir> \
+  --evidence <private-original-evidence.json> \
+  --alerts-cmd '<supported-authoritative-occurrence-sampler>'
+```
+
+Omit `--formal` for this mode. The original evidence file has this shape:
+
+```json
+{
+  "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "canary": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "status": "success",
+    "path": "actual-canary-receipt.log",
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "ci_e2e": {
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "status": "success",
+    "path": "actual-ci-e2e.log",
+    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  }
+}
+```
+
+Paths identify actual retained receipts; hashes establish byte identity, not
+provenance. Independently verify their real deployment and CI origin. A native
+aplexer release is a separate component: retain its source/build/rollout proof
+without substituting its SHA for the Hub canary commit.
+
+The driver makes ten model-less interactive starts on Hetzner, with no forced
+variety or replacement draws. Each must return running within 150 seconds;
+useful-work evidence has a separate 90-second budget. Proof combines a fresh
+data-pinned source audit artifact, an independently derived result absent from
+the brief, actual pane output and matching session/native/workspace identity.
+A banner, echoed prompt, marker alone or fabricated provider output cannot pass.
+It checks model shares (at least three models, zero Astra, at most three Luna),
+normal STOP and complete own-lineage cleanup, and an unchanged authoritative
+alert occurrence watermark. Named probes and automatic verifier children do
+not count as draws. The series aborts on failure without rerolling. Retain actual
+output and failures; do not claim the ten runs from offline tests or simulations.
+
+## Optional formal V2 mode
+
+The remainder describes the additional `--formal` protocol, including its
+per-engine transport attestations and V2 artifacts. Root must verify those
+conditions before selecting formal mode. This does not enroll alert producers
+or grant runtime GO.
 
 ## Root-validated interactive evidence bundle
 
