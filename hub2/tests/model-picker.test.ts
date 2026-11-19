@@ -4,6 +4,41 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pickModelRoute, pickModelRouteDetailed, weightedChoice, buildRoutingPool } from '../src/model-picker.ts';
 import type { RoutingSnapshot } from '../src/routing-pool.ts';
+import {eligibleCandidates} from '../src/routing-pool.ts';
+import {inheritedModelConstraints,normalizeModelConstraint,modelConstraintsAllow} from '../src/intake-model-constraints.ts';
+
+test('semantic intake restrictions precede every advisory fallback and explicit hint',()=>{
+ const sonnet={id:'renamed-sonnet-row',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const opus={...sonnet,id:'renamed-opus-row',model:'opus',weight:1e9};
+ const rules=[{models_by_engine:{claude:['sonnet']},efforts:['medium','unspecified']}];
+ assert.deepEqual(eligibleCandidates({version:22,candidates:[opus,sonnet]},
+   {interactive:true,model_constraints:rules}).map(row=>row.id),[sonnet.id]);
+ for(const input of [{model:'opus'},{tier:'deep'},{effort:'high'}]){
+  const policy={version:22,candidates:[opus,{...opus,id:'opus-high',effort:'high'}]};
+  assert.throws(()=>eligibleCandidates(policy,{interactive:true,model_constraints:rules,...input}),/model_policy_unavailable/);
+ }
+ assert.equal(modelConstraintsAllow({...sonnet,engine:'go',model:'muse',effort:undefined},rules),true);
+ assert.equal(modelConstraintsAllow({...sonnet,engine:'go',model:'muse',effort:'high'},rules),false);
+ assert.equal(eligibleCandidates({version:22,candidates:[opus,sonnet]},{interactive:true}).length,2,'global pool untouched');
+});
+
+test('intake constraint schema is closed, bounded and canonical; corrupt ancestry fails explicitly',()=>{
+ assert.deepEqual(normalizeModelConstraint({models_by_engine:{CLAUDE:['sonnet','SONNET']},efforts:['medium','low']}),
+   {models_by_engine:{claude:['sonnet']},efforts:['low','medium']});
+ for(const invalid of [{},{models_by_engine:{}},{models_by_engine:{claude:[]}},{efforts:[]},
+   {efforts:['turbo']},{efforts:['Medium']},{models_by_engine:{claude:['sonnet'],CLAUDE:['opus']}},{weight:0}])
+  assert.throws(()=>normalizeModelConstraint(invalid),/invalid_model_constraints/);
+ const root={id:'root',source_json:JSON.stringify({model_constraints:{models_by_engine:{claude:['sonnet']}}})};
+ const child={id:'child',parent_intake_id:'root',source_json:JSON.stringify({model_constraints:{models_by_engine:{claude:['opus','sonnet']}}})};
+ const rows=new Map([['root',root],['child',child]]);
+ const inherited=inheritedModelConstraints('child',id=>rows.get(id));
+ assert.equal(inherited.length,2);
+ assert.equal(modelConstraintsAllow({engine:'claude',model:'opus'},inherited.map(row=>row.constraint)),false);
+ assert.equal(modelConstraintsAllow({engine:'claude',model:'sonnet'},inherited.map(row=>row.constraint)),true);
+ assert.throws(()=>inheritedModelConstraints('missing',()=>undefined),/ancestor_missing/);
+ assert.throws(()=>inheritedModelConstraints('loop',()=>({id:'loop',parent_intake_id:'loop'})),/ancestry_invalid/);
+ assert.throws(()=>inheritedModelConstraints('bad',()=>({id:'bad',source_json:'{"model_constraints":{"weight":0}}'})),/constraints_invalid/);
+});
 
 const candidates=[
  {id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -141,6 +176,9 @@ os.environ.clear();os.environ.update(HOME=str(home),PATH=str(binary))
 workspace=home/'project-测试';workspace.mkdir()
 agent_module.local_claude_missing_contexts=lambda contexts,modes,environment:local_claude_missing_contexts(contexts,modes,environment,filesystem_root=home)
 bridge=Bridge.__new__(Bridge);bridge.roots=[workspace];bridge.engines={'claude','codex'};bridge.launcher=NativeLauncher({'private_provider_homes':False})
+# This fixture qualifies Claude auth observations, not a real Codex wrapper or
+# release-pinned profile. Keep unrelated installed-host readiness deterministic.
+bridge.launcher._codex_advertisable=lambda route:True
 def heartbeat(labels,engines,capabilities):print(json.dumps({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities,'workspace':str(workspace)}))
 bridge.client=types.SimpleNamespace(heartbeat=heartbeat)
 bridge.heartbeat([],include_native_sessions=False)

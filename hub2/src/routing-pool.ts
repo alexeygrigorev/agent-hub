@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { HttpError } from './http';
 import { explicitLunaIntent, isLunaModel, matchesModelIntent, isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
+import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} from './intake-model-constraints';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
@@ -32,6 +33,8 @@ const MIN_SHARE = 0.03;     // per eligible candidate; the remaining mass follow
 const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
+  /** ProjectDO-derived intake ancestry; never a start-body preference. */
+  model_constraints?: ModelConstraint[];
   purpose?: SessionPurpose;
   /** Server-authorized explicit central delivery, never inferred from a capability hint. */
   managed_credential_label?: 'hub-claude';
@@ -93,6 +96,13 @@ export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, r
 }
 
 export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Candidate[] {
+  if(input.model_constraints!==undefined&&(!Array.isArray(input.model_constraints)||input.model_constraints.length>32))
+    throw new HttpError('invalid_model_constraints',400);
+  const constraints=(input.model_constraints??[]).map(value=>{
+    const constraint=normalizeModelConstraint(value);
+    if(!constraint)throw new HttpError('invalid_model_constraints',400);
+    return constraint;
+  });
   const purpose = sessionPurpose(input.purpose);
   if(input.managed_credential_label!==undefined&&(input.managed_credential_label!=='hub-claude'
     ||input.engine!=='claude'||input.model!=='opus'||input.effort!=='medium'||input.interactive||input.with_goal))
@@ -121,6 +131,7 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
   const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
   const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !deep;
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && modelConstraintsAllow(candidate,constraints)
     && (!isLunaModel(candidate) || lunaRequested)
     && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
     // High effort is opt-in: an explicit --effort, the exact policy id or a deep tier.

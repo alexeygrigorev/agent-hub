@@ -12,6 +12,7 @@ import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
+import {inheritedModelConstraints,normalizeModelConstraint,type InheritedModelConstraint} from './intake-model-constraints';
 import { codeTask, mergeEvidenceShapeError, mergeGateAll, mergeGaps, readOnlyBrief } from './merge-gate';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
@@ -256,6 +257,10 @@ export class ProjectDO {
     }
     const body = await bodyObject(request, 16_384);
     normalizeCriteria(body);
+    if(body.model_constraints!==undefined){
+      if(!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can set model constraints');
+      body.model_constraints=normalizeModelConstraint(body.model_constraints);
+    }
     if (body.code_task !== undefined && typeof body.code_task !== 'boolean') return error('invalid_code_task',400);
     if (body.parent_intake_id !== undefined && body.parent_intake_id !== null && (typeof body.parent_intake_id !== 'string' || !body.parent_intake_id.trim())) return error('invalid_parent_intake_id', 400);
     if (typeof body.parent_intake_id === 'string' && body.parent_intake_id.trim().length < 6) return error('prefix_too_short', 400, 'parent_intake_id prefix must be at least 6 characters');
@@ -265,7 +270,7 @@ export class ProjectDO {
     if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]), ...(body.parent_intake_id !== undefined ? { parent_intake_id: body.parent_intake_id } : {}) };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]), ...(body.parent_intake_id !== undefined ? { parent_intake_id: body.parent_intake_id } : {}),...(body.model_constraints!==undefined?{model_constraints:body.model_constraints}:{}) };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -291,7 +296,7 @@ export class ProjectDO {
         && !this.canProject(actor, project, 'intake:write') ? actor.resource_id : null);
     this.transaction(() => {
       this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority,parent_intake_id)
-        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task}),2,parentIntakeId);
+        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task,...(normalized.model_constraints?{model_constraints:normalized.model_constraints}:{})}),2,parentIntakeId);
       this.appendEvent(id, `intake:${id}:created`, actor?.id || 'operator', 'created', { title: normalized.title, acceptance_criteria: normalized.acceptance_criteria }, now);
       this.db.run('INSERT INTO idempotency(scope, request_key, request_digest, response_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'intake:create', key, digest, JSON.stringify({ id }), now, now + 180 * 24 * 60 * 60_000);
@@ -620,9 +625,13 @@ export class ProjectDO {
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task','parent_intake_id',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
+    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task','parent_intake_id','model_constraints',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
     if(!editable.some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
     if(body.code_task!==undefined&&typeof body.code_task!=='boolean')return error('invalid_code_task',400);
+    if(body.model_constraints!==undefined){
+      if(!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can set model constraints');
+      body.model_constraints=normalizeModelConstraint(body.model_constraints);
+    }
     if(body.parent_intake_id!==undefined&&body.parent_intake_id!==null&&(typeof body.parent_intake_id!=='string'||!body.parent_intake_id.trim()))return error('invalid_parent_intake_id',400);
     if(typeof body.parent_intake_id==='string'&&body.parent_intake_id.trim().length<6)return error('prefix_too_short',400,'parent_intake_id prefix must be at least 6 characters');
     if(body.project!==undefined&&(typeof body.project!=='string'||!/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(body.project)))return error('invalid_intake_project',400);
@@ -676,10 +685,17 @@ export class ProjectDO {
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
         this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
       }
-      if(typeof body.code_task==='boolean'){
-        const source=(this.parse(row.source_json) as JsonRecord|null)??{},was=codeTask(source);
-        this.db.run('UPDATE intakes SET source_json=? WHERE id=?',JSON.stringify({...source,code_task:body.code_task}),row.id);
-        this.appendEvent(row.id,'code-task:'+row.id+':'+key,actor!.id,'intake_reclassified',{code_task:body.code_task,was,...(body.note?{note:body.note}:{})},at);
+      if(typeof body.code_task==='boolean'||body.model_constraints!==undefined){
+        const source={...((this.parse(row.source_json) as JsonRecord|null)??{})},was=codeTask(source);
+        if(typeof body.code_task==='boolean')source.code_task=body.code_task;
+        if(body.model_constraints!==undefined){
+          if(body.model_constraints===null)delete source.model_constraints;
+          else source.model_constraints=body.model_constraints;
+        }
+        row.source_json=JSON.stringify(source);
+        this.db.run('UPDATE intakes SET source_json=? WHERE id=?',row.source_json,row.id);
+        if(typeof body.code_task==='boolean')this.appendEvent(row.id,'code-task:'+row.id+':'+key,actor!.id,'intake_reclassified',{code_task:body.code_task,was,...(body.note?{note:body.note}:{})},at);
+        if(body.model_constraints!==undefined)this.appendEvent(row.id,'model-constraints:'+row.id+':'+key,actor!.id,'intake_model_constraints_updated',{model_constraints:body.model_constraints},at);
       }
       this.appendEvent(row.id,'edit:'+row.id+':'+key,actor!.id,'intake_updated',{...next,...(body.note?{note:body.note}:{})},at);
       this.db.run('INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',scope,key,digest,JSON.stringify({id:row.id}),at,at+180*86400000);
@@ -699,6 +715,10 @@ export class ProjectDO {
     return saga?this.startResponse(saga,['offered','claimed','running'].includes(saga.state)?201:202):error('dispatch_state_unavailable',503);
   }
 
+  private modelConstraintSnapshot(intakeId:string):InheritedModelConstraint[]{
+    return inheritedModelConstraints(intakeId,id=>this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',id));
+  }
+
   private async serializeRouting<T>(action:()=>Promise<T>):Promise<T>{
     const previous=this.routingQueue;
     let release!:()=>void;
@@ -710,6 +730,7 @@ export class ProjectDO {
   private async prepareStartIntake(request: Request, intakeId: string): Promise<Response|string> {
     const actor = actorFrom(request);
     const body = await bodyObject(request, 16_384);
+    if(body.model_constraints!==undefined)return error('model_constraints_start_forbidden',403,'model constraints belong to operator-owned intake metadata');
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
@@ -850,6 +871,7 @@ export class ProjectDO {
     const operationId = `${operationHash.slice(0,8)}-${operationHash.slice(8,12)}-5${operationHash.slice(13,16)}-a${operationHash.slice(17,20)}-${operationHash.slice(20,32)}`;
     const sessionHash = await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intakeId,key]));
     const sessionId = `${sessionHash.slice(0,8)}-${sessionHash.slice(8,12)}-5${sessionHash.slice(13,16)}-a${sessionHash.slice(17,20)}-${sessionHash.slice(20,32)}`;
+    const modelConstraints=this.modelConstraintSnapshot(intakeId);
     let route: PickedRoute;
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
@@ -895,6 +917,7 @@ export class ProjectDO {
         effort:route.effort??null,weight:1,share:1}],excluded:[]};
     } else {
       const picked = await pickCommittedModelRoute(this.env, {
+          ...(modelConstraints.length?{model_constraints:modelConstraints.map(row=>row.constraint)}:{}),
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
           ...(typeof modelInput === 'string' ? { model: modelInput } : {}),
@@ -975,6 +998,8 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
+        if(JSON.stringify(this.modelConstraintSnapshot(intakeId))!==JSON.stringify(modelConstraints))
+          throw new HttpError('intake_model_constraints_changed',409);
         if (current && continuationOf !== undefined && current.session_id !== continuationOf)
           throw new HttpError('intake_already_assigned', 409, 'continuation superseded');
       const allowedVerification=verificationOf!==undefined&&current?.session_id===verificationOf&&['completed-awaiting-review','failed'].includes(current.status);
@@ -983,7 +1008,7 @@ export class ProjectDO {
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
         const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
           :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
@@ -1380,11 +1405,13 @@ export class ProjectDO {
       return await fail('managed_credential_auth_failed');
     if(saga.attempt>=1)return await fail('model_attempts_exhausted');
     if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
+    const modelConstraints=this.modelConstraintSnapshot(intake.id);
     let next:PickedRoute;
     let diagnostics:PickDiagnostics;
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
       const picked=await pickCommittedModelRoute(this.env,{interactive:launch.interactive===true,
+        ...(modelConstraints.length?{model_constraints:modelConstraints.map(row=>row.constraint)}:{}),
         ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
         with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried},
@@ -1399,12 +1426,13 @@ export class ProjectDO {
     const launchSpec:JsonRecord={...launch,engine:next.engine,model:next.model,...(next.effort?{effort:next.effort}:{})};
     if(!next.effort)delete launchSpec.effort;
     const picker=buildStartPickerEvidence(next,diagnostics,1,route.picker);
-    const routeState={...next,attempted_policy_ids:[...tried,next.policy_id],picker,
+    const routeState={...next,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[...tried,next.policy_id],picker,
       initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker),
       ...((route as JsonRecord).completion_contract===true?{completion_contract:true}:{}),
       ...((route as JsonRecord).completion_contract_omitted==='launch_budget'?{completion_contract_omitted:'launch_budget'}:{})};
     const applied=this.transaction(()=>{
       if(!this.fallbackCurrent(saga,intake))return false;
+      if(JSON.stringify(this.modelConstraintSnapshot(intake.id))!==JSON.stringify(modelConstraints))return false;
       this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
         launch_spec_json=?,routing_json=?,next_action_at=?,last_reason='provider_auth_fallback',updated_at=?
         WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL`,
@@ -1894,7 +1922,9 @@ export class ProjectDO {
       const result=await response.json().catch(()=>({})) as JsonRecord;
       if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??verifierSessionId)};
       else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
-    }catch{outcome={state:'retry',reason:'verification_start_uncertain'};}
+    }catch(caught){outcome=caught instanceof HttpError
+      ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+      :{state:'retry',reason:'verification_start_uncertain'};}
     if(outcome.state==='started'){
       this.transaction(()=>this.appendEvent(intake.id,key,VERIFICATION_ACTOR,'task_verification_started',
         {original_session_id:action.original_session_id,previous_session_id:record.session_id,session_id:outcome.session_id??verifierSessionId,
@@ -2029,7 +2059,9 @@ export class ProjectDO {
         if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
         else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
         else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
-      }catch{outcome={state:'retry',reason:'continuation_start_uncertain'};}
+      }catch(caught){outcome=caught instanceof HttpError
+        ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+        :{state:'retry',reason:'continuation_start_uncertain'};}
     }
     if(outcome.state==='started'){
       // The start transaction replaced the intake's terminal record; the event keeps it.
@@ -2257,7 +2289,9 @@ export class ProjectDO {
       if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
       else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
       else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
-    }catch{outcome={state:'retry',reason:'retry_start_uncertain'};}
+    }catch(caught){outcome=caught instanceof HttpError
+      ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+      :{state:'retry',reason:'retry_start_uncertain'};}
     if(outcome.state==='started'){
       this.transaction(()=>this.appendEvent(row.id,`retry:${row.saga_operation_id}:${attempt}`,RETRY_ACTOR,'task_retry_started',
         {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:depth>0},Date.now()));
