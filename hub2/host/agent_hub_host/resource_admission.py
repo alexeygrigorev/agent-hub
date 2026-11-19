@@ -33,12 +33,13 @@ DEFAULT_MEMORY_MB = 1500
 MAX_MEMORY_MB = 1500
 DEFAULT_PIDS = 256
 MAX_PIDS = 256
-# The admission transaction holds the journal write lock only for bounded
-# reads and one sample; exceeding the fixed window refuses fail-closed.
-ADMISSION_WINDOW_SECONDS = 10
-# Short original-monotonic permit anchored at the sample; the launcher checks
-# it immediately before the runner and never renews it.
-PERMIT_WINDOW_SECONDS = 30
+# ONE original monotonic deadline, established before any evidence
+# collection or lock wait, clips the whole admission: the private census,
+# the BEGIN IMMEDIATE wait, the row/fence reads, the charges, the physical
+# sample and the commit. The dispatch permit carries that same original
+# deadline and the launcher re-checks it immediately before the runner; the
+# budget is never renewed and no fresh window starts after the census.
+ADMISSION_WINDOW_SECONDS = 30
 # A resident worker is credited as mature only with positive same-incarnation
 # OS evidence: exact bound native UUID from a fresh private raw census, live
 # worker, running phase/state, a workload pid whose kernel birth (Linux
@@ -189,20 +190,21 @@ def sample_available_bytes(deadline=None, platform=None):
 
 
 class DispatchPermit:
-    """Short original-monotonic permission to spawn the admitted dispatch.
+    """Permission to spawn the admitted dispatch, clipped by the original budget.
 
-    The deadline is fixed at the physical sample inside the admission
-    transaction and is never renewed. Verification stays read-only: it never
-    resets the dispatch marker or refunds the reservation, so a consumed
-    permit leaves launch custody uncertain, never re-dispatched."""
-    __slots__ = ('operation_id', 'session_id', 'epoch', 'sampled_monotonic', 'permit_deadline')
+    The deadline is the admission's one original monotonic deadline
+    established before any evidence collection or lock wait; it is never
+    renewed and no fresh window starts after the census or the sample.
+    Verification stays read-only: it never resets the dispatch marker or
+    refunds the reservation, so a consumed permit leaves launch custody
+    uncertain, never re-dispatched."""
+    __slots__ = ('operation_id', 'session_id', 'epoch', 'permit_deadline')
 
-    def __init__(self, operation_id, session_id, epoch, sampled_monotonic):
+    def __init__(self, operation_id, session_id, epoch, permit_deadline):
         self.operation_id = operation_id
         self.session_id = session_id
         self.epoch = epoch
-        self.sampled_monotonic = sampled_monotonic
-        self.permit_deadline = sampled_monotonic + PERMIT_WINDOW_SECONDS
+        self.permit_deadline = permit_deadline
 
     def expired(self, now=None):
         return (time.monotonic() if now is None else now) > self.permit_deadline
@@ -306,6 +308,25 @@ def _linux_birth_ms(pid, read=None):
     return boot * 1000 + (start_ticks * 1000) // clock_ticks
 
 
+def _windows_creation_ms(open_process, get_times, close_handle, pid):
+    """Kernel creation time from one OpenProcess/GetProcessTimes exchange.
+
+    Synthetic identity controls exercise this exact protocol cross-platform;
+    a failed open, failed times read or missing handle holds the credit
+    (None) instead of pretending."""
+    handle = open_process(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation, exit_time, kernel_time, user_time = (ctypes.c_ulonglong(),) * 4
+        if not get_times(handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                         ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return None
+        return creation.value // 10000 - _WINDOWS_EPOCH_FILETIME_MS
+    finally:
+        close_handle(handle)
+
+
 def _windows_birth_ms(pid):
     """Kernel creation time of one pid via OpenProcess/GetProcessTimes, or None.
 
@@ -320,18 +341,8 @@ def _windows_birth_ms(pid):
     kernel32.GetProcessTimes.restype = ctypes.c_int
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
-    handle = kernel32.OpenProcess(_WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return None
-    try:
-        creation, exit_code, kernel, user = (ctypes.c_ulonglong(),) * 4
-        if not kernel32.GetProcessTimes(handle, ctypes.byref(creation),
-                                        ctypes.byref(exit_code), ctypes.byref(kernel),
-                                        ctypes.byref(user)):
-            return None
-        return creation.value // 10000 - _WINDOWS_EPOCH_FILETIME_MS
-    finally:
-        kernel32.CloseHandle(handle)
+    return _windows_creation_ms(kernel32.OpenProcess, kernel32.GetProcessTimes,
+                                kernel32.CloseHandle, pid)
 
 
 def _process_birth_ms(pid, read=None):
@@ -509,47 +520,104 @@ def _process_cwd_is_bound(pid, workspace):
     return cwd is not None and _same_workspace(cwd, workspace)
 
 
-def _uncovered_charges(db, raw_rows, exclude_operation, now_ms):
-    """Conservative uncovered RAM charge of the current known-inflight set.
+def _validated_reservation_allowance(reservation, attempt_label):
+    """Sane allowance plus attempt-label proof for one reservation.
 
-    Active dispatched attempts (marker=1, live states) are charged their
-    reservation allowance, or the fixed conservative default when unreserved
-    (upgrade/crash rows). Attempts with complete positive same-incarnation OS
-    proof at the final boundary charge zero: their usage is already inside
-    the physical sample. Undispatched pending/preparation rows hold no
-    reservation and cannot spawn without passing this same serialized
-    admission. Terminal history is never scanned and never poisons the gate."""
-    rows = db.execute(
-        'SELECT l.operation_id AS operation_id, l.tag AS tag, l.workspace AS workspace, '
-        'l.native_id AS native_id, r.allowance_bytes AS allowance_bytes '
-        'FROM launches l LEFT JOIN resource_reservations r ON r.operation_id=l.operation_id '
-        "WHERE l.native_dispatch_started=1 AND l.state IN ('launching','running','aborting','deadline_stopping') "
-        'AND l.operation_id<>? LIMIT ?', (exclude_operation, MAX_INFLIGHT_ROWS + 1)).fetchall()
-    if len(rows) > MAX_INFLIGHT_ROWS:
-        raise RuntimeError('active_native_bound_exceeded')
-    residents = _resident_rows(raw_rows, now_ms)
+    Identity equality against the launches row is enforced by the caller's
+    bound check; here the stored attempt label must re-derive from the exact
+    (session, operation, epoch) and the allowance must be a sane positive int
+    within the fixed cap. Any failure is unknown current inflight: the full
+    conservative default, never zero, never dropped or migrated."""
+    allowance = reservation['allowance_bytes']
+    if not (type(allowance) is int and 0 < allowance <= DEFAULT_ALLOWANCE_BYTES):
+        return DEFAULT_ALLOWANCE_BYTES
+    if attempt_label is not None:
+        try:
+            expected = attempt_label(reservation['session_id'], reservation['operation_id'],
+                                     reservation['epoch'])
+        except (TypeError, ValueError):
+            return DEFAULT_ALLOWANCE_BYTES
+        if reservation['attempt'] != expected:
+            return DEFAULT_ALLOWANCE_BYTES
+    return allowance
+
+
+def _uncovered_charges(db, observation, exclude_operation, now_ms, attempt_label=None):
+    """Conservative uncovered RAM charge of every current candidate.
+
+    Driven from ALL guard-owned unreleased reservations until their exact
+    qualified release - regardless of any terminal-looking launches state, so
+    a retained expired_unconfirmed custody keeps its charge - plus every
+    active launches attempt without a reservation (legacy marker-NULL rows
+    included). A candidate charges zero only with complete positive
+    same-incarnation OS proof at this final boundary; unknown, unbound or
+    invalid identities charge the full conservative default and never zero.
+    Undispatched pending/preparation rows hold no reservation and cannot
+    spawn without passing this same serialized admission. Terminal history is
+    never scanned and never poisons the gate."""
+    residents = _resident_rows(observation, now_ms)
     credited = set()
     total = 0
-    for row in rows:
+    charged = set()
+    reservations = db.execute(
+        'SELECT r.operation_id AS operation_id, r.session_id AS session_id, r.epoch AS epoch, '
+        'r.digest AS digest, r.attempt AS attempt, r.native_id AS reserved_native_id, '
+        'r.allowance_bytes AS allowance_bytes, l.session_id AS launch_session_id, '
+        'l.epoch AS launch_epoch, l.digest AS launch_digest, l.tag AS tag, '
+        'l.workspace AS workspace, l.native_id AS native_id '
+        'FROM resource_reservations r LEFT JOIN launches l ON l.operation_id=r.operation_id '
+        'WHERE r.operation_id<>? LIMIT ?', (exclude_operation, MAX_INFLIGHT_ROWS + 1)).fetchall()
+    if len(reservations) > MAX_INFLIGHT_ROWS:
+        raise RuntimeError('active_native_bound_exceeded')
+    for reservation in reservations:
+        charged.add(reservation['operation_id'])
+        bound = (reservation['launch_session_id'] == reservation['session_id']
+                 and reservation['launch_epoch'] == reservation['epoch']
+                 and reservation['launch_digest'] == reservation['digest']
+                 and isinstance(reservation['native_id'], str)
+                 and (reservation['reserved_native_id'] is None
+                      or reservation['reserved_native_id'] == reservation['native_id']))
+        if not bound:
+            # Unresolvable or mismatched identity: unknown current inflight
+            # keeps the full conservative default, never the stored allowance.
+            total += DEFAULT_ALLOWANCE_BYTES
+            continue
+        if _mature_resident(reservation, residents, credited, now_ms):
+            continue
+        total += _validated_reservation_allowance(reservation, attempt_label)
+    actives = db.execute(
+        'SELECT operation_id, tag, workspace, native_id FROM launches '
+        "WHERE state IN ('launching','running','aborting','deadline_stopping') "
+        'AND operation_id<>? LIMIT ?', (exclude_operation, MAX_INFLIGHT_ROWS + 1)).fetchall()
+    if len(actives) > MAX_INFLIGHT_ROWS:
+        raise RuntimeError('active_native_bound_exceeded')
+    for row in actives:
+        if row['operation_id'] in charged:
+            continue
+        # Active attempt without a guard reservation: pre-feature legacy rows
+        # and upgrade/crash cases keep their full conservative allowance
+        # unless positively OS-proven as current mature residents.
         if _mature_resident(row, residents, credited, now_ms):
             continue
-        allowance = row['allowance_bytes']
-        if not (type(allowance) is int and 0 < allowance <= DEFAULT_ALLOWANCE_BYTES):
-            allowance = DEFAULT_ALLOWANCE_BYTES
-        total += allowance
+        total += DEFAULT_ALLOWANCE_BYTES
     return total
 
 
 def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=None, now_ms=None):
     """Admit one prepared dispatch against physical RAM, journal-atomic.
 
-    Inside one BEGIN IMMEDIATE transaction: re-read the exact launch row
-    (session/epoch/digest/state=launching/marker=0/native NULL) and its STOP
-    fence, validate the same caps the argv emits, refresh current inflight/
-    resident evidence, sample physical available RAM last, require floor
-    headroom, then commit the reservation with the original 0->1 marker CAS.
-    Refusals leave the marker untouched so the caller settles them through
-    the existing no-dispatch path; post-commit refusals stay uncertain."""
+    ONE original monotonic deadline is established before any evidence
+    collection or lock wait and clips every step: the private raw census, the
+    BEGIN IMMEDIATE wait, the exact launch/epoch/digest/state=launching/
+    marker=0/native-NULL re-read with its STOP fence, the conservative
+    uncovered charges (final-boundary freshness and OS-liveness revalidation
+    included), the physical sample taken last, and the commit. The returned
+    permit carries that same original deadline for the launcher's read-only
+    check immediately before the runner; the budget is never renewed.
+    Refusals before the commit leave the marker untouched so the caller
+    settles them through the existing no-dispatch path; a refusal after the
+    commit keeps marker 1 and the reservation held (uncertain custody)."""
+    deadline = time.monotonic() + ADMISSION_WINDOW_SECONDS
     db = bridge.journal.db
     if db.in_transaction:
         raise RuntimeError('native_dispatch_fence_conflict')
@@ -559,7 +627,8 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
                                     (launcher_config or {}).get('pids', None))
     allowance = validate_worker_caps(caps.get('memory_mb'), caps.get('pids'))['memory_mb'] * 1024 * 1024
     observation = _raw_census_rows(bridge) if census is None else census
-    deadline = time.monotonic() + ADMISSION_WINDOW_SECONDS
+    if time.monotonic() > deadline:
+        raise _unqualified()
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     sampler = sample if sample is not None else getattr(bridge, 'resource_sample', None)
@@ -567,6 +636,10 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         sampler = sample_available_bytes
     db.execute('BEGIN IMMEDIATE')
     try:
+        # The original deadline clips the lock wait: an admission whose whole
+        # budget expired while waiting refuses here, before any state work.
+        if time.monotonic() > deadline:
+            raise _unqualified()
         row = db.execute('SELECT * FROM launches WHERE operation_id=?', (operation,)).fetchone()
         if (row is None or row['session_id'] != session or row['epoch'] != epoch
                 or row['state'] != 'launching' or row['native_dispatch_started'] != 0
@@ -578,13 +651,14 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         if db.execute('SELECT 1 FROM resource_reservations WHERE operation_id=?', (operation,)).fetchone():
             raise RuntimeError('native_dispatch_fence_conflict')
         digest, attempt = row['digest'], bridge.attempt_label(session, operation, epoch)
-        # Inside the transaction, at the final boundary: the private raw
+        # Final boundary against the one original deadline: the private raw
         # observation must still be fresh on its own collection clock, OS
-        # proof revalidates per candidate, and the physical sample is taken
-        # last against the pre-transaction monotonic deadline. The permit is
-        # anchored only at the sample monotonic and is never re-anchored.
-        charged = _uncovered_charges(db, observation, operation, now_ms)
-        sampled = time.monotonic()
+        # proof and liveness revalidate per candidate, and the physical
+        # sample is taken last. The permit never re-anchors after the census.
+        charged = _uncovered_charges(db, observation, operation, now_ms,
+                                     attempt_label=bridge.attempt_label)
+        if time.monotonic() > deadline:
+            raise _unqualified()
         available = sampler(deadline)  # the physical sample is always taken last
         if available - (charged + allowance) < RESERVED_FLOOR_BYTES:
             raise RuntimeError('host_launch_queue_full')
@@ -597,8 +671,10 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
             (operation, session, epoch))
         if changed.rowcount != 1:
             raise RuntimeError('native_dispatch_fence_conflict')
+        if time.monotonic() > deadline:
+            raise _unqualified()  # marker 1 and the reservation stay held; never reset
         db.commit()
     except BaseException:
         db.rollback()
         raise
-    return DispatchPermit(operation, session, epoch, sampled)
+    return DispatchPermit(operation, session, epoch, permit_deadline=deadline)

@@ -21,142 +21,8 @@ from agent_hub_host.agent import Journal
 
 FLOOR = resource_admission.RESERVED_FLOOR_BYTES
 ALLOWANCE = resource_admission.DEFAULT_ALLOWANCE_BYTES
+DEFAULT = ALLOWANCE
 
-
-def admit_bridge(journal, config=None, sample=None):
-    """Minimal bridge surface for direct admit_dispatch transactions."""
-    bridge = SimpleNamespace(journal=journal,
-                             launcher=SimpleNamespace(config=dict(config or {})))
-    bridge.attempt_label = lambda session, operation, epoch: hashlib.sha256(
-        json.dumps(['machine-1', session, operation, epoch], separators=(',', ':')).encode()).hexdigest()
-    if sample is not None:
-        bridge.resource_sample = sample
-    return bridge
-
-
-def launching_row(journal, operation='operation-1', session='session-1', epoch=1,
-                  state='launching', marker=0, native=None, deadline=None, failure=None, tag=None):
-    with journal.db as db:
-        db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,'
-                   'interactive,runtime_deadline,native_dispatch_started,legacy_failure_json) '
-                   'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-                   (operation, session, epoch, 'digest', '/owned', tag or 'task-hub2-' + session, native,
-                    state, 0, deadline, marker, json.dumps(failure) if failure else None))
-
-
-def reserve(journal, operation='operation-1', session='session-1', epoch=1,
-            native=None, allowance=ALLOWANCE):
-    with journal.db as db:
-        db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
-                   'native_id,allowance_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)',
-                   (operation, session, epoch, 'digest', 'attempt', native, allowance, int(time.time() * 1000)))
-
-
-def observation(rows, collected_offset=0.0):
-    """Private raw observation shape: (rows, collection monotonic)."""
-    return (tuple(rows), time.monotonic() - collected_offset)
-
-
-def os_proof(self, births=None, cwds=None, alive=True):
-    """Deterministic positive OS incarnation proof seams for fake pids."""
-    births = births or {}
-    cwds = cwds or {}
-    patches = [patch.object(resource_admission, '_process_birth_ms',
-                            side_effect=lambda pid, read=None: births.get(pid)),
-               patch.object(resource_admission, '_process_cwd',
-                            side_effect=lambda pid: cwds.get(pid)),
-               patch.object(resource_admission, '_process_alive',
-                            side_effect=lambda pid: alive)]
-    for item in patches:
-        item.start()
-        self.addCleanup(item.stop)
-
-
-def resident(native_id, tag='task-hub2-session-1', workspace='/owned', birth_ms=None, alive=True,
-             phase='running', state='running', pid=4100):
-    row = {'id': native_id, 'tag': tag, 'workspace': workspace,
-           'phase': phase, 'state': state, 'worker_alive': alive,
-           'created_at_ms': int(time.time() * 1000) - 400_000 if birth_ms is None else birth_ms,
-           'schema_version': 1, 'workload_pid': pid}
-    return {key: value for key, value in row.items() if value is not None or key != 'workload_pid'}
-
-
-class LinuxMeminfoTests(unittest.TestCase):
-    def meminfo(self, available, total):
-        return f'MemTotal:       {total} kB\nMemFree:        1 kB\nMemAvailable:   {available} kB\n'.encode()
-
-    def test_strict_parse_boundaries(self):
-        self.assertEqual(resource_admission.parse_linux_meminfo(self.meminfo(50, 100)), (50 * 1024, 100 * 1024))
-        self.assertEqual(resource_admission.parse_linux_meminfo(self.meminfo(100, 100)), (100 * 1024, 100 * 1024))
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(self.meminfo(101, 100))  # available > total
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemTotal: 100 kB\n')  # missing MemAvailable
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: 1 kB\n')  # missing MemTotal
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(self.meminfo(5, 100) + self.meminfo(6, 100))  # duplicates
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: x kB\nMemTotal: 1 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: 12E kB\nMemTotal: 1 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: -1 kB\nMemTotal: 1 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: 1 kB\nMemTotal: 0 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'\xff\xfe not ascii')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'0' * 65537)
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo('text')
-        # Known-field duplicates refuse whatever their shape, including wrong
-        # units or extra tokens after an already-valid field.
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemTotal: 100 kB\nMemAvailable: 5 kB\nMemAvailable: 6 MB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemTotal: 100 kB\nMemAvailable: 5 kB junk\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable: 5 MB\nMemTotal: 100 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable:\nMemTotal: 100 kB\n')
-        with self.assertRaises(RuntimeError):
-            resource_admission.parse_linux_meminfo(b'MemAvailable kB\nMemTotal: 100 kB\n')
-
-    def test_injected_read_is_platform_independent(self):
-        self.assertEqual(resource_admission.sample_linux(
-            read=lambda: self.meminfo(7, 10)), 7 * 1024)
-
-    @unittest.skipUnless(sys.platform == 'linux', 'real Linux /proc sample')
-    def test_real_linux_meminfo_sample_is_positive(self):
-        available = resource_admission.sample_linux()
-        self.assertIsInstance(available, int)
-        self.assertGreater(available, 0)
-
-
-"""Same-journal pre-dispatch RAM admission: OS samplers, caps, serialization,
-resident credit and release custody. All OS and census evidence here is
-bounded synthetic injection; no provider, model, API or live participant."""
-import ctypes
-import hashlib
-import json
-import os
-import sys
-import tempfile
-import threading
-import time
-import unittest
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
-
-import test_host
-
-from agent_hub_host import resource_admission
-from agent_hub_host.agent import Journal
-
-FLOOR = resource_admission.RESERVED_FLOOR_BYTES
-ALLOWANCE = resource_admission.DEFAULT_ALLOWANCE_BYTES
 
 
 def admit_bridge(journal, config=None, sample=None):
@@ -181,11 +47,11 @@ def launching_row(journal, operation='operation-1', session='session-1', epoch=1
 
 
 def reserve(journal, operation='operation-1', session='session-1', epoch=1,
-            native=None, allowance=ALLOWANCE):
+            native=None, allowance=ALLOWANCE, digest='digest', attempt='attempt'):
     with journal.db as db:
         db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
                    'native_id,allowance_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?,?)',
-                   (operation, session, epoch, 'digest', 'attempt', native, allowance, int(time.time() * 1000)))
+                   (operation, session, epoch, digest, attempt, native, allowance, int(time.time() * 1000)))
 
 
 def observation(rows, collected_offset=0.0):
@@ -400,6 +266,26 @@ class OsIncarnationProofTests(unittest.TestCase):
         self.assertFalse(resource_admission._process_alive(999999999))
         self.assertIsNone(resource_admission._process_cwd(999999999))
 
+    def test_synthetic_windows_identity_protocol_control(self):
+        calls = []
+        def open_process(flag, inherit, pid):
+            calls.append(('open', flag, pid))
+            return 7 if pid == 4242 else 0
+        def get_times(handle, creation, exit_time, kernel_time, user_time):
+            creation._obj.value = (1_700_000_000_000 + resource_admission._WINDOWS_EPOCH_FILETIME_MS) * 10000
+            calls.append(('times', handle))
+            return 1
+        def close_handle(handle):
+            calls.append(('close', handle))
+            return 1
+        birth = resource_admission._windows_creation_ms(open_process, get_times, close_handle, 4242)
+        self.assertEqual(birth, 1_700_000_000_000)
+        self.assertEqual(calls, [('open', 0x1000, 4242), ('times', 7), ('close', 7)])
+        calls.clear()
+        self.assertIsNone(resource_admission._windows_creation_ms(lambda *args: 0, get_times, close_handle, 1))
+        self.assertIsNone(resource_admission._windows_creation_ms(open_process, lambda *args: 0, close_handle, 4242))
+        self.assertEqual(calls, [('open', 0x1000, 4242), ('close', 7)])
+
     def test_windows_birth_path_is_platform_gated(self):
         if sys.platform == 'win32':
             self.skipTest('real win32 platform')
@@ -475,9 +361,12 @@ class ConcurrentAdmissionTests(unittest.TestCase):
         except Exception as error:
             results[operation] = error
 
-    def test_simultaneous_starts_fit_individually_but_never_both(self):
-        # Enough physical headroom for exactly one new allowance above the floor.
-        self.available = FLOOR + ALLOWANCE + 4096
+    def test_simultaneous_preparations_serialize_and_cannot_double_spend(self):
+        # Each unreserved preparer is conservatively charged (plan: undispatched
+        # pending preparation is reserved while it can launch concurrently), so
+        # the sample covers exactly the two accounts; the serialized commits
+        # land both without spending any account twice.
+        self.available = FLOOR + 2 * ALLOWANCE + 4096
         bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
         bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
         results, barrier = {}, threading.Barrier(2)
@@ -490,24 +379,45 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             thread.join(10)
             self.assertFalse(thread.is_alive())
         admitted = [key for key, value in results.items() if isinstance(value, resource_admission.DispatchPermit)]
-        refused = [key for key, value in results.items() if isinstance(value, RuntimeError)]
-        self.assertEqual(len(admitted), 1)
-        self.assertEqual(len(refused), 1)
-        self.assertEqual(str(results[refused[0]]), 'host_launch_queue_full')
-        operation, session = admitted[0], admitted[0].replace('operation', 'session')
+        self.assertEqual(sorted(admitted), ['operation-a', 'operation-b'])
         rows = {row['operation_id']: row['native_dispatch_started']
                 for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
-        # Either thread may win the serialized transaction; exactly one
-        # dispatch marker flips and only the winner holds a reservation.
-        self.assertEqual(sorted(rows.values()), [0, 1])
-        self.assertEqual(rows[operation], 1)
+        # Either thread may win the serialized transaction; both commit exactly
+        # once and no account is spent twice.
+        self.assertEqual(sorted(rows.values()), [1, 1])
         reservations = self.journal.db.execute('SELECT operation_id,session_id,epoch,allowance_bytes '
-                                               'FROM resource_reservations').fetchall()
+                                               'FROM resource_reservations ORDER BY operation_id').fetchall()
         self.assertEqual([(row['operation_id'], row['session_id'], row['epoch'], row['allowance_bytes'])
-                          for row in reservations], [(operation, session, 1, ALLOWANCE)])
+                          for row in reservations],
+                         [('operation-a', 'session-a', 1, ALLOWANCE), ('operation-b', 'session-b', 1, ALLOWANCE)])
+
+    def test_serial_admissions_fit_individually_but_never_together(self):
+        # One new account of headroom: the first dispatch commits its own
+        # reservation; the second sees that charge (plus its own) and refuses
+        # with the typed capacity code - exactly one native effect is possible.
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
+        self.available = FLOOR + ALLOWANCE + 4096
+        bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
+        bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
+        permit = resource_admission.admit_dispatch(bridge_a, 'operation-a', 'session-a', 1,
+                                                   {'memory_mb': 1500, 'pids': 256},
+                                                   census=None, sample=lambda deadline: self.available)
+        self.assertIsInstance(permit, resource_admission.DispatchPermit)
+        # The second attempt arrives as a fresh prepared row afterwards.
+        launching_row(self.journal, 'operation-b', 'session-b')
+        with self.assertRaisesRegex(RuntimeError, 'host_launch_queue_full'):
+            resource_admission.admit_dispatch(bridge_b, 'operation-b', 'session-b', 1,
+                                              {'memory_mb': 1500, 'pids': 256},
+                                              census=None, sample=lambda deadline: self.available)
+        rows = {row['operation_id']: row['native_dispatch_started']
+                for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
+        self.assertEqual(rows, {'operation-a': 1, 'operation-b': 0})
+        self.assertEqual(self.journal.db.execute(
+            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
 
     def test_reservation_is_durable_across_restart_and_private_per_journal(self):
-        self.available = FLOOR + ALLOWANCE + 4096
+        self.available = FLOOR + 2 * ALLOWANCE + 4096  # sibling preparer is conservatively charged
         permit = resource_admission.admit_dispatch(
             admit_bridge(self.journal), 'operation-a', 'session-a', 1,
             {'memory_mb': 1500, 'pids': 256}, census=None, sample=lambda deadline: self.available)
@@ -536,7 +446,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             resource_admission.admit_dispatch(
                 admit_bridge(self.journal), 'operation-a', 'session-a', 1,
                 {'memory_mb': 1500, 'pids': 256}, census=None,
-                sample=lambda deadline: FLOOR + ALLOWANCE + 4096)
+                sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
         self.assertEqual(self.journal.db.execute(
             "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()[0], 0)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
@@ -553,7 +463,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
 
     def test_replayed_admission_never_reserves_twice(self):
-        sample = lambda deadline: FLOOR + ALLOWANCE + 4096
+        sample = lambda deadline: FLOOR + 2 * ALLOWANCE + 4096
         resource_admission.admit_dispatch(admit_bridge(self.journal), 'operation-a', 'session-a', 1,
                                           {'memory_mb': 1500, 'pids': 256}, census=None, sample=sample)
         with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
@@ -569,7 +479,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
                 resource_admission.admit_dispatch(admit_bridge(self.journal), operation, session, epoch,
                                                   {'memory_mb': 1500, 'pids': 256}, census=None,
-                                                  sample=lambda deadline: FLOOR + ALLOWANCE + 4096)
+                                                  sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
 
     def test_active_bound_overrun_refuses_admission(self):
         with self.journal.db as db:
@@ -591,8 +501,9 @@ class ResidentCreditTests(unittest.TestCase):
         self.addCleanup(self.journal.db.close)
         self.now = int(time.time() * 1000)
 
-    def charges(self, observation, exclude='operation-new'):
-        return resource_admission._uncovered_charges(self.journal.db, observation, exclude, self.now)
+    def charges(self, observation, exclude='operation-new', attempt_label=None):
+        return resource_admission._uncovered_charges(self.journal.db, observation, exclude, self.now,
+                                                     attempt_label=attempt_label)
 
     def test_many_legacy_terminal_null_rows_never_poison_or_migrate(self):
         with self.journal.db as db:
@@ -628,6 +539,43 @@ class ResidentCreditTests(unittest.TestCase):
         launching_row(self.journal, state='running', marker=1, native=native)
         reserve(self.journal, native=native)
         self.assertEqual(self.charges(self.proven(native, 4400, birth_ms=self.now - 10_000)), ALLOWANCE)
+
+    def test_retained_expired_unconfirmed_reservation_keeps_its_charge(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        # Terminal-looking custody: the row settled expired_unconfirmed but the
+        # guard-owned reservation was never released, so the charge remains.
+        launching_row(self.journal, state='expired_unconfirmed', marker=1, native=native)
+        reserve(self.journal, native=native)
+        self.assertEqual(self.charges(observation([])), ALLOWANCE)
+        self.assertEqual(self.charges(((), None)), ALLOWANCE)
+
+    def test_active_legacy_null_marker_row_is_charged_and_can_be_os_proven(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=None, native=native)  # pre-feature legacy row
+        self.assertEqual(self.charges(observation([])), ALLOWANCE)
+        self.assertEqual(self.charges(self.proven(native, 4800)), 0)
+
+    def test_invalid_or_orphaned_reservation_tuple_is_unknown_never_zero(self):
+        launching_row(self.journal, state='running', marker=1,
+                      native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d')
+        # A reduced allowance distinguishes validated charges from the
+        # conservative unknown default.
+        reserve(self.journal, digest='mismatched-digest', native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d',
+                allowance=100 * 1024 * 1024)
+        self.assertEqual(self.charges(observation([])), DEFAULT)  # digest mismatch -> unknown
+        reserve(self.journal, 'operation-orphan', 'session-orphan', 2, allowance=100 * 1024 * 1024)
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-orphan'")
+        self.assertEqual(self.charges(observation([])), DEFAULT + DEFAULT)  # orphaned -> unknown, never zero
+
+    def test_attempt_label_proof_validated_when_derivable(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native, allowance=100 * 1024 * 1024)
+        ok = lambda session, operation, epoch: 'attempt'
+        self.assertEqual(self.charges(observation([]), attempt_label=ok), 100 * 1024 * 1024)
+        bad = lambda session, operation, epoch: 'different'
+        self.assertEqual(self.charges(observation([]), attempt_label=bad), DEFAULT)
 
     def test_unknown_current_inflight_keeps_full_allowance(self):
         launching_row(self.journal, marker=1)  # dispatched, unbound, no observation row
@@ -691,7 +639,8 @@ class PermitTests(unittest.TestCase):
         self.assertIsNone(resource_admission.verify_permit(None, journal=self.journal))
 
     def test_expired_permit_refuses_without_renewing_the_clock(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic() - 31)
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() - 1)
         self.assertTrue(permit.expired())
         with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
             resource_admission.verify_permit(permit, journal=self.journal)
@@ -701,7 +650,8 @@ class PermitTests(unittest.TestCase):
 
     def test_fresh_permit_requires_unfenced_launching_row(self):
         launching_row(self.journal)
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic())
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() + 30)
         self.assertIsNone(resource_admission.verify_permit(permit, journal=self.journal))
         with self.journal.db as db:
             db.execute("UPDATE launches SET state='stopped_before_dispatch'")
@@ -714,7 +664,8 @@ class PermitTests(unittest.TestCase):
             resource_admission.verify_permit(permit, journal=self.journal)
 
     def test_permit_without_journal_checks_age_only(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic())
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() + 30)
         self.assertIsNone(resource_admission.verify_permit(permit, journal=None))
 
 
@@ -883,9 +834,12 @@ class ConcurrentAdmissionTests(unittest.TestCase):
         except Exception as error:
             results[operation] = error
 
-    def test_simultaneous_starts_fit_individually_but_never_both(self):
-        # Enough physical headroom for exactly one new allowance above the floor.
-        self.available = FLOOR + ALLOWANCE + 4096
+    def test_simultaneous_preparations_serialize_and_cannot_double_spend(self):
+        # Each unreserved preparer is conservatively charged (plan: undispatched
+        # pending preparation is reserved while it can launch concurrently), so
+        # the sample covers exactly the two accounts; the serialized commits
+        # land both without spending any account twice.
+        self.available = FLOOR + 2 * ALLOWANCE + 4096
         bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
         bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
         results, barrier = {}, threading.Barrier(2)
@@ -898,24 +852,45 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             thread.join(10)
             self.assertFalse(thread.is_alive())
         admitted = [key for key, value in results.items() if isinstance(value, resource_admission.DispatchPermit)]
-        refused = [key for key, value in results.items() if isinstance(value, RuntimeError)]
-        self.assertEqual(len(admitted), 1)
-        self.assertEqual(len(refused), 1)
-        self.assertEqual(str(results[refused[0]]), 'host_launch_queue_full')
-        operation, session = admitted[0], admitted[0].replace('operation', 'session')
+        self.assertEqual(sorted(admitted), ['operation-a', 'operation-b'])
         rows = {row['operation_id']: row['native_dispatch_started']
                 for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
-        # Either thread may win the serialized transaction; exactly one
-        # dispatch marker flips and only the winner holds a reservation.
-        self.assertEqual(sorted(rows.values()), [0, 1])
-        self.assertEqual(rows[operation], 1)
+        # Either thread may win the serialized transaction; both commit exactly
+        # once and no account is spent twice.
+        self.assertEqual(sorted(rows.values()), [1, 1])
         reservations = self.journal.db.execute('SELECT operation_id,session_id,epoch,allowance_bytes '
-                                               'FROM resource_reservations').fetchall()
+                                               'FROM resource_reservations ORDER BY operation_id').fetchall()
         self.assertEqual([(row['operation_id'], row['session_id'], row['epoch'], row['allowance_bytes'])
-                          for row in reservations], [(operation, session, 1, ALLOWANCE)])
+                          for row in reservations],
+                         [('operation-a', 'session-a', 1, ALLOWANCE), ('operation-b', 'session-b', 1, ALLOWANCE)])
+
+    def test_serial_admissions_fit_individually_but_never_together(self):
+        # One new account of headroom: the first dispatch commits its own
+        # reservation; the second sees that charge (plus its own) and refuses
+        # with the typed capacity code - exactly one native effect is possible.
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-b'")
+        self.available = FLOOR + ALLOWANCE + 4096
+        bridge_a = admit_bridge(self.journal, sample=lambda deadline: self.available)
+        bridge_b = admit_bridge(self.journal, sample=lambda deadline: self.available)
+        permit = resource_admission.admit_dispatch(bridge_a, 'operation-a', 'session-a', 1,
+                                                   {'memory_mb': 1500, 'pids': 256},
+                                                   census=None, sample=lambda deadline: self.available)
+        self.assertIsInstance(permit, resource_admission.DispatchPermit)
+        # The second attempt arrives as a fresh prepared row afterwards.
+        launching_row(self.journal, 'operation-b', 'session-b')
+        with self.assertRaisesRegex(RuntimeError, 'host_launch_queue_full'):
+            resource_admission.admit_dispatch(bridge_b, 'operation-b', 'session-b', 1,
+                                              {'memory_mb': 1500, 'pids': 256},
+                                              census=None, sample=lambda deadline: self.available)
+        rows = {row['operation_id']: row['native_dispatch_started']
+                for row in self.journal.db.execute('SELECT operation_id,native_dispatch_started FROM launches')}
+        self.assertEqual(rows, {'operation-a': 1, 'operation-b': 0})
+        self.assertEqual(self.journal.db.execute(
+            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
 
     def test_reservation_is_durable_across_restart_and_private_per_journal(self):
-        self.available = FLOOR + ALLOWANCE + 4096
+        self.available = FLOOR + 2 * ALLOWANCE + 4096  # sibling preparer is conservatively charged
         permit = resource_admission.admit_dispatch(
             admit_bridge(self.journal), 'operation-a', 'session-a', 1,
             {'memory_mb': 1500, 'pids': 256}, census=None, sample=lambda deadline: self.available)
@@ -944,7 +919,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             resource_admission.admit_dispatch(
                 admit_bridge(self.journal), 'operation-a', 'session-a', 1,
                 {'memory_mb': 1500, 'pids': 256}, census=None,
-                sample=lambda deadline: FLOOR + ALLOWANCE + 4096)
+                sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
         self.assertEqual(self.journal.db.execute(
             "SELECT native_dispatch_started FROM launches WHERE operation_id='operation-a'").fetchone()[0], 0)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
@@ -961,7 +936,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM resource_reservations').fetchone())
 
     def test_replayed_admission_never_reserves_twice(self):
-        sample = lambda deadline: FLOOR + ALLOWANCE + 4096
+        sample = lambda deadline: FLOOR + 2 * ALLOWANCE + 4096
         resource_admission.admit_dispatch(admit_bridge(self.journal), 'operation-a', 'session-a', 1,
                                           {'memory_mb': 1500, 'pids': 256}, census=None, sample=sample)
         with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
@@ -977,7 +952,7 @@ class ConcurrentAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'native_dispatch_fence_conflict'):
                 resource_admission.admit_dispatch(admit_bridge(self.journal), operation, session, epoch,
                                                   {'memory_mb': 1500, 'pids': 256}, census=None,
-                                                  sample=lambda deadline: FLOOR + ALLOWANCE + 4096)
+                                                  sample=lambda deadline: FLOOR + 2 * ALLOWANCE + 4096)
 
     def test_active_bound_overrun_refuses_admission(self):
         with self.journal.db as db:
@@ -999,8 +974,9 @@ class ResidentCreditTests(unittest.TestCase):
         self.addCleanup(self.journal.db.close)
         self.now = int(time.time() * 1000)
 
-    def charges(self, observation, exclude='operation-new'):
-        return resource_admission._uncovered_charges(self.journal.db, observation, exclude, self.now)
+    def charges(self, observation, exclude='operation-new', attempt_label=None):
+        return resource_admission._uncovered_charges(self.journal.db, observation, exclude, self.now,
+                                                     attempt_label=attempt_label)
 
     def test_many_legacy_terminal_null_rows_never_poison_or_migrate(self):
         with self.journal.db as db:
@@ -1036,6 +1012,43 @@ class ResidentCreditTests(unittest.TestCase):
         launching_row(self.journal, state='running', marker=1, native=native)
         reserve(self.journal, native=native)
         self.assertEqual(self.charges(self.proven(native, 4400, birth_ms=self.now - 10_000)), ALLOWANCE)
+
+    def test_retained_expired_unconfirmed_reservation_keeps_its_charge(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        # Terminal-looking custody: the row settled expired_unconfirmed but the
+        # guard-owned reservation was never released, so the charge remains.
+        launching_row(self.journal, state='expired_unconfirmed', marker=1, native=native)
+        reserve(self.journal, native=native)
+        self.assertEqual(self.charges(observation([])), ALLOWANCE)
+        self.assertEqual(self.charges(((), None)), ALLOWANCE)
+
+    def test_active_legacy_null_marker_row_is_charged_and_can_be_os_proven(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=None, native=native)  # pre-feature legacy row
+        self.assertEqual(self.charges(observation([])), ALLOWANCE)
+        self.assertEqual(self.charges(self.proven(native, 4800)), 0)
+
+    def test_invalid_or_orphaned_reservation_tuple_is_unknown_never_zero(self):
+        launching_row(self.journal, state='running', marker=1,
+                      native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d')
+        # A reduced allowance distinguishes validated charges from the
+        # conservative unknown default.
+        reserve(self.journal, digest='mismatched-digest', native='1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d',
+                allowance=100 * 1024 * 1024)
+        self.assertEqual(self.charges(observation([])), DEFAULT)  # digest mismatch -> unknown
+        reserve(self.journal, 'operation-orphan', 'session-orphan', 2, allowance=100 * 1024 * 1024)
+        with self.journal.db as db:
+            db.execute("DELETE FROM launches WHERE operation_id='operation-orphan'")
+        self.assertEqual(self.charges(observation([])), DEFAULT + DEFAULT)  # orphaned -> unknown, never zero
+
+    def test_attempt_label_proof_validated_when_derivable(self):
+        native = '1b2f9c3e-4d5a-46b7-8c9d-0e1f2a3b4c5d'
+        launching_row(self.journal, state='running', marker=1, native=native)
+        reserve(self.journal, native=native, allowance=100 * 1024 * 1024)
+        ok = lambda session, operation, epoch: 'attempt'
+        self.assertEqual(self.charges(observation([]), attempt_label=ok), 100 * 1024 * 1024)
+        bad = lambda session, operation, epoch: 'different'
+        self.assertEqual(self.charges(observation([]), attempt_label=bad), DEFAULT)
 
     def test_unknown_current_inflight_keeps_full_allowance(self):
         launching_row(self.journal, marker=1)  # dispatched, unbound, no observation row
@@ -1099,7 +1112,8 @@ class PermitTests(unittest.TestCase):
         self.assertIsNone(resource_admission.verify_permit(None, journal=self.journal))
 
     def test_expired_permit_refuses_without_renewing_the_clock(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic() - 31)
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() - 1)
         self.assertTrue(permit.expired())
         with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
             resource_admission.verify_permit(permit, journal=self.journal)
@@ -1109,7 +1123,8 @@ class PermitTests(unittest.TestCase):
 
     def test_fresh_permit_requires_unfenced_launching_row(self):
         launching_row(self.journal)
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic())
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() + 30)
         self.assertIsNone(resource_admission.verify_permit(permit, journal=self.journal))
         with self.journal.db as db:
             db.execute("UPDATE launches SET state='stopped_before_dispatch'")
@@ -1122,7 +1137,8 @@ class PermitTests(unittest.TestCase):
             resource_admission.verify_permit(permit, journal=self.journal)
 
     def test_permit_without_journal_checks_age_only(self):
-        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1, time.monotonic())
+        permit = resource_admission.DispatchPermit('operation-1', 'session-1', 1,
+                                                   permit_deadline=time.monotonic() + 30)
         self.assertIsNone(resource_admission.verify_permit(permit, journal=None))
 
 

@@ -220,8 +220,22 @@ class Host:
 
     def start(self):
         log = open(self.log_path, "ab")
+        # Hermetic synthetic physical-RAM measurement for the REAL daemon on
+        # CI runners below the 10GiB admission floor. This is fixture-only:
+        # the bootstrap lives in this test's private root, patches the one
+        # measurement seam inside the daemon process the fixture itself
+        # spawns, and then runs the unmodified real CLI entrypoint. There is
+        # no production bypass: no env/config/floor key exists, the shipped
+        # entrypoint and the real sampler are byte-identical, and admission
+        # tests keep the real low-RAM refusal controls.
+        bootstrap = self.root / "host-bootstrap.py"
+        bootstrap.write_text(
+            "from agent_hub_host import cli, resource_admission\n"
+            "resource_admission.sample_available_bytes = "
+            "lambda deadline, platform=None: 64 * 1024**3\n"
+            "cli.main()\n")
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "agent_hub_host.cli", "--config", str(self.config), "serve", "--label", "e2e"],
+            [sys.executable, str(bootstrap), "--config", str(self.config), "serve", "--label", "e2e"],
             cwd=self.root, env=self.env(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
     def alive(self):
