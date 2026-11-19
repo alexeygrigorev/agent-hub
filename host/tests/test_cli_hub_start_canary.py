@@ -4863,15 +4863,61 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn('"--memory", f"{caps[\'memory_mb\']}M"', launch)
         self.assertIn('"--pids", str(caps[\'pids\'])', launch)
         # The canary's advertised defaults must equal the maintained strict
-        # validator's defaults AND ceilings: values are refused, never clamped,
-        # so an above-ceiling config can never reach the native argv. Source
-        # text only: the hub2 package shares the legacy import name and stays
-        # out of this process.
+        # validator's ACTUAL behavior, not just its source spelling: values
+        # are refused, never clamped, so an above-ceiling config can never
+        # reach the native argv. The pure validator core is AST-extracted
+        # into a private namespace and really executed here — no hub2
+        # package import in this legacy-shard process (shared import name),
+        # no sys.modules mutation, no OS access on these paths.
+        import ast
         admission = (ROOT / "hub2/host/agent_hub_host/resource_admission.py").read_text()
-        self.assertIn("DEFAULT_MEMORY_MB = %d" % mod.LAUNCHER_DEFAULT_MEMORY_MB, admission)
-        self.assertIn("DEFAULT_PIDS = %d" % mod.LAUNCHER_DEFAULT_PIDS, admission)
-        self.assertIn("MAX_MEMORY_MB = %d" % mod.LAUNCHER_DEFAULT_MEMORY_MB, admission)
-        self.assertIn("MAX_PIDS = %d" % mod.LAUNCHER_DEFAULT_PIDS, admission)
+        wanted_functions = {"_validated_cap", "validate_worker_caps"}
+        wanted_constants = {"DEFAULT_MEMORY_MB", "MAX_MEMORY_MB", "DEFAULT_PIDS", "MAX_PIDS"}
+        body = []
+        for node in ast.parse(admission).body:
+            if isinstance(node, ast.Assign):
+                if any(t.id in wanted_constants
+                       for t in node.targets if isinstance(t, ast.Name)):
+                    body.append(node)
+            elif isinstance(node, ast.FunctionDef) and node.name in wanted_functions:
+                body.append(node)
+        extracted = {n.name for n in body if isinstance(n, ast.FunctionDef)}
+        present = set()
+        for node in body:
+            if isinstance(node, ast.Assign):
+                present.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        self.assertEqual((wanted_functions - extracted) | (wanted_constants - present), set())
+        namespace = {}
+        exec(compile(ast.Module(body=body, type_ignores=[]),
+                     "<resource_admission-cap-extract>", "exec"), namespace)
+        # Real behavior: absent config takes the canary-advertised defaults,
+        # and explicit values at the exact ceilings pass through unchanged.
+        self.assertEqual(namespace["validate_worker_caps"](None, None),
+                         {"memory_mb": mod.LAUNCHER_DEFAULT_MEMORY_MB,
+                          "pids": mod.LAUNCHER_DEFAULT_PIDS})
+        self.assertEqual(
+            namespace["validate_worker_caps"](mod.LAUNCHER_DEFAULT_MEMORY_MB,
+                                              mod.LAUNCHER_DEFAULT_PIDS),
+            {"memory_mb": mod.LAUNCHER_DEFAULT_MEMORY_MB,
+             "pids": mod.LAUNCHER_DEFAULT_PIDS})
+        self.assertEqual(namespace["DEFAULT_MEMORY_MB"], mod.LAUNCHER_DEFAULT_MEMORY_MB)
+        self.assertEqual(namespace["MAX_MEMORY_MB"], mod.LAUNCHER_DEFAULT_MEMORY_MB)
+        self.assertEqual(namespace["DEFAULT_PIDS"], mod.LAUNCHER_DEFAULT_PIDS)
+        self.assertEqual(namespace["MAX_PIDS"], mod.LAUNCHER_DEFAULT_PIDS)
+        # Strict refusal semantics, really executed: above-ceiling and
+        # non-strict-int values raise instead of being clamped to the cap.
+        for label, memory, pids in (
+            ("above memory ceiling", namespace["MAX_MEMORY_MB"] + 1, None),
+            ("above pids ceiling", None, namespace["MAX_PIDS"] + 1),
+            ("bool memory", True, None),
+            ("string pids", None, "256"),
+            ("float memory", 1500.0, None),
+            ("zero memory", 0, None),
+            ("negative pids", None, -1),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    namespace["validate_worker_caps"](memory, pids)
         cli = (ROOT / "hub2/host/agent_hub_host/cli.py").read_text()
         self.assertIn('default=Path.home() / ".config/agent-hub/v2.json"', cli)
         self.assertEqual(mod.LAUNCHER_CONFIG_RELATIVE, ".config/agent-hub/v2.json")
