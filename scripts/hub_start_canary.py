@@ -4006,20 +4006,31 @@ def send_mail(subject, body):
 CANARY_ALERT_DECISIONS = {
     "critical": ("alert", "critical", "dev"),
     "critical_dedup": ("alert_dedup", "critical_dedup", "dev"),
-    "recovery": ("recovery", "recovery", "none"),
+    # Recovery mail goes to the same dev recipient as critical mail.
+    "recovery": ("recovery", "recovery", "dev"),
 }
+
+# Truthful flag for branches that never reach the mailer (deploy gate,
+# metadata previews, lock-busy/error accounting, coverage-only observations).
+# Counted alert decisions claim nothing about mail here: each frame is emitted
+# before the single dedupe/SMTP action it precedes, so no flag may assert a
+# mail outcome.
+_NO_MAIL_FLAGS = {"no_mail": True}
 
 
 def _observer_emit(observer, phase, **fields):
-    """Best-effort emit against a trusted injected observer. Observation
-    failure makes the occurrence evidence unknown (the failed observer is
-    marked dirty); it never gates, suppresses or retries the business/mail
-    action, and it never yields a healthy or complete claim."""
+    """Best-effort emit against a trusted injected observer. A raising emit or
+    any non-True acknowledgement is observation failure: the observer is
+    marked failed and the occurrence evidence stays unknown. This never gates,
+    suppresses or retries the business/mail action, and never yields a healthy
+    or complete claim."""
     if observer is None:
         return
     try:
-        observer.emit(phase, **fields)
+        acked = observer.emit(phase, **fields)
     except Exception:
+        acked = False
+    if acked is not True:
         try:
             observer.fail()
         except Exception:
@@ -4043,32 +4054,35 @@ class _CanaryAttempt:
     def decided(self):
         return self._decision is not None
 
-    def decision(self, decision, condition, recipient_class="none"):
+    def decision(self, decision, condition, recipient_class="none", flags=None):
         if self._observer is None or self._decision is not None:
             return
         self._decision = (decision, condition)
         _observer_emit(self._observer, "decision", decision=decision,
-                       condition=condition, recipient_class=recipient_class)
+                       condition=condition, recipient_class=recipient_class,
+                       flags=dict(flags) if flags else {})
 
 
 def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, _attempt=None):
     """Bounded occurrence hook for the finite Hub dev@ occurrence counter
     (invoked before dedup/SMTP on alert decisions: critical/critical_dedup/
     recovery map to the counted decisions alert/alert_dedup/recovery with the
-    fixed condition literals critical/critical_dedup/recovery, while
-    pass/recovering/failure_below_threshold emit coverage-only observation
-    decisions that never count). The attempt is a private trusted-caller
-    injection (_managed_observer -> main -> apply_alerting); unmanaged runs
-    stay observation-silent with their existing behavior, and this hook claims
+    fixed condition literals critical/critical_dedup/recovery and the truthful
+    dev recipient (all canary mail, including recovery, goes to the fixed dev
+    address), while pass/recovering/failure_below_threshold emit
+    coverage-only observation decisions that never count and carry the
+    no_mail flag). The attempt is a private trusted-caller injection
+    (_managed_observer -> main -> apply_alerting); unmanaged runs stay
+    observation-silent with their existing behavior, and this hook claims
     no authority of its own."""
     _ = (sdir, result, state)
     if _attempt is None:
         return
     counted = CANARY_ALERT_DECISIONS.get(decision)
     if counted is not None:
-        _attempt.decision(*counted)
+        _attempt.decision(counted[0], counted[1], recipient_class=counted[2])
     else:
-        _attempt.decision("observation", decision)
+        _attempt.decision("observation", decision, flags=_NO_MAIL_FLAGS)
 
 
 def apply_alerting(result, *, _attempt=None):
@@ -4085,7 +4099,7 @@ def _apply_alerting_locked(result, attempt):
         st = load_state(path)
         mode = result["mode"]
         if not result["ok"] and result.get("stage") == "lock" and result.get("reason") == "deploy_gate_lock_busy":
-            attempt.decision("observation", "lock_busy")
+            attempt.decision("observation", "lock_busy", flags=_NO_MAIL_FLAGS)
             st["last_lock_busy"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
             save_state(path, st)
             return
@@ -4138,9 +4152,11 @@ def main(argv=None, *, _managed_observer=None):
     pattern as the quota publisher): natural invocations pass no observer and
     keep the legacy unmanaged defaults; no observer is ever derived from the
     environment, files or CLI flags here. One injected observer spans exactly
-    one canary attempt: begin at business entry, exactly one decision (the
-    alerting branch decision, or a fixed deploy_gate/lock_busy/error
-    observation on no-mail branches), terminal at exit."""
+    one canary attempt: begin right after argument parsing, exactly one
+    decision (the alerting branch decision, or a fixed deploy_gate/lock_busy/
+    metadata_only/error observation on no-mail branches), terminal at exit —
+    covering the read-only metadata previews too. Argparse usage failures exit
+    before any frame: no attempt ever began, so nothing needs a terminal."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("shell", "full"), default=None)
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
@@ -4153,42 +4169,44 @@ def main(argv=None, *, _managed_observer=None):
     p.add_argument("--physical-admission-check", action="store_true",
                    help="read-only preview of the physical admission (no quota, no start, no state); never authorizes a start")
     args = p.parse_args(argv)
-    if args.physical_admission_check:
-        if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha
-                or args.candidate_cli_sha256 or args.candidate_updater_sha256
-                or args.run_token or args.helper_sha256):
-            p.error("--physical-admission-check takes no other option")
-        result = physical_admission_check()
-        print(json.dumps(result, sort_keys=True), flush=True)
-        return 0 if result["ok"] else 1
-    if args.print_helper_sha256:
-        print(compute_helper_sha256())
-        return 0
-    bound_args = (
-        args.candidate_sha,
-        args.candidate_cli_sha256,
-        args.candidate_updater_sha256,
-        args.run_token,
-        args.helper_sha256,
-    )
-    if any(v is not None for v in bound_args):
-        if not args.deploy_gate or not all(v is not None for v in bound_args):
-            p.error("--candidate-sha, --candidate-cli-sha256, --candidate-updater-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
-        if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
-            p.error("--candidate-sha must be a 40-character lowercase hex SHA")
-        if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_cli_sha256):
-            p.error("--candidate-cli-sha256 must be a 64-character lowercase hex SHA-256")
-        if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_updater_sha256):
-            p.error("--candidate-updater-sha256 must be a 64-character lowercase hex SHA-256")
-        if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
-            p.error("--run-token must be a 32..64-character lowercase hex token")
-        if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
-            p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
-    mode = args.mode or "full"
-    run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
     attempt = _CanaryAttempt(_managed_observer)
-    _observer_emit(_managed_observer, "begin")
+    _observer_emit(_managed_observer, "begin", recipient_class="none")
     try:
+        if args.physical_admission_check:
+            if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha
+                    or args.candidate_cli_sha256 or args.candidate_updater_sha256
+                    or args.run_token or args.helper_sha256):
+                p.error("--physical-admission-check takes no other option")
+            result = physical_admission_check()
+            attempt.decision("observation", "metadata_only", flags=_NO_MAIL_FLAGS)
+            print(json.dumps(result, sort_keys=True), flush=True)
+            return 0 if result["ok"] else 1
+        if args.print_helper_sha256:
+            attempt.decision("observation", "metadata_only", flags=_NO_MAIL_FLAGS)
+            print(compute_helper_sha256())
+            return 0
+        bound_args = (
+            args.candidate_sha,
+            args.candidate_cli_sha256,
+            args.candidate_updater_sha256,
+            args.run_token,
+            args.helper_sha256,
+        )
+        if any(v is not None for v in bound_args):
+            if not args.deploy_gate or not all(v is not None for v in bound_args):
+                p.error("--candidate-sha, --candidate-cli-sha256, --candidate-updater-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
+            if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
+                p.error("--candidate-sha must be a 40-character lowercase hex SHA")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_cli_sha256):
+                p.error("--candidate-cli-sha256 must be a 64-character lowercase hex SHA-256")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_updater_sha256):
+                p.error("--candidate-updater-sha256 must be a 64-character lowercase hex SHA-256")
+            if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
+                p.error("--run-token must be a 32..64-character lowercase hex token")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
+                p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
+        mode = args.mode or "full"
+        run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
         result = Canary(
             mode,
             run_id,
@@ -4201,7 +4219,7 @@ def main(argv=None, *, _managed_observer=None):
         ).execute()
         if args.deploy_gate:
             result["deploy_gate"] = True
-            attempt.decision("observation", "deploy_gate")
+            attempt.decision("observation", "deploy_gate", flags=_NO_MAIL_FLAGS)
         else:
             try:
                 apply_alerting(result, _attempt=attempt)
@@ -4219,19 +4237,27 @@ def main(argv=None, *, _managed_observer=None):
             print(line, file=sys.stderr, flush=True)
         return 0 if result["ok"] else 1
     finally:
-        # Exactly one decision per attempt: a run that crashed or errored
-        # before any branch decision keeps the sequence well-formed with a
-        # coverage-only error observation that claims no mail and counts no
-        # occurrence.
+        # Exactly one decision per attempt: a run that crashed, errored or was
+        # rejected before any branch decision keeps the sequence well-formed
+        # with a coverage-only error observation that claims no mail and
+        # counts no occurrence.
         if not attempt.decided:
-            attempt.decision("observation", "error")
+            attempt.decision("observation", "error", flags=_NO_MAIL_FLAGS)
         if _managed_observer is not None and sys.exc_info()[0] is not None:
+            # An active business/control exception keeps priority: terminal
+            # observation failure (a raise or a non-True ACK) must never mask
+            # or replace it, but still marks the evidence failed.
             try:
-                _managed_observer.emit("terminal")
+                acked = _managed_observer.emit("terminal", recipient_class="none")
             except BaseException:
-                pass  # Preserve the original managed business/control exception.
+                acked = False
+            if acked is not True:
+                try:
+                    _managed_observer.fail()
+                except BaseException:
+                    pass
         else:
-            _observer_emit(_managed_observer, "terminal")
+            _observer_emit(_managed_observer, "terminal", recipient_class="none")
 
 
 if __name__ == "__main__":

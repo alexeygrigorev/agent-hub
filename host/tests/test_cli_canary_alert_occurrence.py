@@ -4,20 +4,24 @@ _CanaryAttempt/apply_alerting, replacing the record_dev_alert_occurrence
 no-op).
 
 The managed observer authority is always a clearly simulated in-process
-stand-in (SimulatedObserver / RaisingObserver / NegativeAckObserver below)
-implementing the bounded observer contract emit(phase, **fields) -> bool plus
-fail()/dirty. No real broker, identity, provider, Hub instance or SMTP is ever
-contacted: mail renders to an owned sink and canary state lives in an owned
-temp HUB_CANARY_STATE_DIR.
+stand-in (SimulatedObserver / RaisingObserver / NegativeAckObserver /
+NoneAckObserver below) implementing the bounded observer contract
+emit(phase, **fields) -> bool plus fail()/dirty. Negative ACKs do NOT
+self-mark: the source under test must call fail() on any non-True
+acknowledgement itself. No real broker, identity, provider, Hub instance or
+SMTP is ever contacted: mail renders to an owned sink and canary state lives
+in an owned temp HUB_CANARY_STATE_DIR.
 
-Emitted decision vocabulary is validated against the REAL existing producer
-contract in scripts/hub_alert_client.py (imported stdlib-only, never
-connected): decision must be one of ram.DECISIONS (only alert/alert_dedup/
-recovery increment occurrences; observation is coverage-only), condition must
-be one of the fixed CONDITIONS literals, recipient_class is dev/none. The
-attempt lifecycle follows the alert authority's canary rule: begin, exactly
-one decision, terminal per run. Natural (unmanaged) invocations are covered to
-stay observation-silent.
+Every recorded event is additionally rebuilt as a full API-v1 frame and
+validated with the REAL maintained producer validator
+scripts/hub_alert_client.checked (imported stdlib-only, never connected):
+exact frame shape, closed CONDITIONS/FLAGS vocabulary, bool flag values,
+dev/none recipient_class, seq bounds, begin/terminal carrying no decision.
+Counted decisions (alert/alert_dedup/recovery) increment occurrences,
+observation never does. The attempt lifecycle follows the alert authority's
+canary rule: begin, exactly one decision, terminal per run; no-mail branches
+carry the truthful no_mail flag and never pretend mail happened. Natural
+(unmanaged) invocations are covered to stay observation-silent.
 
 Run: scripts/capped-test-run.sh -- scripts/with-temp-home.sh -- python3 -m unittest host.tests.test_cli_canary_alert_occurrence
 """
@@ -60,18 +64,35 @@ class SimulatedObserver:
     def decision_events(self):
         return [e for e in self.events if e["phase"] == "decision"]
 
+    def api_frames(self):
+        """Rebuild every recorded event as the exact API-v1 frame the
+        maintained producer client would put on the wire (simulated 32-hex
+        invocation identity, role canary, one seq per frame, clean
+        observer_ok)."""
+        return [dict(v=1, invocation_id="0" * 32, parent_id=None, role="canary",
+                     phase=event["phase"], seq=index,
+                     decision=event.get("decision"), condition=event.get("condition"),
+                     flags=event.get("flags", {}), recipient_class=event["recipient_class"],
+                     observer_ok=True)
+                for index, event in enumerate(self.events)]
+
     def assert_valid_contract(self, testcase):
-        """Every recorded decision must satisfy the real producer contract:
-        counted decisions (alert/alert_dedup/recovery) increment occurrences,
-        observation never does; conditions are fixed literals."""
+        """Every recorded event must pass the REAL maintained producer frame
+        validator (alert_client.checked: exact shape, closed vocabulary, bool
+        flags, dev/none recipient, seq bounds, begin/terminal with no
+        decision); counted decisions increment occurrences, observation never
+        does, and no-mail branches claim no mail."""
+        for frame in self.api_frames():
+            alert_client.checked(frame)
         for event in self.events:
-            testcase.assertIn(event["phase"], ("begin", "decision", "terminal"))
             if event["phase"] != "decision":
-                testcase.assertEqual(set(event), {"phase"})
                 continue
-            testcase.assertIn(event["decision"], alert_client.ram.DECISIONS)
-            testcase.assertIn(event["condition"], alert_client.CONDITIONS)
-            testcase.assertIn(event["recipient_class"], ("dev", "none"))
+            testcase.assertEqual(alert_client.ram.DECISIONS[event["decision"]],
+                                 event["decision"] != "observation")
+            if event["decision"] == "observation":
+                testcase.assertEqual(event["flags"], {"no_mail": True})
+            else:
+                testcase.assertEqual(event["flags"], {})
 
 
 class RaisingObserver(SimulatedObserver):
@@ -86,12 +107,22 @@ class RaisingObserver(SimulatedObserver):
 
 
 class NegativeAckObserver(SimulatedObserver):
-    """Simulated observer that answers every emit with a negative ACK."""
+    """Simulated observer that answers every emit with a negative ACK and
+    deliberately does NOT mark itself: the source under test must notice the
+    non-True acknowledgement and call fail() itself."""
 
     def emit(self, phase, **fields):
         self.events.append({"phase": phase, "negative_ack": True, **fields})
-        self.fail()
         return False
+
+
+class NoneAckObserver(SimulatedObserver):
+    """Simulated observer returning a malformed (None) acknowledgement; like a
+    negative ACK this must make the source mark the evidence failed."""
+
+    def emit(self, phase, **fields):
+        self.events.append({"phase": phase, **fields})
+        return None
 
 
 class OccurrenceObserverTest(unittest.TestCase):
@@ -197,6 +228,9 @@ class OccurrenceObserverTest(unittest.TestCase):
         self.run_main(["--mode", "shell"], recover_obs,
                       verdict(ok=True, stage="capture", reason="canary-ok", run_id="run-000002"))
         self.assertEqual(recover_obs.decisions(), ["observation", "recovery"])
+        recovery_decision = recover_obs.decision_events()[1]
+        self.assertEqual(recovery_decision["recipient_class"], "dev")  # recovery mails to dev
+        self.assertEqual(recovery_decision["flags"], {})  # emitted before the single mail action
         mails = self.mails()
         self.assertEqual(len(mails), 2)
         self.assertIn("[RECOVERED]", mails[1])
@@ -229,7 +263,7 @@ class OccurrenceObserverTest(unittest.TestCase):
         for decision, counted, condition, recipient in (
             ("critical", "alert", "critical", "dev"),
             ("critical_dedup", "alert_dedup", "critical_dedup", "dev"),
-            ("recovery", "recovery", "recovery", "none"),
+            ("recovery", "recovery", "recovery", "dev"),  # recovery mail also goes to dev
             ("pass", "observation", "pass", "none"),
             ("recovering", "observation", "recovering", "none"),
             ("failure_below_threshold", "observation", "failure_below_threshold", "none"),
@@ -238,8 +272,13 @@ class OccurrenceObserverTest(unittest.TestCase):
             attempt = canary._CanaryAttempt(obs)
             canary.record_dev_alert_occurrence(self.tmp, "shell", verdict(), {}, decision=decision, _attempt=attempt)
             self.assertEqual(obs.decisions(), [counted], decision)
-            self.assertEqual(obs.decision_events()[0]["condition"], condition)
-            self.assertEqual(obs.decision_events()[0]["recipient_class"], recipient)
+            event = obs.decision_events()[0]
+            self.assertEqual(event["condition"], condition)
+            self.assertEqual(event["recipient_class"], recipient)
+            # Counted decisions claim nothing about mail; observation branches
+            # truthfully carry no_mail (this hook never mails).
+            self.assertEqual(event["flags"],
+                             {} if counted != "observation" else {"no_mail": True})
             self.assertEqual(alert_client.ram.DECISIONS[counted], counted in ("alert", "alert_dedup", "recovery"))
             obs.assert_valid_contract(self)
 
@@ -272,12 +311,29 @@ class OccurrenceObserverTest(unittest.TestCase):
         self.assertEqual(len(self.mails()), 1)
         self.assertTrue(self.state()["incident_open"])
 
-    def test_negative_ack_observer_never_gates_mail(self):
+    def test_negative_ack_observer_is_failed_by_source_and_mail_still_once(self):
+        # The double answers False WITHOUT self-marking; the source itself
+        # must call fail() on the non-True acknowledgement (evidence unknown),
+        # and the original mail action still happens exactly once.
         self.seed_failures(canary.FAIL_THRESHOLD - 1)
         obs = NegativeAckObserver()
         self.run_main(["--mode", "shell"], obs)
+        self.assertTrue(obs.dirty)  # marked by the source, not by the double
+        self.assertEqual([e["phase"] for e in obs.events],
+                         ["begin", "decision", "terminal"])
+        self.assertEqual(obs.decisions(), ["alert"])
         self.assertEqual(len(self.mails()), 1)
         self.assertTrue(self.state()["incident_open"])
+        obs.assert_valid_contract(self)
+
+    def test_malformed_none_ack_is_treated_like_observation_failure(self):
+        self.seed_failures(canary.FAIL_THRESHOLD - 1)
+        obs = NoneAckObserver()
+        self.run_main(["--mode", "shell"], obs)
+        self.assertTrue(obs.dirty)
+        self.assertEqual(len(self.mails()), 1)
+        self.assertTrue(self.state()["incident_open"])
+        obs.assert_valid_contract(self)
 
     # -- no-mail/deploy-gate/metadata/lock/error paths
 
@@ -290,6 +346,7 @@ class OccurrenceObserverTest(unittest.TestCase):
         self.assertEqual(obs.decision_events()[0]["decision"], "observation")
         self.assertEqual(obs.decision_events()[0]["condition"], "deploy_gate")
         self.assertEqual(obs.decision_events()[0]["recipient_class"], "none")
+        self.assertEqual(obs.decision_events()[0]["flags"], {"no_mail": True})
         obs.assert_valid_contract(self)
         self.assertEqual(self.mails(), [])
 
@@ -299,10 +356,56 @@ class OccurrenceObserverTest(unittest.TestCase):
                               _attempt=canary._CanaryAttempt(obs))
         self.assertEqual(obs.decision_events()[0]["decision"], "observation")
         self.assertEqual(obs.decision_events()[0]["condition"], "lock_busy")
+        self.assertEqual(obs.decision_events()[0]["flags"], {"no_mail": True})
         obs.assert_valid_contract(self)
         self.assertEqual(self.mails(), [])
         self.assertEqual(self.state()["last_lock_busy"]["reason"], "deploy_gate_lock_busy")
         self.assertEqual(self.state()["last_lock_busy"]["run_id"], "run-000000")
+
+    def test_metadata_previews_emit_metadata_only_without_mail(self):
+        # The read-only previews (--physical-admission-check,
+        # --print-helper-sha256) run inside the attempt lifecycle: begin,
+        # one metadata_only observation, terminal. No mail, no occurrence,
+        # verdict/exit codes unchanged.
+        cases = (
+            (["--physical-admission-check"],
+             mock.patch.object(canary, "physical_admission_check",
+                               return_value={"ok": False, "stage": "admission",
+                                             "reason": "simulated-preview"}),
+             1),
+            (["--physical-admission-check"],
+             mock.patch.object(canary, "physical_admission_check",
+                               return_value={"ok": True}),  # simulated verdict fixture
+             0),
+            (["--print-helper-sha256"],
+             mock.patch.object(canary, "compute_helper_sha256", return_value="0" * 64),
+             0),
+        )
+        for argv, patcher, expected_code in cases:
+            with patcher:
+                obs = SimulatedObserver()
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    code = canary.main(list(argv), _managed_observer=obs)
+                self.assertEqual(code, expected_code, argv)
+                self.assertTrue(out.getvalue().strip(), argv)
+            self.assertEqual([e["phase"] for e in obs.events],
+                             ["begin", "decision", "terminal"], argv)
+            decision = obs.decision_events()[0]
+            self.assertEqual(decision["decision"], "observation", argv)
+            self.assertEqual(decision["condition"], "metadata_only", argv)
+            self.assertEqual(decision["recipient_class"], "none", argv)
+            self.assertEqual(decision["flags"], {"no_mail": True}, argv)
+            obs.assert_valid_contract(self)
+            self.assertEqual(self.mails(), [], argv)
+            self.assertEqual(self.state(), {}, argv)  # previews write no canary state
+
+    def test_unmanaged_metadata_preview_stays_observation_silent(self):
+        with mock.patch.object(canary, "compute_helper_sha256", return_value="a" * 64):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = canary.main(["--print-helper-sha256"])
+        self.assertEqual(code, 0)
+        self.assertIn("a" * 64, out.getvalue())
+        self.assertEqual(self.mails(), [])
 
     def test_alert_state_lock_error_records_error_observation_and_typed_result(self):
         obs = SimulatedObserver()
