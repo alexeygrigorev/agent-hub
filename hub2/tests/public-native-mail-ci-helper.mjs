@@ -68,6 +68,33 @@ export function decodeSupervision(raw) {
     const bytes=Buffer.from(value,'base64');need(bytes.length<=cap&&bytes.toString('base64')===value,'supervisor_capture_cap');return bytes;};
   return {stdout:decode(r.stdout_b64,65536),stderr:decode(r.stderr_b64,16384),proof:p};
 }
+const SCENARIO_PHASES=new Set(['prepare','public_seed','first_receiver','first_cli_and_effect',
+  'real_reconnect_uncertainty','later_cli','later_server_delivery','later_actual_receipt']);
+const SCENARIO_REASONS=new Set(['composition_deadline','operation_deadline','expected_event_absent','source_changed',
+  'adapter_changed','adapter_factory_changed','literal_owned_origin_required','scratch_budget_exceeded',
+  'scratch_entry_limit','capture_byte_limit','actual_cli_failed','receiver_ended_before_event',
+  'actual_child_exit73_required','first_receipt_forbidden','actual_public_later_receipt_required',
+  'no_reexecution_clear_or_fabricated_receipt','child_failed','external_abort','composition_unqualified']);
+/** Public CI diagnostics contain fixed codes and verified supervision facts only. */
+export function failureMetadata(phase,value) {
+  need(['probe','scenario'].includes(phase),'diagnostic_phase');
+  const result={phase,closed:value.closed===true,supervisor_exit_code:Number.isInteger(value.exit_code)?value.exit_code:null,
+    supervisor_signal:['SIGINT','SIGTERM','SIGKILL'].includes(value.signal)?value.signal:null,supervision:null};
+  // Independently project the strict schema. Never publish raw stdout/stderr,
+  // exception strings, paths, IDs, environment, configuration or input.
+  try {result.supervision=decodeSupervision(JSON.stringify({schema:1,
+    stdout_b64:'',stderr_b64:'',supervision:value.supervision})).proof;}catch{}
+  if(phase==='probe'&&Buffer.isBuffer(value.stderr)&&value.stderr.length<=16384
+    &&value.stderr.toString('utf8').split('\n').some(line=>line==="ModuleNotFoundError: No module named 'websockets'"))
+    result.probe_failure='python_transport_missing';
+  if(phase==='scenario'&&Buffer.isBuffer(value.stdout)&&value.stdout.length<=65536){
+    try {const scenario=JSON.parse(value.stdout.toString('utf8'));
+      if(scenario.status==='FAILED_OR_UNKNOWN'&&SCENARIO_PHASES.has(scenario.phase)&&SCENARIO_REASONS.has(scenario.reason))
+        result.scenario_failure={status:'FAILED_OR_UNKNOWN',phase:scenario.phase,reason:scenario.reason};
+    }catch{}
+  }
+  return result;
+}
 export function runChild(executable,args,{cwd,env,input='',deadline,cap=65536,retain=()=>{},python,supervisor}, deps={}) {
   const launch=deps.spawn||spawn,now=deps.now||(()=>performance.now()),timer=deps.timer||setTimeout,clear=deps.clear||clearTimeout;
   need(now()<deadline&&isAbsolute(python)&&isAbsolute(supervisor),'child_deadline_or_supervisor');
@@ -81,7 +108,13 @@ export function runChild(executable,args,{cwd,env,input='',deadline,cap=65536,re
         if(!proof.owned_subtree_reaped||proof.unknown)error=new Error('owned_subtree_unknown');
         else if(!proof.capture_complete)error=new Error('capture_incomplete_unknown');
         else if(proof.residual_children)error=new Error('residual_child_cleanup_failed');
-        else if(!proof.success||proof.leader_exit_code!==0||proof.leader_status!==0)error??=new Error('child_failed');
+        else if(!proof.success||proof.leader_exit_code!==0||proof.leader_status!==0){
+          // Exit1 is the reviewed supervisor's normal failure result. A strict
+          // complete ECHILD receipt proves closure even when business failed.
+          // Preserve real transport/deadline faults and abnormal supervisor exit.
+          if(!error||(!fault&&!exitSignal&&exitCode===1&&error.message==='supervisor_failed_unknown'))
+            error=new Error('child_failed');
+        }
         value={stdout:out.toString('utf8'),stderr:err.toString('utf8'),closed:true,group_reaped:true};
       }catch{error=new Error('owned_subtree_unknown');}
       try{retain({stdout:out,stderr:err,closed,fault,exit_code:exitCode,signal:exitSignal,supervision:proof});}
@@ -125,6 +158,8 @@ export async function executeCi(root, env=process.env) {
     const retain=name=>value=>{
       for(const key of ['stdout','stderr'])fs.writeFileSync(join(own,name+'.'+key+'.private'),value[key],{mode:0o600,flag:'wx'});
       fs.writeFileSync(join(own,name+'.closure.private.json'),JSON.stringify({closed:value.closed,fault:value.fault,exit_code:value.exit_code,signal:value.signal,supervision:value.supervision})+'\n',{mode:0o600,flag:'wx'});
+      if(value.fault||value.exit_code!==0||value.signal||value.supervision?.success!==true)
+        console.error('[public-native-mail-ci] '+JSON.stringify(failureMetadata(name,value)));
     };
     const probe=await runChild(python,['-I','-B','-c',PROBE],{cwd:root,env:childEnv,deadline:Math.min(end,performance.now()+1500),cap:1024,retain:retain('probe'),python,supervisor});
     checkProbe(probe.stdout);
