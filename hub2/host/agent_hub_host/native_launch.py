@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import stat
 import sys
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -22,6 +23,7 @@ from .client import private_file
 from . import provider_home
 from . import claude_goal
 from . import resource_admission
+from .first_action_observation import FirstActionObserver
 from .provider_home import clean_provider_environment, native_environment, session_binding
 
 FIRST_ACTION_INSTRUCTION = (
@@ -518,45 +520,60 @@ def goal_prompt(prompt, workspace, task_id, first_action_path):
     return result
 
 
-def validate_first_action(fa_path, start_json, min_mtime):
+def first_action_proof(fa_path, start_json, min_mtime):
     """Artifact identity check against the launch start record; clone-proof.
 
     A genuine rich native whoami taken after start must show live mutation:
     active phase and live fields (updated_at_ms/last_activity_ms) after the
     record's created_at_ms. The wrapper start JSON itself — byte-identical,
     reformatted, or augmented — is rejected as a laundered clone.
+
+    Returns the artifact's own activity stamp (epoch ms) or None for unknown.
+    The file must be a regular, non-symlinked, same-owner file in a
+    non-symlinked directory, and nothing may be from the future.
     """
     try:
-        if not os.path.exists(fa_path):
-            return False
-        if os.path.getmtime(fa_path) < min_mtime - 5:
-            return False
-        with open(fa_path, 'rb') as stream:
+        parent = os.path.dirname(fa_path)
+        if stat.S_ISLNK(os.lstat(parent).st_mode):
+            return None
+        flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+        fd = os.open(fa_path, flags)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and info.st_uid != os.getuid()):
+                return None
+            now = time.time()
+            if info.st_mtime < min_mtime - 5 or info.st_mtime > now + 5:
+                return None
             raw = stream.read(262145)
         if len(raw) > 262144:
-            return False
+            return None
         data = json.loads(raw)
         if not isinstance(data, dict) or not REQUIRED_WHOAMI_FIELDS.issubset(data):
-            return False
+            return None
         if not isinstance(data.get("worker_pid"), int) or isinstance(data.get("worker_pid"), bool) or data["worker_pid"] <= 0:
-            return False
+            return None
         if data.get("phase") not in ("running", "working", "launching"):
-            return False
+            return None
         if data.get("id") != start_json.get("id") or data.get("tag") != start_json.get("tag"):
-            return False
+            return None
         if not same_workspace(data.get("workspace"), start_json.get("workspace")):
-            return False
+            return None
         if "parent_session" in start_json and data.get("parent_session") != start_json.get("parent_session"):
-            return False
+            return None
         created = start_json.get("created_at_ms")
         stamp = data.get("updated_at_ms", data.get("last_activity_ms"))
-        if type(created) is not int or type(stamp) is not int or stamp <= created:
-            return False
+        if type(created) is not int or type(stamp) is not int or stamp <= created or stamp > now * 1000 + 5000:
+            return None
         if set(start_json).issubset(set(data)) and all(data.get(key) == value for key, value in start_json.items()):
-            return False
-        return True
+            return None
+        return stamp
     except (OSError, ValueError, TypeError):
-        return False
+        return None
+
+
+def validate_first_action(fa_path, start_json, min_mtime):
+    return first_action_proof(fa_path, start_json, min_mtime) is not None
 
 
 def native_state_directory(state_dir=None):
@@ -755,6 +772,9 @@ class NativeLauncher:
         self.runner, self.journal = runner, journal
         self.native_binary = self.config.get("aplexer") or aplexer
         self.state_dir = self.config.get("aplexer_state_dir")
+        self._evidence_lock = threading.Lock()
+        # Late proof worker; its journal connection (if any) is thread-local.
+        self._first_action = FirstActionObserver(on_exit=lambda: self.journal.close_thread() if self.journal is not None else None)
 
     def native(self, *args, input=None, allow_failure=False, timeout=30, workspace=None, env_overrides=None, output_limit=262144):
         env = os.environ.copy()
@@ -1321,7 +1341,80 @@ class NativeLauncher:
         if goal_registration:
             receipt["goal_registration"] = goal_registration
         self.record_evidence(task_id, specification, receipt, start_json)
+        if (not receipt["first_action_verified"] and provider in FIRST_ACTION_PROVIDERS
+                and not specification.get("interactive")):
+            self.observe_first_action(task_id, specification, start_json, started, fa_path)
         return receipt
+
+    def observe_first_action(self, task_id, specification, start_json, started, fa_path):
+        """Arm the later, off-thread proof; never waits and never fails the start."""
+        try:
+            native_id = start_json["id"]
+            current = specification.get("first_action_current")
+            return self._first_action.watch(
+                task_id, native_id, started + specification["timeout_seconds"],
+                lambda: first_action_proof(str(fa_path), start_json, started),
+                (lambda: bool(current(native_id))) if current else (lambda: True),
+                lambda stamp: self.update_first_action_evidence(task_id, specification, start_json, stamp))
+        except Exception:
+            return False
+
+    def first_action_activity(self, native_id):
+        """Proven later activity (epoch ms) for heartbeat projection, or None."""
+        return self._first_action.activity(native_id)
+
+    def update_first_action_evidence(self, task_id, specification, start_json, stamp_ms):
+        """Latch first_action_validated_at once into the exact attempt's record.
+
+        True when finished (written, already latched, or definitively refused);
+        False only for a retryable write failure. Same-process writers are
+        serialised; replacement is atomic so readers never see a torn record.
+        """
+        path = Path(specification["workspace"]) / ".local" / f"launch-{task_id}.json"
+        with self._evidence_lock:
+            try:
+                fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                with os.fdopen(fd, 'rb') as stream:
+                    raw = stream.read(262145)
+                if len(raw) > 262144:
+                    return True
+                record = json.loads(raw)
+            except (OSError, ValueError):
+                return True  # Missing, symlinked or corrupt evidence is never rewritten.
+            if (not isinstance(record, dict) or record.get("task_id") != task_id
+                    or record.get("session_id") != start_json["id"] or record.get("tag") != "task-" + task_id
+                    or not same_workspace(record.get("workspace"), specification["workspace"])
+                    or record.get("created_at_ms") != start_json.get("created_at_ms")):
+                return True
+            for field in ("operation_id", "epoch"):
+                if field in record and record[field] != specification.get(field):
+                    return True
+            if record.get("first_action_validated_at") is not None:
+                return True
+            record["first_action_validated_at"] = min(stamp_ms / 1000, time.time())
+            try:
+                self._write_evidence(path, record)
+            except OSError:
+                return False
+            return True
+
+    @staticmethod
+    def _write_evidence(path, evidence):
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf8') as stream:
+                stream.write(json.dumps(evidence))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        private_file(path)
 
     def profile_command(self, task_id, specification, route, prompt):
         """Use the same local profile primitive as model-roulette, without shell parsing."""
@@ -1457,12 +1550,11 @@ class NativeLauncher:
                         "goal_registration": receipt.get("goal_registration"),
                         "task_output": specification.get("_task_output"),
                         "managed_exec_context": specification.get("_managed_exec_context")}
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-            with os.fdopen(fd, 'w', encoding='utf8') as stream:
-                stream.write(json.dumps(evidence))
-                stream.flush()
-                os.fsync(stream.fileno())
-            private_file(path)
+            for field in ("operation_id", "epoch"):
+                if specification.get(field) is not None:
+                    evidence[field] = specification[field]
+            with self._evidence_lock:
+                self._write_evidence(path, evidence)
         except OSError:
             import logging
             logging.getLogger(__name__).exception('Native launch evidence write failed task=%s', task_id)

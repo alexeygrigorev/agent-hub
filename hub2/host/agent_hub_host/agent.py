@@ -709,6 +709,7 @@ class Bridge:
             launch['attempt_label'] = self.attempt_label(session, operation, epoch)
             launch['before_native_dispatch'] = lambda: self.mark_native_dispatch(operation, session, epoch, launch)
             launch['native_identity_observed'] = lambda native_id: self.bind_dispatched_native(operation, session, epoch, native_id)
+            launch['first_action_current'] = lambda native_id: self.first_action_current(operation, session, epoch, native_id)
             with db:
                 changed = db.execute(
                     "UPDATE launches SET state='launching',runtime_deadline=?,native_dispatch_started=0 "
@@ -833,6 +834,14 @@ class Bridge:
         original-monotonic dispatch permit for the pre-runner freshness check."""
         return resource_admission.admit_dispatch(
             self, operation, session, epoch, (specification or {}).get('admission_caps'))
+
+    def first_action_current(self, operation, session, epoch, native_id):
+        """Exact live attempt for a late proof; runs on the observer thread only."""
+        db = self.journal.db
+        row = db.execute("SELECT 1 FROM launches WHERE operation_id=? AND session_id=? AND epoch=? AND native_id=? "
+                         "AND state IN ('launching','running')", (operation, session, epoch, native_id)).fetchone()
+        return bool(row) and not db.execute('SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?',
+                                            (session, epoch)).fetchone()
 
     def bind_dispatched_native(self, operation, session, epoch, native_id):
         with self.journal.db as db:
@@ -1637,6 +1646,12 @@ class Bridge:
                     phase = 'missing'
             activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
             if type(activity) is not int:activity=None
+            late=getattr(self.launcher,'first_action_activity',None)
+            if native_id and status is not None and phase not in ('missing','unknown','dead') and callable(late):
+                # Memory-only lookup of artifact-proven work; never a refresh-to-now.
+                proven=late(native_id)
+                if type(proven) is int and (activity is None or proven>activity):
+                    activity=proven
             exit_code=native_returncode((status or {}).get('exit') or {}) if phase=='exited' else None
             result.append({'session_id':row['session_id'],'native_id':native_id,'phase':phase,
                            'last_activity_at':activity,'exit_code':exit_code,
