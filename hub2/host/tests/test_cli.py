@@ -248,6 +248,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIsNone(Handler.calls[-1][2]["parent_intake_id"])
 
+    def test_serve_natural_startup_hook_runs_only_for_continuous_serve_and_never_gates(self):
+        save_config(self.config, {
+            "server": f"http://127.0.0.1:{self.server.server_port}",
+            "token": "synthetic-token",
+            "machine_id": "test-machine",
+            "roots": [self.temp.name],
+            "engines": ["shell"],
+        })
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host",
+                   side_effect=RuntimeError("no_helper")) as hook, \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--label", "l1")
+        self.assertEqual(code, 0)
+        hook.assert_called_once_with(["--config", str(self.config), "serve", "--label", "l1"])
+        bridge.return_value.serve.assert_called_once()
+
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host") as hook, \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--once")
+        self.assertEqual(code, 0)
+        hook.assert_not_called()
+        bridge.return_value.drain.assert_called_once()
+
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host") as hook, \
+             patch("agent_hub_host.quota_natural_startup.consume_natural_handoff",
+                   side_effect=RuntimeError("bad_fd")), \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--alert-handoff-fd", "9")
+        self.assertEqual(code, 0)
+        hook.assert_not_called()
+        bridge.return_value.serve.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
