@@ -56,17 +56,25 @@ def main(argv=None):
                                     help="Opt in to staged same-process quota dispatch (default OFF)")
     quota_dispatch_cmd.add_argument("--handoff-fd", type=int, default=None,
                                     help="Inherited Root-prepared descriptor manifest pipe FD")
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
     natural_donation = None
-    if args.command == "serve" and args.alert_handoff_fd is not None:
-        try:
-            from .quota_natural_startup import consume_natural_handoff
-            natural_donation = consume_natural_handoff(args.alert_handoff_fd)
-            # The receiver bound this stable name to the donated FD and our
-            # actual kernel image; child exec cannot depend on inherited FDs.
-            sys.executable = natural_donation.child_interpreter
-        except Exception:
-            pass  # Missing optional evidence never gates primary host startup.
+    if args.command == "serve":
+        if args.alert_handoff_fd is not None:
+            try:
+                from .quota_natural_startup import consume_natural_handoff
+                natural_donation = consume_natural_handoff(args.alert_handoff_fd)
+                # The receiver bound this stable name to the donated FD and our
+                # actual kernel image; child exec cannot depend on inherited FDs.
+                sys.executable = natural_donation.child_interpreter
+            except Exception:
+                pass  # Missing optional evidence never gates primary host startup.
+        elif not args.once:
+            try:
+                from .quota_natural_exec import maybe_exec_natural_host
+                maybe_exec_natural_host(raw_argv)
+            except Exception:
+                pass  # Missing optional helper/donation never gates primary host startup.
     if args.command == "self-update" and os.name == "nt":
         from .windows_host import windows_self_update
         try:
