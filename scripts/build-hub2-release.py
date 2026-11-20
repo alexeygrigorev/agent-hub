@@ -9,10 +9,11 @@ import hashlib
 import importlib.util
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import runpy
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -27,6 +28,14 @@ CLI_INSTALLERS = ('install.sh', 'install.ps1')
 WINDOWS_HOST_INSTALLER = 'host-install.ps1'
 WINDOWS_READER_CLOSURE = ('private_fs.py', 'win32_fs.py')
 WINDOWS_ARTIFACT_ABI = 'hub2-windows-credential-artifacts-v1'
+NATURAL_ARCHIVE = 'agent-hub-quota-dispatcher.pyz'
+NATURAL_PAYLOADS = ('hub-quota-publish.py', 'hub_alert_client.py', 'natural-quota-prelude.py')
+NATURAL_HOST_CLOSURE = (
+    '__init__.py', 'alert_authority.py', 'alert_broker.py', 'alert_collector.py',
+    'quota_dispatch.py', 'quota_dispatch_manager.py', 'quota_dispatch_entry.py',
+    'quota_natural_primary.py', 'quota_natural_resources.py', 'quota_natural_startup.py',
+    'agent.py', 'cli.py', 'transport.py', '_release.py',
+)
 MAX_MANIFEST = 128 * 1024
 
 
@@ -72,6 +81,9 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     # Releases built before the Windows host installer stay valid rollback targets.
     if WINDOWS_HOST_INSTALLER in records:
         expected_files.add(WINDOWS_HOST_INSTALLER)
+    # Retained pre-natural-archive releases remain valid rollback targets.
+    if NATURAL_ARCHIVE in records:
+        expected_files.add(NATURAL_ARCHIVE)
     if records.keys() != expected_files or {path.name for path in directory.iterdir()} != expected_files | {'host-release.json'}:
         raise ValueError('release directory has missing or unexpected files')
     for name, record in records.items():
@@ -95,7 +107,72 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     expected = f'HOST_VERSION = {expected_commit!r}\nPROTOCOL_VERSION = {manifest["protocol_version"]}\n'
     if wheel_marker != expected:
         raise ValueError('host wheel does not match the deployment commit and protocol')
+    if NATURAL_ARCHIVE in records:
+        verify_natural_archive(directory / NATURAL_ARCHIVE, expected_commit, expected, records, wheel)
     return manifest
+
+
+def verify_natural_archive(archive_path, expected_commit, expected_release_marker, records, wheel_name):
+    """Verify inert natural Host archive without executing it or trusting internal hashes alone."""
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        names = [entry.filename for entry in entries]
+        if len(entries) > 512 or len(set(names)) != len(names):
+            raise ValueError('natural archive member ambiguity')
+        actual_hashes = {}
+        for entry in entries:
+            name = entry.filename
+            path = PurePosixPath(name)
+            if (path.is_absolute() or '..' in path.parts or '\\' in name
+                    or name.rstrip('/') != str(path)
+                    or any(ord(char) < 32 for char in name)
+                    or stat.S_ISLNK(entry.external_attr >> 16)):
+                raise ValueError('unsafe natural archive member')
+            if entry.is_dir():
+                continue
+            if not 0 < entry.file_size <= 1024 * 1024:
+                raise ValueError('natural archive member size')
+            actual_hashes[name] = hashlib.sha256(archive.read(entry)).hexdigest()
+        if 'MANIFEST.json' not in actual_hashes or '__main__.py' not in actual_hashes:
+            raise ValueError('natural archive missing manifest or entrypoint')
+        inner = json.loads(archive.read('MANIFEST.json').decode('utf-8'))
+        if (not isinstance(inner, dict) or inner.get('v') != 1
+                or inner.get('entry') != 'agent_hub_host.quota_dispatch_entry:main'
+                or not isinstance(inner.get('sources'), dict)
+                or not isinstance(inner.get('host_release'), dict)):
+            raise ValueError('invalid natural archive manifest')
+        sources = inner['sources']
+        expected_members = set(actual_hashes) - {'MANIFEST.json'}
+        if set(sources.keys()) != expected_members:
+            raise ValueError('natural archive manifest member mismatch')
+        for name, digest in sources.items():
+            if actual_hashes[name] != digest:
+                raise ValueError('natural archive member checksum mismatch: ' + name)
+        required = {'__main__.py', 'websockets/__init__.py', 'websockets/exceptions.py',
+                    'websockets/sync/client.py',
+                    *(f'agent_hub_host/{name}' for name in NATURAL_HOST_CLOSURE),
+                    *(f'natural/{name}' for name in NATURAL_PAYLOADS)}
+        if not required <= expected_members:
+            raise ValueError('natural archive lacks required closure')
+        host_release = inner['host_release']
+        if host_release.get('commit') != expected_commit:
+            raise ValueError('natural archive does not match the deployment commit')
+        if host_release.get('host_wheel_sha256') != records[wheel_name]['sha256']:
+            raise ValueError('natural archive host wheel binding mismatch')
+        if host_release.get('transport_wheel_sha256') != records['websockets-16.0-py3-none-any.whl']['sha256']:
+            raise ValueError('natural archive transport wheel binding mismatch')
+        payload_hashes = host_release.get('natural_payloads')
+        if (not isinstance(payload_hashes, dict)
+                or set(payload_hashes.keys()) != set(NATURAL_PAYLOADS)):
+            raise ValueError('natural archive payload provenance invalid')
+        for name in NATURAL_PAYLOADS:
+            if payload_hashes[name] != actual_hashes['natural/' + name]:
+                raise ValueError('natural archive payload checksum mismatch: ' + name)
+        if 'hub_alert_client.py' in records:
+            if actual_hashes['natural/hub_alert_client.py'] != records['hub_alert_client.py']['sha256']:
+                raise ValueError('natural archive alert client differs from bundle')
+        if archive.read('agent_hub_host/_release.py').decode('utf-8') != expected_release_marker:
+            raise ValueError('natural archive release marker mismatch')
 
 
 def run(args, **kwargs):
@@ -113,7 +190,7 @@ def export_source(repo, revision, target):
     archive = run(['git', '-C', str(repo), 'archive', sha, '--', 'hub2/host', 'host/agent_hub_host',
                    'config/model-routing.json', 'scripts/build-hub-cli.py',
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
-                   'scripts/hub_alert_client.py',
+                   'scripts/build-quota-dispatcher.py', *(f'scripts/{name}' for name in NATURAL_PAYLOADS),
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
                    'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'deploy/' + WINDOWS_HOST_INSTALLER, 'uv.lock',
                    *(f'public/cli/{name}' for name in CLI_INSTALLERS)])
@@ -194,6 +271,22 @@ def build(repo, revision, output):
         shutil.copyfile(source / 'deploy' / WINDOWS_HOST_INSTALLER, artifacts / WINDOWS_HOST_INSTALLER)
         for unit in UNITS:
             shutil.copyfile(source / 'deploy' / unit, artifacts / unit)
+        host_wheels = [path.name for path in artifacts.iterdir()
+                       if path.name.startswith('agent_hub_host_v2-') and path.name.endswith('.whl')]
+        if len(host_wheels) != 1:
+            raise ValueError('host wheel ambiguity during natural archive build')
+        disp_spec = importlib.util.spec_from_file_location(
+            'hub_quota_dispatcher_builder', source / 'scripts/build-quota-dispatcher.py')
+        dispatcher = importlib.util.module_from_spec(disp_spec)
+        disp_spec.loader.exec_module(dispatcher)
+        dispatcher.build_normal_host_archive(
+            artifacts / NATURAL_ARCHIVE,
+            host_wheel_path=artifacts / host_wheels[0],
+            transport_wheel_path=artifacts / 'websockets-16.0-py3-none-any.whl',
+            commit=sha,
+            uv_lock_bytes=(source / 'uv.lock').read_bytes(),
+            natural_sources={name: (source / 'scripts' / name).read_bytes() for name in NATURAL_PAYLOADS},
+        )
         files = {}
         for path in sorted(artifacts.iterdir()):
             files[path.name] = {'sha256': hashlib.sha256(path.read_bytes()).hexdigest(), 'size': path.stat().st_size}

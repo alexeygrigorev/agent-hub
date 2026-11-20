@@ -142,6 +142,53 @@ def _wheel_python(raw, package):
     return contents
 
 
+def _assemble_host_archive(output_path, host_bytes, transport_bytes, lock_bytes, natural_sources,
+                           *, host_release_provenance, manifest_out=None):
+    """Assemble and validate host/transport wheel closures and natural payloads without executing them."""
+    lock = tomllib.loads(lock_bytes.decode('utf-8'))
+    transport_name = 'websockets-16.0-py3-none-any.whl'
+    dependency = next(p for p in lock['package'] if p['name'] == 'websockets' and p['version'] == '16.0')
+    locked = [w for w in dependency['wheels'] if w['url'].endswith('/' + transport_name)]
+    if (len(locked) != 1 or locked[0]['hash'] != 'sha256:' + hashlib.sha256(transport_bytes).hexdigest()
+            or locked[0]['size'] != len(transport_bytes)):
+        raise ValueError('transport differs from committed lock')
+    contents = _wheel_python(host_bytes, 'agent_hub_host')
+    required = {f'agent_hub_host/{name}' for name in SOURCE_CLOSURE}
+    required.update('agent_hub_host/' + name for name in ('agent.py', 'cli.py', 'transport.py', '_release.py'))
+    if not required <= contents.keys():
+        raise ValueError('Host release lacks natural startup closure')
+    contents.update(_wheel_python(transport_bytes, 'websockets'))
+    if not {'websockets/exceptions.py', 'websockets/sync/client.py'} <= contents.keys():
+        raise ValueError('transport closure missing')
+    for name in NATURAL_PAYLOADS:
+        if name not in natural_sources:
+            raise ValueError('missing natural payload: ' + name)
+        contents['natural/' + name] = natural_sources[name]
+    return _write_archive(output_path, contents, manifest_out=manifest_out, host_release=host_release_provenance)
+
+
+def build_normal_host_archive(output_path, *, host_wheel_path, transport_wheel_path, commit,
+                              uv_lock_bytes, natural_sources, manifest_out=None):
+    """Assemble inert natural Host archive during normal CI build with honest input provenance."""
+    host_bytes = Path(host_wheel_path).read_bytes()
+    transport_bytes = Path(transport_wheel_path).read_bytes()
+    if len(host_bytes) > 16 * 1024 * 1024 or len(transport_bytes) > 16 * 1024 * 1024:
+        raise ValueError('release wheel exceeds size limit')
+    provenance = {
+        'commit': commit,
+        'host_wheel_sha256': hashlib.sha256(host_bytes).hexdigest(),
+        'transport_wheel_sha256': hashlib.sha256(transport_bytes).hexdigest(),
+        'natural_payloads': {
+            name: hashlib.sha256(natural_sources[name]).hexdigest()
+            for name in NATURAL_PAYLOADS
+        },
+    }
+    return _assemble_host_archive(
+        output_path, host_bytes, transport_bytes, uv_lock_bytes, natural_sources,
+        host_release_provenance=provenance, manifest_out=manifest_out,
+    )
+
+
 def build_host_archive(output_path, release_directory, commit, manifest_sha256, *, manifest_out=None):
     """Assemble existing verified normal artifacts; no user site or wheel exec."""
     spec = importlib.util.spec_from_file_location('quota_normal_release_verifier', RELEASE_VERIFIER)
@@ -157,26 +204,15 @@ def build_host_archive(output_path, release_directory, commit, manifest_sha256, 
     transport_name = 'websockets-16.0-py3-none-any.whl'
     host = _release_blob(directory, host_name, artifacts[host_name])
     transport = _release_blob(directory, transport_name, artifacts[transport_name])
-    lock = tomllib.loads(_committed(commit, 'uv.lock').decode('utf-8'))
-    dependency = next(p for p in lock['package'] if p['name'] == 'websockets' and p['version'] == '16.0')
-    locked = [w for w in dependency['wheels'] if w['url'].endswith('/' + transport_name)]
-    if (len(locked) != 1 or locked[0]['hash'] != 'sha256:' + hashlib.sha256(transport).hexdigest()
-            or locked[0]['size'] != len(transport)):
-        raise ValueError('transport differs from committed lock')
-    contents = _wheel_python(host, 'agent_hub_host')
-    required = {f'agent_hub_host/{name}' for name in SOURCE_CLOSURE}
-    required.update('agent_hub_host/' + name for name in ('agent.py', 'cli.py', 'transport.py', '_release.py'))
-    if not required <= contents.keys():
-        raise ValueError('Host release lacks natural startup closure')
-    contents.update(_wheel_python(transport, 'websockets'))
-    if not {'websockets/exceptions.py', 'websockets/sync/client.py'} <= contents.keys():
-        raise ValueError('transport closure missing')
-    contents.update({'natural/' + name: _committed(commit, 'scripts/' + name)
-                     for name in NATURAL_PAYLOADS})
+    lock_bytes = _committed(commit, 'uv.lock')
+    natural_sources = {name: _committed(commit, 'scripts/' + name) for name in NATURAL_PAYLOADS}
     provenance = {'commit': commit, 'manifest_sha256': manifest_sha256,
         'host_wheel_sha256': artifacts[host_name]['sha256'],
         'transport_wheel_sha256': artifacts[transport_name]['sha256']}
-    return _write_archive(output_path, contents, manifest_out=manifest_out, host_release=provenance)
+    return _assemble_host_archive(
+        output_path, host, transport, lock_bytes, natural_sources,
+        host_release_provenance=provenance, manifest_out=manifest_out,
+    )
 
 
 def main(argv=None):

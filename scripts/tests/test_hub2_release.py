@@ -3339,7 +3339,9 @@ class AlertClientPackagingTests(unittest.TestCase):
         names = ['hub2/host/pyproject.toml', 'host/agent_hub_host/__init__.py',
                  'config/model-routing.json', 'scripts/build-hub-cli.py',
                  'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py',
-                 'scripts/hub2-enroll.py', 'scripts/hub_alert_client.py', 'deploy/host-install.sh',
+                 'scripts/hub2-enroll.py', 'scripts/build-quota-dispatcher.py',
+                 'scripts/hub-quota-publish.py', 'scripts/hub_alert_client.py',
+                 'scripts/natural-quota-prelude.py', 'deploy/host-install.sh',
                  'deploy/' + builder.WINDOWS_HOST_INSTALLER, 'uv.lock',
                  *(f'deploy/{name}' for name in builder.UNITS),
                  *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]
@@ -3370,12 +3372,29 @@ class AlertClientPackagingTests(unittest.TestCase):
         repo = self.directory / 'build-repo'
         repo.mkdir()
         output = self.directory / 'built'
+        transport_bytes = b''
+        def _make_transport_wheel():
+            nonlocal transport_bytes
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, 'w') as wheel:
+                for rel in ('websockets/__init__.py', 'websockets/exceptions.py', 'websockets/sync/client.py'):
+                    wheel.writestr(rel, b'# synthetic websockets\n')
+            transport_bytes = buf.getvalue()
+            return hashlib.sha256(transport_bytes).hexdigest()
+        transport_sha = _make_transport_wheel()
         def export(_repo, _revision, target):
             files = {
                 'hub2/host/agent_hub_host/__init__.py': b'',
                 'hub2/host/pyproject.toml': b'[project]\nname = "agent_hub_host_v2"\nversion = "2.0.0"\n',
-                'uv.lock': b'[[package]]\nname = "websockets"\nversion = "16.0"\nwheels = [{url = "https://fixture.invalid/websockets-16.0-py3-none-any.whl", hash = "sha256:' + b'a'*64 + b'"}]\n',
+                'uv.lock': (
+                    '[[package]]\nname = "websockets"\nversion = "16.0"\n'
+                    'wheels = [{url = "https://fixture.invalid/websockets-16.0-py3-none-any.whl", '
+                    f'hash = "sha256:{transport_sha}", size = {len(transport_bytes)}}}]\n'
+                ).encode(),
                 'scripts/hub_alert_client.py': self.client,
+                'scripts/build-quota-dispatcher.py': (REPO / 'scripts/build-quota-dispatcher.py').read_bytes(),
+                'scripts/hub-quota-publish.py': (REPO / 'scripts/hub-quota-publish.py').read_bytes(),
+                'scripts/natural-quota-prelude.py': (REPO / 'scripts/natural-quota-prelude.py').read_bytes(),
             }
             # Match the real exported release closure; these source bytes are not executed.
             for name in ('private_fs.py', 'win32_fs.py'):
@@ -3411,9 +3430,12 @@ def build(out, version):
             artifacts = Path(args[args.index('--wheel-dir')+1] if 'wheel' in args else args[args.index('--dest')+1])
             if 'wheel' in args:
                 with zipfile.ZipFile(artifacts / HOST, 'w') as wheel:
-                    wheel.writestr('agent_hub_host/_release.py', f'HOST_VERSION = {SHA!r}\nPROTOCOL_VERSION = 1\n')
+                    for rel in builder.NATURAL_HOST_CLOSURE:
+                        data = (f'HOST_VERSION = {SHA!r}\nPROTOCOL_VERSION = 1\n' if rel == '_release.py'
+                                else '# synthetic host module\n')
+                        wheel.writestr('agent_hub_host/' + rel, data)
             else:
-                (artifacts / 'websockets-16.0-py3-none-any.whl').write_bytes(b'synthetic pinned transport fixture')
+                (artifacts / 'websockets-16.0-py3-none-any.whl').write_bytes(transport_bytes)
             return b''
         with patch.object(builder, 'export_source', side_effect=export), patch.object(builder, 'run', side_effect=build_command):
             manifest = builder.build(repo, SHA, output)
