@@ -169,6 +169,7 @@ class LateFirstAction:
         self._lock = threading.Lock()
         self._proofs = {}
         self._thread = None
+        self._cursor = ''
 
     @staticmethod
     def key(candidate):
@@ -189,12 +190,18 @@ class LateFirstAction:
         with self._lock:
             for key in [key for key in self._proofs if key not in live_keys]:
                 del self._proofs[key]
-            pending = [candidate for candidate in candidates if self.key(candidate) not in self._proofs
-                       or self._proofs[self.key(candidate)]['created_at_ms'] != candidate['created_at_ms']][:MAX_PASS]
+            unproven = sorted((candidate for candidate in candidates if self.key(candidate) not in self._proofs
+                               or self._proofs[self.key(candidate)]['created_at_ms'] != candidate['created_at_ms']),
+                              key=lambda candidate: repr(self.key(candidate)))
+            # Fair rotation: unknown launches (no artifact yet) must not starve
+            # later ones, so each pass resumes after the last candidate served.
+            after = [item for item in unproven if repr(self.key(item)) > self._cursor]
+            pending = (after + [item for item in unproven if item not in after])[:MAX_PASS]
             if not pending or (stop is not None and stop.is_set()):
                 return False
             if self._thread is not None and self._thread.is_alive():
                 return False
+            self._cursor = repr(self.key(pending[-1]))
             self._thread = threading.Thread(target=self._pass, args=(pending, stop),
                                             name='hub2-first-action', daemon=True)
             self._thread.start()

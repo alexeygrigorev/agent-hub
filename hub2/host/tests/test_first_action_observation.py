@@ -279,7 +279,43 @@ class PassTests(unittest.TestCase):
         with mock.patch.object(self.late, 'observe', observe):
             self.late.request(many, {self.late.key(c) for c in many})
             self.late._thread.join(5)
-        self.assertEqual(seen, [f's{i}' for i in range(fao.MAX_PASS)])
+        self.assertEqual(len(seen), fao.MAX_PASS)
+        self.assertIn('s0', seen)  # the failing one was attempted, the rest still ran
+
+    def run_passes(self, candidates, passes, seen):
+        for _ in range(passes):
+            self.late.request(candidates, {self.late.key(c) for c in candidates})
+            self.late._thread.join(5)
+
+    def test_unknown_candidates_beyond_the_cap_are_not_starved(self):
+        seen = []
+        self.late.observe = lambda candidate, stop=None: seen.append(candidate['session_id'])
+        many = [{**self.fixture.candidate, 'session_id': f's{i:02d}'} for i in range(40)]
+        self.run_passes(many, 3, seen)
+        self.assertEqual(set(seen), {c['session_id'] for c in many})  # every unknown seen within 3 passes
+        self.assertEqual(len(seen), 3 * fao.MAX_PASS)
+
+    def test_rotation_survives_membership_changes_and_pruning(self):
+        seen = []
+        self.late.observe = lambda candidate, stop=None: seen.append(candidate['session_id'])
+        many = [{**self.fixture.candidate, 'session_id': f's{i:02d}'} for i in range(20)]
+        self.run_passes(many, 1, seen)
+        served = set(seen)
+        shrunk = [c for c in many if c['session_id'] not in {'s05', 's16'}] + [
+            {**self.fixture.candidate, 'session_id': 's99'}]  # served members leave, a new one joins
+        seen.clear()
+        self.run_passes(shrunk, 2, seen)
+        self.assertEqual(set(seen) | served, {c['session_id'] for c in shrunk} | served)
+        self.assertIn('s99', seen)
+        self.assertTrue({c['session_id'] for c in shrunk} <= set(seen) | served)
+
+    def test_unknown_launches_do_not_starve_a_later_real_proof(self):
+        late_candidate = {**self.fixture.candidate}
+        self.fixture.write_artifact()
+        filler = [{**self.fixture.candidate, 'session_id': f'a{i:02d}'} for i in range(fao.MAX_PASS + 4)]
+        everyone = filler + [late_candidate]  # real session sorts after 16+ missing-evidence entries
+        self.run_passes(everyone, 3, [])
+        self.assertEqual(self.late.activity(late_candidate), STAMP)
 
     def test_retired_launches_are_pruned_from_the_latch(self):
         self.fixture.write_artifact = None
