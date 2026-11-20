@@ -35,10 +35,14 @@ class StubTransport:
             if 'status=failed' in path:
                 return {'items': [{'id': 'abc-1', 'project': 'o/r', 'title': 'T', 'status': 'failed'}], 'next': None}
             return {'items': [], 'next': None}
-        assert path == '/api/intakes/abc-1/context'
-        return {'task': {'owner': self.owner}, 'events': [
+        if path == '/api/intakes/abc-1/context':
+            return {'task': {'owner': self.owner}, 'events': [
+                {'seq': 7, 'kind': 'worker_append', 'body': {}},
+                {'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}]}
+        assert path == '/api/intakes/abc-1/history?after=0&limit=100', path
+        return {'events': [
             {'seq': 7, 'kind': 'worker_append', 'body': {}},
-            {'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}]}
+            {'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': None}
 
 
 class RecoveryAlertTest(unittest.TestCase):
@@ -575,6 +579,151 @@ class LoaderDescriptorCleanupTest(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(result.SYNTHETIC_CLIENT)
 
+
+class HistoryPagingTest(RecoveryAlertTest):
+    def test_mails_alert_older_than_50_context_events_once(self):
+        class OldAlertTransport(StubTransport):
+            def get(self, path):
+                if path == '/api/intakes/abc-1/context':
+                    self.paths.append(path)
+                    return {'task': {'owner': self.owner}, 'events': [
+                        {'seq': i, 'kind': 'worker_append', 'body': {}} for i in range(51, 101)]}
+                if path == '/api/intakes/abc-1/history?after=0&limit=100':
+                    self.paths.append(path)
+                    return {'events': [
+                        {'seq': 10, 'kind': 'developer_alert_raised', 'body': ALERT},
+                        {'seq': 51, 'kind': 'worker_append', 'body': {}}], 'next': None}
+                return super().get(path)
+
+        observer = HookRecorder()
+        self.assertEqual(poller.deliver(OldAlertTransport(), self.state, self.helper, observer=observer),
+                         {'sent': 1, 'errors': 0})
+        self.assertFalse(observer.dirty)
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:10'])
+        self.assertEqual(poller.deliver(OldAlertTransport(), self.state, self.helper), {'sent': 0, 'errors': 0})
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+
+    def test_multipages_history_and_marks_complete(self):
+        class MultiPageTransport(StubTransport):
+            def get(self, path):
+                if path == '/api/intakes/abc-1/history?after=0&limit=100':
+                    self.paths.append(path)
+                    return {'events': [
+                        {'seq': i, 'kind': 'worker_append', 'body': {}} for i in range(1, 101)], 'next': 100}
+                if path == '/api/intakes/abc-1/history?after=100&limit=100':
+                    self.paths.append(path)
+                    return {'events': [
+                        {'seq': 150, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': None}
+                return super().get(path)
+
+        observer = HookRecorder()
+        transport = MultiPageTransport()
+        self.assertEqual(poller.deliver(transport, self.state, self.helper, observer=observer),
+                         {'sent': 1, 'errors': 0})
+        self.assertFalse(observer.dirty)
+        self.assertIn('/api/intakes/abc-1/history?after=0&limit=100', transport.paths)
+        self.assertIn('/api/intakes/abc-1/history?after=100&limit=100', transport.paths)
+        self.assertIn('mailer_scan_complete', [f.get('condition') for f in observer.frames])
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:150'])
+
+    def test_malformed_nonprogress_and_page_cap_stay_dirty_and_unsuccessful(self):
+        bad_pages = [
+            ('missing_next', {'events': [{'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}]}),
+            ('bool_next', {'events': [{'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': True}),
+            ('str_next', {'events': [{'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': '9'}),
+            ('wrong_next', {'events': [{'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': 5}),
+            ('empty_with_next', {'events': [], 'next': 9}),
+            ('non_list_events', {'events': None, 'next': None}),
+            ('non_increasing_seq', {'events': [
+                {'seq': 9, 'kind': 'worker_append', 'body': {}},
+                {'seq': 9, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': None}),
+            ('seq_below_after', {'events': [{'seq': 0, 'kind': 'developer_alert_raised', 'body': ALERT}], 'next': None}),
+        ]
+        for label, payload in bad_pages:
+            with self.subTest(case=label):
+                class BadHistoryTransport(StubTransport):
+                    def get(self, path):
+                        if path.startswith('/api/intakes/abc-1/history?'):
+                            self.paths.append(path)
+                            return payload
+                        return super().get(path)
+
+                observer = HookRecorder()
+                result = poller.deliver(BadHistoryTransport(), self.state, self.helper, observer=observer)
+                self.assertEqual(result['errors'], 1)
+                self.assertEqual(result['sent'], 0)
+                self.assertTrue(observer.dirty)
+                conditions = [f.get('condition') for f in observer.frames]
+                self.assertIn('mailer_scan_incomplete', conditions)
+                self.assertNotIn('mailer_scan_complete', conditions)
+                self.assertNotIn('mailer_scan_empty', conditions)
+
+        class CapTransport(StubTransport):
+            def get(self, path):
+                if path == '/api/intakes/abc-1/history?after=0&limit=100':
+                    self.paths.append(path)
+                    return {'events': [{'seq': 1, 'kind': 'worker_append', 'body': {}}], 'next': 1}
+                if path == '/api/intakes/abc-1/history?after=1&limit=100':
+                    self.paths.append(path)
+                    return {'events': [{'seq': 2, 'kind': 'worker_append', 'body': {}}], 'next': 2}
+                return super().get(path)
+
+        observer = HookRecorder()
+        with patch.object(poller, 'MAX_HISTORY_PAGES', 2):
+            result = poller.deliver(CapTransport(), self.state, self.helper, observer=observer)
+        self.assertEqual(result, {'sent': 0, 'errors': 1})
+        self.assertTrue(observer.dirty)
+        self.assertIn('mailer_scan_incomplete', [f.get('condition') for f in observer.frames])
+
+    def test_earlier_helper_failure_then_later_success_retries_without_watermark(self):
+        class TwoAlertsTransport(StubTransport):
+            def get(self, path):
+                if path == '/api/intakes/abc-1/history?after=0&limit=100':
+                    self.paths.append(path)
+                    return {'events': [
+                        {'seq': 10, 'kind': 'developer_alert_raised', 'body': ALERT},
+                        {'seq': 12, 'kind': 'developer_alert_raised', 'body': dict(ALERT, session_id='s-4')}], 'next': None}
+                return super().get(path)
+
+        calls = []
+
+        def flaky_helper(argv, *, env, **kwargs):
+            calls.append(env['PING_ALERT_MESSAGE'])
+            if len(calls) == 1:
+                return types.SimpleNamespace(returncode=3)
+            with self.log.open('a') as stream:
+                stream.write(env['PRINCIPAL_ALERT_TO'] + '|' + env['PING_ALERT_MESSAGE'] + '\n')
+            return types.SimpleNamespace(returncode=0)
+
+        observer = HookRecorder()
+        with patch.object(poller.subprocess, 'run', side_effect=flaky_helper):
+            first = poller.deliver(TwoAlertsTransport(), self.state, self.helper, observer=observer)
+        self.assertEqual(first, {'sent': 1, 'errors': 1})
+        self.assertTrue(observer.dirty)
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:12'])
+
+        observer2 = HookRecorder()
+        second = poller.deliver(TwoAlertsTransport(), self.state, self.helper, observer=observer2)
+        self.assertEqual(second, {'sent': 1, 'errors': 0})
+        self.assertFalse(observer2.dirty)
+        self.assertEqual(json.loads(self.state.read_text())['sent'], ['abc-1:12', 'abc-1:10'])
+        self.assertEqual(len(self.log.read_text().splitlines()), 2)
+
+    def test_history_api_error_marks_dirty_and_preserves_host_alerts(self):
+        class HistoryErrorTransport(StubTransport):
+            def get(self, path):
+                if path.startswith('/api/intakes/abc-1/history?'):
+                    self.paths.append(path)
+                    raise OSError('history unavailable')
+                return super().get(path)
+
+        observer = HookRecorder()
+        result = poller.deliver(HistoryErrorTransport(machines=[HOST]), self.state, self.helper, observer=observer)
+        self.assertEqual(result, {'sent': 1, 'errors': 1})
+        self.assertTrue(observer.dirty)
+        conditions = [f.get('condition') for f in observer.frames]
+        self.assertIn('mailer_api_error', conditions)
+        self.assertIn('mailer_scan_incomplete', conditions)
 
 
 if __name__ == '__main__':
