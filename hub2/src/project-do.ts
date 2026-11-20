@@ -1615,7 +1615,7 @@ export class ProjectDO {
         if(route.acceptance_verification===true){
           const verdict=launchFailed?undefined:this.findVerificationVerdict(current,saga);
           completion=this.verificationOutcome(current,currentSaga,verdict,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-            :body.exit_code===0?'verifier_exit_without_verdict':'verifier_exit_'+String(body.exit_code),now);
+            :'verifier_exit_'+String(body.exit_code),now);
           // Hub's own gate decided: independent verification passed and, for
           // code work, the merge gate holds. The intake is accepted.
           status=completion.outcome==='claimed'?'accepted':'failed';
@@ -1686,7 +1686,7 @@ export class ProjectDO {
 
   /** Turn a verifier exit into one durable result: pass, explicit gaps to send
    * back to the worker, a bounded verifier retry, or a loud escalation. */
-  private verificationOutcome(intake:IntakeRow,saga:SagaRow,verdict:VerificationVerdict|undefined,reason:string,now:number):CompletionRecord{
+  private verificationOutcome(intake:IntakeRow,saga:SagaRow,verdict:VerificationVerdict|undefined,exitReason:string,now:number):CompletionRecord{
     const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
     const attempt=Number(route.verification_attempt),origin=String(route.verification_origin_session_id??'');
     const picker=(route.picker as JsonRecord|undefined)??{};
@@ -1703,6 +1703,16 @@ export class ProjectDO {
         gaps.push(...mergeGaps(gate));
       }
     }
+    // A pass exists only inside an explicit verdict record: the gate reads the
+    // verdict, never the process exit, so a verifier exit without a verdict is
+    // retried, then escalated — it can never accept the intake. The journaled
+    // reason names its basis (intake 95ded88d: the raw exit label was recorded
+    // even on verdict-backed passes, so 'task_acceptance_verified' carried
+    // reason 'verifier_exit_without_verdict' and verified work looked
+    // auto-accepted). A no-verdict exit 0 keeps that canonical name; the exit
+    // label itself is journaled separately as exit_reason.
+    const reason=verdict?'verifier_verdict_'+verdict.verdict+(mergeBlocked?'_merge_gate_blocked':'')
+      :exitReason==='verifier_exit_0'?'verifier_exit_without_verdict':exitReason;
     const explicit=verdict!==undefined;
     const round=typeof route.verification_round==='string'?route.verification_round:undefined;
     const criteria=this.parse(intake.acceptance_criteria_json);
@@ -1736,7 +1746,7 @@ export class ProjectDO {
     }
     this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
       passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
-      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,
+      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,exit_reason:exitReason,
         ...(missing?{cause:missing}:{}),...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
     return record;
   }
