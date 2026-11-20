@@ -183,6 +183,13 @@ def add_admission_diagnostic(result, failure):
         result["admission_diagnostic"] = {"category": "unavailable"}
 
 
+def is_young_resident_hold(failure):
+    """True only for an admission hold whose sole premise is a young resident without a finite cap."""
+    detail = failure.admission_diagnostic
+    return (failure.stage == "admission" and failure.reason == "resident_bound_unknown" and type(detail) is dict
+            and detail.get("age_class") == "young" and detail.get("cap_status") == "unavailable")
+
+
 class CanaryTerminated(BaseException):
     def __init__(self, signum, sig_name):
         super().__init__(f"terminated by {sig_name}")
@@ -2588,6 +2595,26 @@ class Canary(PhysicalAdmission):
         self.admission_time_left(deadline)
         self.physical_admit(deadline, workspace, worker_bytes, floor_gb)
 
+    def admit_past_young_holds(self, deadline):
+        """Fresh admission, repeated while the refusal is only a still-young resident without a finite cap.
+
+        That premise expires by itself: once the row is mature (>= MATURE_RESIDENT_AGE_S) and running it
+        reserves nothing extra (coordinator_reserve / resident_reserve). Every repeat is a complete fresh
+        admission inside the same bounded deadline; any other refusal ends at once, and when the deadline
+        runs out the last young-hold refusal (with its closed diagnostic) is the one reported.
+        """
+        held = None
+        while True:
+            try:
+                return self.admit(deadline)
+            except StageFailure as failure:
+                if held is not None and failure.reason == "admission_deadline_exceeded":
+                    raise held
+                if not is_young_resident_hold(failure) or time.monotonic() + self.poll >= deadline:
+                    raise
+                held = failure
+            self.pause(deadline)
+
     def admission_allows(self, deadline, workspace=None):
         """Replay-seam wrapper: True only when a fresh admission passes."""
         stage = self.current_stage
@@ -3355,7 +3382,7 @@ class Canary(PhysicalAdmission):
         self.current_stage = "admission"
         # Fresh admission before EVERY possible Hub START; refusal happens before
         # any pending state or session exists, so there is nothing to clean up.
-        self.admit(self.stage_deadline(ADMISSION_BUDGET_S))
+        self.admit_past_young_holds(self.stage_deadline(ADMISSION_BUDGET_S))
         self.current_stage = "start"
         ensure_private_dir(self.workspace, stage="start", prefix="workspace")
         self.started_at = time.monotonic()
