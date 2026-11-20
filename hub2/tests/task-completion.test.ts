@@ -1142,6 +1142,91 @@ test('a doubly wrapped verdict is read as written and an absent verdict fails lo
   }finally{f.close();}
 });
 
+// Intake 95ded88d (20 Nov 2026): the journal recorded task_acceptance_verified
+// with reason verifier_exit_without_verdict, so a verdict-backed pass was
+// indistinguishable from an auto-accept. A verifier exit without a verdict must
+// stay unfinished (retry, then escalate) and a verdict-backed pass must be
+// journaled by its verdict, never by its exit code.
+test('a verifier that exits without a verdict never passes: Hub retries, then escalates, and nothing closes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verifier-no-verdict',true);
+    await start(f,id,'first');const first=await run(f,id);await addMergeProof(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    // First verifier attempt: exits 0 having appended no verdict record.
+    const firstVerifier=await run(f,id);
+    await finish(f,firstVerifier,0);
+    const attempt1=events(f,id).find(e=>e.kind==='task_verifier_unfinished');
+    assert(attempt1,'the no-verdict exit is journaled as unfinished');
+    assert.equal(attempt1.body.verdict,'missing');
+    assert.equal(attempt1.body.reason,'verifier_exit_without_verdict');
+    assert.equal(attempt1.body.exit_reason,'verifier_exit_0');
+    assert(!events(f,id).some(e=>e.kind==='task_acceptance_verified'),'no pass without a verdict record');
+    assert.equal(intakeRow(f,id).status,'failed','the intake is not closed on a no-verdict exit');
+    assert.equal(completion(f,id).outcome,'unfinished');
+    assert.equal(completion(f,id).verification.state,'pending','Hub retries verification itself');
+    assert.match(completion(f,id).cause,/^verifier_exit_without_verdict: /);
+    // An operator cannot accept over the missing verification.
+    const acceptEarly=await f.call('/api/intakes/'+id,'PATCH',{key:'accept-early',status:'accepted'});
+    assert.equal(acceptEarly.status,409,JSON.stringify(await acceptEarly.clone().json()));
+    // Last verifier attempt also appends nothing: loud escalation, still no pass.
+    await f.project.alarm();
+    const lastVerifier=await run(f,id);
+    await finish(f,lastVerifier,0);
+    const attempt2=events(f,id).filter(e=>e.kind==='task_verifier_unfinished').at(-1);
+    assert.equal(attempt2.body.attempt,MAX_VERIFICATION_ATTEMPTS);
+    assert(!events(f,id).some(e=>e.kind==='task_acceptance_verified'),'still no pass');
+    assert.equal(intakeRow(f,id).status,'failed');
+    assert.equal(completion(f,id).verification.state,'escalated');
+    assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='verification_exhausted'),'the developer is alerted');
+    const acceptLate=await f.call('/api/intakes/'+id,'PATCH',{key:'accept-late',status:'accepted'});
+    assert.equal(acceptLate.status,409);
+  }finally{f.close();}
+});
+
+test('a verdict-backed pass is journaled by its verdict and a fail by its gap, never as an exit label',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verifier-verdict-reasons',true);
+    await start(f,id,'first');const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    // An explicit fail verdict: journaled by its verdict, not its exit code.
+    const verifier=await run(f,id);
+    await verify(f,id,verifier.session_id,'fail','A criterion is not met');await finish(f,verifier,0);
+    const failed=events(f,id).find(e=>e.kind==='task_acceptance_verification_failed');
+    assert.equal(failed.body.verdict,'fail');
+    assert.equal(failed.body.reason,'verifier_verdict_fail');
+    assert.equal(failed.body.exit_reason,'verifier_exit_0');
+    assert.equal(intakeRow(f,id).status,'failed');
+    // The gap goes back to a worker; after its fix, a passing verdict accepts.
+    await f.project.alarm();
+    const fixed=await run(f,id);
+    await claim(f,id,fixed.session_id);await addMergeProof(f,id);await finish(f,fixed,0);
+    await f.project.alarm();
+    const retryVerifier=await run(f,id);
+    await verify(f,id,retryVerifier.session_id,'pass');await finish(f,retryVerifier,0);
+    const accepted=events(f,id).find(e=>e.kind==='task_acceptance_verified');
+    assert.equal(accepted.body.verdict,'pass');
+    assert.equal(accepted.body.reason,'verifier_verdict_pass');
+    assert.equal(accepted.body.exit_reason,'verifier_exit_0','the raw exit label stays separate from the verdict basis');
+    assert.equal(intakeRow(f,id).status,'accepted');
+    assert.equal(completion(f,id).verification.state,'passed');
+
+    // A pass held back only by the merge gate is a named failure, not a pass.
+    const unmerged=await createIntake(f,'verifier-pass-unmerged',true);
+    await start(f,unmerged,'first');const worker=await run(f,unmerged);await claim(f,unmerged,worker.session_id);await finish(f,worker,0);
+    await f.project.alarm();
+    const gateVerifier=await run(f,unmerged);
+    await verify(f,unmerged,gateVerifier.session_id,'pass');await finish(f,gateVerifier,0);
+    const held=events(f,unmerged).find(e=>e.kind==='task_acceptance_verification_failed');
+    assert.equal(held.body.verdict,'fail');
+    assert.equal(held.body.reason,'verifier_verdict_pass_merge_gate_blocked');
+    assert.equal(held.body.merge_gate_blocked,true);
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    assert(!events(f,unmerged).some(e=>e.kind==='task_acceptance_verified'));
+  }finally{f.close();}
+});
+
 test('merge-state is readable by operators and the intake worker only, and names the gate problems',async()=>{
   const f=fixture();
   try{
