@@ -21,6 +21,7 @@ from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABI
 from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
 from .local_auth_readiness import local_claude_missing_contexts
 from .git_salvage import salvage_branch
+from . import first_action_observation
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
@@ -1616,6 +1617,8 @@ class Bridge:
     def live_sessions(self):
         rows=self.journal.db.execute("SELECT session_id,operation_id,epoch,native_id,tag,workspace,state,native_dispatch_started FROM launches WHERE state IN ('launching','running','aborting','deadline_stopping') ORDER BY session_id LIMIT 100").fetchall()
         result=[]
+        late=self._late_first_action()
+        candidates,live_keys=[],set()
         for row in rows:
             if row['session_id'] in self._inflight and row['state']=='launching':
                 native_id,status,phase=None,None,'launching'
@@ -1637,11 +1640,45 @@ class Bridge:
                     phase = 'missing'
             activity=(status or {}).get('last_activity_ms',(status or {}).get('updated_at_ms',(status or {}).get('created_at_ms')))
             if type(activity) is not int:activity=None
+            candidate=self._first_action_candidate(row,native_id,status,phase)
+            if candidate is not None:
+                live_keys.add(late.key(candidate))
+                proven=late.activity(candidate)
+                if proven is first_action_observation.UNOBSERVED:
+                    candidates.append(candidate)
+                elif proven is not None and (activity is None or proven>activity):
+                    # Genuine validated artifact activity only; never a clock refresh.
+                    activity=proven
             exit_code=native_returncode((status or {}).get('exit') or {}) if phase=='exited' else None
             result.append({'session_id':row['session_id'],'native_id':native_id,'phase':phase,
                            'last_activity_at':activity,'exit_code':exit_code,
                            'containment_empty':(status or {}).get('containment_empty') is True})
+        try:
+            # Snapshot only: one bounded single-inflight worker does the file reads.
+            late.request(candidates,live_keys,getattr(self,'_native_inventory_stop',None))
+        except Exception:
+            logging.getLogger(__name__).warning('Late first-action observation unavailable')
         return result
+
+    def _late_first_action(self):
+        with _NATIVE_INVENTORY_START_LOCK:
+            observer=getattr(self,'_late_first_action_observer',None)
+            if observer is None:
+                observer=self._late_first_action_observer=first_action_observation.LateFirstAction()
+            return observer
+
+    @staticmethod
+    def _first_action_candidate(row,native_id,status,phase):
+        """Exact running incarnation for a prompted launch, else None (unknown)."""
+        if (phase!='running' or not isinstance(native_id,str) or not UUID_RE.fullmatch(native_id)
+                or not isinstance(status,dict) or status.get('id')!=native_id
+                or type(status.get('created_at_ms')) is not int or row['state']!='running'
+                or status.get('tag')!=row['tag'] or row['tag']!='task-hub2-'+row['session_id']
+                or not same_workspace(status.get('workspace'),row['workspace'])):
+            return None
+        return {'session_id':row['session_id'],'operation_id':row['operation_id'],'epoch':row['epoch'],
+                'native_id':native_id,'tag':row['tag'],'workspace':row['workspace'],
+                'created_at_ms':status['created_at_ms']}
 
     def resolve_launch_native(self,row, *, timeout=None):
         expected={'tag':row['tag'],'workspace':row['workspace']}
