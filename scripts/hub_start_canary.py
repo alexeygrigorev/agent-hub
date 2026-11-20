@@ -3998,21 +3998,23 @@ def send_mail(subject, body):
     return r.returncode == 0
 
 
-# Canary decision -> counted occurrence decision on the existing bounded
-# observer API (same vocabulary as the quota publisher: alert/alert_dedup/
-# recovery increment dev_alert_occurrences_v1; everything else below is
-# emitted as coverage-only and must never increment occurrences).
-COUNTED_OCCURRENCE_DECISIONS = {
-    "critical": "alert",
-    "critical_dedup": "alert_dedup",
-    "recovery": "recovery",
+# Canary decision -> (observer decision, condition, recipient_class) on the
+# existing bounded observer API. Vocabulary and conditions are the fixed
+# literals of scripts/hub_alert_client.py (CONDITIONS; ram.DECISIONS mirrors
+# hub2 alert_authority DECISIONS: only alert/alert_dedup/recovery increment
+# occurrences; observation is coverage-only and must never count).
+CANARY_ALERT_DECISIONS = {
+    "critical": ("alert", "critical", "dev"),
+    "critical_dedup": ("alert_dedup", "critical_dedup", "dev"),
+    "recovery": ("recovery", "recovery", "none"),
 }
 
 
 def _observer_emit(observer, phase, **fields):
     """Best-effort emit against a trusted injected observer. Observation
-    failure makes the occurrence evidence unknown (failed observer is marked
-    dirty); it never gates, suppresses or retries the business/mail action."""
+    failure makes the occurrence evidence unknown (the failed observer is
+    marked dirty); it never gates, suppresses or retries the business/mail
+    action, and it never yields a healthy or complete claim."""
     if observer is None:
         return
     try:
@@ -4024,45 +4026,58 @@ def _observer_emit(observer, phase, **fields):
             pass
 
 
-def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, _observer=None):
+class _CanaryAttempt:
+    """One bounded single-decision canary attempt over the injected observer.
+
+    The alert authority (hub2 alert_authority.LiveRAM.hook) admits one attempt
+    per canary run and requires begin -> exactly one decision -> terminal: a
+    second decision or a terminal without any decision poisons the
+    start_canary producer, so the first decision wins and later ones drop.
+    """
+
+    def __init__(self, observer):
+        self._observer = observer
+        self._decision = None
+
+    @property
+    def decided(self):
+        return self._decision is not None
+
+    def decision(self, decision, condition, recipient_class="none"):
+        if self._observer is None or self._decision is not None:
+            return
+        self._decision = (decision, condition)
+        _observer_emit(self._observer, "decision", decision=decision,
+                       condition=condition, recipient_class=recipient_class)
+
+
+def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, _attempt=None):
     """Bounded occurrence hook for the finite Hub dev@ occurrence counter
-    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions:
-    critical/critical_dedup/recovery map to the counted decisions
-    alert/alert_dedup/recovery, while pass/recovering/failure_below_threshold
-    emit coverage-only observations that never count). The observer is a
-    private trusted-caller injection (_managed_observer); unmanaged runs stay
-    observation-silent with their existing behavior, and this hook claims no
-    authority of its own."""
+    (invoked before dedup/SMTP on alert decisions: critical/critical_dedup/
+    recovery map to the counted decisions alert/alert_dedup/recovery with the
+    fixed condition literals critical/critical_dedup/recovery, while
+    pass/recovering/failure_below_threshold emit coverage-only observation
+    decisions that never count). The attempt is a private trusted-caller
+    injection (_managed_observer -> main -> apply_alerting); unmanaged runs
+    stay observation-silent with their existing behavior, and this hook claims
+    no authority of its own."""
     _ = (sdir, result, state)
-    if _observer is None:
+    if _attempt is None:
         return
-    counted = COUNTED_OCCURRENCE_DECISIONS.get(decision)
+    counted = CANARY_ALERT_DECISIONS.get(decision)
     if counted is not None:
-        _observer_emit(_observer, "decision", decision=counted,
-                       condition=f"hub_start_canary:{mode}:{decision}",
-                       recipient_class="dev" if counted in ("alert", "alert_dedup") else "none")
+        _attempt.decision(*counted)
     else:
-        _observer_emit(_observer, "decision", decision="observation",
-                       condition=f"hub_start_canary:{mode}:{decision}",
-                       recipient_class="none")
+        _attempt.decision("observation", decision)
 
 
-def apply_alerting(result, *, _managed_observer=None):
-    observer = _managed_observer
-    _observer_emit(observer, "begin")
-    try:
-        _apply_alerting_locked(result, observer)
-    finally:
-        if _managed_observer is not None and sys.exc_info()[0] is not None:
-            try:
-                observer.emit("terminal")
-            except BaseException:
-                pass  # Preserve the original managed business/control exception.
-        else:
-            _observer_emit(observer, "terminal")
+def apply_alerting(result, *, _attempt=None):
+    if _attempt is None:
+        _attempt = _CanaryAttempt(None)
+    _apply_alerting_locked(result, _attempt)
 
 
-def _apply_alerting_locked(result, observer):
+def _apply_alerting_locked(result, attempt):
     sdir = state_dir()
     lock_fd = acquire_lock_fd(sdir / f"{result['mode']}.lock", 30.0, stage="lock", busy_reason="alert_state_lock_busy")
     try:
@@ -4070,6 +4085,7 @@ def _apply_alerting_locked(result, observer):
         st = load_state(path)
         mode = result["mode"]
         if not result["ok"] and result.get("stage") == "lock" and result.get("reason") == "deploy_gate_lock_busy":
+            attempt.decision("observation", "lock_busy")
             st["last_lock_busy"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
             save_state(path, st)
             return
@@ -4078,16 +4094,16 @@ def _apply_alerting_locked(result, observer):
             if st.get("incident_open"):
                 st["successes"] = st.get("successes", 0) + 1
                 if st["successes"] >= RECOVER_THRESHOLD:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery", _observer=observer)
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery", _attempt=attempt)
                     body = (f"Hub start canary ({mode}) recovered at {result['timestamp']}.\n"
                             f"Run id: {result['run_id']}\nIncident: {st.get('incident_id')}\n")
                     if send_mail(f"[RECOVERED] Hub start canary ({mode}) is passing again", body):
                         st.update(incident_open=False, successes=0, incident_id="-")
                 else:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering", _observer=observer)
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering", _attempt=attempt)
             else:
                 st["successes"] = 0
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass", _observer=observer)
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass", _attempt=attempt)
         else:
             st["successes"] = 0
             st["failures"] = st.get("failures", 0) + 1
@@ -4098,7 +4114,7 @@ def _apply_alerting_locked(result, observer):
                     result,
                     st,
                     decision="critical_dedup" if st.get("incident_open") else "critical",
-                    _observer=observer,
+                    _attempt=attempt,
                 )
                 if not st.get("incident_open"):
                     incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
@@ -4110,7 +4126,7 @@ def _apply_alerting_locked(result, observer):
                     if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
                         st.update(incident_open=True, incident_id=incident)
             else:
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold", _observer=observer)
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold", _attempt=attempt)
         st["last"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
         save_state(path, st)
     finally:
@@ -4121,7 +4137,10 @@ def main(argv=None, *, _managed_observer=None):
     """Trusted-caller injection point for the bounded managed observer (same
     pattern as the quota publisher): natural invocations pass no observer and
     keep the legacy unmanaged defaults; no observer is ever derived from the
-    environment, files or CLI flags here."""
+    environment, files or CLI flags here. One injected observer spans exactly
+    one canary attempt: begin at business entry, exactly one decision (the
+    alerting branch decision, or a fixed deploy_gate/lock_busy/error
+    observation on no-mail branches), terminal at exit."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("shell", "full"), default=None)
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
@@ -4167,34 +4186,52 @@ def main(argv=None, *, _managed_observer=None):
             p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
     mode = args.mode or "full"
     run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
-    result = Canary(
-        mode,
-        run_id,
-        deploy_gate=args.deploy_gate,
-        candidate_sha=args.candidate_sha,
-        candidate_cli_sha256=args.candidate_cli_sha256,
-        candidate_updater_sha256=args.candidate_updater_sha256,
-        run_token=args.run_token,
-        expected_helper_sha256=args.helper_sha256,
-    ).execute()
-    if args.deploy_gate:
-        result["deploy_gate"] = True
-    else:
-        try:
-            apply_alerting(result, _managed_observer=_managed_observer)
-        except StageFailure as failure:
-            result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
-            if result["ok"]:
-                result.update(ok=False, stage=failure.stage, reason=failure.reason)
-        except OSError:
-            result["alert_state_error"] = "lock:alert_state_write_failed"
-            if result["ok"]:
-                result.update(ok=False, stage="lock", reason="alert_state_write_failed")
-    line = json.dumps(result, sort_keys=True)
-    print(line, flush=True)
-    if not result["ok"]:
-        print(line, file=sys.stderr, flush=True)
-    return 0 if result["ok"] else 1
+    attempt = _CanaryAttempt(_managed_observer)
+    _observer_emit(_managed_observer, "begin")
+    try:
+        result = Canary(
+            mode,
+            run_id,
+            deploy_gate=args.deploy_gate,
+            candidate_sha=args.candidate_sha,
+            candidate_cli_sha256=args.candidate_cli_sha256,
+            candidate_updater_sha256=args.candidate_updater_sha256,
+            run_token=args.run_token,
+            expected_helper_sha256=args.helper_sha256,
+        ).execute()
+        if args.deploy_gate:
+            result["deploy_gate"] = True
+            attempt.decision("observation", "deploy_gate")
+        else:
+            try:
+                apply_alerting(result, _attempt=attempt)
+            except StageFailure as failure:
+                result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
+                if result["ok"]:
+                    result.update(ok=False, stage=failure.stage, reason=failure.reason)
+            except OSError:
+                result["alert_state_error"] = "lock:alert_state_write_failed"
+                if result["ok"]:
+                    result.update(ok=False, stage="lock", reason="alert_state_write_failed")
+        line = json.dumps(result, sort_keys=True)
+        print(line, flush=True)
+        if not result["ok"]:
+            print(line, file=sys.stderr, flush=True)
+        return 0 if result["ok"] else 1
+    finally:
+        # Exactly one decision per attempt: a run that crashed or errored
+        # before any branch decision keeps the sequence well-formed with a
+        # coverage-only error observation that claims no mail and counts no
+        # occurrence.
+        if not attempt.decided:
+            attempt.decision("observation", "error")
+        if _managed_observer is not None and sys.exc_info()[0] is not None:
+            try:
+                _managed_observer.emit("terminal")
+            except BaseException:
+                pass  # Preserve the original managed business/control exception.
+        else:
+            _observer_emit(_managed_observer, "terminal")
 
 
 if __name__ == "__main__":
