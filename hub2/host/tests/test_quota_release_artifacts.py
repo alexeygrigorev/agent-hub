@@ -43,8 +43,10 @@ def _synthetic_bundle(root):
     }
     _build_wheel(root / HOST_WHEEL, host_entries)
     transport_entries = {
-        name: f'# {name}\n'.encode()
-        for name in ('websockets/__init__.py', 'websockets/exceptions.py', 'websockets/sync/client.py')
+        'websockets/__init__.py': b'# websockets/__init__.py\n',
+        'websockets/asyncio/__init__.py': b'',
+        'websockets/exceptions.py': b'# websockets/exceptions.py\n',
+        'websockets/sync/client.py': b'# websockets/sync/client.py\n',
     }
     _build_wheel(root / TRANSPORT_WHEEL, transport_entries)
     transport_bytes = (root / TRANSPORT_WHEEL).read_bytes()
@@ -72,7 +74,8 @@ def _synthetic_bundle(root):
     cli_sha = hashlib.sha256((root / 'hub.pyz').read_bytes()).hexdigest()
     (root / 'hub.pyz.sha256').write_text(f'{cli_sha}  hub.pyz\n')
     (root / 'manifest.json').write_text(json.dumps({'built_from_commit': COMMIT, 'sha256': cli_sha}))
-    (root / 'hub_alert_client.py').write_bytes(natural_sources['hub_alert_client.py'])
+    for name in dispatcher.NATURAL_PAYLOADS:
+        (root / name).write_bytes(natural_sources[name])
     for name in ('host-install.sh', builder.WINDOWS_HOST_INSTALLER, 'hub2-self-update.py',
                  'hub2-enroll.py', *builder.CLI_INSTALLERS, *builder.UNITS):
         (root / name).write_bytes(b'synthetic\n')
@@ -126,8 +129,10 @@ class NaturalHostReleaseArtifactTests(unittest.TestCase):
         bundle, digest, uv_lock, natural_sources = _synthetic_bundle(self.root / 'bundle')
         verified = builder.verify_bundle(bundle, COMMIT, digest)
         self.assertIn(builder.NATURAL_ARCHIVE, verified['artifacts'])
+        self.assertLessEqual(len(verified['artifacts']), 20)
         with zipfile.ZipFile(bundle / builder.NATURAL_ARCHIVE) as zf:
             inner = json.loads(zf.read('MANIFEST.json').decode('utf-8'))
+            self.assertEqual(zf.read('websockets/asyncio/__init__.py'), b'')
         self.assertNotIn('manifest_sha256', inner['host_release'])
         self.assertEqual(inner['host_release']['commit'], COMMIT)
         second = dispatcher.build_normal_host_archive(
@@ -143,9 +148,11 @@ class NaturalHostReleaseArtifactTests(unittest.TestCase):
 
     def test_legacy_bundle_without_natural_archive_remains_valid(self):
         bundle, _, _, _ = _synthetic_bundle(self.root / 'legacy')
-        (bundle / builder.NATURAL_ARCHIVE).unlink()
+        for name in (builder.NATURAL_ARCHIVE, 'hub-quota-publish.py', 'natural-quota-prelude.py'):
+            (bundle / name).unlink()
         manifest = json.loads((bundle / 'host-release.json').read_bytes())
-        del manifest['artifacts'][builder.NATURAL_ARCHIVE]
+        for name in (builder.NATURAL_ARCHIVE, 'hub-quota-publish.py', 'natural-quota-prelude.py'):
+            del manifest['artifacts'][name]
         raw = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
         (bundle / 'host-release.json').write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
@@ -153,12 +160,31 @@ class NaturalHostReleaseArtifactTests(unittest.TestCase):
         self.assertNotIn(builder.NATURAL_ARCHIVE, verified['artifacts'])
 
     def test_tampered_or_self_authorized_natural_archive_is_rejected(self):
+        def _subst_payload(name):
+            def _mutate(m, i):
+                bad = b'# substituted ' + name.encode() + b'\n'
+                m['natural/' + name] = bad
+                i['host_release']['natural_payloads'][name] = hashlib.sha256(bad).hexdigest()
+            return _mutate
+
         cases = [
+            ('substituted_host_module', lambda m, i: m.__setitem__('agent_hub_host/agent.py', b'# evil\n'),
+             'host module differs from outer wheel'),
+            ('substituted_transport_module', lambda m, i: m.__setitem__('websockets/sync/client.py', b'# evil\n'),
+             'transport module differs from outer wheel'),
+            ('substituted_entrypoint', lambda m, i: m.__setitem__('__main__.py', b'raise SystemExit(0)\n'),
+             'entrypoint differs from maintained stub'),
+            ('substituted_publish_payload', _subst_payload('hub-quota-publish.py'),
+             'payload differs from outer bundle'),
+            ('substituted_prelude_payload', _subst_payload('natural-quota-prelude.py'),
+             'payload differs from outer bundle'),
             ('tampered_alert_client', lambda m, i: m.__setitem__('natural/hub_alert_client.py', b'tampered\n'),
-             'payload checksum mismatch|alert client differs'),
+             'payload checksum mismatch|payload differs from outer bundle'),
+            ('extra_member', lambda m, i: m.__setitem__('agent_hub_host/extra.py', b'# extra\n'),
+             'members differ from outer verified inputs'),
             ('mixed_commit_marker', lambda m, i: m.__setitem__('agent_hub_host/_release.py',
              f'HOST_VERSION = {"d" * 40!r}\nPROTOCOL_VERSION = 1\n'.encode()),
-             'release marker mismatch'),
+             'host module differs from outer wheel|release marker mismatch'),
             ('mixed_commit_provenance', lambda m, i: i['host_release'].__setitem__('commit', 'd' * 40),
              'deployment commit'),
             ('wrong_host_wheel_binding', lambda m, i: i['host_release'].__setitem__('host_wheel_sha256', '0' * 64),
@@ -175,9 +201,11 @@ class NaturalHostReleaseArtifactTests(unittest.TestCase):
 
     def test_externally_pinned_build_host_archive_remains_compatible(self):
         bundle, _, uv_lock, _ = _synthetic_bundle(self.root / 'pinned')
-        (bundle / builder.NATURAL_ARCHIVE).unlink()
+        for name in (builder.NATURAL_ARCHIVE, 'hub-quota-publish.py', 'natural-quota-prelude.py'):
+            (bundle / name).unlink()
         manifest = json.loads((bundle / 'host-release.json').read_bytes())
-        del manifest['artifacts'][builder.NATURAL_ARCHIVE]
+        for name in (builder.NATURAL_ARCHIVE, 'hub-quota-publish.py', 'natural-quota-prelude.py'):
+            del manifest['artifacts'][name]
         raw = (json.dumps(manifest, indent=2, sort_keys=True) + '\n').encode()
         (bundle / 'host-release.json').write_bytes(raw)
         digest = hashlib.sha256(raw).hexdigest()
