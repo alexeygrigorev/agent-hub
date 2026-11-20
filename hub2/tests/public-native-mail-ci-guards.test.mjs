@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {EventEmitter} from 'node:events';
-import {bareEnv,pythonPath,checkProbe,checkResult,runChild,PINS,SOURCES} from './public-native-mail-ci-helper.mjs';
+import {bareEnv,pythonPath,checkProbe,checkResult,runChild,failureMetadata,PINS,SOURCES} from './public-native-mail-ci-helper.mjs';
 
 function fake() {
   const child=new EventEmitter();child.pid=1234;child.stdout=new EventEmitter();child.stderr=new EventEmitter();child.stdin=new EventEmitter();
@@ -46,8 +46,31 @@ test('CI guard: strict subreaper receipt closes owned subtree and decoded captur
 test('CI guard: nonzero leader status fails with genuine closed subtree retained',async()=>{
   const f=fake(),retained=[],p=f.run({retain:v=>retained.push(v)});
   f.publish('failure evidence','',{leader_exit_code:1,leader_status:256,success:false},1);
-  await assert.rejects(p,/supervisor_failed_unknown/);assert.equal(retained[0].supervision.owned_subtree_reaped,true);
+  await assert.rejects(p,/child_failed/);assert.equal(retained[0].supervision.owned_subtree_reaped,true);
   assert.equal(retained[0].stdout.toString(),'failure evidence');
+});
+test('CI guard: diagnostics publish only fixed phase/failure codes and strict supervision facts',()=>{
+  const f=fake(),proof=f.receipt().supervision;
+  const input={closed:true,fault:'private fault',exit_code:1,signal:'private signal',supervision:proof,
+    stdout:Buffer.from(JSON.stringify({status:'FAILED_OR_UNKNOWN',phase:'later_cli',reason:'actual_cli_failed',
+      first:'private ID',evidence_directory:'/private/path',token:'private token'})),
+    stderr:Buffer.from('private traceback\nModuleNotFoundError: No module named \'websockets\'\n')};
+  const scenario=failureMetadata('scenario',input),probe=failureMetadata('probe',input);
+  assert.deepEqual(scenario.scenario_failure,{status:'FAILED_OR_UNKNOWN',phase:'later_cli',reason:'actual_cli_failed'});
+  assert.equal(probe.probe_failure,'python_transport_missing');assert.deepEqual(probe.supervision,proof);
+  assert(!JSON.stringify([probe,scenario]).includes('private'));
+  for(const changes of [{phase:'private phase'},{reason:'private reason'},{status:'private status'}]){
+    const value={...input,stdout:Buffer.from(JSON.stringify({status:'FAILED_OR_UNKNOWN',phase:'later_cli',reason:'actual_cli_failed',...changes}))};
+    assert.equal(failureMetadata('scenario',value).scenario_failure,undefined);
+  }
+  assert.equal(failureMetadata('probe',{...input,supervision:{...proof,secret:'private'}}).supervision,null);
+  assert.throws(()=>failureMetadata('private phase',input),/diagnostic_phase/);
+});
+test('CI guard: an abnormal supervisor exit never becomes an ordinary child failure',async()=>{
+  const f=fake(),p=f.run();
+  f.child.stdout.emit('data',Buffer.from(JSON.stringify(f.receipt('','',{success:false}))));
+  f.child.emit('exit',2,null);f.child.emit('close',2,null);
+  await assert.rejects(p,/supervisor_failed_unknown/);
 });
 test('CI guard: leader/stdio close alone never credits subtree closure',async()=>{
   const f=fake(),p=f.run();f.child.emit('close',0,null);await assert.rejects(p,/owned_subtree_unknown/);
