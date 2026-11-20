@@ -29,6 +29,7 @@ class BootstrapTests(unittest.TestCase):
         with zipfile.ZipFile(self.archive, 'w') as z:
             z.writestr('agent_hub_host/_release.py',
                        f'HOST_VERSION = {COMMIT!r}\nPROTOCOL_VERSION = 1\n')
+        self.archive.chmod(0o644)
         self.slots = [os.open(self.image, os.O_RDONLY | os.O_CLOEXEC),
                       os.open(self.archive, os.O_RDONLY | os.O_CLOEXEC)]
         self.slots.extend(os.open('/dev/null', os.O_RDONLY | os.O_CLOEXEC) for _ in range(11))
