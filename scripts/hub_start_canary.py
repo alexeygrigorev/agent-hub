@@ -3998,16 +3998,71 @@ def send_mail(subject, body):
     return r.returncode == 0
 
 
-def record_dev_alert_occurrence(sdir, mode, result, state, *, decision):
-    """Reserved integration hook for the finite Hub dev@ occurrence counter
+# Canary decision -> counted occurrence decision on the existing bounded
+# observer API (same vocabulary as the quota publisher: alert/alert_dedup/
+# recovery increment dev_alert_occurrences_v1; everything else below is
+# emitted as coverage-only and must never increment occurrences).
+COUNTED_OCCURRENCE_DECISIONS = {
+    "critical": "alert",
+    "critical_dedup": "alert_dedup",
+    "recovery": "recovery",
+}
+
+
+def _observer_emit(observer, phase, **fields):
+    """Best-effort emit against a trusted injected observer. Observation
+    failure makes the occurrence evidence unknown (failed observer is marked
+    dirty); it never gates, suppresses or retries the business/mail action."""
+    if observer is None:
+        return
+    try:
+        observer.emit(phase, **fields)
+    except Exception:
+        try:
+            observer.fail()
+        except Exception:
+            pass
+
+
+def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, _observer=None):
+    """Bounded occurrence hook for the finite Hub dev@ occurrence counter
     (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions:
-    critical/critical_dedup/recovery increment cumulative occurrences, while
-    pass/recovering/failure_below_threshold update observation coverage only).
-    """
-    _ = (sdir, mode, result, state, decision)
+    critical/critical_dedup/recovery map to the counted decisions
+    alert/alert_dedup/recovery, while pass/recovering/failure_below_threshold
+    emit coverage-only observations that never count). The observer is a
+    private trusted-caller injection (_managed_observer); unmanaged runs stay
+    observation-silent with their existing behavior, and this hook claims no
+    authority of its own."""
+    _ = (sdir, result, state)
+    if _observer is None:
+        return
+    counted = COUNTED_OCCURRENCE_DECISIONS.get(decision)
+    if counted is not None:
+        _observer_emit(_observer, "decision", decision=counted,
+                       condition=f"hub_start_canary:{mode}:{decision}",
+                       recipient_class="dev" if counted in ("alert", "alert_dedup") else "none")
+    else:
+        _observer_emit(_observer, "decision", decision="observation",
+                       condition=f"hub_start_canary:{mode}:{decision}",
+                       recipient_class="none")
 
 
-def apply_alerting(result):
+def apply_alerting(result, *, _managed_observer=None):
+    observer = _managed_observer
+    _observer_emit(observer, "begin")
+    try:
+        _apply_alerting_locked(result, observer)
+    finally:
+        if _managed_observer is not None and sys.exc_info()[0] is not None:
+            try:
+                observer.emit("terminal")
+            except BaseException:
+                pass  # Preserve the original managed business/control exception.
+        else:
+            _observer_emit(observer, "terminal")
+
+
+def _apply_alerting_locked(result, observer):
     sdir = state_dir()
     lock_fd = acquire_lock_fd(sdir / f"{result['mode']}.lock", 30.0, stage="lock", busy_reason="alert_state_lock_busy")
     try:
@@ -4023,16 +4078,16 @@ def apply_alerting(result):
             if st.get("incident_open"):
                 st["successes"] = st.get("successes", 0) + 1
                 if st["successes"] >= RECOVER_THRESHOLD:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery")
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery", _observer=observer)
                     body = (f"Hub start canary ({mode}) recovered at {result['timestamp']}.\n"
                             f"Run id: {result['run_id']}\nIncident: {st.get('incident_id')}\n")
                     if send_mail(f"[RECOVERED] Hub start canary ({mode}) is passing again", body):
                         st.update(incident_open=False, successes=0, incident_id="-")
                 else:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering")
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering", _observer=observer)
             else:
                 st["successes"] = 0
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass")
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass", _observer=observer)
         else:
             st["successes"] = 0
             st["failures"] = st.get("failures", 0) + 1
@@ -4043,6 +4098,7 @@ def apply_alerting(result):
                     result,
                     st,
                     decision="critical_dedup" if st.get("incident_open") else "critical",
+                    _observer=observer,
                 )
                 if not st.get("incident_open"):
                     incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
@@ -4054,14 +4110,18 @@ def apply_alerting(result):
                     if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
                         st.update(incident_open=True, incident_id=incident)
             else:
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold")
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold", _observer=observer)
         st["last"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
         save_state(path, st)
     finally:
         os.close(lock_fd)
 
 
-def main():
+def main(argv=None, *, _managed_observer=None):
+    """Trusted-caller injection point for the bounded managed observer (same
+    pattern as the quota publisher): natural invocations pass no observer and
+    keep the legacy unmanaged defaults; no observer is ever derived from the
+    environment, files or CLI flags here."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("shell", "full"), default=None)
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
@@ -4073,7 +4133,7 @@ def main():
     p.add_argument("--print-helper-sha256", action="store_true", help="print canonical helper bundle SHA-256 and exit")
     p.add_argument("--physical-admission-check", action="store_true",
                    help="read-only preview of the physical admission (no quota, no start, no state); never authorizes a start")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if args.physical_admission_check:
         if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha
                 or args.candidate_cli_sha256 or args.candidate_updater_sha256
@@ -4121,7 +4181,7 @@ def main():
         result["deploy_gate"] = True
     else:
         try:
-            apply_alerting(result)
+            apply_alerting(result, _managed_observer=_managed_observer)
         except StageFailure as failure:
             result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
             if result["ok"]:
