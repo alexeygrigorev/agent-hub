@@ -1125,6 +1125,43 @@ class GoJsonOutputTests(unittest.TestCase):
             self.assertEqual(argv[argv.index('--profile')+1],nl.LOCAL_ROUTES['go']['profile'])
 
 
+class ZaiProfileHarnessTests(unittest.TestCase):
+    def test_profile_uses_same_snapshot_setting_as_direct_zai_without_losing_prompt_or_effort(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent, prefix='zai-profile-flags-') as root:
+            launcher = nl.NativeLauncher({'private_provider_homes': False}, aplexer='synthetic-a')
+            prompt = 'Read README; preserve Unicode λ and literal --disable.'
+            spec = {'workspace': root, 'operation_id': 'op-zai-flags', 'epoch': 1,
+                    'timeout_seconds': 120, 'model': 'glm-5.3-flash', 'effort': 'medium'}
+            argv = launcher.profile_command('zai-flags', spec, nl.LOCAL_ROUTES['zai'], prompt)
+            engine_args = [value.removeprefix('--engine-arg=') for value in argv
+                           if value.startswith('--engine-arg=')]
+            self.assertEqual(engine_args, ['--model', 'glm-5.3-flash', '--disable', 'shell_snapshot',
+                                           '-c', 'model_reasoning_effort="medium"'])
+            self.assertEqual(argv[:3], ['synthetic-a', 'task', 'run'])
+            self.assertEqual(argv[argv.index('--profile') + 1], 'hub-zai-central')
+            self.assertEqual(Path(argv[argv.index('--prompt-file') + 1]).read_text(encoding='utf-8'), prompt)
+            self.assertEqual(argv[argv.index('--timeout-secs') + 1], '120')
+            direct = nl.adapter_argv('zai', prompt, 'glm-5.3-flash')
+            self.assertEqual(direct[direct.index('--disable'):direct.index('--disable') + 2],
+                             ['--disable', 'shell_snapshot'])
+            self.assertEqual(direct.count('shell_snapshot'), 1)
+
+    def test_profile_does_not_add_zai_harness_flags_to_other_providers(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        for provider, model in [('codex', 'gpt-6.1-sol'), ('claude', 'sonnet'),
+                                ('go', nl.OPENCODE_MODEL), ('antigravity', 'gemini-4-argon-medium')]:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory(dir=parent) as root:
+                launcher = nl.NativeLauncher({}, aplexer='synthetic-a')
+                spec = {'workspace': root, 'operation_id': 'op-other-flags', 'epoch': 1,
+                        'timeout_seconds': 120, 'model': model}
+                argv = launcher.profile_command('other-flags', spec, nl.LOCAL_ROUTES[provider], 'Read README')
+                self.assertNotIn('--engine-arg=--disable', argv)
+                self.assertNotIn('--engine-arg=shell_snapshot', argv)
+
+
 class HeadlessStreamOutputTests(unittest.TestCase):
     MODELS = {'claude': 'opus', 'antigravity': 'gemini-4-argon-medium'}
 

@@ -79,6 +79,8 @@ LOCAL_ROUTES = {
     "claude": {"provider": "claude", "engine": "claude"},
     "antigravity": {"provider": "antigravity", "profile": "hub-hub-antigravity"},
 }
+# Keep the direct adapter and maintained local ZAI profile on the same harness.
+ZAI_HARNESS_FLAGS = ('--disable', 'shell_snapshot')
 HEADLESS_OUTPUT_FLAGS = {
     'claude': ('--output-format', 'stream-json', '--verbose'),
     'antigravity': ('--output-format', 'stream-json'),
@@ -323,7 +325,7 @@ def adapter_argv(provider, goal, model):
         raise ValueError('provider_route_unsupported')
     if provider == 'zai':
         return [binary, '--dangerously-bypass-approvals-and-sandbox', 'exec', '--model', str(model),
-                '--disable', 'shell_snapshot', '-c', 'check_for_update_on_startup=false', '--json', goal]
+                *ZAI_HARNESS_FLAGS, '-c', 'check_for_update_on_startup=false', '--json', goal]
     if provider == 'codex':
         return [binary, 'exec', '--model', str(model), '--dangerously-bypass-approvals-and-sandbox', '--json', goal]
     if provider == 'antigravity':
@@ -1351,6 +1353,8 @@ class NativeLauncher:
         output_args = ['--output-dir', str(Path(specification['workspace']).resolve().joinpath(*output['parts']))] if output else []
         selector = ['--profile', profile] if profile else ['--engine', route.get('engine', provider)]
         args = ['--model', model]
+        if provider == 'zai':
+            args += ZAI_HARNESS_FLAGS
         args += HEADLESS_OUTPUT_FLAGS.get(provider, ())
         if provider == 'claude' and not specification.get('interactive') and not specification.get('managed_credential_label'):
             args += CLAUDE_MANAGED_HEADLESS_FLAGS
