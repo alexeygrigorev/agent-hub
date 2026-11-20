@@ -32,6 +32,7 @@ import urllib.request
 RECIPIENT = 'dev@dtcdev.click'
 STATUSES = ('open', 'failed')
 MAX_PAGES = 20
+MAX_HISTORY_PAGES = 100
 MAX_SENT = 5000
 
 
@@ -170,7 +171,58 @@ class Transport:
             return json.loads(response.read(4 * 1024 * 1024))
 
 
-def pending_alerts(transport, observer=None):
+def _iter_intake_history_events(transport, intake_id, observer=None, result=None):
+    """Yield (seq, event) across bounded /history pages; mark incomplete on invalid cursor/page."""
+    after = 0
+    for _ in range(MAX_HISTORY_PAGES):
+        query = urllib.parse.urlencode({'after': str(after), 'limit': '100'})
+        try:
+            page = transport.get('/api/intakes/' + intake_id + '/history?' + query)
+        except Exception:
+            if result is None:
+                raise
+            result['errors'] += 1
+            observation_error(observer, 'mailer_api_error')
+            return
+        if not isinstance(page, dict) or 'next' not in page or not isinstance(page.get('events'), list):
+            if result is not None:
+                result['errors'] += 1
+            observation_error(observer, 'mailer_scan_incomplete')
+            return
+        events = page['events']
+        prev_seq = after
+        for event in events:
+            if not isinstance(event, dict):
+                if result is not None:
+                    result['errors'] += 1
+                observation_error(observer, 'mailer_scan_incomplete')
+                return
+            seq = event.get('seq')
+            if type(seq) is not int or seq <= prev_seq:
+                if result is not None:
+                    result['errors'] += 1
+                observation_error(observer, 'mailer_scan_incomplete')
+                return
+            prev_seq = seq
+        nxt = page['next']
+        if nxt is not None:
+            if type(nxt) is not int or not events or nxt != prev_seq:
+                if result is not None:
+                    result['errors'] += 1
+                observation_error(observer, 'mailer_scan_incomplete')
+                return
+        for event in events:
+            yield event['seq'], event
+        if nxt is None:
+            return
+        after = nxt
+    else:
+        if result is not None:
+            result['errors'] += 1
+        observation_error(observer, 'mailer_scan_incomplete')
+
+
+def pending_alerts(transport, observer=None, result=None):
     """Yield (key, intake, alert body) for unresolved developer alerts."""
     for status in STATUSES:
         cursor = None
@@ -186,9 +238,9 @@ def pending_alerts(transport, observer=None):
                 context = transport.get('/api/intakes/' + intake_id + '/context')
                 if (context.get('task') or {}).get('owner') != RECIPIENT:
                     continue  # already picked up by someone, or restarted
-                for event in context.get('events') or []:
+                for seq, event in _iter_intake_history_events(transport, intake_id, observer, result):
                     if event.get('kind') == 'developer_alert_raised':
-                        yield intake_id + ':' + str(event.get('seq')), item, event.get('body') or {}
+                        yield intake_id + ':' + str(seq), item, event.get('body') or {}
             cursor = page.get('next')
             if not cursor:
                 break
@@ -254,7 +306,7 @@ def save_state(path, state):
 def alert_rows(transport, result, observer=None):
     stage = 'mailer_api_error'
     try:
-        for key, item, alert in pending_alerts(transport, observer):
+        for key, item, alert in pending_alerts(transport, observer, result):
             stage = 'mailer_render_error'
             message = render(item, alert)
             yield key, message, 'intake_recovery'
