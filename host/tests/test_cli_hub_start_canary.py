@@ -4407,6 +4407,98 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNone(result["session_id"])
         c.run.assert_not_called()
 
+    YOUNG_HOLD = {"category": "coordinator_kernel_cap", "target_kind": "workload_current", "age_class": "young",
+                  "state_class": "running", "phase_class": "running", "cap_status": "unavailable"}
+
+    def scripted_admit(self, c, outcomes):
+        calls = []
+
+        def admit(deadline=None, workspace=None, *, seam="start"):
+            calls.append(deadline)
+            outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+            if outcome is not None:
+                raise outcome
+        c.admit = admit
+        return calls
+
+    def test_main_start_repeats_fresh_admission_while_only_a_young_uncapped_resident_holds(self):
+        mod = self.mod()
+        c = mod.Canary("full", "adm-test")
+        c.poll = 0.001
+        young = mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic=dict(self.YOUNG_HOLD))
+        calls = self.scripted_admit(c, [young, young, None])
+        deadline = time.monotonic() + 5
+        c.admit_past_young_holds(deadline)
+        self.assertEqual(calls, [deadline] * 3)
+
+    def test_other_admission_refusals_are_not_repeated(self):
+        mod = self.mod()
+        refusals = [
+            mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic={**self.YOUNG_HOLD, "age_class": "mature"}),
+            mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic={**self.YOUNG_HOLD, "cap_status": "changed"}),
+            mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic={"category": "starting_recorded_cap", "cap_status": "unavailable"}),
+            mod.StageFailure("admission", "resident_bound_unknown"),
+            mod.StageFailure("admission", "resident_fallback_changed", admission_diagnostic=dict(self.YOUNG_HOLD)),
+            mod.StageFailure("admission", "memory_below_floor"),
+        ]
+        for refusal in refusals:
+            with self.subTest(reason=refusal.reason, detail=refusal.admission_diagnostic):
+                c = mod.Canary("full", "adm-test")
+                c.poll = 0.001
+                calls = self.scripted_admit(c, [refusal, None])
+                with self.assertRaises(mod.StageFailure) as caught:
+                    c.admit_past_young_holds(time.monotonic() + 5)
+                self.assertIs(caught.exception, refusal)
+                self.assertEqual(len(calls), 1)
+
+    def test_a_young_hold_followed_by_another_refusal_reports_the_new_refusal(self):
+        mod = self.mod()
+        c = mod.Canary("full", "adm-test")
+        c.poll = 0.001
+        young = mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic=dict(self.YOUNG_HOLD))
+        floor = mod.StageFailure("admission", "memory_below_floor")
+        calls = self.scripted_admit(c, [young, floor, None])
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.admit_past_young_holds(time.monotonic() + 5)
+        self.assertIs(caught.exception, floor)
+        self.assertEqual(len(calls), 2)
+
+    def test_exhausted_admission_budget_reports_the_last_young_hold_with_its_diagnostic(self):
+        mod = self.mod()
+        c = mod.Canary("full", "adm-test")
+        c.poll = 0.001
+        young = mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic=dict(self.YOUNG_HOLD))
+        expired = mod.StageFailure("admission", "admission_deadline_exceeded")
+        self.scripted_admit(c, [young, expired])
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.admit_past_young_holds(time.monotonic() + 5)
+        self.assertIs(caught.exception, young)
+        c = mod.Canary("full", "adm-test")
+        c.poll = 0.05
+        calls = self.scripted_admit(c, [young])
+        deadline = time.monotonic() + 0.2
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.admit_past_young_holds(deadline)
+        self.assertIs(caught.exception, young)
+        self.assertGreaterEqual(time.monotonic() + c.poll, deadline)
+        self.assertGreater(len(calls), 1)
+        result = {"ok": False, "stage": "admission", "reason": young.reason}
+        mod.add_admission_diagnostic(result, caught.exception)
+        self.assertEqual(result["admission_diagnostic"], self.YOUNG_HOLD)
+
+    def test_main_start_admission_goes_through_the_young_hold_repeat(self):
+        mod = self.mod()
+        c = mod.Canary("full", "adm-test")
+        refusal = mod.StageFailure("admission", "memory_below_floor")
+        seen = []
+        c.admit_past_young_holds = lambda deadline: seen.append(deadline) or (_ for _ in ()).throw(refusal)
+        c.admit = mock.Mock(side_effect=AssertionError("start must admit through the young-hold repeat"))
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.start()
+        self.assertIs(caught.exception, refusal)
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(c.start_attempted)
+
     # ---- root workspace config -------------------------------------------------
 
     def test_root_config_overrides_hostile_environment_and_is_used_for_start(self):
