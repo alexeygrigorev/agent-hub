@@ -1,5 +1,6 @@
 """Owned USER natural-Host startup tests; Root helper/peer/image facts are simulated."""
 import array
+import errno
 import json
 import os
 from pathlib import Path
@@ -283,6 +284,124 @@ class NaturalExecTests(unittest.TestCase):
              patch.object(natural_exec, 'sys', types.SimpleNamespace(platform='linux')):
             with self.assertRaises(transfer.TransferError):
                 natural_exec.maybe_exec_natural_host(['serve'])
+
+    def test_consumed_nat_dir_close_eio_does_not_retry_reused_sentinel_fd(self):
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        sentinel = [None]
+        real_close = os.close
+
+        def close_then_reuse(value):
+            if value == fd and sentinel[0] is None:
+                real_close(value)
+                sentinel[0] = os.open('/dev/null', os.O_RDONLY | os.O_CLOEXEC)
+                self.assertEqual(sentinel[0], fd)
+                raise OSError(errno.EIO, 'simulated consumed close')
+            return real_close(value)
+
+        proxy = types.SimpleNamespace(**vars(os))
+        proxy.close = close_then_reuse
+        resource = types.SimpleNamespace(
+            close=lambda: True,
+            recheck=lambda: None,
+            take=lambda: self.fail('must not take after failed directory close'),
+        )
+        with patch.object(natural_exec, 'os', proxy), \
+             patch.dict(os.environ, {'INVOCATION_ID': INVOCATION_ID}, clear=False), \
+             patch.object(natural_exec, 'sys', types.SimpleNamespace(platform='linux')), \
+             patch.object(natural_exec, 'host_release', return_value=(COMMIT, 1)), \
+             patch.object(natural_exec, '_verify_installed_helper'), \
+             patch.object(natural_exec, '_open_user_runtime_dir', return_value=fd), \
+             patch.object(natural_exec, '_bind_unique_endpoint', return_value=(resource, (1, 1))), \
+             patch.object(natural_exec, '_launch_bounded_donor'), \
+             patch.object(natural_exec, '_accept_root_peer', return_value=resource), \
+             patch.object(natural_exec.transfer, 'receive_root_donation', return_value=resource), \
+             patch.object(natural_exec.bootstrap, 'validate_donated_images', return_value=resource), \
+             patch.object(natural_exec, '_unlink_owned_endpoint'):
+            with self.assertRaises(OSError):
+                natural_exec.maybe_exec_natural_host(['serve'], exec_fn=lambda *a: self.fail('must not exec'))
+        try:
+            os.fstat(sentinel[0])
+        finally:
+            real_close(sentinel[0])
+
+    def test_walk_transition_close_error_closes_unreturned_successor_without_retry(self):
+        opened = []
+        first = [True]
+        real_open = os.open
+        real_close = os.close
+
+        def tracking_open(*args, **kwargs):
+            f = real_open(*args, **kwargs)
+            opened.append(f)
+            return f
+
+        def consumed_error(f):
+            real_close(f)
+            if first[0]:
+                first[0] = False
+                raise OSError(errno.EIO, 'simulated walk close')
+
+        proxy = types.SimpleNamespace(**vars(os))
+        proxy.open = tracking_open
+        proxy.close = consumed_error
+        root_parents = {str(p) for p in Path(self.runtime_root).parents} | {str(self.runtime_root)}
+        real_fstat = os.fstat
+        real_readlink = os.readlink
+
+        def runtime_fstat(f):
+            info = real_fstat(f)
+            try:
+                p = real_readlink(f'/proc/self/fd/{f}')
+            except OSError:
+                p = ''
+            return self._root_stat(info) if p in root_parents else info
+
+        proxy.fstat = runtime_fstat
+        with patch.object(natural_exec, 'os', proxy):
+            with self.assertRaises(OSError):
+                natural_exec._open_user_runtime_dir(self.uid, runtime_root=str(self.runtime_root))
+        for f in opened:
+            with self.assertRaises(OSError):
+                os.fstat(f)
+
+    def test_bind_unique_endpoint_unlinks_own_created_socket_on_listen_failure(self):
+        nat_dir = self.uid_dir / natural_exec.RUNTIME_SUBDIR
+        nat_dir.mkdir(mode=0o700)
+        directory = os.open(nat_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, directory)
+        real_socket = natural_exec.socket.socket
+
+        class FailListen(real_socket):
+            def listen(self, *args):
+                raise OSError(errno.EIO, 'simulated listen failure')
+
+        with patch.object(natural_exec.socket, 'socket', FailListen):
+            with self.assertRaises(OSError):
+                natural_exec._bind_unique_endpoint(directory, 'owned.sock', self.uid)
+        self.assertFalse((nat_dir / 'owned.sock').exists())
+
+    def test_verify_installed_helper_rejects_cleanup_failure(self):
+        real_fstat = os.fstat
+        real_readlink = os.readlink
+        proxy = types.SimpleNamespace(**vars(os))
+
+        def helper_fstat(fd):
+            info = real_fstat(fd)
+            try:
+                p = real_readlink(f'/proc/self/fd/{fd}')
+            except OSError:
+                p = ''
+            if p == str(self.helper):
+                return self._root_stat(info)
+            return info
+
+        proxy.fstat = helper_fstat
+        with patch.object(natural_exec, 'os', proxy), \
+             patch.object(natural_exec.startup, '_root_graph',
+                          return_value=({str(self.root): os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)}, ())), \
+             patch.object(natural_exec.transfer, '_close_owned', return_value=False):
+            with self.assertRaises(transfer.TransferError):
+                natural_exec._verify_installed_helper(str(self.helper))
 
 
 if __name__ == '__main__':

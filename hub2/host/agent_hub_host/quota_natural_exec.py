@@ -43,6 +43,7 @@ def _verify_installed_helper(helper_path=HELPER_PATH):
                       and path.name not in ('', '.', '..'))
     nodes, _edges = startup._root_graph([path.parent])
     helper_fd = -1
+    clean = True
     try:
         helper_fd = os.open(path.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
                             dir_fd=nodes[str(path.parent)])
@@ -51,46 +52,48 @@ def _verify_installed_helper(helper_path=HELPER_PATH):
                           and info.st_nlink == 1 and not (info.st_mode & 0o022)
                           and info.st_size > 0)
     finally:
-        transfer._close_owned([helper_fd, *nodes.values()])
+        to_close = [fd for fd in (helper_fd, *nodes.values()) if fd >= 0]
+        helper_fd = -1
+        nodes.clear()
+        clean = transfer._close_owned(to_close)
+    transfer._require(clean)
+
+
+def _step_dir(holder, name):
+    """Advance holder[0] with ownership transferred before closing the prior FD."""
+    nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=holder[0])
+    old, holder[0] = holder[0], nxt
+    os.close(old)
 
 
 def _open_user_runtime_dir(uid, *, runtime_root='/run/user'):
     """Open or create private 0700 /run/user/<uid>/agent-hub-natural safely."""
     root_path = Path(runtime_root)
     transfer._require(root_path.is_absolute() and '..' not in root_path.parts)
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    holder = [os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
     try:
-        info = os.fstat(fd)
+        info = os.fstat(holder[0])
         transfer._require(info.st_uid == 0 and not (info.st_mode & 0o022))
         for part in root_path.parts[1:]:
-            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-            old, fd = fd, -1
-            os.close(old)
-            fd = nxt
-            info = os.fstat(fd)
+            _step_dir(holder, part)
+            info = os.fstat(holder[0])
             transfer._require(info.st_uid == 0 and not (info.st_mode & 0o022))
-        uid_fd = os.open(str(uid), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-        old, fd = fd, -1
-        os.close(old)
-        fd = uid_fd
-        info = os.fstat(fd)
+        _step_dir(holder, str(uid))
+        info = os.fstat(holder[0])
         transfer._require(info.st_uid in (0, uid) and not (info.st_mode & 0o022))
         try:
-            os.mkdir(RUNTIME_SUBDIR, 0o700, dir_fd=fd)
+            os.mkdir(RUNTIME_SUBDIR, 0o700, dir_fd=holder[0])
         except FileExistsError:
             pass
-        nat_fd = os.open(RUNTIME_SUBDIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-        old, fd = fd, -1
-        os.close(old)
-        fd = nat_fd
-        info = os.fstat(fd)
+        _step_dir(holder, RUNTIME_SUBDIR)
+        info = os.fstat(holder[0])
         transfer._require(stat.S_ISDIR(info.st_mode) and info.st_uid == uid
                           and stat.S_IMODE(info.st_mode) == 0o700)
-        result, fd = fd, -1
+        result, holder[0] = holder[0], -1
         return result
     finally:
-        if fd >= 0:
-            transfer._close_owned([fd])
+        if holder[0] >= 0:
+            transfer._close_owned(holder)
 
 
 def _bind_unique_endpoint(nat_dir_fd, sock_name, uid):
@@ -103,19 +106,24 @@ def _bind_unique_endpoint(nat_dir_fd, sock_name, uid):
         raise transfer.TransferError('natural_donation_transfer_rejected')
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | getattr(socket, 'SOCK_CLOEXEC', 0))
+    owned_identity = None
     try:
         sock.setblocking(False)
         sock.bind(f'/proc/self/fd/{nat_dir_fd}/{sock_name}')
         st = os.stat(sock_name, dir_fd=nat_dir_fd, follow_symlinks=False)
-        transfer._require(stat.S_ISSOCK(st.st_mode) and st.st_uid == uid)
+        if stat.S_ISSOCK(st.st_mode) and st.st_uid == uid:
+            owned_identity = (st.st_dev, st.st_ino)
+        transfer._require(owned_identity is not None)
         sock.listen(1)
-        return sock, (st.st_dev, st.st_ino)
-    except BaseException:
-        try:
-            sock.close()
-        except OSError:
-            pass
-        raise
+        result, sock = sock, None
+        return result, owned_identity
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            _unlink_owned_endpoint(nat_dir_fd, sock_name, owned_identity)
 
 
 def _unlink_owned_endpoint(nat_dir_fd, sock_name, owned_identity):
@@ -243,19 +251,19 @@ def maybe_exec_natural_host(
         conn = _accept_root_peer(listener, deadline_ns)
         nonce = secrets.token_hex(32)
         donation = transfer.receive_root_donation(conn, nonce=nonce, deadline_ns=deadline_ns)
-        conn.close()
-        conn = None
+        closing_conn, conn = conn, None
+        closing_conn.close()
         images = bootstrap.validate_donated_images(donation, expected_commit)
         images.recheck()
         transfer._require(images.close())
         images = None
 
-        listener.close()
-        listener = None
-        _unlink_owned_endpoint(nat_dir_fd, sock_name, owned_identity)
-        owned_identity = None
-        os.close(nat_dir_fd)
-        nat_dir_fd = -1
+        closing_listener, listener = listener, None
+        closing_listener.close()
+        identity, owned_identity = owned_identity, None
+        _unlink_owned_endpoint(nat_dir_fd, sock_name, identity)
+        closing_nat, nat_dir_fd = nat_dir_fd, -1
+        os.close(closing_nat)
 
         taken_slots = donation.take()
         for fd in taken_slots:
