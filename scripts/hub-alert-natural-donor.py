@@ -8,6 +8,7 @@ All privileged work requires genuine UID/EUID 0 and a fixed Root-owned profile.
 import argparse
 import array
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -53,6 +54,12 @@ def _require(cond, reason='donor_rejected'):
         raise DonorError(reason)
 
 
+def _remaining_secs(deadline_ns, monotonic_ns):
+    remaining = (deadline_ns - monotonic_ns()) / 1_000_000_000
+    _require(remaining > 0, 'handoff_deadline_expired')
+    return remaining
+
+
 def _unique_json_pairs(items):
     result = {}
     for key, value in items:
@@ -82,17 +89,30 @@ def _close_once(fds):
     return clean
 
 
-def _walk_dir(path_str, target_uid, *, require_mode=None, root_only=False):
+def _walk_dir(path_str, target_uid, *, require_mode=None, root_only=False,
+              deadline_ns=None, monotonic_ns=time.monotonic_ns):
     path = Path(path_str)
     _require(path.is_absolute() and '..' not in path.parts, 'invalid_directory')
+    if deadline_ns is not None:
+        _remaining_secs(deadline_ns, monotonic_ns)
     allowed_uids = (0,) if root_only else (0, target_uid)
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         root_info = os.fstat(fd)
         _require(root_info.st_uid == 0 and not (root_info.st_mode & 0o022), 'untrusted_root_directory')
         for part in path.parts[1:]:
+            if deadline_ns is not None:
+                _remaining_secs(deadline_ns, monotonic_ns)
             nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
-            os.close(fd)
+            old, fd = fd, -1
+            try:
+                os.close(old)
+            except BaseException:
+                try:
+                    os.close(nxt)
+                except OSError:
+                    pass
+                raise
             fd = nxt
             info = os.fstat(fd)
             _require(
@@ -107,14 +127,20 @@ def _walk_dir(path_str, target_uid, *, require_mode=None, root_only=False):
             )
         return fd
     except BaseException:
-        os.close(fd)
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         raise
 
 
-def _read_root_json(path_str, *, optional=False):
+def _read_root_json(path_str, *, optional=False, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     p = Path(path_str)
     _require(p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'), 'invalid_root_file')
-    dir_fd = _walk_dir(str(p.parent), 0, root_only=True)
+    if deadline_ns is not None:
+        _remaining_secs(deadline_ns, monotonic_ns)
+    dir_fd = _walk_dir(str(p.parent), 0, root_only=True, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     fd = -1
     try:
         try:
@@ -129,6 +155,8 @@ def _read_root_json(path_str, *, optional=False):
             and not (st.st_mode & 0o022) and 0 < st.st_size <= MAX_CONFIG_BYTES,
             'untrusted_root_file',
         )
+        if deadline_ns is not None:
+            _remaining_secs(deadline_ns, monotonic_ns)
         raw = os.pread(fd, st.st_size + 1, 0)
         _require(len(raw) == st.st_size, 'root_file_size_mismatch')
         st2 = os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
@@ -141,15 +169,18 @@ def _read_root_json(path_str, *, optional=False):
         _require(isinstance(data, dict), 'invalid_root_json_schema')
         return data
     finally:
-        if fd >= 0:
-            os.close(fd)
-        os.close(dir_fd)
+        primary = sys.exc_info()[1]
+        clean = _close_once([fd, dir_fd])
+        if primary is None and not clean:
+            raise DonorError('cleanup_uncertain')
 
 
-def _write_root_json_atomic(path_str, payload):
+def _write_root_json_atomic(path_str, payload, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     p = Path(path_str)
     _require(p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'), 'invalid_ledger_path')
-    dir_fd = _walk_dir(str(p.parent), 0, root_only=True)
+    if deadline_ns is not None:
+        _remaining_secs(deadline_ns, monotonic_ns)
+    dir_fd = _walk_dir(str(p.parent), 0, root_only=True, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     tmp_name = f'.{p.name}.tmp.{os.getpid()}'
     raw = (json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
     fd = -1
@@ -157,32 +188,40 @@ def _write_root_json_atomic(path_str, payload):
         fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dir_fd)
         written = 0
         while written < len(raw):
+            if deadline_ns is not None:
+                _remaining_secs(deadline_ns, monotonic_ns)
             n = os.write(fd, raw[written:])
             _require(n > 0, 'ledger_write_failed')
             written += n
+        if deadline_ns is not None:
+            _remaining_secs(deadline_ns, monotonic_ns)
         os.fsync(fd)
-        os.close(fd)
-        fd = -1
+        closing, fd = fd, -1
+        os.close(closing)
+        if deadline_ns is not None:
+            _remaining_secs(deadline_ns, monotonic_ns)
         os.rename(tmp_name, p.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         os.fsync(dir_fd)
+        if deadline_ns is not None:
+            _remaining_secs(deadline_ns, monotonic_ns)
     except BaseException:
         if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            _close_once([fd])
         try:
             os.unlink(tmp_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise
     finally:
-        os.close(dir_fd)
+        primary = sys.exc_info()[1]
+        clean = _close_once([dir_fd])
+        if primary is None and not clean:
+            raise DonorError('cleanup_uncertain')
 
 
-def load_fixed_profile(profile_path=DEFAULT_PROFILE_PATH):
+def load_fixed_profile(profile_path=DEFAULT_PROFILE_PATH, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     """Load and validate the fixed Root-owned donor profile."""
-    cfg = _read_root_json(profile_path, optional=False)
+    cfg = _read_root_json(profile_path, optional=False, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     required = {
         'v', 'target_user', 'unit', 'python_bin', 'release_commit',
         'entry_archive', 'entry_sha256', 'source_directory', 'selection_path',
@@ -203,8 +242,10 @@ def load_fixed_profile(profile_path=DEFAULT_PROFILE_PATH):
     return cfg
 
 
-def pin_interpreter(python_bin):
+def pin_interpreter(python_bin, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     _require(python_bin in APPROVED_INTERPRETERS, 'unapproved_interpreter')
+    if deadline_ns is not None:
+        _remaining_secs(deadline_ns, monotonic_ns)
     fd = os.open(python_bin, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try:
         info = os.fstat(fd)
@@ -217,6 +258,8 @@ def pin_interpreter(python_bin):
         hasher = hashlib.sha256()
         total = offset = 0
         while True:
+            if deadline_ns is not None:
+                _remaining_secs(deadline_ns, monotonic_ns)
             chunk = os.pread(fd, 65536, offset)
             if not chunk:
                 break
@@ -230,14 +273,14 @@ def pin_interpreter(python_bin):
             'ctime_ns': info.st_ctime_ns, 'sha256': hasher.hexdigest(),
         }
     except BaseException:
-        os.close(fd)
+        _close_once([fd])
         raise
 
 
-def pin_entry_archive(entry_path, expected_sha256):
+def pin_entry_archive(entry_path, expected_sha256, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     p = Path(entry_path)
     _require(p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'), 'invalid_entry_archive')
-    dir_fd = _walk_dir(str(p.parent), 0, root_only=True)
+    dir_fd = _walk_dir(str(p.parent), 0, root_only=True, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     fd = -1
     try:
         fd = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
@@ -250,6 +293,8 @@ def pin_entry_archive(entry_path, expected_sha256):
         hasher = hashlib.sha256()
         total = offset = 0
         while True:
+            if deadline_ns is not None:
+                _remaining_secs(deadline_ns, monotonic_ns)
             chunk = os.pread(fd, 65536, offset)
             if not chunk:
                 break
@@ -265,16 +310,18 @@ def pin_entry_archive(entry_path, expected_sha256):
             'ctime_ns': info.st_ctime_ns, 'sha256': digest,
         }
     except BaseException:
-        if fd >= 0:
-            os.close(fd)
+        _close_once([fd])
         raise
     finally:
-        os.close(dir_fd)
+        primary = sys.exc_info()[1]
+        clean = _close_once([dir_fd])
+        if primary is None and not clean:
+            raise DonorError('cleanup_uncertain')
 
 
-def pin_root_source(dir_path, name):
+def pin_root_source(dir_path, name, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     _require('/' not in name and name not in ('', '.', '..'), 'invalid_source_name')
-    dir_fd = _walk_dir(dir_path, 0, root_only=True)
+    dir_fd = _walk_dir(dir_path, 0, root_only=True, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     fd = -1
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
@@ -284,6 +331,8 @@ def pin_root_source(dir_path, name):
             and not (info.st_mode & 0o222) and 0 < info.st_size <= MAX_SOURCE_BYTES,
             'untrusted_source',
         )
+        if deadline_ns is not None:
+            _remaining_secs(deadline_ns, monotonic_ns)
         raw = os.pread(fd, info.st_size + 1, 0)
         _require(len(raw) == info.st_size, 'source_size_mismatch')
         return fd, dir_fd, {
@@ -292,9 +341,7 @@ def pin_root_source(dir_path, name):
             'sha256': hashlib.sha256(raw).hexdigest(),
         }
     except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        os.close(dir_fd)
+        _close_once([fd, dir_fd])
         raise
 
 
@@ -311,17 +358,16 @@ def open_fanotify_group(quota_dir_fd, quota_name):
         _require(rc >= 0, 'fanotify_mark_failed')
         return group
     except BaseException:
-        os.close(group)
+        _close_once([group])
         raise
 
 
-def bind_source_gate(gate_dir, target_uid):
-    dir_fd = _walk_dir(gate_dir, target_uid, require_mode=0o700)
+def bind_source_gate(gate_dir, target_uid, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
+    dir_fd = _walk_dir(gate_dir, target_uid, require_mode=0o700, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     node_fd = -1
     node_identity = None
     try:
-        # Refuse if a pre-existing/foreign gate node is already present.
         try:
             os.stat('source-gate.sock', dir_fd=dir_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -351,7 +397,10 @@ def bind_source_gate(gate_dir, target_uid):
         sock.listen(1)
         return sock, dir_fd, node_fd, node_identity
     except BaseException:
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
         if node_identity is not None:
             try:
                 cur = os.stat('source-gate.sock', dir_fd=dir_fd, follow_symlinks=False)
@@ -359,34 +408,40 @@ def bind_source_gate(gate_dir, target_uid):
                     os.unlink('source-gate.sock', dir_fd=dir_fd)
             except OSError:
                 pass
-        if node_fd >= 0:
-            os.close(node_fd)
-        os.close(dir_fd)
+        _close_once([node_fd, dir_fd])
         raise
 
 
-def _remaining_secs(deadline_ns, monotonic_ns):
-    remaining = (deadline_ns - monotonic_ns()) / 1_000_000_000
-    _require(remaining > 0, 'handoff_deadline_expired')
-    return remaining
+def _default_boot_id_reader():
+    return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
 
 
 def _default_proc_reader(pid):
     stat_raw = Path(f'/proc/{pid}/stat').read_text(encoding='ascii')
     status_raw = Path(f'/proc/{pid}/status').read_text(encoding='ascii')
-    return stat_raw, status_raw
+    cgroup_raw = Path(f'/proc/{pid}/cgroup').read_text(encoding='ascii')
+    return stat_raw, status_raw, cgroup_raw
 
 
 def _default_pidfd_opener(pid):
-    if hasattr(os, 'pidfd_open'):
-        return os.pidfd_open(pid, 0)
-    return -1
+    _require(hasattr(os, 'pidfd_open'), 'pidfd_unavailable')
+    fd = os.pidfd_open(pid, 0)
+    _require(type(fd) is int and fd >= 0, 'invalid_pidfd')
+    return fd
 
 
-def query_user_main_pid(target_user, target_uid, deadline_ns, *, runner=subprocess.run,
-                        proc_reader=_default_proc_reader, pidfd_opener=_default_pidfd_opener,
-                        monotonic_ns=time.monotonic_ns):
-    """Query current USER service MainPID and bind process identity within remaining budget."""
+def _verify_live_pidfd(pidfd):
+    _require(type(pidfd) is int and pidfd >= 0, 'invalid_pidfd')
+    while True:
+        try:
+            ready, _, _ = select.select([pidfd], [], [], 0)
+            break
+        except InterruptedError:
+            continue
+    _require(not ready, 'main_pid_exited')
+
+
+def _read_unit_show(target_user, deadline_ns, runner, monotonic_ns):
     timeout_s = _remaining_secs(deadline_ns, monotonic_ns)
     res = runner(
         [
@@ -415,30 +470,69 @@ def query_user_main_pid(target_user, target_uid, deadline_ns, *, runner=subproce
     except ValueError:
         raise DonorError('invalid_unit_pid_or_timestamp')
     _require(main_pid > 1 and start_mono > 0, 'invalid_main_pid')
+    return main_pid, props['InvocationID'], start_mono
 
+
+def _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader):
+    boot_id = boot_id_reader().strip()
+    _require(bool(boot_id), 'missing_boot_id')
+    stat_raw, status_raw, cgroup_raw = proc_reader(main_pid)
+    after_comm = stat_raw.rsplit(')', 1)[1].split()
+    starttime_ticks = int(after_comm[19])
+    _require(starttime_ticks > 0, 'invalid_proc_starttime')
+    uid_line = next((line for line in status_raw.splitlines() if line.startswith('Uid:')), '')
+    uids = [int(x) for x in uid_line.split()[1:5]]
+    _require(len(uids) == 4 and all(u == target_uid for u in uids), 'proc_uid_mismatch')
+    _require(TARGET_UNIT in cgroup_raw, 'proc_unit_cgroup_mismatch')
+    return boot_id, starttime_ticks
+
+
+def query_user_main_pid(target_user, target_uid, deadline_ns, *, runner=subprocess.run,
+                        proc_reader=_default_proc_reader, pidfd_opener=_default_pidfd_opener,
+                        boot_id_reader=_default_boot_id_reader, monotonic_ns=time.monotonic_ns):
+    """Query current USER service MainPID and bind real pidfd/boot/birth/cgroup identity."""
+    main_pid, invocation_id, start_mono = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
     pidfd = pidfd_opener(main_pid)
     try:
-        stat_raw, status_raw = proc_reader(main_pid)
-        after_comm = stat_raw.rsplit(')', 1)[1].split()
-        starttime_ticks = int(after_comm[19])
-        _require(starttime_ticks > 0, 'invalid_proc_starttime')
-        uid_line = next((line for line in status_raw.splitlines() if line.startswith('Uid:')), '')
-        uids = [int(x) for x in uid_line.split()[1:5]]
-        _require(len(uids) == 4 and all(u == target_uid for u in uids), 'proc_uid_mismatch')
+        _verify_live_pidfd(pidfd)
+        _remaining_secs(deadline_ns, monotonic_ns)
+        boot_id, starttime_ticks = _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader)
+        _verify_live_pidfd(pidfd)
+        _remaining_secs(deadline_ns, monotonic_ns)
         return {
             'main_pid': main_pid,
-            'invocation_id': props['InvocationID'],
+            'invocation_id': invocation_id,
             'exec_start_mono': start_mono,
             'proc_starttime_ticks': starttime_ticks,
+            'boot_id': boot_id,
             'pidfd': pidfd,
         }
     except BaseException:
-        if pidfd >= 0:
-            try:
-                os.close(pidfd)
-            except OSError:
-                pass
+        _close_once([pidfd])
         raise
+
+
+def verify_incarnation_still_current(expected, target_user, target_uid, deadline_ns, *,
+                                     runner=subprocess.run, proc_reader=_default_proc_reader,
+                                     boot_id_reader=_default_boot_id_reader,
+                                     monotonic_ns=time.monotonic_ns):
+    """Recheck live pidfd, boot/birth/UID/cgroup, and systemctl unit identity."""
+    _remaining_secs(deadline_ns, monotonic_ns)
+    _verify_live_pidfd(expected['pidfd'])
+    main_pid, invocation_id, start_mono = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
+    _require(
+        main_pid == expected['main_pid']
+        and invocation_id == expected['invocation_id']
+        and start_mono == expected['exec_start_mono'],
+        'unit_incarnation_changed',
+    )
+    boot_id, starttime_ticks = _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader)
+    _require(
+        boot_id == expected['boot_id'] and starttime_ticks == expected['proc_starttime_ticks'],
+        'proc_incarnation_changed',
+    )
+    _verify_live_pidfd(expected['pidfd'])
+    _remaining_secs(deadline_ns, monotonic_ns)
 
 
 def _wait_fd(fd_or_sock, deadline_ns, monotonic_ns, *, write=False):
@@ -458,23 +552,48 @@ def _peer_cred(sock):
     return pid, uid, gid
 
 
-def _connect_user_endpoint(socket_path, target_uid):
+def _connect_user_endpoint(socket_path, target_uid, deadline_ns, monotonic_ns):
     p = Path(socket_path)
     _require(p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'), 'invalid_startup_socket')
-    dir_fd = _walk_dir(str(p.parent), target_uid)
+    dir_fd = _walk_dir(str(p.parent), target_uid, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     try:
         st = os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
         _require(stat.S_ISSOCK(st.st_mode) and st.st_uid == target_uid, 'untrusted_startup_socket')
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | getattr(socket, 'SOCK_CLOEXEC', 0))
         try:
-            sock.connect(f'/proc/self/fd/{dir_fd}/{p.name}')
             sock.setblocking(False)
+            target = f'/proc/self/fd/{dir_fd}/{p.name}'
+            while True:
+                _remaining_secs(deadline_ns, monotonic_ns)
+                try:
+                    sock.connect(target)
+                    break
+                except InterruptedError:
+                    continue
+                except BlockingIOError:
+                    _wait_fd(sock, deadline_ns, monotonic_ns, write=True)
+                    err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    _require(err == 0, 'connect_failed')
+                    break
+                except OSError as exc:
+                    if exc.errno in (errno.EINPROGRESS, errno.EAGAIN):
+                        _wait_fd(sock, deadline_ns, monotonic_ns, write=True)
+                        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        _require(err == 0, 'connect_failed')
+                        break
+                    raise
             return sock
         except BaseException:
-            sock.close()
+            try:
+                sock.close()
+            except OSError:
+                pass
             raise
     finally:
-        os.close(dir_fd)
+        primary = sys.exc_info()[1]
+        clean = _close_once([dir_fd])
+        if primary is None and not clean:
+            raise DonorError('cleanup_uncertain')
 
 
 def _validate_request(raw, target_uid, deadline_ns, prior_ledger, monotonic_ns):
@@ -514,6 +633,7 @@ def donate_from_fixed_profile(
     runner=subprocess.run,
     proc_reader=_default_proc_reader,
     pidfd_opener=_default_pidfd_opener,
+    boot_id_reader=_default_boot_id_reader,
     monotonic_ns=time.monotonic_ns,
     endpoint_connector=_connect_user_endpoint,
     peer_cred_getter=_peer_cred,
@@ -525,20 +645,21 @@ def donate_from_fixed_profile(
     """Execute one bounded Root descriptor donation against a fixed Root profile."""
     _require(uid_getter() == 0 and euid_getter() == 0, 'root_entry_required')
     deadline_ns = monotonic_ns() + HANDOFF_DEADLINE_NS
-    profile = load_fixed_profile(profile_path)
+    profile = load_fixed_profile(profile_path, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     pw = pw_lookup(profile['target_user'])
     target_uid = pw.pw_uid
     _require(target_uid > 0 and pw.pw_gid > 0 and pw.pw_name == profile['target_user'], 'non_root_target_required')
 
-    prior_ledger = ledger_reader(profile['ledger_path'], optional=True)
+    prior_ledger = ledger_reader(profile['ledger_path'], optional=True, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
     if prior_ledger is not None and prior_ledger.get('state') in ('rights_may_have_transferred', 'unknown'):
         raise DonorError('prior_custody_unknown')
 
     incarnation = query_user_main_pid(
         profile['target_user'], target_uid, deadline_ns,
-        runner=runner, proc_reader=proc_reader, pidfd_opener=pidfd_opener, monotonic_ns=monotonic_ns,
+        runner=runner, proc_reader=proc_reader, pidfd_opener=pidfd_opener,
+        boot_id_reader=boot_id_reader, monotonic_ns=monotonic_ns,
     )
-    pidfd = incarnation.pop('pidfd')
+    pidfd = incarnation['pidfd']
     sock = None
     owned_fds = []
     gate_sock = None
@@ -547,33 +668,41 @@ def donate_from_fixed_profile(
     gate_node_identity = None
     ack_r = ack_w = manifest_r = manifest_w = -1
     rights_may_have_transferred = False
+    cleanup_certain = True
     try:
-        sock = endpoint_connector(profile['startup_socket_path'], target_uid)
+        sock = endpoint_connector(profile['startup_socket_path'], target_uid, deadline_ns, monotonic_ns)
         peer_pid, peer_uid, _ = peer_cred_getter(sock)
         _require(peer_uid == target_uid and peer_pid == incarnation['main_pid'], 'peer_identity_mismatch')
 
-        _wait_fd(sock, deadline_ns, monotonic_ns)
-        req_bytes, _anc, flags, _addr = sock.recvmsg(MAX_PACKET, 0, getattr(socket, 'MSG_DONTWAIT', 0))
+        while True:
+            _wait_fd(sock, deadline_ns, monotonic_ns)
+            try:
+                req_bytes, _anc, flags, _addr = sock.recvmsg(MAX_PACKET, 0, getattr(socket, 'MSG_DONTWAIT', 0))
+                break
+            except (BlockingIOError, InterruptedError):
+                continue
         _require(not (flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)) and bool(req_bytes), 'invalid_request_packet')
         nonce, effective_deadline_ns, slot_for = _validate_request(
             req_bytes, target_uid, deadline_ns, prior_ledger, monotonic_ns,
         )
 
-        interp_fd, interp_pin = pin_interpreter(profile['python_bin'])
+        interp_fd, interp_pin = pin_interpreter(profile['python_bin'], deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         owned_fds.append(interp_fd)
-        entry_fd, entry_pin = pin_entry_archive(profile['entry_archive'], profile['entry_sha256'])
+        entry_fd, entry_pin = pin_entry_archive(profile['entry_archive'], profile['entry_sha256'], deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         owned_fds.append(entry_fd)
         sel_path = Path(profile['selection_path'])
-        sel_fd, sel_dir_fd, sel_pin = pin_root_source(str(sel_path.parent), sel_path.name)
+        sel_fd, sel_dir_fd, sel_pin = pin_root_source(str(sel_path.parent), sel_path.name, deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         owned_fds.extend((sel_fd, sel_dir_fd))
-        src_fd, src_dir_fd, src_pin = pin_root_source(profile['source_directory'], 'hub-quota-publish.py')
+        src_fd, src_dir_fd, src_pin = pin_root_source(profile['source_directory'], 'hub-quota-publish.py', deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         owned_fds.extend((src_fd, src_dir_fd))
-        cli_fd, cli_dir_fd, cli_pin = pin_root_source(profile['source_directory'], 'hub_alert_client.py')
+        cli_fd, cli_dir_fd, cli_pin = pin_root_source(profile['source_directory'], 'hub_alert_client.py', deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         owned_fds.extend((cli_fd, cli_dir_fd))
         fan_group = fanotify_opener(src_dir_fd, 'hub-quota-publish.py')
         owned_fds.append(fan_group)
 
-        gate_sock, gate_dir_fd, gate_node_fd, gate_node_identity = gate_binder(profile['gate_directory'], target_uid)
+        gate_sock, gate_dir_fd, gate_node_fd, gate_node_identity = gate_binder(
+            profile['gate_directory'], target_uid, deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns,
+        )
         ack_r, ack_w = os.pipe2(os.O_CLOEXEC)
         manifest_r, manifest_w = os.pipe2(os.O_CLOEXEC)
 
@@ -600,7 +729,9 @@ def donate_from_fixed_profile(
         }, separators=(',', ':')).encode('utf-8')
         _require(len(manifest) <= MAX_PACKET and os.write(manifest_w, manifest) == len(manifest), 'manifest_write_failed')
         consumed_w, manifest_w = manifest_w, -1
-        os.close(consumed_w)
+        if not _close_once([consumed_w]):
+            cleanup_certain = False
+            raise DonorError('cleanup_uncertain')
 
         donor_fds = [
             interp_fd, entry_fd, sel_fd, sel_dir_fd, src_fd, src_dir_fd,
@@ -616,10 +747,12 @@ def donate_from_fixed_profile(
             'roles': list(ROLES),
         }, separators=(',', ':')).encode('utf-8')
         _require(len(reply) <= MAX_PACKET, 'reply_too_large')
-        _remaining_secs(effective_deadline_ns, monotonic_ns)
 
-        # Record durable unknown-custody intent BEFORE sendmsg so any partial
-        # send, missing ACK, or exception preserves the adopted/unknown gate.
+        verify_incarnation_still_current(
+            incarnation, profile['target_user'], target_uid, effective_deadline_ns,
+            runner=runner, proc_reader=proc_reader, boot_id_reader=boot_id_reader, monotonic_ns=monotonic_ns,
+        )
+
         custody_record = {
             'v': 1,
             'state': 'rights_may_have_transferred',
@@ -630,32 +763,52 @@ def donate_from_fixed_profile(
             'gate_node': {'dev': gate_node_identity[0], 'ino': gate_node_identity[1]},
             'deadline_ns': effective_deadline_ns,
         }
-        ledger_writer(profile['ledger_path'], custody_record)
+        ledger_writer(profile['ledger_path'], custody_record, deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
         rights_may_have_transferred = True
 
-        _wait_fd(sock, effective_deadline_ns, monotonic_ns, write=True)
-        sent = sock.sendmsg(
-            [reply],
-            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', donor_fds))],
-        )
+        while True:
+            _wait_fd(sock, effective_deadline_ns, monotonic_ns, write=True)
+            try:
+                sent = sock.sendmsg(
+                    [reply],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', donor_fds))],
+                )
+                break
+            except (BlockingIOError, InterruptedError):
+                continue
         _require(sent == len(reply), 'partial_rights_send')
 
-        # Drop donor-side copies of transferred FDs; keep only ack_r.
-        _close_once([ack_w, manifest_r, gate_node_fd, gate_dir_fd])
+        to_close = [ack_w, manifest_r, gate_node_fd, gate_dir_fd]
         ack_w = manifest_r = gate_node_fd = gate_dir_fd = -1
-        gate_sock.close()
+        cleanup_certain = _close_once(to_close) and cleanup_certain
+        try:
+            gate_sock.close()
+        except OSError:
+            cleanup_certain = False
         gate_sock = None
-        _close_once(owned_fds)
+        cleanup_certain = _close_once(owned_fds) and cleanup_certain
 
         ack_buf = b''
         while len(ack_buf) < len(ACK_BYTES):
             _wait_fd(ack_r, effective_deadline_ns, monotonic_ns)
-            chunk = os.read(ack_r, len(ACK_BYTES) - len(ack_buf))
+            try:
+                chunk = os.read(ack_r, len(ACK_BYTES) - len(ack_buf))
+            except (BlockingIOError, InterruptedError):
+                continue
             _require(bool(chunk), 'ack_eof_before_confirmation')
             ack_buf += chunk
         _require(ack_buf == ACK_BYTES, 'invalid_ack_payload')
+        _remaining_secs(effective_deadline_ns, monotonic_ns)
+
+        verify_incarnation_still_current(
+            incarnation, profile['target_user'], target_uid, effective_deadline_ns,
+            runner=runner, proc_reader=proc_reader, boot_id_reader=boot_id_reader, monotonic_ns=monotonic_ns,
+        )
+
         custody_record['state'] = 'adopted'
-        ledger_writer(profile['ledger_path'], custody_record)
+        ledger_writer(profile['ledger_path'], custody_record, deadline_ns=effective_deadline_ns, monotonic_ns=monotonic_ns)
+        _remaining_secs(effective_deadline_ns, monotonic_ns)
+        _require(cleanup_certain, 'cleanup_uncertain')
         return {
             'status': 'DONATED',
             'nonce': nonce,
@@ -663,21 +816,17 @@ def donate_from_fixed_profile(
             'gate_node': custody_record['gate_node'],
         }
     finally:
-        if pidfd >= 0:
-            try:
-                os.close(pidfd)
-            except OSError:
-                pass
+        primary = sys.exc_info()[1]
         if sock is not None:
             try:
                 sock.close()
             except OSError:
-                pass
+                cleanup_certain = False
         if gate_sock is not None:
             try:
                 gate_sock.close()
             except OSError:
-                pass
+                cleanup_certain = False
         if not rights_may_have_transferred and gate_node_identity is not None and gate_dir_fd >= 0:
             try:
                 cur = os.stat('source-gate.sock', dir_fd=gate_dir_fd, follow_symlinks=False)
@@ -685,8 +834,12 @@ def donate_from_fixed_profile(
                     os.unlink('source-gate.sock', dir_fd=gate_dir_fd)
             except OSError:
                 pass
-        _close_once([ack_r, ack_w, manifest_r, manifest_w, gate_node_fd, gate_dir_fd])
-        _close_once(owned_fds)
+        closing = [ack_r, ack_w, manifest_r, manifest_w, gate_node_fd, gate_dir_fd, pidfd]
+        ack_r = ack_w = manifest_r = manifest_w = gate_node_fd = gate_dir_fd = pidfd = -1
+        cleanup_certain = _close_once(closing) and cleanup_certain
+        cleanup_certain = _close_once(owned_fds) and cleanup_certain
+        if primary is None and not cleanup_certain:
+            raise DonorError('cleanup_uncertain')
 
 
 def main(argv=None):
