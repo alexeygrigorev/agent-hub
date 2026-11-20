@@ -33,6 +33,9 @@ def _load_donor():
 
 donor = _load_donor()
 COMMIT = 'a' * 40
+INVOCATION_ID = '1' * 32
+BOOT_UUID = '00000000-0000-4000-8000-000000000001'
+CONTROL_GROUP = '/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub2-host.service'
 
 
 class SimulatedRootDonorTests(unittest.TestCase):
@@ -61,7 +64,6 @@ class SimulatedRootDonorTests(unittest.TestCase):
             'selection_path': str(self.root / 'sel/selection.json'),
             'broker_directory': str(self.root / 'broker'),
             'gate_directory': str(self.gate_dir),
-            'startup_socket_path': str(self.root / 'startup.sock'),
             'ledger_path': str(self.ledger_path),
         }
         self.profile_path.write_text(json.dumps(self.profile), encoding='utf-8')
@@ -156,14 +158,18 @@ class SimulatedRootDonorTests(unittest.TestCase):
             self.assertEqual(argv[:4], [donor.SYSTEMCTL_BIN, '--user', '--machine=alexey@.host', 'show'])
             return types.SimpleNamespace(
                 returncode=0,
-                stdout='MainPID=4242\nActiveState=active\nSubState=running\nInvocationID=inv-1\nExecMainStartTimestampMonotonic=555\n',
+                stdout=(
+                    f'MainPID=4242\nActiveState=active\nSubState=running\n'
+                    f'InvocationID={INVOCATION_ID}\nExecMainStartTimestampMonotonic=555\n'
+                    f'ControlGroup={CONTROL_GROUP}\n'
+                ),
             )
 
         def default_proc(_pid):
             return (
                 '4242 (hub2) S ' + '0 ' * 18 + '12345 0',
                 'Uid:\t1000\t1000\t1000\t1000\n',
-                '0::/user.slice/user-1000.slice/user@1000.service/app.slice/agent-hub2-host.service\n',
+                f'0::{CONTROL_GROUP}\n',
             )
 
         def default_pidfd(_pid):
@@ -203,6 +209,11 @@ class SimulatedRootDonorTests(unittest.TestCase):
                 raise OSError(errno.EIO, 'simulated_close_eio')
             real_close(fd)
 
+        observed_connect = {}
+        def capture_connector(path, _u, _d, _m):
+            observed_connect['path'] = path
+            return connector_sock
+
         with patch.multiple(
             donor,
             load_fixed_profile=lambda _p=None, **_k: dict(self.profile),
@@ -219,15 +230,16 @@ class SimulatedRootDonorTests(unittest.TestCase):
                     runner=runner_fn or default_runner,
                     proc_reader=proc_fn or default_proc,
                     pidfd_opener=pidfd_factory or default_pidfd,
-                    boot_id_reader=boot_fn or (lambda: 'boot-1'),
+                    boot_id_reader=boot_fn or (lambda: BOOT_UUID),
                     monotonic_ns=clock_fn or (lambda: self.clock_ns),
-                    endpoint_connector=lambda _p, _u, _d, _m: connector_sock,
+                    endpoint_connector=capture_connector,
                     peer_cred_getter=lambda _s: (peer_pid, peer_uid, 1000),
                     fanotify_opener=fake_fan,
                     gate_binder=fake_gate,
                     ledger_reader=fake_ledger_read,
                     ledger_writer=fake_ledger_write,
                 )
+                received_bundle['connect_path'] = observed_connect.get('path')
                 return res, received_bundle, ledger_store['current']
             finally:
                 try:
@@ -259,6 +271,10 @@ class SimulatedRootDonorTests(unittest.TestCase):
         res, bundle, ledger = self._run_donation(eagain_send=True)
         self.assertEqual(res['status'], 'DONATED')
         self.assertEqual(res['main_pid'], 4242)
+        self.assertEqual(
+            bundle['connect_path'],
+            f'/run/user/1000/agent-hub-natural/{INVOCATION_ID}-4242.sock',
+        )
         self.assertEqual(bundle['reply']['kind'], 'natural_donation_rights_v1')
         self.assertEqual(bundle['reply']['roles'], list(donor.ROLES))
         self.assertEqual(len(bundle['fds']), 14)
@@ -270,6 +286,16 @@ class SimulatedRootDonorTests(unittest.TestCase):
         self.assertEqual(manifest['entry']['fd'], bundle['req_slots'][1])
         self.assertEqual(manifest['fan_group'], bundle['req_slots'][8])
         self.assertEqual(ledger['state'], 'adopted')
+        self.assertEqual(ledger['control_group'], CONTROL_GROUP)
+        self.assertEqual(ledger['boot_id'], BOOT_UUID)
+        self.assertEqual(ledger['proc_starttime_ticks'], 12345)
+        self.assertEqual(ledger['exec_start_mono'], 555)
+
+    def test_profile_rejects_arbitrary_startup_socket_path(self):
+        bad_profile = dict(self.profile, startup_socket_path='/tmp/arbitrary.sock')
+        with patch.object(donor, '_read_root_json', return_value=bad_profile):
+            with self.assertRaisesRegex(donor.DonorError, 'arbitrary_startup_socket_forbidden'):
+                donor.load_fixed_profile(str(self.profile_path))
 
     def test_incarnation_guards_reject_missing_pidfd_dead_pid_and_reused_pid(self):
         with self.assertRaisesRegex(donor.DonorError, 'invalid_pidfd'):
@@ -280,17 +306,30 @@ class SimulatedRootDonorTests(unittest.TestCase):
         os.close(w_dead)
         with self.assertRaisesRegex(donor.DonorError, 'main_pid_exited'):
             self._run_donation(pidfd_factory=lambda _pid: r_dead)
-        # Wrong unit cgroup membership rejected.
+        # Suffix lookalike cgroup must be rejected (no substring matching).
         with self.assertRaisesRegex(donor.DonorError, 'proc_unit_cgroup_mismatch'):
-            self._run_donation(proc_fn=lambda _p: ('4242 (x) S ' + '0 ' * 18 + '123 0', 'Uid:\t1000\t1000\t1000\t1000\n', '0::/user.slice/other.service\n'))
+            self._run_donation(proc_fn=lambda _p: (
+                '4242 (x) S ' + '0 ' * 18 + '123 0',
+                'Uid:\t1000\t1000\t1000\t1000\n',
+                f'0::/foreign/{donor.TARGET_UNIT}-FOREIGN\n',
+            ))
+        # Non-UUID boot_id rejected.
+        with self.assertRaisesRegex(donor.DonorError, 'invalid_boot_id'):
+            self._run_donation(boot_fn=lambda: 'not-a-uuid')
+        # Non-32hex InvocationID rejected.
+        with self.assertRaisesRegex(donor.DonorError, 'invalid_invocation_id'):
+            self._run_donation(runner_fn=lambda *_a, **_k: types.SimpleNamespace(
+                returncode=0,
+                stdout=f'MainPID=4242\nActiveState=active\nSubState=running\nInvocationID=inv-1\nExecMainStartTimestampMonotonic=555\nControlGroup={CONTROL_GROUP}\n',
+            ))
         # InvocationID changing between initial query and pre-send recheck is rejected.
         calls = {'n': 0}
         def changing_runner(*_a, **_k):
             calls['n'] += 1
-            inv = 'inv-1' if calls['n'] == 1 else 'inv-2'
+            inv = INVOCATION_ID if calls['n'] == 1 else ('2' * 32)
             return types.SimpleNamespace(
                 returncode=0,
-                stdout=f'MainPID=4242\nActiveState=active\nSubState=running\nInvocationID={inv}\nExecMainStartTimestampMonotonic=555\n',
+                stdout=f'MainPID=4242\nActiveState=active\nSubState=running\nInvocationID={inv}\nExecMainStartTimestampMonotonic=555\nControlGroup={CONTROL_GROUP}\n',
             )
         with self.assertRaisesRegex(donor.DonorError, 'unit_incarnation_changed'):
             self._run_donation(runner_fn=changing_runner)
@@ -298,7 +337,7 @@ class SimulatedRootDonorTests(unittest.TestCase):
         boots = {'n': 0}
         def changing_boot():
             boots['n'] += 1
-            return 'boot-1' if boots['n'] <= 2 else 'boot-2'
+            return BOOT_UUID if boots['n'] <= 2 else '00000000-0000-4000-8000-000000000002'
         with self.assertRaisesRegex(donor.DonorError, 'proc_incarnation_changed'):
             self._run_donation(boot_fn=changing_boot)
 
@@ -349,6 +388,58 @@ class SimulatedRootDonorTests(unittest.TestCase):
             return self.clock_ns if steps['n'] < 15 else self.clock_ns + 10_000_000_000
         with self.assertRaisesRegex(donor.DonorError, 'handoff_deadline_expired'):
             self._run_donation(clock_fn=expire_late)
+
+    def test_verify_live_pidfd_eintr_is_bounded_by_deadline(self):
+        tick = {'v': 1_000_000_000}
+        def advancing():
+            tick['v'] += 100_000_000
+            return tick['v']
+        pidfd = os.pidfd_open(os.getpid(), 0)
+        self.addCleanup(os.close, pidfd)
+        with patch.object(donor.select, 'select', side_effect=InterruptedError('eintr')):
+            with self.assertRaisesRegex(donor.DonorError, 'handoff_deadline_expired'):
+                donor._verify_live_pidfd(pidfd, 1_250_000_000, advancing)
+
+    def test_pin_entry_archive_and_connect_do_not_leak_return_fd_when_dir_close_fails(self):
+        entry_file = self.root / 'host.pyz'
+        entry_file.write_bytes(self.entry_bytes)
+        entry_file.chmod(0o400)
+        st = entry_file.stat()
+        root_stat = os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0, st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
+        dir_fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        closed = []
+        real_close = os.close
+        def fail_dir_close(fd):
+            closed.append(fd)
+            real_close(fd)
+            if fd == dir_fd:
+                raise OSError(errno.EIO, 'dir_close_failed')
+        with patch.object(donor, '_walk_dir', return_value=dir_fd), \
+             patch.object(os, 'fstat', return_value=root_stat), \
+             patch.object(os, 'close', side_effect=fail_dir_close):
+            with self.assertRaisesRegex(donor.DonorError, 'cleanup_uncertain'):
+                donor.pin_entry_archive(str(entry_file), self.entry_sha)
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(len(set(closed)), 2)
+
+        # Same check for _connect_user_endpoint: dir_fd close failure closes sock once.
+        dir_fd2 = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(srv.close)
+        sock_path = self.root / 'c.sock'
+        srv.bind(f'/proc/self/fd/{dir_fd2}/c.sock')
+        srv.listen(1)
+        sock_st = os.stat(f'/proc/self/fd/{dir_fd2}/c.sock')
+        sock_user_st = os.stat_result((sock_st.st_mode, sock_st.st_ino, sock_st.st_dev, sock_st.st_nlink, os.getuid(), 0, sock_st.st_size, sock_st.st_atime, sock_st.st_mtime, sock_st.st_ctime))
+        def fail_dir2_close(fd):
+            real_close(fd)
+            if fd == dir_fd2:
+                raise OSError(errno.EIO, 'dir2_close_failed')
+        with patch.object(donor, '_walk_dir', return_value=dir_fd2), \
+             patch.object(os, 'stat', return_value=sock_user_st), \
+             patch.object(os, 'close', side_effect=fail_dir2_close):
+            with self.assertRaisesRegex(donor.DonorError, 'cleanup_uncertain'):
+                donor._connect_user_endpoint(str(sock_path), os.getuid(), 10**18, lambda: 1)
 
     def test_missing_ack_partial_send_and_uncertain_close_never_claim_clean(self):
         with self.assertRaisesRegex(donor.DonorError, 'ack_eof_before_confirmation'):

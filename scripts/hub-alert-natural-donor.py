@@ -222,10 +222,11 @@ def _write_root_json_atomic(path_str, payload, *, deadline_ns=None, monotonic_ns
 def load_fixed_profile(profile_path=DEFAULT_PROFILE_PATH, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
     """Load and validate the fixed Root-owned donor profile."""
     cfg = _read_root_json(profile_path, optional=False, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
+    _require('startup_socket_path' not in cfg, 'arbitrary_startup_socket_forbidden')
     required = {
         'v', 'target_user', 'unit', 'python_bin', 'release_commit',
         'entry_archive', 'entry_sha256', 'source_directory', 'selection_path',
-        'broker_directory', 'gate_directory', 'startup_socket_path', 'ledger_path',
+        'broker_directory', 'gate_directory', 'ledger_path',
     }
     _require(required <= set(cfg.keys()), 'incomplete_donor_profile')
     _require(type(cfg['v']) is int and cfg['v'] == 1, 'unsupported_profile_version')
@@ -236,10 +237,18 @@ def load_fixed_profile(profile_path=DEFAULT_PROFILE_PATH, *, deadline_ns=None, m
     expected_entry = f"{RELEASE_ROOT}/{cfg['release_commit']}/host.pyz"
     _require(cfg['entry_archive'] == expected_entry, 'unapproved_entry_archive')
     _require(type(cfg['entry_sha256']) is str and re.fullmatch(r'[0-9a-f]{64}', cfg['entry_sha256']), 'invalid_entry_sha256')
-    for key in ('source_directory', 'selection_path', 'broker_directory', 'gate_directory', 'startup_socket_path', 'ledger_path'):
+    for key in ('source_directory', 'selection_path', 'broker_directory', 'gate_directory', 'ledger_path'):
         val = cfg[key]
         _require(type(val) is str and Path(val).is_absolute() and '..' not in Path(val).parts, f'invalid_{key}')
     return cfg
+
+
+def derive_startup_socket_path(target_uid, invocation_id, main_pid):
+    """Derive the per-incarnation USER startup socket path from verified identity."""
+    _require(type(target_uid) is int and target_uid > 0, 'invalid_target_uid')
+    _require(type(invocation_id) is str and re.fullmatch(r'[0-9a-f]{32}', invocation_id), 'invalid_invocation_id')
+    _require(type(main_pid) is int and main_pid > 1, 'invalid_main_pid')
+    return f'/run/user/{target_uid}/agent-hub-natural/{invocation_id}-{main_pid}.sock'
 
 
 def pin_interpreter(python_bin, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
@@ -304,19 +313,17 @@ def pin_entry_archive(entry_path, expected_sha256, *, deadline_ns=None, monotoni
         _require(total == info.st_size, 'entry_archive_size_mismatch')
         digest = hasher.hexdigest()
         _require(digest == expected_sha256, 'entry_archive_sha256_mismatch')
+        # Complete dir_fd cleanup BEFORE transferring ownership of fd to caller.
+        closing_dir, dir_fd = dir_fd, -1
+        _require(_close_once([closing_dir]), 'cleanup_uncertain')
         return fd, {
             'path': entry_path, 'dev': info.st_dev, 'ino': info.st_ino,
             'size': info.st_size, 'mtime_ns': info.st_mtime_ns,
             'ctime_ns': info.st_ctime_ns, 'sha256': digest,
         }
     except BaseException:
-        _close_once([fd])
+        _close_once([fd, dir_fd])
         raise
-    finally:
-        primary = sys.exc_info()[1]
-        clean = _close_once([dir_fd])
-        if primary is None and not clean:
-            raise DonorError('cleanup_uncertain')
 
 
 def pin_root_source(dir_path, name, *, deadline_ns=None, monotonic_ns=time.monotonic_ns):
@@ -430,9 +437,10 @@ def _default_pidfd_opener(pid):
     return fd
 
 
-def _verify_live_pidfd(pidfd):
+def _verify_live_pidfd(pidfd, deadline_ns, monotonic_ns):
     _require(type(pidfd) is int and pidfd >= 0, 'invalid_pidfd')
     while True:
+        _remaining_secs(deadline_ns, monotonic_ns)
         try:
             ready, _, _ = select.select([pidfd], [], [], 0)
             break
@@ -447,7 +455,7 @@ def _read_unit_show(target_user, deadline_ns, runner, monotonic_ns):
         [
             SYSTEMCTL_BIN, '--user', f'--machine={target_user}@.host', 'show', TARGET_UNIT,
             '-p', 'MainPID', '-p', 'ActiveState', '-p', 'SubState',
-            '-p', 'InvocationID', '-p', 'ExecMainStartTimestampMonotonic',
+            '-p', 'InvocationID', '-p', 'ExecMainStartTimestampMonotonic', '-p', 'ControlGroup',
         ],
         env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
         shell=False,
@@ -463,19 +471,28 @@ def _read_unit_show(target_user, deadline_ns, runner, monotonic_ns):
             k, v = line.split('=', 1)
             props[k] = v.strip()
     _require(props.get('ActiveState') == 'active' and props.get('SubState') == 'running', 'user_unit_not_running')
-    _require(props.get('InvocationID'), 'missing_invocation_id')
+    inv_id = props.get('InvocationID', '')
+    _require(bool(re.fullmatch(r'[0-9a-f]{32}', inv_id)), 'invalid_invocation_id')
+    cgroup = props.get('ControlGroup', '')
+    _require(
+        cgroup.startswith('/') and '..' not in Path(cgroup).parts and Path(cgroup).name == TARGET_UNIT,
+        'invalid_unit_control_group',
+    )
     try:
         main_pid = int(props.get('MainPID', '0'))
         start_mono = int(props.get('ExecMainStartTimestampMonotonic', '0'))
     except ValueError:
         raise DonorError('invalid_unit_pid_or_timestamp')
     _require(main_pid > 1 and start_mono > 0, 'invalid_main_pid')
-    return main_pid, props['InvocationID'], start_mono
+    return main_pid, inv_id, start_mono, cgroup
 
 
-def _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader):
+def _read_proc_incarnation(main_pid, target_uid, expected_cgroup, proc_reader, boot_id_reader):
     boot_id = boot_id_reader().strip()
-    _require(bool(boot_id), 'missing_boot_id')
+    _require(
+        bool(re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', boot_id)),
+        'invalid_boot_id',
+    )
     stat_raw, status_raw, cgroup_raw = proc_reader(main_pid)
     after_comm = stat_raw.rsplit(')', 1)[1].split()
     starttime_ticks = int(after_comm[19])
@@ -483,7 +500,13 @@ def _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader):
     uid_line = next((line for line in status_raw.splitlines() if line.startswith('Uid:')), '')
     uids = [int(x) for x in uid_line.split()[1:5]]
     _require(len(uids) == 4 and all(u == target_uid for u in uids), 'proc_uid_mismatch')
-    _require(TARGET_UNIT in cgroup_raw, 'proc_unit_cgroup_mismatch')
+    unified = [line[3:].strip() for line in cgroup_raw.splitlines() if line.startswith('0::')]
+    _require(len(unified) == 1, 'proc_unified_cgroup_missing')
+    proc_cgroup = unified[0]
+    _require(
+        proc_cgroup == expected_cgroup or proc_cgroup.startswith(expected_cgroup + '/'),
+        'proc_unit_cgroup_mismatch',
+    )
     return boot_id, starttime_ticks
 
 
@@ -491,18 +514,21 @@ def query_user_main_pid(target_user, target_uid, deadline_ns, *, runner=subproce
                         proc_reader=_default_proc_reader, pidfd_opener=_default_pidfd_opener,
                         boot_id_reader=_default_boot_id_reader, monotonic_ns=time.monotonic_ns):
     """Query current USER service MainPID and bind real pidfd/boot/birth/cgroup identity."""
-    main_pid, invocation_id, start_mono = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
+    main_pid, invocation_id, start_mono, control_group = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
     pidfd = pidfd_opener(main_pid)
     try:
-        _verify_live_pidfd(pidfd)
+        _verify_live_pidfd(pidfd, deadline_ns, monotonic_ns)
         _remaining_secs(deadline_ns, monotonic_ns)
-        boot_id, starttime_ticks = _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader)
-        _verify_live_pidfd(pidfd)
+        boot_id, starttime_ticks = _read_proc_incarnation(
+            main_pid, target_uid, control_group, proc_reader, boot_id_reader,
+        )
+        _verify_live_pidfd(pidfd, deadline_ns, monotonic_ns)
         _remaining_secs(deadline_ns, monotonic_ns)
         return {
             'main_pid': main_pid,
             'invocation_id': invocation_id,
             'exec_start_mono': start_mono,
+            'control_group': control_group,
             'proc_starttime_ticks': starttime_ticks,
             'boot_id': boot_id,
             'pidfd': pidfd,
@@ -518,20 +544,23 @@ def verify_incarnation_still_current(expected, target_user, target_uid, deadline
                                      monotonic_ns=time.monotonic_ns):
     """Recheck live pidfd, boot/birth/UID/cgroup, and systemctl unit identity."""
     _remaining_secs(deadline_ns, monotonic_ns)
-    _verify_live_pidfd(expected['pidfd'])
-    main_pid, invocation_id, start_mono = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
+    _verify_live_pidfd(expected['pidfd'], deadline_ns, monotonic_ns)
+    main_pid, invocation_id, start_mono, control_group = _read_unit_show(target_user, deadline_ns, runner, monotonic_ns)
     _require(
         main_pid == expected['main_pid']
         and invocation_id == expected['invocation_id']
-        and start_mono == expected['exec_start_mono'],
+        and start_mono == expected['exec_start_mono']
+        and control_group == expected['control_group'],
         'unit_incarnation_changed',
     )
-    boot_id, starttime_ticks = _read_proc_incarnation(main_pid, target_uid, proc_reader, boot_id_reader)
+    boot_id, starttime_ticks = _read_proc_incarnation(
+        main_pid, target_uid, control_group, proc_reader, boot_id_reader,
+    )
     _require(
         boot_id == expected['boot_id'] and starttime_ticks == expected['proc_starttime_ticks'],
         'proc_incarnation_changed',
     )
-    _verify_live_pidfd(expected['pidfd'])
+    _verify_live_pidfd(expected['pidfd'], deadline_ns, monotonic_ns)
     _remaining_secs(deadline_ns, monotonic_ns)
 
 
@@ -556,44 +585,60 @@ def _connect_user_endpoint(socket_path, target_uid, deadline_ns, monotonic_ns):
     p = Path(socket_path)
     _require(p.is_absolute() and '..' not in p.parts and p.name not in ('', '.', '..'), 'invalid_startup_socket')
     dir_fd = _walk_dir(str(p.parent), target_uid, deadline_ns=deadline_ns, monotonic_ns=monotonic_ns)
+    sock = None
     try:
         st = os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
         _require(stat.S_ISSOCK(st.st_mode) and st.st_uid == target_uid, 'untrusted_startup_socket')
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | getattr(socket, 'SOCK_CLOEXEC', 0))
-        try:
-            sock.setblocking(False)
-            target = f'/proc/self/fd/{dir_fd}/{p.name}'
-            while True:
-                _remaining_secs(deadline_ns, monotonic_ns)
+        sock.setblocking(False)
+        target = f'/proc/self/fd/{dir_fd}/{p.name}'
+        while True:
+            _remaining_secs(deadline_ns, monotonic_ns)
+            try:
+                sock.connect(target)
+                break
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                _wait_fd(sock, deadline_ns, monotonic_ns, write=True)
+                err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                _require(err == 0, 'connect_failed')
                 try:
-                    sock.connect(target)
+                    sock.getpeername()
                     break
-                except InterruptedError:
-                    continue
-                except BlockingIOError:
+                except OSError as peer_exc:
+                    if peer_exc.errno in (errno.ENOTCONN, errno.EAGAIN):
+                        continue
+                    raise
+            except OSError as exc:
+                if exc.errno in (errno.EINPROGRESS, errno.EAGAIN):
                     _wait_fd(sock, deadline_ns, monotonic_ns, write=True)
                     err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                     _require(err == 0, 'connect_failed')
-                    break
-                except OSError as exc:
-                    if exc.errno in (errno.EINPROGRESS, errno.EAGAIN):
-                        _wait_fd(sock, deadline_ns, monotonic_ns, write=True)
-                        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                        _require(err == 0, 'connect_failed')
+                    try:
+                        sock.getpeername()
                         break
-                    raise
-            return sock
-        except BaseException:
+                    except OSError as peer_exc:
+                        if peer_exc.errno in (errno.ENOTCONN, errno.EAGAIN):
+                            continue
+                        raise
+                raise
+        try:
+            sock.getpeername()
+        except OSError:
+            raise DonorError('connect_not_connected')
+        # Complete dir_fd cleanup BEFORE transferring ownership of sock to caller.
+        closing_dir, dir_fd = dir_fd, -1
+        _require(_close_once([closing_dir]), 'cleanup_uncertain')
+        return sock
+    except BaseException:
+        if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
-            raise
-    finally:
-        primary = sys.exc_info()[1]
-        clean = _close_once([dir_fd])
-        if primary is None and not clean:
-            raise DonorError('cleanup_uncertain')
+        _close_once([dir_fd])
+        raise
 
 
 def _validate_request(raw, target_uid, deadline_ns, prior_ledger, monotonic_ns):
@@ -670,7 +715,10 @@ def donate_from_fixed_profile(
     rights_may_have_transferred = False
     cleanup_certain = True
     try:
-        sock = endpoint_connector(profile['startup_socket_path'], target_uid, deadline_ns, monotonic_ns)
+        startup_socket_path = derive_startup_socket_path(
+            target_uid, incarnation['invocation_id'], incarnation['main_pid'],
+        )
+        sock = endpoint_connector(startup_socket_path, target_uid, deadline_ns, monotonic_ns)
         peer_pid, peer_uid, _ = peer_cred_getter(sock)
         _require(peer_uid == target_uid and peer_pid == incarnation['main_pid'], 'peer_identity_mismatch')
 
@@ -760,6 +808,10 @@ def donate_from_fixed_profile(
             'target_uid': target_uid,
             'main_pid': incarnation['main_pid'],
             'invocation_id': incarnation['invocation_id'],
+            'exec_start_mono': incarnation['exec_start_mono'],
+            'control_group': incarnation['control_group'],
+            'proc_starttime_ticks': incarnation['proc_starttime_ticks'],
+            'boot_id': incarnation['boot_id'],
             'gate_node': {'dev': gate_node_identity[0], 'ino': gate_node_identity[1]},
             'deadline_ns': effective_deadline_ns,
         }
