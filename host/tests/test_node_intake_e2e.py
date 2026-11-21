@@ -537,7 +537,8 @@ def test_real_cli_purpose_gates_review_only_model_and_tier_weights_the_pick(plai
         plain = {r["policy_id"]: r["share"] for r in hub.cli.json("sessions", "pick", "--json")["pool"]}
         deep_pick = hub.cli.json("sessions", "pick", "--tier", "deep", "--json")
         deep = {r["policy_id"]: r["share"] for r in deep_pick["pool"]}
-        assert set(plain) == {"e2e-codex", "e2e-alt", "e2e-sol"}, plain
+        # Medium-default effort (Alexey t2760u): the low-effort alt route is explicit-only, never in the automatic pool.
+        assert set(plain) == {"e2e-codex", "e2e-sol"}, plain
         assert max(plain.values()) - min(plain.values()) < 1e-9, plain
         assert deep == {"e2e-sol": pytest.approx(1.0)}, (plain, deep)
         human = hub.cli.run("sessions", "pick", "--tier", "deep").stdout
