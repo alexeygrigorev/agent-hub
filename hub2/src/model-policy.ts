@@ -8,9 +8,11 @@ export type ModelPolicyRoute = {
   capabilities?: string[];
 };
 
-// Z.ai GLM is a pool member only through the canonical `zai` engine on the zai-central account.
-const FORBIDDEN_ZAI_ENGINES = new Set(['zcodex', 'goz']);
-const FORBIDDEN_ZAI_ACCOUNTS = new Set(['shared-zai', 'zcodex']);
+// Standing policy: "No zai-central in the Hub picker". Z.ai has no other allowed
+// account (shared-zai/zcodex alias the same central login), so no Z.ai route is
+// selectable by the picker at all.
+const FORBIDDEN_ZAI_ENGINES = new Set(['zai', 'zcodex', 'goz']);
+const FORBIDDEN_ZAI_ACCOUNTS = new Set(['zai-central', 'shared-zai', 'zcodex']);
 const CLAUDE_PICKER_MODELS = new Set(['sonnet', 'opus']);
 const CARBON_POLICY_ID = 'antigravity-carbon-medium';
 const CARBON_MODEL_ID = 'gemini-4-carbon-medium';
@@ -44,8 +46,7 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
     || candidate.capabilities[0] !== 'think-only'
   )) return 'carbon_policy_contract_invalid';
 
-  if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
-    || (engine === 'zai' && account !== 'zai-central'))
+  if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account))
     return 'zai_picker_route_forbidden';
   if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
     return 'go_orin_picker_route_forbidden';

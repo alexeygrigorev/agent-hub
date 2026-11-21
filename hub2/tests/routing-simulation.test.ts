@@ -43,13 +43,15 @@ test('skewed headroom keeps Go above three percent in the real simulation and dr
  const f=skewedFixture();let index=0;
  const result=await simulateModelRoutes(f.env,{interactive:false},1000,()=>((index++)+.5)/1000);
  assert.deepEqual(result.share_floor,{minimum_share:.03,applied:true,reason:null});
- assert.equal(result.pool.length,6);assert.equal(result.pool_degraded,false);
+ assert.equal(result.pool.length,5);assert.equal(result.pool_degraded,false);
  assert.ok(result.pool.every(row=>row.share>.03));
  assert.ok(Math.abs(result.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  const go=result.pool.find(row=>row.policy_id==='go-muse')!;
- assert.ok(Math.abs(go.share-(.03+.82*7/361.45))<1e-12);
- // Six automatic routes (including canonical zai): headroom 361.45, residual 1-6*.03=.82; Luna is explicit-only.
- assert.ok(result.counts['zai-glm-5-3-flash']>0);
+ assert.ok(Math.abs(go.share-(.03+.85*7/296.45))<1e-12);
+ // Five automatic routes: headroom 296.45, residual 1-5*.03=.85; Luna is explicit-only.
+ // No zai-central in the Hub picker, even with a healthy zai-central account and an advertised zai engine.
+ assert.ok(!result.pool.some(row=>row.engine==='zai'||row.account_id==='zai-central'));
+ assert.equal(result.counts['zai-glm-5-3-flash'],undefined);
  assert.ok(result.counts['go-muse']>30);
  // The actual start draw uses the same transformed weights, not just diagnostics.
  const start=await pickModelRouteDetailed(f.env,{interactive:false},()=>result.pool.slice(0,result.pool.findIndex(r=>r.policy_id==='go-muse')).reduce((s,r)=>s+r.share,0)+1e-6);
@@ -74,7 +76,7 @@ test('exploration retains the five-percent eligibility boundary and cannot resto
 test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
  const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
  const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.82*50/404.45))<1e-12);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.85*50/339.45))<1e-12);
  assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
  f.accountRows.get('shared-go').fresh=true;
  const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
@@ -97,10 +99,10 @@ test('automatic non-Luna weights and candidate shares survive skew and additiona
  const f=skewedFixture();
  for(const [id,row] of f.accountRows)row.quota.remaining=id==='codex'?100:5;
  const original=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.equal(original.pool.length,6);
+ assert.equal(original.pool.length,5);
  assert.ok(!original.pool.some(row=>row.policy_id==='codex-luna-max'));
- // Sol100 and five 5-point accounts: total125, exploration residual .82.
- for(const row of original.pool)assert.ok(Math.abs(row.share-(.03+.82*(row.policy_id==='codex-sol-medium'?100:5)/125))<1e-12);
+ // Sol100 and four 5-point routes: total120, exploration residual .85.
+ for(const row of original.pool)assert.ok(Math.abs(row.share-(.03+.85*(row.policy_id==='codex-sol-medium'?100:5)/120))<1e-12);
  assert.ok(Math.abs(original.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
  f.machines.set('h2',{machine_id:'h2',connected:true,engines:['codex'],capabilities:[flags()[0]]});
  const expanded=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
@@ -129,13 +131,14 @@ test('1000 simulated draws use one passive observation set and the committed ord
  assert.ok(!result.pool.some(row=>row.policy_id==='antigravity-argon-medium'));
  assert.ok(result.pool.some(row=>row.policy_id==='antigravity-hydrogen-medium')&&!result.pool.some(row=>row.engine==='antigravity'&&/flash|argon/.test(row.model)));
  assert.ok(result.pool.every(row=>row.share>.03&&!/astra|fable/i.test(row.model)));
- assert.equal(result.pool.length,6);
+ assert.equal(result.pool.length,5);
  assert.ok(!result.pool.some(row=>/luna/i.test(row.model)));
+ assert.ok(!result.pool.some(row=>row.engine==='zai'||row.account_id==='zai-central'));
  assert.equal(result.counts['codex-luna-max'],undefined);
- assert.ok(result.pool.every(row=>Math.abs(row.share-1/6)<1e-12));
+ assert.ok(result.pool.every(row=>Math.abs(row.share-1/5)<1e-12));
  for(const kind of ['accounts','machines']){
   const rows=f.calls.filter(call=>call.kind===kind);
-  assert.equal(rows.length,kind==='accounts'?5:1);
+  assert.equal(rows.length,kind==='accounts'?4:1);
   assert.ok(rows.every(call=>call.path==='/_internal/routing-snapshot'&&call.method==='GET'));
  }
  assert.equal(result.advisories.filter(row=>row.reason==='local_login_unverified').length,result.pool.length);

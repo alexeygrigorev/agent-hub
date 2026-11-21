@@ -324,7 +324,8 @@ test('pool spreads across engines and keeps automatic Luna/Astra/unadvertised en
   const route=await pickModelRoute(env,{interactive:false},()=>(i+0.5)/200);
   seen.set(route.policy_id,(seen.get(route.policy_id)||0)+1);
  }
- assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse','zai-glm-flash'].sort(),'all five surviving default routes stay usable');
+ assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse'].sort(),'all four surviving default routes stay usable');
+ assert.ok(!seen.has('zai-glm-flash'),'No zai-central in the Hub picker, even from a stored policy row');
  assert.ok(!seen.has('codex-astra-medium'));
  assert.ok(!seen.has('gemini-argon-medium'),'engine no host advertises is not picked');
  assert.ok(!seen.has('codex-luna-max'),'Luna must never be an automatic default');
@@ -557,10 +558,10 @@ test('advertising goal:claude admits Opus and Sonnet to the real weighted goal d
  };
  // Review purpose keeps the non-ordinary ZAI route eligible without the deep-tier strong preference.
  const input={interactive:true,with_goal:true,machine_id:host,purpose:'review' as const};
- assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex','zai']);
+ assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex']);
  capabilities.push('goal:claude');
  const result=buildRoutingPool(snapshot,input);
- assert.deepEqual(result.options.map(row=>row.value.model).sort(),['glm-5.3-flash','gpt-6.1-sol','opus','sonnet']);
+ assert.deepEqual(result.options.map(row=>row.value.model).sort(),['gpt-6.1-sol','opus','sonnet']);
  let cumulative=0;
  const total=result.options.reduce((sum,row)=>sum+row.weight,0);
  const drawn=new Set<string>();
@@ -685,7 +686,7 @@ test('ordinary default/fix/implement in both modes and quick/daily excludes Argo
   const models=result.options.map(row=>row.value.model);
   assert(models.includes('gemini-4-hydrogen-medium'));
   assert(models.includes('gpt-6.1-sol'));
-  assert(models.includes('glm-5.3-flash'));
+  assert(!models.includes('glm-5.3-flash'),'No zai-central in the Hub picker');
   assert(!models.some(model=>/gemini-4-(?:argon|flash)/.test(model)));
   for(const draw of [0,.25,.5,.75,.999999])assert(!/gemini-4-(?:argon|flash)/.test(weightedChoice(result.options,()=>draw).model));
  }
@@ -711,28 +712,18 @@ test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon 
 });
 
 
-test('committed ZAI route works in ordinary pool, --engine zai, explicit and review/deep while Hydrogen replaces Antigravity Flash/Argon', () => {
+test('No zai-central in the Hub picker: committed policy has no Z.ai route and stored zai-central rows are never selectable', () => {
+ assert(!hydrogenPolicy.candidates.some((row:any)=>row.engine==='zai'||row.account_id==='zai-central'));
+ // hydrogenFixture still carries a zai-central row with a huge weight, a healthy account and an advertised zai engine.
  const snapshot=hydrogenFixture();
- snapshot.policy.candidates=hydrogenPolicy.candidates;
  snapshot.machines.get('h1')!.capabilities!.push('effort:zai');
- const id='zai-glm-5-3-flash';
- for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
-  const models=buildRoutingPool(snapshot,{interactive,purpose,tier}).options.map(row=>row.value.model);
-  assert(models.includes('gemini-4-hydrogen-medium'));
-  assert(models.includes('glm-5.3-flash'));
-  assert(!models.some(model=>/gemini-4-(?:argon|flash)/i.test(model)));
+ for(const purpose of [undefined,'fix','implement','review','think'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily','deep']){
+  const result=buildRoutingPool(snapshot,{interactive,purpose,tier});
+  assert(!result.options.some(row=>row.value.engine==='zai'||row.value.account_id==='zai-central'));
  }
- for(const input of [{engine:'zai'},{model:'glm-5.3-flash'},{model:id},{purpose:'review' as const},{purpose:'think' as const}]){
-  assert(buildRoutingPool(snapshot,{interactive:false,...input}).options.some(row=>row.value.policy_id===id));
+ for(const input of [{engine:'zai'},{model:'glm-5.3-flash'},{model:'zai-glm-flash'},{engine:'zai',model:'glm-5.3-flash',effort:'medium'}]){
+  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,...input}),(e:any)=>e.code==='model_policy_unavailable',JSON.stringify(input));
  }
- // A deep tier prefers strong models, so the flash route is only its advisory fallback.
- assert(!buildRoutingPool(snapshot,{interactive:false,tier:'deep'}).options.some(row=>row.value.policy_id===id));
- const explicit=buildRoutingPool(snapshot,{interactive:false,engine:'zai',model:'glm-5.3-flash',effort:'medium',purpose:'implement'});
- assert.deepEqual(explicit.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
-  [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
- const byEngine=buildRoutingPool(snapshot,{interactive:false,engine:'zai'});
- assert.deepEqual(byEngine.options.map(row=>({engine:row.value.engine,model:row.value.model,effort:row.value.effort,account:row.value.account_id})),
-  [{engine:'zai',model:'glm-5.3-flash',effort:'medium',account:'zai-central'}]);
 });
 
 // ---- Codex reserve (AGENTS.md quota gate): fresh known quota strictly above 15%, fail closed ----
@@ -801,7 +792,7 @@ test('Codex reserve is not restorable by explicit model/engine, override, effort
  assert.deepEqual(codexIds(buildRoutingPool(mixedAccounts,{interactive:true,engine:'codex'})),['codex-orin-route']);
 });
 
-test('Codex reserve leaves other providers on advisory 5% and unknown semantics, and ZAI is not Codex',()=>{
+test('Codex reserve leaves other providers on advisory 5% and unknown semantics, and ZAI is never picked',()=>{
  const snap=reserveSnapshot({codex:6,'codex-orin':6,claude:7,'shared-go':5,'zai-central':null,gemini:6} as any);
  const result=buildRoutingPool(snap,{interactive:false});
  const engines=new Set(result.options.map(row=>row.value.engine));
@@ -809,11 +800,10 @@ test('Codex reserve leaves other providers on advisory 5% and unknown semantics,
  for(const engine of ['claude','go'])assert.ok(engines.has(engine),engine);
  const below=buildRoutingPool(reserveSnapshot({codex:100,claude:4.99,'shared-go':4.99,'zai-central':null,'codex-orin':100,gemini:6} as any),{interactive:false});
  assert.ok(below.diagnostics.excluded.some(row=>row.policy_id==='go-muse'&&row.reason==='quota_below_minimum'));
- // A ZAI route is never subject to the Codex reserve, even with unknown/very low quota and when selected explicitly.
- const zai=buildRoutingPool(reserveSnapshot({codex:6,'codex-orin':6,claude:80,'zai-central':3}),{interactive:false,model:'glm-5.3-flash'});
- assert.deepEqual(zai.options.map(row=>row.value.policy_id),['zai-glm-flash']);
- const unknownZai=buildRoutingPool(reserveSnapshot({codex:6,claude:80,'zai-central':null} as any),{interactive:false,engine:'zai',tier:'deep'});
- assert.deepEqual(unknownZai.options.map(row=>row.value.policy_id),['zai-glm-flash']);
+ // No zai-central in the Hub picker: a stored zai-central row stays unselectable even with healthy quota and an explicit request.
+ assert.ok(!engines.has('zai'));
+ assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:6,'codex-orin':6,claude:80,'zai-central':80}),{interactive:false,model:'glm-5.3-flash'}),(e:any)=>e.code==='model_policy_unavailable');
+ assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:6,claude:80,'zai-central':80}),{interactive:false,engine:'zai',tier:'deep'}),(e:any)=>e.code==='model_policy_unavailable');
  // Every provider below 5% still follows the existing advisory fallback, never a refusal.
  const exhaustedOthers=buildRoutingPool(reserveSnapshot({codex:100,'codex-orin':100,claude:1,'shared-go':1,'zai-central':1,gemini:1}),{interactive:false});
  assert.ok(exhaustedOthers.options.length>0);
@@ -1162,17 +1152,18 @@ print(json.dumps(published))
   assert(!machine.capabilities.includes('headless:codex'));
   assert(!machine.capabilities.includes('headless:zai'),'compact declaration avoids redundant legacy hints');
   // Flash is intentionally outside ordinary implement defaults; review is its supported source-audit purpose.
-  const now=Date.now(),policy={version:1,candidates:hydrogenPolicy.candidates.filter((row:any)=>['codex-sol-medium','zai-glm-5-3-flash'].includes(row.id))};
+  // A stored zai-central row stays unselectable (No zai-central in the Hub picker), so only Codex can route here.
+  const now=Date.now(),policy={version:1,candidates:[...hydrogenPolicy.candidates.filter((row:any)=>row.id==='codex-sol-medium'),
+   {id:'zai-glm-5-3-flash',engine:'zai',model:'glm-5.3-flash',effort:'medium',account_id:'zai-central',weight:1,capabilities:[],enabled:true}]};
   const snapshot:RoutingSnapshot={policy,observed_at:now,machines:new Map([['h1',machine]]),accounts:new Map(
    ['codex','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['h1'],...observed(80,now)}]))};
-  const headless=buildRoutingPool(snapshot,{interactive:false,purpose:'review'});
-  assert.deepEqual(headless.options.map(row=>row.value.engine),['zai'],JSON.stringify({machine,diagnostics:headless.diagnostics}));
-  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
-  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,with_goal:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
+  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,purpose:'review'}),(error:any)=>error.code==='model_policy_unavailable','unready headless Codex is excluded and zai-central is never a fallback');
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,with_goal:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
   const onlyCodex={...snapshot,policy:{...policy,candidates:policy.candidates.filter((row:any)=>row.engine==='codex')}};
   assert.throws(()=>buildRoutingPool(onlyCodex,{interactive:false,purpose:'review'}),(error:any)=>error.code==='model_policy_unavailable');
   snapshot.machines.set('h1',{...machine,capabilities:['headless','interactive','effort']});
-  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex','zai']);
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
  }finally{rmSync(home,{recursive:true,force:true});}
 });
 
