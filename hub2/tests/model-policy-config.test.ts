@@ -57,7 +57,11 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   });
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'shared-zai'})), 'zai_picker_route_forbidden');
-  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'})), null);
+  // Standing policy: "No zai-central in the Hub picker"; Z.ai has no other allowed account.
+  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'sneaky', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-other'})), 'zai_picker_route_forbidden');
+  assert.ok(!policy.candidates.some(c => c.account_id === 'zai-central' || c.engine === 'zai'), 'committed policy has no zai-central route');
   assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin'})), 'go_orin_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'go-orin', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'go-orin', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
@@ -72,10 +76,10 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(route({model: 'gemini-4-argon-medium', effort: 'max'})), 'bounded_effort_required');
 });
 
-test('zai appears only as the canonical zai engine on zai-central; astra stays out of the default pool', () => {
+test('No zai-central in the Hub picker: no Z.ai engine or zai-central account; astra stays out of the default pool', () => {
   for (const candidate of policy.candidates) {
-    assert.ok(!['zcodex', 'goz'].includes(candidate.engine), `candidate ${candidate.id} routes through a legacy zai engine`);
-    if (candidate.engine === 'zai') assert.equal(candidate.account_id, 'zai-central');
+    assert.ok(!['zai', 'zcodex', 'goz'].includes(candidate.engine), `candidate ${candidate.id} routes through a zai engine`);
+    assert.ok(!['zai-central', 'shared-zai', 'zcodex'].includes(candidate.account_id), `candidate ${candidate.id} uses a zai account`);
     assert.ok(!/astra/i.test(candidate.model + ' ' + candidate.id), 'astra is explicit-only, never a default candidate');
   }
 });
@@ -90,7 +94,7 @@ test('Gemini 4 Hydrogen via Antigravity replaces the flash route for ordinary pi
   assert.deepEqual(hydrogen.capabilities ?? [], [], 'ordinary: not review-only');
   const ordinary = policy.candidates.filter(isOrdinaryWorkModel);
   assert.ok(!ordinary.some(candidate => candidate.engine === 'antigravity' && /flash|argon/i.test(`${candidate.id} ${candidate.model}`)), 'no antigravity flash/argon route remains in the ordinary automatic pool');
-  assert.ok(ordinary.some(candidate => candidate.id === 'zai-glm-5-3-flash'), 'canonical zai route remains in the ordinary automatic pool');
+  assert.ok(!ordinary.some(candidate => candidate.account_id === 'zai-central'), 'No zai-central in the Hub picker');
   assert.equal(modelPolicyCandidateViolation({id: hydrogen.id, engine: 'antigravity', model: hydrogen.model, effort: 'medium', account_id: 'gemini', capabilities: []}), null);
 });
 
@@ -195,13 +199,8 @@ test('Astra policy writes require review-only capability for both id and model a
 });
 
 
-test('committed GLM uses only the canonical ZAI route and remains in ordinary work', () => {
-  const routes = policy.candidates.filter(candidate => candidate.engine === 'zai');
-  assert.deepEqual(routes, [{id: 'zai-glm-5-3-flash', engine: 'zai', model: 'glm-5.3-flash',
-    effort: 'medium', account_id: 'zai-central', weight: 1, capabilities: [], enabled: true}]);
-  assert.equal(isOrdinaryWorkModel(routes[0]), true);
+test('No zai-central in the Hub picker: committed policy has no GLM route and Go stays on Muse', () => {
+  assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'zai' || /glm/i.test(candidate.model)), []);
   assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'go').map(candidate => candidate.model),
     ['opencode-go/muse-spark-1.3-contributor']);
-  assert(policy.candidates.filter(candidate => /glm/i.test(candidate.model))
-    .every(candidate => candidate.engine === 'zai' && candidate.account_id === 'zai-central'));
 });
