@@ -1635,9 +1635,36 @@ export class ProjectDO {
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
     });
+    await this.markProviderQuotaExhausted(duplicate, saga.account_id, evidence, now);
     await this.scheduleNext();
     await this.releaseSessionCap(saga.operation_id,saga.session_id);
     return json({ ok: true, intake_id: intake.id,...(duplicate?{duplicate:true}:{}) });
+  }
+
+  private async markProviderQuotaExhausted(duplicate: boolean, accountId: string | null, evidence: JsonRecord, now: number): Promise<void> {
+    if (duplicate || !accountId || !this.env.ACCOUNTS) return;
+    const quotaError = evidence.provider_quota_error && typeof evidence.provider_quota_error === 'object' && !Array.isArray(evidence.provider_quota_error)
+      ? evidence.provider_quota_error as JsonRecord : undefined;
+    if (!quotaError || quotaError.exhausted !== true || Number(quotaError.status) !== 429) return;
+    const rawCaptured = Number.isSafeInteger(quotaError.captured_at) ? Number(quotaError.captured_at) : now;
+    const capturedAt = Math.min(Math.max(0, rawCaptured), now);
+    const resetAt = Number.isSafeInteger(quotaError.reset_at) && Number(quotaError.reset_at) > now ? Number(quotaError.reset_at) : null;
+    const validUntil = Math.min(capturedAt + 3_600_000, resetAt !== null && resetAt > now ? resetAt : capturedAt + 3_600_000);
+    if (validUntil <= now) return;
+    await this.env.ACCOUNTS.get(this.env.ACCOUNTS.idFromName(accountId)).fetch('https://account.internal/api/account/quota', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub2-actor': JSON.stringify({ kind: 'service', id: 'hub2-project-do', scopes: ['quota:write'] }),
+      },
+      body: JSON.stringify({
+        remaining: 0,
+        captured_at: capturedAt,
+        valid_until: validUntil,
+        ...(resetAt !== null ? { reset_at: resetAt } : {}),
+        source: 'session_output:provider.quota',
+      }),
+    }).catch(() => undefined);
   }
 
   private async releaseSessionCap(operationId:string,sessionId:string):Promise<void>{

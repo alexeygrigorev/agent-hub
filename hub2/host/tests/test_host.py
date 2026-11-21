@@ -426,6 +426,30 @@ class HostTests(unittest.TestCase):
         self.assertEqual(payload['evidence']['retirement_origin']['observed_workspace'], str(self.root / 'different-cwd'))
         self.assertEqual(payload['evidence']['retirement_origin']['created_at_ms'], manifest['created_at_ms'])
 
+    def test_extract_provider_quota_error_parses_go_usage_limit_429(self):
+        from agent_hub_host.agent import _extract_provider_quota_error
+        ndjson = '\n'.join([
+            json.dumps({'type': 'step_start', 'timestamp': 1795236664319}),
+            json.dumps({
+                'type': 'error',
+                'timestamp': 1795236664336,
+                'error': {
+                    'type': 'provider.quota',
+                    'message': 'OpenCode Go usage limit reached (monthly, resets in 1d 1h).',
+                    'status': 429,
+                },
+            }),
+        ])
+        captured_at = 1795236664000
+        parsed = _extract_provider_quota_error(ndjson, captured_at)
+        self.assertEqual(parsed, {
+            'type': 'provider.quota',
+            'status': 429,
+            'exhausted': True,
+            'captured_at': captured_at,
+            'reset_at': captured_at + 25 * 3_600_000,
+        })
+
     def test_origin_retirement_restart_keeps_one_durable_failed_finish(self):
         row, _, _ = self.origin_retirement_fixture()
         self.bridge.reconcile()

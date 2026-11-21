@@ -8,7 +8,7 @@ import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purp
 import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} from './intake-model-constraints';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
-export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
+export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number; reset_at?: number | null } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
 export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
@@ -82,6 +82,13 @@ function currentQuota(view: AccountView | undefined, now: number): number | null
       || now - quota.captured_at! >= QUOTA_MAX_AGE_MS || quota.valid_until! <= now
       || quota.valid_until! < quota.captured_at! || quota.valid_until! > quota.captured_at! + 3600000) return null;
   return quota.remaining;
+}
+
+/** An exhausted account with a known future reset stays excluded even after probe freshness expires. */
+function exhaustedUntilReset(view: AccountView | undefined, now: number): boolean {
+  const quota = view?.quota;
+  if (!quota || typeof quota.remaining !== 'number' || !Number.isFinite(quota.remaining) || quota.remaining > 0) return false;
+  return typeof quota.reset_at === 'number' && Number.isSafeInteger(quota.reset_at) && quota.reset_at > now;
 }
 
 export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, random = Math.random): T {
@@ -275,7 +282,11 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     ? centralReady(row.candidate)?'central_host_not_approved':'central_credentials_unavailable'
     : row.knownLocalMissing?'local_credentials_missing'
     :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
-  pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
+  pool = narrow(
+    pool,
+    row => !exhaustedUntilReset(accounts.get(row.candidate.account_id), quotaNow) && (row.left === null || row.left >= MIN_HEADROOM),
+    row => exhaustedUntilReset(accounts.get(row.candidate.account_id), quotaNow) ? 'quota_exhausted_until_reset' : 'quota_below_minimum',
+  );
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');
   // Capability preference is global: a candidate without a capable host must not
   // survive its own advisory fallback when another candidate can satisfy launch.
