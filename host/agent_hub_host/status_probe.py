@@ -42,10 +42,7 @@ CF_API_BASE = 'https://api.cloudflare.com/client/v4/'
 MAX_CF_BODY = 1024 * 1024
 MAX_CREDENTIAL_READ = 65536
 DEFAULT_BASE_URL = 'https://hub.dtcdev.click'
-TRUSTED_HUB_HOSTS = {
-    'hub.dtcdev.click',
-    'agent-hub.cloudflare-ai-agent-de9ca0.workers.dev',
-}
+TRUSTED_HUB_HOSTS = {'hub.dtcdev.click'}
 MAX_MANIFEST_BYTES = 65536
 MAX_CLI_ARCHIVE_BYTES = 8 * 1024 * 1024
 
@@ -54,7 +51,6 @@ MAX_CLI_ARCHIVE_BYTES = 8 * 1024 * 1024
 ALLOWLIST = {
     'git': {'rev-parse', 'merge-base', 'status', 'log', 'show-ref', 'branch', 'ls-remote'},
     'gh': {'api', 'run'},
-    'wrangler': {'deployments'},
 }
 REFUSED_GIT_REMOTES = {'fetch', 'push', 'pull', 'clone'}
 _GH_WRITE_TOKENS = {'post', 'patch', 'put', 'delete'}
@@ -125,10 +121,6 @@ def check_argv(argv: Any) -> tuple[list | None, str | None]:
         # Only read-only run inspection; cancel/rerun are mutations.
         if len(argv) < 3 or argv[2] not in _GH_RUN_READONLY:
             return None, 'probe_gh_run_write_refused'
-        return argv, None
-    if tool == 'wrangler' and argv[1] == 'deployments':
-        if len(argv) < 3 or argv[2] != 'list':
-            return None, 'probe_subcommand_not_allowlisted'
         return argv, None
     return argv, None
 
@@ -1307,7 +1299,7 @@ def collect_probes(spec: dict, runner: Callable | None = None,
             })
             continue
 
-        # Standard argv-based probes (git, gh, wrangler)
+        # Standard argv-based probes (git, gh)
         if not cwd:
             skipped.append({'id': pid, 'reason': 'invalid_probe_entry'})
             continue

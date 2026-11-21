@@ -10,7 +10,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "validate-workflow.py"
-ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "ci" / "rollback.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 

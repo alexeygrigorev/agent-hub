@@ -13,7 +13,6 @@ from agent_hub_host import _prod_guard, api
 
 
 PROD = "https://hub.dtcdev.click"
-PROD_WORKER = "https://agent-hub.cloudflare-ai-agent-de9ca0.workers.dev"
 LOCAL = "http://127.0.0.1:19487"
 PROTECTED_PATHS = (
     "/api/machines/register",
@@ -41,7 +40,7 @@ STATIC_SCAN_ALLOWLIST = {
         "the lifecycle rejects production Hub URLs before its local test requests",
 }
 
-PRODUCTION_MARKERS = ("hub.dtcdev.click", "agent-hub.cloudflare-ai-agent-de9ca0.workers.dev")
+PRODUCTION_MARKERS = ("hub.dtcdev.click",)
 WRITE_MARKERS = (*PROTECTED_PATHS, "register_machine(", "device_login(")
 SOURCE_SUFFIXES = {".py", ".ts", ".js", ".mjs", ".sh"}
 
@@ -71,7 +70,6 @@ class TestProductionHubWriteGuard(unittest.TestCase):
     def test_production_urls_are_recognized_exactly(self):
         self.assertTrue(_prod_guard.is_production_base_url(PROD))
         self.assertTrue(_prod_guard.is_production_base_url(PROD.upper() + ":443/"))
-        self.assertTrue(_prod_guard.is_production_base_url(PROD_WORKER))
         self.assertFalse(_prod_guard.is_production_base_url("https://hub.dtcdev.click.attacker.invalid"))
         self.assertFalse(_prod_guard.is_production_base_url(LOCAL))
         self.assertFalse(_prod_guard.is_production_base_url(None))
@@ -85,8 +83,6 @@ class TestProductionHubWriteGuard(unittest.TestCase):
             # A test marker is not an exemption: this build uses isolated test Hubs.
             with self.assertRaises(_prod_guard.ProductionHubWriteError):
                 _prod_guard.assert_test_hub_write(PROD, "/api/host/poll", "POST", cfg={"test_machine": True})
-            with self.assertRaises(_prod_guard.ProductionHubWriteError):
-                _prod_guard.assert_test_hub_write(PROD_WORKER, "/api/host/poll", "POST", cfg={})
 
     def test_shared_http_transport_fails_before_opening_a_production_write(self):
         with mock.patch.object(_prod_guard, "in_test_context", return_value=True), \

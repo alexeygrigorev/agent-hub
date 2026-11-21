@@ -264,7 +264,7 @@ or include either token in reports.
    `agent-hub-vm.dtcdev.click A 35.198.99.237` (plan: 1 add, 0 change,
    0 destroy).
 2. aws-infra `sandbox/hub-edge`: CloudFront origin
-   `agent-hub.cloudflare-ai-agent-*.workers.dev` (https-only) →
+   the retired workers.dev Worker (https-only) →
    `agent-hub-vm.dtcdev.click` (http-only, X-Forwarded-Host preserved),
    applied via a reviewed change set (no replacement).
 3. Verified `https://hub.dtcdev.click/health`, then bootstrap→active.
