@@ -138,6 +138,16 @@ class EffortAndInteractiveTest(unittest.TestCase):
         argv = nl.headless_effort_argv('claude', base, 'high')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
 
+    def test_headless_effort_antigravity_neon(self):
+        base = ['agy', '--model', 'gemini-pro-orchestrator-neon', '--dangerously-skip-permissions', '-p', 'goal']
+        # agy rejects --effort for the orchestrator, so none is passed.
+        self.assertEqual(nl.headless_effort_argv('antigravity', base, 'medium'), base)
+        xhigh = ['agy', '--model', 'gemini-4-neon-xhigh', '-p', 'goal']
+        argv = nl.headless_effort_argv('antigravity', xhigh, 'max')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'xhigh')
+        med = ['agy', '--model', 'gemini-4-neon-medium', '-p', 'goal']
+        self.assertEqual(nl.headless_effort_argv('antigravity', med, 'medium')[3:5], ['--effort', 'medium'])
+
     def test_interactive_removes_exec_and_keeps_model(self):
         base = nl.adapter_argv('zai', 'goal', 'glm-5.3-flash')
         argv = nl.interactive_argv('zai', base, 'goal', model='glm-5.3-flash', effort='medium')

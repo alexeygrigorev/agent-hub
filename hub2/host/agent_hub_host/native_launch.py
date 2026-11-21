@@ -342,13 +342,22 @@ def _headless_insert_flags(provider, argv, flags):
     return [*argv[:index], *flags, *argv[index:]]
 
 
+# agy: `--effort` is rejected for the Neon orchestrator (verified agy 1.5.14 on hetzner).
+ANTIGRAVITY_NO_EFFORT_MODELS = frozenset({'gemini-pro-orchestrator-neon'})
+
+
 def headless_effort_argv(provider, argv, effort):
     if provider in {'codex', 'zai'}:
         value = 'xhigh' if effort == 'max' else effort
         if value not in {'low', 'medium', 'high', 'xhigh'}:
             raise ValueError('headless_effort_unsupported')
         flags = ['-c', 'model_reasoning_effort=' + json.dumps(value)]
-    elif provider in {'claude', 'antigravity'} and effort in {'low', 'medium', 'high', 'max'}:
+    elif provider == 'antigravity' and effort in {'low', 'medium', 'high', 'max'}:
+        model = next((argv[i + 1] for i, v in enumerate(argv[:-1]) if v == '--model'), '')
+        if model in ANTIGRAVITY_NO_EFFORT_MODELS:
+            return list(argv)  # agy rejects --effort for these models; their policy effort is nominal
+        flags = ['--effort', 'xhigh' if effort == 'max' else effort]
+    elif provider == 'claude' and effort in {'low', 'medium', 'high', 'max'}:
         flags = ['--effort', effort]
     else:
         raise ValueError('headless_effort_unsupported')
@@ -384,7 +393,10 @@ def interactive_argv(provider, argv, prompt, *, model, effort=None, with_goal=Fa
         if effort is not None:
             if effort not in {'low', 'medium', 'high', 'max'}:
                 raise ValueError('interactive_effort_unsupported')
-            result += ['--effort', effort]
+            if provider == 'antigravity' and model in ANTIGRAVITY_NO_EFFORT_MODELS:
+                pass
+            else:
+                result += ['--effort', 'xhigh' if provider == 'antigravity' and effort == 'max' else effort]
         if not with_goal:
             result += ['--prompt-interactive', prompt] if provider == 'antigravity' else [prompt]
     else:
