@@ -133,6 +133,46 @@
       "effort": "medium"
     },
     {
+      "id": "antigravity-neon-low",
+      "model": "gemini-4-neon-low",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "low"
+    },
+    {
+      "id": "antigravity-neon-medium",
+      "model": "gemini-4-neon-medium",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
+      "id": "antigravity-neon-high",
+      "model": "gemini-4-neon-high",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "antigravity-neon-xhigh",
+      "model": "gemini-4-neon-xhigh",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "max"
+    },
+    {
+      "id": "antigravity-orchestrator-neon",
+      "model": "gemini-pro-orchestrator-neon",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
       "id": "antigravity-carbon-medium",
       "model": "gemini-4-carbon-medium",
       "provider": "gemini",

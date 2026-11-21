@@ -98,6 +98,12 @@ export function isExplicitOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'mo
   return /astra/i.test(`${candidate.id} ${candidate.model}`);
 }
 
+/** Neon variants other than medium (low/high/xhigh, orchestrator) are pinned-only: the picker pool gets Neon medium alone. */
+export function isNeonPinnedOnlyModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model' | 'engine'>): boolean {
+  return candidate.engine.toLowerCase() === 'antigravity'
+    && /neon/i.test(candidate.model) && candidate.model.toLowerCase() !== 'gemini-4-neon-medium';
+}
+
 /** Luna needs explicit model/policy intent, never a machine/effort/tier hint. */
 export function isLunaModel(candidate: Pick<ModelPolicyRoute, 'id' | 'model'>): boolean {
   return /luna/i.test(candidate.model);
@@ -112,10 +118,11 @@ export function matchesModelIntent(candidate: Pick<ModelPolicyRoute, 'id' | 'mod
 // Closed projection of the existing model-routing catalog's NON-Luna names.
 // The adjacent test checks the catalog projection; no runtime file/config read.
 const NON_LUNA_MODEL_NAMES = new Set([
-  "antigravity-carbon-medium","antigravity-hydrogen-medium","argon","argon-gemini",
+  "antigravity-carbon-medium","antigravity-hydrogen-medium","antigravity-neon-high","antigravity-neon-low",
+  "antigravity-neon-medium","antigravity-neon-xhigh","antigravity-orchestrator-neon","argon","argon-gemini",
   "astra","beam-free","claude-fable-5-2","deepseek-flash",
   "deepseek-v4-pro","fable","gemini-4-argon-contributor","gemini-4-argon-medium",
-  "gemini-4-carbon-medium","gemini-4-hydrogen-medium","glm-5-2","glm-5-3",
+  "gemini-4-carbon-medium","gemini-4-hydrogen-medium","gemini-4-neon-high","gemini-4-neon-low","gemini-4-neon-medium","gemini-4-neon-xhigh","gemini-pro-orchestrator-neon","glm-5-2","glm-5-3",
   "glm-5-3-flash","glm-5.3-flash","glm-flash","glm-flash-zcodex",
   "gpt-6-astra","gpt-6.1-sol","grok","grok-4-7",
   "grok-4.6","hy3","hy4-preview","kimi-k2-7-code",
@@ -159,4 +166,14 @@ export function isStrongModel(candidate: Pick<ModelPolicyRoute, 'engine' | 'mode
 /** Elevated effort (high/max) is never part of an ordinary automatic pick; luna's max is its only mode. */
 export function isElevatedEffort(candidate: Pick<ModelPolicyRoute, 'model' | 'effort'>): boolean {
   return candidate.effort === 'high' || candidate.effort === 'max' && !/luna/i.test(candidate.model);
+}
+
+/** Default effort per model: Haiku and Luna run at max, every other model at medium (Alexey t2760u). */
+export function defaultEffortFor(model: string): 'max' | 'medium' {
+  return /haiku|luna/i.test(model) ? 'max' : 'medium';
+}
+
+/** True when the candidate's effort is not its model's default, so it needs an explicit request. */
+export function isNonDefaultEffort(candidate: Pick<ModelPolicyRoute, 'model' | 'effort'>): boolean {
+  return !!candidate.effort && candidate.effort !== defaultEffortFor(candidate.model);
 }
