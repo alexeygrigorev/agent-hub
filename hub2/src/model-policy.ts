@@ -8,11 +8,15 @@ export type ModelPolicyRoute = {
   capabilities?: string[];
 };
 
+// Z.ai policy writes keep the deployed shape (only the canonical `zai` engine on
+// zai-central) so a deploy can still prove the previous stored policy restorable.
+const FORBIDDEN_ZAI_ENGINES = new Set(['zcodex', 'goz']);
+const FORBIDDEN_ZAI_ACCOUNTS = new Set(['shared-zai', 'zcodex']);
 // Standing policy: "No zai-central in the Hub picker". Z.ai has no other allowed
-// account (shared-zai/zcodex alias the same central login), so no Z.ai route is
-// selectable by the picker at all.
-const FORBIDDEN_ZAI_ENGINES = new Set(['zai', 'zcodex', 'goz']);
-const FORBIDDEN_ZAI_ACCOUNTS = new Set(['zai-central', 'shared-zai', 'zcodex']);
+// account (shared-zai/zcodex alias the same central login), so the runtime picker
+// never selects any Z.ai route, even from a stored policy row.
+const PICKER_EXCLUDED_ZAI_ENGINES = new Set(['zai', 'zcodex', 'goz']);
+const PICKER_EXCLUDED_ZAI_ACCOUNTS = new Set(['zai-central', 'shared-zai', 'zcodex']);
 const CLAUDE_PICKER_MODELS = new Set(['sonnet', 'opus']);
 const CARBON_POLICY_ID = 'antigravity-carbon-medium';
 const CARBON_MODEL_ID = 'gemini-4-carbon-medium';
@@ -46,7 +50,8 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
     || candidate.capabilities[0] !== 'think-only'
   )) return 'carbon_policy_contract_invalid';
 
-  if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account))
+  if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
+    || (engine === 'zai' && account !== 'zai-central'))
     return 'zai_picker_route_forbidden';
   if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
     return 'go_orin_picker_route_forbidden';
@@ -66,8 +71,15 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   return null;
 }
 
+/** True when the runtime picker must never select this route. */
+export function isPickerExcludedZaiRoute(candidate: Pick<ModelPolicyRoute, 'engine' | 'account_id'>): boolean {
+  return PICKER_EXCLUDED_ZAI_ENGINES.has(candidate.engine.toLowerCase())
+    || PICKER_EXCLUDED_ZAI_ACCOUNTS.has(candidate.account_id.toLowerCase());
+}
+
+/** Runtime picker eligibility: valid policy data and not an excluded Z.ai route. */
 export function isModelPolicyCandidateAllowed(candidate: ModelPolicyRoute): boolean {
-  return modelPolicyCandidateViolation(candidate) === null;
+  return modelPolicyCandidateViolation(candidate) === null && !isPickerExcludedZaiRoute(candidate);
 }
 
 /** Carbon identity stays think-only even if policy metadata omits its marker. */

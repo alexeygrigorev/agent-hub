@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { isOrdinaryWorkModel, isThinkOnlyModel, modelPolicyCandidateViolation } from '../src/model-policy.ts';
+import { isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isThinkOnlyModel, modelPolicyCandidateViolation } from '../src/model-policy.ts';
 
 const root = resolve(import.meta.dirname, '../..');
 const policy = JSON.parse(readFileSync(resolve(root, 'config/model-policy.json'), 'utf8')) as {
@@ -58,9 +58,14 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-central', engine: 'zcodex', model: 'glm-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'shared-zai'})), 'zai_picker_route_forbidden');
   // Standing policy: "No zai-central in the Hub picker"; Z.ai has no other allowed account.
-  assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
-  assert.equal(modelPolicyCandidateViolation(route({id: 'sneaky', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  // Writes still accept the previously deployed zai-central shape so a deploy can prove v22 restorable,
+  // but the runtime picker never selects it.
+  const central = route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-central'});
+  assert.equal(modelPolicyCandidateViolation(central), null);
+  assert.equal(isModelPolicyCandidateAllowed(central), false);
+  assert.equal(isModelPolicyCandidateAllowed(route({id: 'sneaky', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'zai-central'})), false);
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-other'})), 'zai_picker_route_forbidden');
+  assert.equal(isModelPolicyCandidateAllowed(route({id: 'sol', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'codex'})), true);
   assert.ok(!policy.candidates.some(c => c.account_id === 'zai-central' || c.engine === 'zai'), 'committed policy has no zai-central route');
   assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin'})), 'go_orin_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({id: 'go-orin', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');

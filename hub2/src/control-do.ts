@@ -1614,6 +1614,7 @@ export class ControlDO {
       const c=candidate as JsonRecord;
       if(Object.keys(c).some(k=>!['id','engine','model','effort','account_id','weight','capabilities','enabled'].includes(k)))throw new HttpError('unknown_model_candidate_field',400);
       if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','high','max'].includes(String(c.effort))))throw new HttpError('invalid_model_candidate',400);
+      if(['shared-zai','zcodex'].includes(String(c.account_id))||['zcodex','goz','zai'].includes(String(c.engine))&&c.account_id!=='zai-central')throw new HttpError('zai_central_account_required',400);
       const policyViolation=modelPolicyCandidateViolation(c as unknown as ModelPolicyRoute);
       if(policyViolation)throw new HttpError(policyViolation,400);
       if(ids.has(String(c.id)))throw new HttpError('duplicate_model_candidate',400);ids.add(String(c.id));candidates.push({...c,capabilities:[...new Set(c.capabilities)].sort()});

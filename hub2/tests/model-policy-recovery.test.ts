@@ -113,6 +113,26 @@ test('Carbon policy recovery restores the prior Hydrogen-only policy before code
   } finally { f.database.close(); }
 });
 
+test('removing the zai-central picker route keeps the prior v22 policy restorable for deploy rollback', async () => {
+  const f = fixture();
+  try {
+    // Live v22 shape: the committed pool still carried the canonical zai route on zai-central.
+    const zaiCentral = {id:'zai-glm-5-3-flash',engine:'zai',model:'glm-5.3-flash',effort:'medium',account_id:'zai-central',weight:1,capabilities:[],enabled:true};
+    const initial = await f.publicCall('PUT', {candidates: [hydrogenCandidate, zaiCentral], expected_version: 0});
+    assert.equal(initial.status, 200);
+    const desired = [hydrogenCandidate];
+    const preflight = await f.publicCall('POST', recovery('validate_recovery', 1, desired));
+    assert.equal(preflight.status, 200, JSON.stringify(await body(preflight.clone())));
+    assert.equal((await body(preflight)).changed, true);
+    const applied = await f.publicCall('POST', recovery('apply_recoverable', 1, desired));
+    assert.equal(applied.status, 200);
+    assert.equal((await body(applied)).version, 2);
+    // The deploy transaction's rollback must still be able to restore the snapshot.
+    const restored = await f.publicCall('PUT', {candidates: [hydrogenCandidate, zaiCentral], expected_version: 2});
+    assert.equal(restored.status, 200);
+  } finally { f.database.close(); }
+});
+
 test('recovery validates the stored legacy policy using the operator PUT rules', async () => {
   const f = fixture();
   try {
