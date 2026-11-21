@@ -10,6 +10,7 @@ registerHooks({resolve(specifier,context,next){
 }});
 await import('./model-picker.test.ts');
 await import('./carbon-routing.test.ts');
+await import('./neon-routing.test.ts');
 await import('./routing-simulation.test.ts');
 await import('./machine-capabilities.test.ts');
 

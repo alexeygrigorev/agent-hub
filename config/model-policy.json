@@ -98,6 +98,56 @@
       "weight": 1,
       "capabilities": ["think-only"],
       "enabled": true
+    },
+    {
+      "id": "antigravity-neon-low",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-low",
+      "effort": "low",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-medium",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-high",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-high",
+      "effort": "high",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-xhigh",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-xhigh",
+      "effort": "max",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-orchestrator-neon",
+      "engine": "antigravity",
+      "model": "gemini-pro-orchestrator-neon",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
     }
   ]
 }

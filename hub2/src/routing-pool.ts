@@ -3,7 +3,7 @@
 // otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
-import { explicitLunaIntent, isLunaModel, matchesModelIntent, isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
+import { explicitLunaIntent, isLunaModel, matchesModelIntent, isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isNeonPinnedOnlyModel, isNonDefaultEffort, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
 import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} from './intake-model-constraints';
 
@@ -95,6 +95,11 @@ export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, r
   return values[values.length - 1].value;
 }
 
+/** An exact model name is an explicit pick of that one variant only when no other candidate shares the name (so `opus` never admits opus-high). */
+function exactUniqueModel(policy: RoutingPolicy, candidate: Candidate, model?: string): boolean {
+  return !!model && model === candidate.model && policy.candidates.filter(c => c.model === model).length === 1;
+}
+
 export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Candidate[] {
   if(input.model_constraints!==undefined&&(!Array.isArray(input.model_constraints)||input.model_constraints.length>32))
     throw new HttpError('invalid_model_constraints',400);
@@ -135,10 +140,13 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
     && (!isLunaModel(candidate) || lunaRequested)
     && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
     // High effort is opt-in: an explicit --effort, the exact policy id or a deep tier.
-    && (!isElevatedEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || deep)
+    && (!isElevatedEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || deep || exactUniqueModel(policy, candidate, input.model))
+    // Every model defaults to medium (Haiku/Luna max); any other effort only when requested by effort, id or exact model.
+    && (!isNonDefaultEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || exactUniqueModel(policy, candidate, input.model) || deep)
     && (!isThinkOnlyModel(candidate) || purpose === 'think' && !!input.model
       && (input.model === candidate.model || input.model === candidate.id))
     && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
+    && (!isNeonPinnedOnlyModel(candidate) || !!input.model && (input.model === candidate.id || input.model === candidate.model))
     && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
     && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
     && isModelPolicyCandidateAllowed(candidate)

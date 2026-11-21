@@ -705,8 +705,8 @@ test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon 
  const snapshot=hydrogenFixture();
  const result=buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'});
  assert(result.options.length>0);
- assert(result.options.every(row=>row.value.model==='gemini-4-hydrogen-medium'));
- snapshot.policy.candidates=snapshot.policy.candidates.filter(row=>row.model!=='gemini-4-hydrogen-medium');
+ assert(result.options.every(row=>['gemini-4-hydrogen-medium','gemini-4-neon-medium'].includes(row.value.model))&&result.options.some(row=>row.value.model==='gemini-4-hydrogen-medium'));
+ snapshot.policy.candidates=snapshot.policy.candidates.filter(row=>row.model!=='gemini-4-hydrogen-medium'&&row.model!=='gemini-4-neon-medium');
  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'}),(e:any)=>e.code==='model_policy_unavailable');
  assert.equal(buildRoutingPool(snapshot,{interactive:false,engine:'antigravity',model:'gemini-4-argon-medium'}).options[0].value.model,'gemini-4-argon-medium');
 });
