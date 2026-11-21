@@ -1391,7 +1391,7 @@ class NativeLauncher:
             args.append('--hub-managed-claude-context=' + str(context_path))
         effort = specification.get('effort')
         if effort is not None:
-            args += headless_effort_argv(provider, ['prompt'], effort)[:-1]
+            args += headless_effort_argv(provider, ['--model', model, 'prompt'], effort)[2:-1]
         return [self.native_binary, 'task', 'run', *selector, '--cwd', specification['workspace'],
                 '--prompt-file', str(path), '--timeout-secs', str(specification['timeout_seconds']),
                 '--no-notify', *output_args, *['--engine-arg=' + arg for arg in args]]

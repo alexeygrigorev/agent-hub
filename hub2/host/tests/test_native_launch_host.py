@@ -148,6 +148,13 @@ class EffortAndInteractiveTest(unittest.TestCase):
         med = ['agy', '--model', 'gemini-4-neon-medium', '-p', 'goal']
         self.assertEqual(nl.headless_effort_argv('antigravity', med, 'medium')[3:5], ['--effort', 'medium'])
 
+    def test_headless_effort_antigravity_orchestrator_profile_route_has_no_effort(self):
+        # The profile/task-run path builds --engine-arg flags from a model-only argv.
+        orch = nl.headless_effort_argv('antigravity', ['--model', 'gemini-pro-orchestrator-neon', 'prompt'], 'medium')
+        self.assertNotIn('--effort', orch)
+        med = nl.headless_effort_argv('antigravity', ['--model', 'gemini-4-neon-medium', 'prompt'], 'medium')
+        self.assertEqual(med[2:4], ['--effort', 'medium'])
+
     def test_interactive_removes_exec_and_keeps_model(self):
         base = nl.adapter_argv('zai', 'goal', 'glm-5.3-flash')
         argv = nl.interactive_argv('zai', base, 'goal', model='glm-5.3-flash', effort='medium')
