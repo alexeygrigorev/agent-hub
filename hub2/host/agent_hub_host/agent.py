@@ -18,7 +18,9 @@ from . import native_launch, launch_reaper, credential_delivery, resource_admiss
 from .implement_workspace import prepare_workspace, _identity_and_ref
 from .advertisement import Advertisement, INVENTORY_OVERFLOW_TAG
 from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABILITY
-from .native_launch import NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical, native_returncode, same_workspace, spawn_environment
+from .native_launch import (NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical,
+                            detect_antigravity_first_run_block, native_returncode,
+                            same_workspace, spawn_environment)
 from .local_auth_readiness import local_claude_missing_contexts
 from .git_salvage import salvage_branch
 
@@ -173,6 +175,7 @@ class OfferAcknowledgement:
 HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential preparation was refused.',
  'account_unconfigured': 'Provider credential preparation was refused.',
  'active_native_bound_exceeded': 'Launch preparation was refused.',
+ 'antigravity_first_run_blocked': 'Antigravity is blocked on first-run onboarding or Terms of Service.',
  'antigravity_settings_unverified': 'Launch preparation was refused.',
  'antigravity_workspace_trust_unverified': 'Launch preparation was refused.',
  'capture_fence_conflict': 'Launch preparation was refused.',
@@ -378,6 +381,7 @@ class Bridge:
         # samples here instead of reading the real host's memory.
         self.resource_sample = None
         self._unavailable_workspace_warnings=set()
+        self._runtime_failure_reasons={}
         self.executable = shutil.which(executable) or str(Path(executable).resolve(strict=True))
 
     def native(self, *args, input=None, allow_failure=False, timeout=30, cwd=None):
@@ -1061,6 +1065,8 @@ class Bridge:
                                             (row['operation_id'],))
                 row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?",(row['operation_id'],)).fetchone()
             if phase != "exited":
+                if row['state'] == 'running' and self._check_antigravity_first_run_block(row, native):
+                    row = self.journal.db.execute("SELECT * FROM launches WHERE operation_id=?", (row['operation_id'],)).fetchone()
                 if row['state'] in {'aborting','deadline_stopping'}:
                     self.native('kill',row['native_id'],allow_failure=True)
                     try:
@@ -1097,6 +1103,10 @@ class Bridge:
             elif type(native.get('deadline_ms')) is int:
                 payload['evidence']['native_deadline']={'deadline_ms':native['deadline_ms'],'exceeded':native.get('deadline_exceeded') is True}
             if row['state']=='aborting':payload['launch_failed']=True
+            runtime_failure = getattr(self, '_runtime_failure_reasons', {}).get((row['operation_id'], row['epoch']))
+            if runtime_failure in HOST_FAILURE_DETAILS:
+                payload['failure_reason'] = runtime_failure
+                payload['detail'] = HOST_FAILURE_DETAILS[runtime_failure]
             # All verified exits (normal, deadline and explicit stop) converge
             # here. Preserve committed work before journaling the finish, so a
             # continuation cannot race ahead of its salvage receipt.
@@ -1122,6 +1132,67 @@ class Bridge:
                 resource_admission.release_reservation(self.journal.db, row['operation_id'], row['session_id'], row['epoch'])
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
+            getattr(self, '_runtime_failure_reasons', {}).pop((row['operation_id'], row['epoch']), None)
+
+    def _is_antigravity_native(self, native):
+        if not isinstance(native, dict):
+            return False
+        if native.get('engine') == 'antigravity':
+            return True
+        command = native.get('command')
+        if isinstance(command, list) and command and isinstance(command[0], str):
+            base = Path(command[0]).name.lower()
+            if base in {'agy', 'agy.exe', 'agy.cmd'}:
+                return True
+        return False
+
+    def _check_antigravity_first_run_block(self, row, native):
+        """Detect an Antigravity first-run/ToS hang and turn it into a named Hub alert + clean stop."""
+        if not self._is_antigravity_native(native):
+            return False
+        key = (row['operation_id'], row['epoch'])
+        reasons = getattr(self, '_runtime_failure_reasons', None)
+        if reasons is None:
+            reasons = self._runtime_failure_reasons = {}
+        if key in reasons:
+            return False
+        try:
+            fa_path = Path(row['workspace']) / '.local' / f"first-action-hub2-{row['session_id']}.json"
+            if fa_path.exists():
+                return False
+        except OSError:
+            pass
+        try:
+            captured = self.native('capture', row['native_id'], '--screen', '--plain', allow_failure=True, timeout=5)
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            return False
+        if captured.returncode != 0 or not detect_antigravity_first_run_block(captured.stdout):
+            return False
+        reason = 'antigravity_first_run_blocked'
+        detail = HOST_FAILURE_DETAILS[reason]
+        reasons[key] = reason
+        logging.getLogger(__name__).error(
+            'FIRST-RUN BLOCKED session=%s operation=%s stage=host_runtime reason=%s detail=%s',
+            row['session_id'], row['operation_id'], reason, detail)
+        socket = getattr(self, '_managed_socket', None)
+        if socket is not None:
+            try:
+                socket.send(canonical({
+                    'type': 'host.error',
+                    'session_id': row['session_id'],
+                    'operation_id': row['operation_id'],
+                    'epoch': row['epoch'],
+                    'stage': 'host_runtime',
+                    'reason': reason,
+                    'detail': detail,
+                }))
+            except Exception:
+                pass
+        with self.journal.db:
+            self.journal.db.execute(
+                "UPDATE launches SET state='deadline_stopping' WHERE operation_id=? AND state='running'",
+                (row['operation_id'],))
+        return True
 
     def bound_capture(self, command, row, *, diagnostic=None):
         """Read only this exact attempt; a finished task never falls back to a pane."""

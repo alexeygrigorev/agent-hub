@@ -102,6 +102,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "duplicate_terminal_field": "Launch preparation was refused.",
   "host_launch_queue_full": "Launch preparation was refused.",
   "host_command_queue_full": "Launch preparation was refused.",
+  "antigravity_first_run_blocked": "Antigravity is blocked on first-run onboarding or Terms of Service.",
   "antigravity_settings_unverified": "Launch preparation was refused.",
   "invalid_native_send": "Launch preparation was refused.",
   "native_prompt_invalid": "Launch preparation was refused.",
@@ -1268,11 +1269,14 @@ export class MachineDO {
       : undefined;
     if(lateLaunchFailure&&!failureNotification)return error('launch_failure_notification_missing',409);
     const now = Date.now();
-    const state = !launchFailed&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
+    const typedFailure = typeof body.failure_reason === 'string' && Object.hasOwn(HOST_FAILURE_DETAILS, body.failure_reason)
+      ? body.failure_reason : null;
+    const state = !launchFailed&&!typedFailure&&nativeDeadline?.exceeded!==true&&Number(body.exit_code) === 0 ? 'completed-awaiting-review' : 'failed';
     const payload = { operation_id: row.dispatch_id, attempt_operation_id: row.operation_id, session_id: row.id,
       machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
       ...(launch[WORKSPACE_BINDING_FIELD]?{workspace_binding:launch[WORKSPACE_BINDING_FIELD]}:{}),
       ...(launchFailed?{launch_failed:true}:{}),
+      ...(typedFailure?{failure_reason:typedFailure,detail:fixedHostDetail(typedFailure)}:{}),
       ...(failureNotification?{after_notification:failureNotification.id}:{}),
       // An accepted STOP remains intent even if its ACK failed or timed out.
       // Freeze it before forwarding; this is never proof of STOP confirmation.
@@ -1302,7 +1306,7 @@ export class MachineDO {
       this.db.run("UPDATE native_sessions SET phase='exited',last_activity_at=?,exit_code=?,containment_empty=1,observed_at=? WHERE session_id=?",
         now,Number(body.exit_code),now,row.id);
       if(state==='failed'&&!payload.stop_requested)this.db.run('INSERT OR REPLACE INTO attention(session_id, reason, observed_at) VALUES (?, ?, ?)',
-        row.id,nativeDeadline?.exceeded===true?'deadline_exceeded':launchFailed?'launch_failed':'native_exit_'+String(body.exit_code),now);
+        row.id,nativeDeadline?.exceeded===true?'deadline_exceeded':typedFailure??(launchFailed?'launch_failed':'native_exit_'+String(body.exit_code)),now);
       if(failureNotification)this.db.run("UPDATE machine_outbox SET state='pending',attempt=0,next_action_at=?,updated_at=? WHERE id=? AND state='dead_letter'",
         now,now,failureNotification.id);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);

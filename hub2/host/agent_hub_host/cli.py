@@ -24,6 +24,8 @@ def main(argv=None):
     enroll.add_argument("--code-env", default="HUB2_PAIRING_CODE")
     enroll.add_argument("--root", action="append", required=True)
     enroll.add_argument("--engine", action="append", default=[])
+    enroll.add_argument("--capability", action="append", default=[])
+    enroll.add_argument("--workspace", action="append", default=[], metavar="LABEL=PATH")
     serve = commands.add_parser("serve")
     serve.add_argument("--once", action="store_true")
     serve.add_argument("--alert-handoff-fd", type=int, default=None, help=argparse.SUPPRESS)
@@ -126,11 +128,31 @@ def main(argv=None):
             from .auth import refresh
             client=refresh(config,args.config,server)
         if args.command == "enroll":
+            from .advertisement import Advertisement, configure
+            previous = config if isinstance(config, dict) else {}
             code = os.environ.get(args.code_env) or getpass.getpass("Pairing code: ")
             enrolled = client.request("POST", "/api/enrollments/complete", {"code": code})
             config = {"server": server, "token": enrolled["token"], "machine_id": enrolled["machine_id"],
                       "roots": roots,
                       "engines": args.engine}
+            if isinstance(previous.get("launcher"), dict) and previous["launcher"]:
+                config["launcher"] = dict(previous["launcher"])
+            if args.capability or args.workspace:
+                config = configure(config, args.capability, args.workspace)
+            else:
+                preserved_caps = previous.get("capabilities") if isinstance(previous.get("capabilities"), list) else []
+                preserved_ws = {}
+                if isinstance(previous.get("workspaces"), dict):
+                    probe = Advertisement(roots)
+                    for label, ws_path in previous["workspaces"].items():
+                        try:
+                            preserved_ws[label] = str(probe.allowed_path(ws_path))
+                        except ValueError:
+                            continue
+                if preserved_caps or preserved_ws:
+                    observed = Advertisement(roots, preserved_caps, preserved_ws)
+                    config["capabilities"] = observed.capabilities
+                    config["workspaces"] = preserved_ws
             save_config(args.config, config)
             print(json.dumps({"enrolled": config["machine_id"]}))
         elif args.command == "request":

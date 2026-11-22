@@ -203,6 +203,7 @@ class InstallerScriptTests(unittest.TestCase):
         # Only the throwaway preflight venv is ever deleted.
         self.assertEqual(set(re.findall(r'Remove-Item -LiteralPath (\$\w+)', text)), {'$Preflight'})
         self.assertIn("$tag -like 'hub-controller-*' -and $engine -eq 'shell'", text)
+        self.assertIn('--workspace ("home=" + $workspaceRoot)', text)
 
     def test_serve_is_stopped_only_after_a_preflight_install_and_pip_is_ensured(self):
         text = self.SCRIPT.read_text(encoding='utf-8')

@@ -345,7 +345,7 @@ $config = Join-Path $env:USERPROFILE '.config\agent-hub\v2.json'
 if (-not (Test-Path -LiteralPath $config)) {
   if (-not $env:HUB2_PAIRING_CODE) { throw "not enrolled: set HUB2_PAIRING_CODE (and HUB2_WORKSPACE_ROOT) and rerun" }
   $workspaceRoot = if ($env:HUB2_WORKSPACE_ROOT) { $env:HUB2_WORKSPACE_ROOT } else { $env:USERPROFILE }
-  & $VenvPython @HostCli --server $Base enroll --root $workspaceRoot --engine codex --engine claude --engine go
+  & $VenvPython @HostCli --server $Base enroll --root $workspaceRoot --workspace ("home=" + $workspaceRoot) --engine codex --engine claude --engine go
   if ($LASTEXITCODE -ne 0) { throw 'enrollment failed' }
 }
 if ($env:HUB2_CREDENTIAL_MODE) {
