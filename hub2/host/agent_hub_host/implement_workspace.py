@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import threading
@@ -586,6 +587,41 @@ def _ensure_unlocked_worktree(root, target_path, session_is_dead):
                 raise ValueError(f'implement_worktree_locked worktree={entry["path"]}{_lock_detail(entry)}')
 
 
+def _discard_retired_husk(root, target):
+    """Remove the scratch-only leftovers of a retired session's worktree path.
+
+    After a worktree is removed, the retired session's TMPDIR can recreate the
+    directory holding only `.local/tmp/...` scratch. Such a path has no `.git`,
+    is not a registered worktree, and holds no regular file outside `.local/tmp`,
+    so it carries nothing to protect and must not block a same-intake retry.
+    Anything else (a real worktree, foreign files, symlinks) is left untouched.
+    """
+    if target.is_symlink() or not target.is_dir() or (target / '.git').exists():
+        return False
+    resolved = str(target.resolve())
+    for entry in _worktree_entries(root):
+        try:
+            if str(Path(entry['path']).resolve()) == resolved:
+                return False
+        except OSError:
+            return False
+    try:
+        top = sorted(entry.name for entry in os.scandir(target))
+        local = target / '.local'
+        if top != ['.local'] or local.is_symlink() or sorted(
+                entry.name for entry in os.scandir(local)) != ['tmp']:
+            return False
+        if (local / 'tmp').is_symlink():
+            return False
+        for dirpath, dirnames, filenames in os.walk(local / 'tmp'):
+            if any((Path(dirpath) / name).is_symlink() for name in dirnames):
+                return False
+    except OSError:
+        return False
+    shutil.rmtree(target)
+    return True
+
+
 def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_dead=None, allowed_roots=None, intake_worktree=None):
     """A bound continuation preserves all commits and dirty files, even offline."""
     root = Path(workspace).resolve(strict=True)
@@ -610,6 +646,9 @@ def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_d
         target = directory / digest
         if target.is_symlink():
             raise ValueError(f'implement_worktree_path_untrusted worktree={target}')
+        if target.exists() and not target.is_symlink():
+            with _repository_lock(root):
+                _discard_retired_husk(root, target)
         if target.exists():
             if (_owner(target) != identity
                     or Path(_git(target, 'rev-parse', '--show-toplevel')).resolve() != target):
