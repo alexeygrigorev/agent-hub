@@ -323,8 +323,10 @@ def request(method, path, payload=None):
 
     def send(access):
         validate_v2_request(cfg)
-        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
-                                     headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
+        headers = {'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'}
+        if isinstance(payload_key, str) and payload_key:
+            headers['Idempotency-Key'] = payload_key
+        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method, headers=headers)
         try:
             deadline = _request_deadline.get()
             if deadline is not None:
