@@ -894,8 +894,10 @@ class NativeLauncher:
             return result.stdout if result.returncode == 0 else ''
 
         def key(hex_bytes):
+            # `--hex` already sends the decoded bytes unframed; aplexer rejects
+            # `--raw` with `--hex` (exit 2), which refused the first live start.
             try:
-                result = self.native('send', native_id, '--raw', '--hex', hex_bytes, allow_failure=True, timeout=5)
+                result = self.native('send', native_id, '--hex', hex_bytes, allow_failure=True, timeout=5)
             except subprocess.TimeoutExpired:
                 raise RuntimeError('claude_workspace_trust_unverified') from None
             if result.returncode != 0:
