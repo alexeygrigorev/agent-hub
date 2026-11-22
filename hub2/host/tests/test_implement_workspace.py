@@ -93,6 +93,25 @@ class ImplementWorkspaceTests(unittest.TestCase):
             prepare_workspace(self.shared, 'implement', 'one', 'org/repo')
         self.assertEqual(self.git(self.shared, 'branch', '--show-current'), 'old-merged-feature')
 
+    def test_plain_non_git_workspace_runs_in_place_for_implement(self):
+        # Desktop `home` workspace (DESKTOP-FP4OP26, intake 2699b8d7): the user
+        # profile is not a repository, so interactive starts must run in place
+        # instead of failing `git rev-parse` with exit 128.
+        directory = self.root / 'plain-home'
+        directory.mkdir()
+        with patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': str(self.root)}):
+            for purpose in (None, 'implement', 'fix'):
+                self.assertEqual(prepare_workspace(directory, purpose, 'intake-home', 'org/home'), directory.resolve())
+        self.assertFalse((directory / '.local').exists())
+
+    def test_git_failure_other_than_not_a_repository_stays_loud(self):
+        directory = self.root / 'odd'
+        directory.mkdir()
+        failed = subprocess.CompletedProcess([], 128, '', 'fatal: detected dubious ownership in repository')
+        with patch('agent_hub_host.implement_workspace.subprocess.run', return_value=failed):
+            with self.assertRaisesRegex(ValueError, '^implement_worktree_git_failed operation=rev-parse exit_code=128$'):
+                prepare_workspace(directory, 'implement', 'intake-odd', 'org/odd')
+
     def test_foreign_path_and_symlink_refused(self):
         directory = self.shared / '.local' / 'hub-worktrees'
         directory.parent.mkdir()

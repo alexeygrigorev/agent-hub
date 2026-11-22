@@ -117,6 +117,38 @@ for(const [label,detail] of [
  });
 }
 
+test('host.error typed git refusal surfaces the real host error with closed facts (DESKTOP-FP4OP26, intake 2699b8d7)',async()=>{
+ const f=fixture(),sessionId='host-diagnostic-git-failed',epoch=await startOffered(f,sessionId),socket=hostSocket(f);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,epoch,stage:'host_launch',reason:'implement_worktree_git_failed',
+  detail:'Workspace git operation failed. (operation=rev-parse exit_code=128)'}));
+ const session=await view(f,sessionId);
+ assert.equal(session.state,'failed');
+ assert.equal(session.attention.reason,'implement_worktree_git_failed');
+ assert.equal(session.attention.stage,'host_launch');
+ assert.equal(session.attention.detail,'Workspace git operation failed. (operation=rev-parse exit_code=128)');
+ assert.notEqual(session.attention.detail,'Host operation failed.');
+});
+
+for(const detail of [
+ 'Workspace git operation failed. (worktree=C:/Users/PRIVATE)',
+ 'Workspace git operation failed. (operation=rev-parse exit_code=128) PRIVATE',
+ 'Workspace git operation failed. (operation=PRIVATE)',
+ 'Workspace git operation failed. (reason=a reason=b reason=c reason=d reason=e)',
+ 'Workspace git operation failed. (exit_code=128\nPRIVATE)',
+ 'Launch preparation was refused. (operation=rev-parse)',
+]){
+ test(`host.error typed detail facts outside the closed shape fall back to the fixed detail: ${JSON.stringify(detail)}`,async()=>{
+  const f=fixture(),sessionId='host-diagnostic-facts-'+Buffer.from(detail).toString('hex').slice(-24),epoch=await startOffered(f,sessionId),socket=hostSocket(f);
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+   operation_id:'op-'+sessionId,epoch,stage:'host_launch',reason:'implement_worktree_git_failed',detail}));
+  const session=await view(f,sessionId);
+  assert.equal(session.attention.reason,'implement_worktree_git_failed');
+  assert.equal(session.attention.detail,'Workspace git operation failed.');
+  assert.doesNotMatch(JSON.stringify(session),/PRIVATE/);
+ });
+}
+
 test('host.error refuses stale attempts and epochs without changing current attention or failure state',async()=>{
  const f=fixture(),sessionId='host-diagnostic-fence',epoch=await startOffered(f,sessionId),socket=hostSocket(f);
  const common={type:'host.error',session_id:sessionId,stage:'host_launch',reason:'workspace_unavailable',detail:'stale diagnostic'};

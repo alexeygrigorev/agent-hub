@@ -58,6 +58,32 @@ def _git(root, *args):
     return _run_git(root, args)[1]
 
 
+def _is_plain_directory(root):
+    """True only when Git positively reports that `root` is not a repository.
+
+    A plain directory (e.g. the Windows `home` workspace, the user profile) has no
+    Git state to isolate, so an intake worktree cannot and need not be created.
+    Every other Git failure (dubious ownership, missing git, timeouts) stays a
+    loud typed refusal. The probe forces the C locale so Git's message is stable.
+    """
+    try:
+        result = subprocess.run(['git', '-C', str(root), 'rev-parse', '--is-inside-work-tree'],
+                                capture_output=True, text=True, timeout=120, check=False,
+                                env={**os.environ, 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C',
+                                     'LANG': 'C', 'LANGUAGE': 'C'})
+    except subprocess.TimeoutExpired:
+        raise ValueError('implement_worktree_git_failed operation=rev-parse reason=timeout') from None
+    except OSError:
+        raise ValueError('implement_worktree_git_failed operation=rev-parse reason=unavailable') from None
+    if result.returncode == 0:
+        if result.stdout.strip() != 'true':
+            raise ValueError('implement_worktree_git_failed operation=rev-parse reason=not_work_tree')
+        return False
+    if result.returncode == 128 and 'not a git repository' in (result.stderr or '').lower():
+        return True
+    raise ValueError(f'implement_worktree_git_failed operation=rev-parse exit_code={int(result.returncode)}')
+
+
 def _symbolic_head(root):
     """Return the exact symbolic HEAD ref, or None when HEAD is detached."""
     code, out = _run_git(root, ('symbolic-ref', '-q', 'HEAD'), allowed=(0, 1))
@@ -630,6 +656,9 @@ def prepare_workspace(workspace, purpose, intake_id, project_id, *, session_is_d
     if purpose not in {None, 'implement', 'fix'}:
         raise ValueError('invalid_session_purpose')
     identity, digest, ref = _identity_and_ref(intake_id, project_id)
+    if _is_plain_directory(root):
+        # No repository means no intake branch or worktree to own: run in place.
+        return root
     branch = 'hub/intake-' + digest
     with _LOCK:
         # A continuation may request the previously bound absolute worktree.
