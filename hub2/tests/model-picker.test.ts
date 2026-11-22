@@ -1183,3 +1183,30 @@ test('engine mode declarations do not override unrelated global capabilities or 
  snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort','modes:v1:codex:i','modes:v1:codex:hi']});
  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude'],'another positive declaration cannot heal a complete negative');
 });
+
+test('exhausted go account with future reset_at stays excluded from picker pool until reset even when stale',()=>{
+ const now=Date.now(),resetAt=now+21*3600_000;
+ const staleExhausted={
+  credential_status:'ready',credential_usable:true,hosts:['h1'],fresh:false,
+  account:{enabled:true,min_remaining:0},
+  quota:{remaining:0,captured_at:now-7200_000,valid_until:now-3600_000,reset_at:resetAt},
+ };
+ const snap={
+  observed_at:now,
+  policy:{version:22,candidates:[
+   {id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:80,capabilities:['headless'],enabled:true},
+   {id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',account_id:'shared-go',weight:50,capabilities:['headless'],enabled:true},
+  ]},
+  accounts:new Map<string,any>([
+   ['claude',{credential_status:'ready',credential_usable:true,hosts:['h1'],fresh:true,account:{enabled:true,min_remaining:0},quota:{remaining:80,captured_at:now,valid_until:now+900_000}}],
+   ['shared-go',staleExhausted],
+  ]),
+  machines:new Map<string,any>([['h1',{machine_id:'h1',connected:true,engines:['claude','go'],capabilities:['headless','effort']}]]),
+ };
+ const beforeReset=buildRoutingPool(snap,{interactive:false,purpose:'fix'});
+ assert.deepEqual(beforeReset.options.map(row=>row.value.policy_id),['claude-sonnet-medium']);
+ assert.ok(beforeReset.diagnostics.excluded.some(row=>row.policy_id==='go-muse'&&row.account_id==='shared-go'&&row.reason==='quota_exhausted_until_reset'));
+
+ const afterReset=buildRoutingPool({...snap,observed_at:resetAt}, {interactive:false,purpose:'fix'});
+ assert.ok(afterReset.options.some(row=>row.value.policy_id==='go-muse'));
+});

@@ -29,6 +29,57 @@ LIVE_SESSION_HEARTBEAT_SECONDS = 30
 _NATIVE_INVENTORY_START_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LIMIT = 128
+_RESET_UNIT_MS = {'d': 86_400_000, 'h': 3_600_000, 'm': 60_000, 's': 1_000}
+
+
+def _parse_reset_delay_ms(message):
+    """Parse relative reset durations like 'resets in 1d 1h' into milliseconds."""
+    if not isinstance(message, str) or not message:
+        return None
+    match = re.search(r'resets\s+in\s+([^.)]+)', message, re.IGNORECASE)
+    if not match:
+        return None
+    total = 0
+    for amount, unit in re.findall(r'(\d+)\s*([dhms])\b', match.group(1), re.IGNORECASE):
+        total += int(amount) * _RESET_UNIT_MS[unit.lower()]
+    return total if total > 0 else None
+
+
+def _extract_provider_quota_error(output, captured_at_ms):
+    """Extract compact 429 provider.quota exhaustion evidence from NDJSON task output."""
+    if not isinstance(output, str) or not output:
+        return None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get('type') != 'error':
+            continue
+        err = event.get('error')
+        if not isinstance(err, dict):
+            continue
+        if err.get('type') != 'provider.quota' or err.get('status') != 429:
+            continue
+        message = err.get('message') if isinstance(err.get('message'), str) else ''
+        if not message:
+            body = err.get('response', {}).get('body') if isinstance(err.get('response'), dict) else None
+            if isinstance(body, str):
+                try:
+                    nested = json.loads(body)
+                    if isinstance(nested, dict) and isinstance(nested.get('error'), dict):
+                        message = str(nested['error'].get('message') or '')
+                except ValueError:
+                    pass
+        delay_ms = _parse_reset_delay_ms(message)
+        result = {'type': 'provider.quota', 'status': 429, 'exhausted': True, 'captured_at': captured_at_ms}
+        if delay_ms is not None:
+            result['reset_at'] = captured_at_ms + delay_ms
+        return result
+    return None
 
 
 def run_heartbeat_loop(beat, stop, interval=LIVE_SESSION_HEARTBEAT_SECONDS):
@@ -1113,6 +1164,16 @@ class Bridge:
             salvage = salvage_branch(row['workspace']) if workspace_available else None
             if salvage is not None:
                 payload['evidence']['git_salvage'] = salvage
+            if code != 0 and workspace_available:
+                try:
+                    from .task_output import CAPTURE_OUTPUT_BYTES, capture_task_output
+                    captured_out = capture_task_output('hub2-' + row['session_id'], row, row['native_id'], limit=CAPTURE_OUTPUT_BYTES, retained_only=True)
+                except Exception:
+                    captured_out = ''
+                exited_ms = exit_info.get('exited_at_ms') if type(exit_info.get('exited_at_ms')) is int else int(time.time() * 1000)
+                quota_error = _extract_provider_quota_error(captured_out, exited_ms)
+                if quota_error is not None:
+                    payload['evidence']['provider_quota_error'] = quota_error
             if native.get('retirement') == 'verified_origin' and len(canonical(payload['evidence']).encode('utf8')) > 8192:
                 logging.getLogger(__name__).warning('Origin retirement evidence too large session=%s', row['session_id'])
                 continue

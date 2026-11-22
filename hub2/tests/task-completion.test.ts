@@ -1520,3 +1520,47 @@ test('implementation sessions default to a 2h deadline, review keeps 30 min',asy
     assert.equal(JSON.parse(sagas(f,id)[0].launch_spec_json).timeout_seconds,7200);
   }finally{f.close?.();}
 });
+
+test('finish with 429 provider.quota evidence marks account exhausted until reset_at',async()=>{
+  const quotaPuts:Array<{id:string;body:any}>=[];
+  const f=fixture();
+  try{
+    const env=(f.project as any).env;
+    const origAccounts=env.ACCOUNTS;
+    env.ACCOUNTS={
+      idFromName:(id:string)=>({toString:()=>id}),
+      get:(idObj:any)=>({
+        fetch:async(r:Request)=>{
+          const url=new URL(r.url);
+          if(url.pathname==='/api/account/quota'&&r.method==='PUT'){
+            quotaPuts.push({id:idObj.toString(),body:await r.json()});
+            return Response.json({recorded:true});
+          }
+          return origAccounts.get(idObj).fetch(r);
+        },
+      }),
+    };
+    const id=await createIntake(f,'go-quota-exhaust');
+    assert.equal((await start(f,id,'first')).status,201);
+    const binding=await run(f,id);
+    f.db().run("UPDATE dispatch_sagas SET account_id='shared-go' WHERE operation_id=?",binding.operation_id);
+    const now=Date.now(),resetAt=now+21*3600_000;
+    const res=await f.call('/_internal/finish','POST',{
+      operation_id:binding.operation_id,attempt_operation_id:binding.attempt_operation_id,
+      session_id:binding.session_id,machine_id:binding.machine_id,epoch:binding.epoch,
+      native_id:binding.native_id,exit_code:1,native_exit_confirmed:true,
+      evidence:{
+        source:'aplexer_retirement',containment_empty:true,
+        native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:binding.workspace},
+        native_exit:{code:1,exited_at_ms:now},
+        provider_quota_error:{type:'provider.quota',status:429,exhausted:true,captured_at:now,reset_at:resetAt},
+      },
+    });
+    assert.equal(res.status,200);
+    assert.equal(quotaPuts.length,1);
+    assert.equal(quotaPuts[0].id,'shared-go');
+    assert.equal(quotaPuts[0].body.remaining,0);
+    assert.equal(quotaPuts[0].body.reset_at,resetAt);
+    assert.equal(quotaPuts[0].body.source,'session_output:provider.quota');
+  }finally{f.close?.();}
+});
