@@ -57,7 +57,7 @@ const fixture = await createFixture({ root, entry: wrappedEntry,
   env: { HUB2_RELEASE_MODE: 'active', HUB_ADMINS: 'cli@example.test' },
 });
 const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-const call = (path, method = 'GET', body) => fixture.fetch(path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+const call = (path, method = 'GET', body, extraHeaders = {}) => fixture.fetch(path, { method, headers: { ...headers, ...extraHeaders }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 const scratch = await makeTempDir('cli-auth-routes-');
 let hostSocket;
 async function command(program, args, env = {}) {
@@ -114,10 +114,14 @@ try {
   assert.equal((await (await call('/api/repos')).json()).items[0].canonical_name, 'owner/repo');
 
   // POST /api/sessions reports validation refusals clearly and includes the selected route on acceptance.
-  const start = (body) => call('/api/sessions', 'POST', body);
+  const start = (body, headers = {}) => call('/api/sessions', 'POST', body, headers);
   const base = { key: 'start-test-0001', workspace: '/tmp/ws', mode: 'headless', brief: 'do the thing', repo: 'owner/repo' };
   for (const [patch, status, code] of [
     [{ key: undefined }, 400, 'idempotency_key_required'],
+    [{ key: '' }, 400, 'idempotency_key_required'],
+    [{ key: '-bad' }, 400, 'idempotency_key_required'],
+    [{ key: 'gha-6' }, 503, 'no_connected_host'],
+    [{ key: 'k' }, 503, 'no_connected_host'],
     [{ brief: undefined }, 400, 'brief_required'],
     [{ purpose: 'Review' }, 400, 'invalid_purpose'],
     [{ purpose: null }, 400, 'invalid_purpose'],
@@ -126,6 +130,9 @@ try {
     const refused = await start({ ...base, ...patch });
     assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
   }
+  const headerKey = await start({ ...base, key: undefined }, { 'Idempotency-Key': 'gha-6' });
+  assert.equal(headerKey.status, 503);
+  assert.equal((await headerKey.json()).error, 'no_connected_host');
   const noWorkspace = await start({ ...base, key: 'start-no-workspace', workspace: undefined, repo: undefined });
   const noWorkspaceBody = await noWorkspace.json();
   assert.equal(noWorkspace.status, 400); assert.equal(noWorkspaceBody.error, 'workspace_required');

@@ -197,6 +197,31 @@ class TestSessionControlCli(unittest.TestCase):
                     self.assertEqual(call.args[2]['intake_task_id'], 'task-fixture')
                     self.assertEqual(call.args[2].get('with_goal', False), bool(mode))
 
+    def test_start_sends_short_key_in_body_and_idempotency_header(self):
+        import os
+        captured = {}
+
+        def fake_http_json(req, **_kwargs):
+            captured['method'] = req.get_method()
+            captured['url'] = req.full_url
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            captured['header_key'] = req.get_header('Idempotency-key')
+            return {'id': 'session-gha-6', 'state': 'offered'}
+
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=fake_http_json):
+            result = session_control.execute(self.parse(
+                'start', '--repo', 'org/repo', '--machine', 'hetzner-aplexer',
+                '--purpose', 'fix', '--intake-task-id', '20ae035b-a3c9-4779-b7ef-b14c55e34fbf',
+                '--headless', '--key', 'gha-6', '--no-wait', '--prompt', 'fix it',
+            ))
+        self.assertEqual(captured['method'], 'POST')
+        self.assertTrue(captured['url'].endswith('/api/sessions'))
+        self.assertEqual(captured['body']['key'], 'gha-6')
+        self.assertEqual(captured['header_key'], 'gha-6')
+        self.assertEqual(result['client_key'], 'gha-6')
+
     def test_send_capture_stop_payloads(self):
         with patch.object(session_control, 'read_file', return_value='prompt'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
