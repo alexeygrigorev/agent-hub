@@ -909,7 +909,10 @@ class NativeLauncher:
                 sleep(0.5)
 
         deadline = clock() + wait_seconds
-        text = wait_for(lambda t: claude_ready_screen(t) or claude_workspace_trust_prompt(t, workspace) is not None, deadline)
+        # 'unverified' frames (Claude still painting, torn redraw) keep polling;
+        # only a state that is still unverified at the deadline refuses.
+        text = wait_for(lambda t: claude_workspace_trust_prompt(t, workspace) in ('yes', 'no')
+                        or (claude_ready_screen(t) and claude_workspace_trust_prompt(t, workspace) is None), deadline)
         state = claude_workspace_trust_prompt(text, workspace)
         if state is None:
             if not claude_ready_screen(text):
@@ -917,7 +920,7 @@ class NativeLauncher:
             return False
         if state == 'no':
             key('1b5b42')
-            text = wait_for(lambda t: claude_workspace_trust_prompt(t, workspace) != 'no', clock() + step_seconds)
+            text = wait_for(lambda t: claude_workspace_trust_prompt(t, workspace) in ('yes', None), clock() + step_seconds)
             state = claude_workspace_trust_prompt(text, workspace)
         if state != 'yes':
             raise RuntimeError('claude_workspace_trust_unverified')
