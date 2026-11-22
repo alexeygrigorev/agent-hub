@@ -30,6 +30,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "workspace_label_ambiguous": "Workspace label is ambiguous.",
   "native_launch_route_missing": "Native launch route is unavailable.",
   "codex_launch_wrapper_unavailable": "Codex launch wrapper is unavailable.",
+  "claude_workspace_trust_unverified": "Claude folder-trust prompt could not be answered.",
   "launcher_capability_unavailable": "Launcher capability is unavailable.",
   "managed_exec_unavailable": "Managed execution is unavailable.",
   "invalid_offer_identity": "Offer identity is invalid.",

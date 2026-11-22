@@ -536,6 +536,39 @@ def detect_antigravity_first_run_block(screen_text):
     return False
 
 
+_CLAUDE_TRUST_YES = 'yes, i trust this folder'
+_CLAUDE_TRUST_NO = 'no, exit'
+
+
+def claude_workspace_trust_prompt(screen_text, workspace):
+    """Classify Claude Code's folder-trust dialog for exactly `workspace`.
+
+    Returns None when the screen is not that dialog, else 'yes' or 'no' for the
+    option the cursor (❯) is on. Claude defaults to "No, exit" for the user's
+    home directory and never persists home trust, so a Hub-delivered Enter
+    there exits the session with code 1 (DESKTOP-FP4OP26, intake 2699b8d7).
+    The path must appear on screen, so another folder's dialog never matches.
+    """
+    if not isinstance(screen_text, str) or not isinstance(workspace, str) or not workspace:
+        return None
+    plain = _ANSI_ESCAPE_RE.sub(' ', screen_text[-16384:])
+    lowered = plain.lower()
+    collapsed = re.sub(r'\s+', ' ', lowered)
+    if 'accessing workspace' not in collapsed or _CLAUDE_TRUST_YES not in collapsed or _CLAUDE_TRUST_NO not in collapsed:
+        return None
+    if re.sub(r'\s+', '', workspace).lower() not in re.sub(r'\s+', '', lowered):
+        return None
+    for line in plain.splitlines():
+        if '\u276f' in line:
+            item = re.sub(r'\s+', ' ', line.replace('\u276f', ' ')).strip().lower()
+            item = re.sub(r'^[0-9]+\.\s*', '', item)
+            if item.startswith(_CLAUDE_TRUST_YES):
+                return 'yes'
+            if item.startswith(_CLAUDE_TRUST_NO):
+                return 'no'
+    return None
+
+
 def goal_prompt(prompt, workspace, task_id, first_action_path):
     if '\r' not in prompt and '\n' not in prompt and len(('/goal ' + prompt).encode('utf-16-le')) // 2 <= 4000:
         return prompt
@@ -818,6 +851,37 @@ class NativeLauncher:
         if len(result.stdout) > output_limit:
             raise RuntimeError("native_response_too_large")
         return result
+
+    def accept_claude_workspace_trust(self, native_id, workspace, *, wait_seconds=15.0, sleep=time.sleep, clock=time.monotonic):
+        """Answer Claude's folder-trust dialog for the exact launched workspace.
+
+        Hub placed this pane in an enrolled workspace, so trust is the operator's
+        decision already (as for agy's session-only --settings). Bounded: stop
+        at the ready prompt or after `wait_seconds`. A dialog that is seen but
+        cannot be answered refuses the launch loudly instead of leaving a pane
+        whose first Enter exits it.
+        """
+        deadline = clock() + wait_seconds
+        accepted = False
+        while True:
+            screen = self.native('capture', native_id, '--screen', '--plain', allow_failure=True, timeout=5)
+            text = screen.stdout if screen.returncode == 0 else ''
+            choice = claude_workspace_trust_prompt(text, workspace)
+            if choice is None:
+                ready = any(marker in text.lower() for marker in ('? for shortcuts', 'esc to interrupt'))
+                if accepted or ready or clock() >= deadline:
+                    return accepted
+            else:
+                key = '0d' if choice == 'yes' else '1b5b42'
+                if self.native('send', native_id, '--raw', '--hex', key, allow_failure=True, timeout=5).returncode != 0:
+                    raise RuntimeError('claude_workspace_trust_unverified')
+                if choice == 'yes':
+                    accepted = True
+                    import logging
+                    logging.getLogger(__name__).warning('CLAUDE WORKSPACE TRUST ACCEPTED native=%s', native_id)
+                if clock() >= deadline:
+                    raise RuntimeError('claude_workspace_trust_unverified')
+            sleep(0.5)
 
     def inventory(self):
         from .native_inventory import collect_native_inventory, CENSUS_TIMEOUT_SECONDS, MAX_CENSUS_BYTES
@@ -1344,6 +1408,10 @@ class NativeLauncher:
             raise RuntimeError("native_profile_command_mismatch")
         if specification.get("interactive") and start_json.get("command") != child:
             raise RuntimeError("native_interactive_command_mismatch")
+        if specification.get("interactive") and provider == 'claude':
+            # Before any goal or prompt delivery: Enter on the default "No, exit"
+            # would end the pane (home workspace, intake 2699b8d7).
+            self.accept_claude_workspace_trust(start_json["id"], str(specification["workspace"]))
         goal_registration = None
         if objective is not None:
             if start_json.get('engine') != ('claude' if provider == 'claude' else 'codex'):

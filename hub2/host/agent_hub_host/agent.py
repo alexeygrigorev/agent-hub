@@ -187,6 +187,7 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'child_credential_unverified': 'Provider credential preparation was refused.',
  'claim_ack_unverified': 'Claim acknowledgement is unverified.',
  'claimed_offer_without_local_intent': 'Launch preparation was refused.',
+ 'claude_workspace_trust_unverified': 'Claude folder-trust prompt could not be answered.',
  'codex_launch_wrapper_unavailable': 'Codex launch wrapper is unavailable.',
  'command_fence_conflict': 'Launch preparation was refused.',
  'command_id_conflict': 'Launch preparation was refused.',

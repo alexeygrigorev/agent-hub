@@ -24,3 +24,16 @@ def _synthetic_codex_wrapper(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def _codex_wrapper_env(_synthetic_codex_wrapper, monkeypatch):
     monkeypatch.setenv('CODEX_LAUNCH_WRAPPER', _synthetic_codex_wrapper)
+
+
+@pytest.fixture(autouse=True)
+def _claude_workspace_trust_step(request, monkeypatch):
+    """Interactive Claude launches answer the folder-trust dialog by capturing
+    the pane (intake 2699b8d7). Launch fakes that predate that step do not
+    model `capture`; ClaudeWorkspaceTrust* tests exercise the real method."""
+    cls = getattr(request.node, 'cls', None)
+    if cls is not None and cls.__name__.startswith('ClaudeWorkspaceTrust'):
+        return
+    from agent_hub_host import native_launch
+    monkeypatch.setattr(native_launch.NativeLauncher, 'accept_claude_workspace_trust',
+                        lambda self, native_id, workspace, **kwargs: False)
