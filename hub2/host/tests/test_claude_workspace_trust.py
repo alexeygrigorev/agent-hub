@@ -159,6 +159,26 @@ class ClaudeWorkspaceTrustLauncherTests(unittest.TestCase):
         self.assertEqual(pane.sends(), ['1b5b42', '0d'])
         self.assertTrue(pane.dismissed and not pane.dead)
 
+    def test_partial_first_frame_and_cursorless_redraw_keep_polling(self):
+        # Review of PR 729 (A): Claude still painting, and a ConPTY redraw
+        # without the cursor line, must not abort a launch that then settles.
+        pane = FakePane()
+        frames = [LIVE_DESKTOP_CAPTURE.split(' Security guide')[0], None]
+        original = pane.screen
+
+        def screen():
+            if frames and frames[0] is not None and not pane.sends():
+                return frames.pop(0)
+            if pane.sends() == ['1b5b42'] and frames:
+                frames.pop(0)
+                return trust_screen(pane.path, None)
+            return original()
+        pane.screen = screen
+        with self.assertLogs('agent_hub_host.native_launch', level='WARNING'):
+            self.assertTrue(self.accept(pane))
+        self.assertEqual(pane.sends(), ['1b5b42', '0d'])
+        self.assertTrue(pane.dismissed and not pane.dead)
+
     def test_preselected_yes_is_confirmed_without_moving(self):
         pane = FakePane(selected='yes')
         with self.assertLogs('agent_hub_host.native_launch', level='WARNING'):
