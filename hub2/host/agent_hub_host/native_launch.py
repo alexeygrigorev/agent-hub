@@ -504,6 +504,38 @@ def antigravity_trust_argv(argv, workspace):
     return [*options, '--settings', settings, *prompt_suffix]
 
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+def detect_antigravity_first_run_block(screen_text):
+    """Return True when captured Antigravity CLI screen text shows a first-run,
+    onboarding, or Terms of Service prompt that blocks execution indefinitely."""
+    if not isinstance(screen_text, str) or not screen_text.strip():
+        return False
+    plain = _ANSI_ESCAPE_RE.sub(' ', screen_text[-16384:])
+    normalized = re.sub(r'\s+', ' ', plain).strip().lower()
+    if not normalized:
+        return False
+    if 'welcome to antigravity cli' in normalized and any(
+        cue in normalized for cue in (
+            'choose your color scheme', 'terms of service', 'terms of use',
+            'security notice', 'data use', 'onboarding',
+        )
+    ):
+        return True
+    if any(cue in normalized for cue in ('terms of service', 'terms of use', 'security notice & data use')) and any(
+        prompt in normalized for prompt in (
+            '[next]', '[done]', '[previous]', 'navigate', 'enter confirm', 'press enter', 'accept', 'agree', 'decline',
+        )
+    ):
+        return True
+    if 'you are currently not signed in' in normalized and any(
+        cue in normalized for cue in ('authentication required', 'please visit the url to log in', 'paste the authorization code')
+    ):
+        return True
+    return False
+
+
 def goal_prompt(prompt, workspace, task_id, first_action_path):
     if '\r' not in prompt and '\n' not in prompt and len(('/goal ' + prompt).encode('utf-16-le')) // 2 <= 4000:
         return prompt

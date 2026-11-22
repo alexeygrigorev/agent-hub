@@ -46,3 +46,32 @@ class AdvertisementCliTests(unittest.TestCase):
                 cleared = json.loads(config_path.read_text())
                 self.assertEqual(cleared['capabilities'], [])
                 self.assertEqual(cleared['workspaces'], {})
+
+    def test_enroll_accepts_workspace_and_preserves_existing_observations_on_reenroll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_path = root / 'v2.json'
+            fake_enroll = {'machine_id': 'DESKTOP-FP4OP26', 'token': 'synthetic-machine-token'}
+
+            def invoke(*args):
+                with (patch('agent_hub_host.client.Client.request', return_value=fake_enroll),
+                      patch.dict('os.environ', {'HUB2_PAIRING_CODE': 'synthetic-code'}),
+                      contextlib.redirect_stdout(io.StringIO()),
+                      contextlib.redirect_stderr(io.StringIO())):
+                    return main(['--config', str(config_path), '--server', 'https://hub.example', *args])
+
+            self.assertEqual(invoke('enroll', '--root', str(root), '--engine', 'claude',
+                                    '--capability', 'browser:orin-chrome',
+                                    '--workspace', f'home={root}'), 0)
+            saved = json.loads(config_path.read_text())
+            self.assertEqual(saved['capabilities'], ['browser:orin-chrome'])
+            self.assertEqual(saved['workspaces'], {'home': str(root)})
+
+            # Re-enrolling without --workspace/--capability preserves existing valid entries and launcher.
+            saved['launcher'] = {'routes': {'claude': {'provider': 'claude'}}}
+            save_config(config_path, saved)
+            self.assertEqual(invoke('enroll', '--root', str(root), '--engine', 'claude'), 0)
+            reenrolled = json.loads(config_path.read_text())
+            self.assertEqual(reenrolled['capabilities'], ['browser:orin-chrome'])
+            self.assertEqual(reenrolled['workspaces'], {'home': str(root)})
+            self.assertEqual(reenrolled['launcher'], {'routes': {'claude': {'provider': 'claude'}}})

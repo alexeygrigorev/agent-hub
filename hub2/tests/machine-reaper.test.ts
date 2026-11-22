@@ -354,6 +354,32 @@ test('host launch refusal terminally fails an unclaimed offer with a visible rea
  assert.equal(f.events.at(-1)?.body.launch_failed,true);
 });
 
+test('running antigravity first-run block raises named attention and fails finish loudly',async()=>{
+ const f=fixture(),sessionId='agy-tos-blocked',nativeId='11111111-2222-3333-4444-555555555555';
+ const epoch=await startClaimed(f,sessionId,nativeId);
+ const admittedAt=Date.now();
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(
+  JSON.stringify({workspace:'/tmp',engine:'antigravity',model:'gemini-4-hydrogen-medium',prompt:'test work',interactive:true,timeout_seconds:1800}),sessionId);
+ f.database.prepare('INSERT INTO launch_admissions(operation_id,session_id,epoch,observed_at) VALUES(?,?,?,?)').run('op-'+sessionId,sessionId,epoch,admittedAt);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,epoch,stage:'host_runtime',reason:'antigravity_first_run_blocked'}));
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'antigravity_first_run_blocked');
+ const finished=await f.call(`/api/sessions/${sessionId}/finish`,'POST',{
+  operation_id:'op-'+sessionId,epoch,native_id:nativeId,exit_code:143,native_exit_confirmed:true,
+  failure_reason:'antigravity_first_run_blocked',
+  evidence:{source:'aplexer_status',native_identity:{id:nativeId,tag:'task-hub2-'+sessionId,workspace:'/tmp'},
+   containment_empty:true,native_exit:{code:143,exited_at_ms:admittedAt+1000},
+   native_deadline:{deadline_ms:admittedAt+1800*1000,exceeded:false},launcher_state:'finalized'},
+ });
+ assert.equal(finished.status,201);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'antigravity_first_run_blocked');
+ assert.equal(f.events.at(-1)?.body.failure_reason,'antigravity_first_run_blocked');
+ assert.equal(f.events.at(-1)?.body.detail,'Antigravity is blocked on first-run onboarding or Terms of Service.');
+});
+
 test('authentication refusal from an unclaimed offer routes to model fallback',async()=>{
  const f=fixture(),sessionId='auth-refused-offer';await startOffered(f,sessionId);
  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};

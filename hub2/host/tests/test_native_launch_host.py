@@ -1957,3 +1957,72 @@ class ProfileCommandUtf8PromptTest(unittest.TestCase):
             self.assertTrue(any(enc in ('utf8', 'utf-8') for enc in seen_encodings))
             prompt_file = Path(argv[argv.index('--prompt-file') + 1])
             self.assertEqual(prompt_file.read_text(encoding='utf-8'), prompt)
+
+
+class AntigravityFirstRunBlockTests(unittest.TestCase):
+    def test_detects_onboarding_and_tos_screens_and_ignores_normal_output(self):
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            '\x1b[1mWelcome to Antigravity CLI!\x1b[0m Choose your color scheme: > terminal [Next]'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Terms of Service\nPlease review and accept the terms.\n> Accept  Decline  enter Confirm'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Security Notice & Data Use\n[Next] Navigate · enter Confirm'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Welcome to the Antigravity CLI. You are currently not signed in.\nAuthentication required. Please visit the URL to log in:'))
+        self.assertFalse(nl.detect_antigravity_first_run_block(''))
+        self.assertFalse(nl.detect_antigravity_first_run_block(
+            'Accessing workspace: C:\\Users\\User\\git\\agent-desktop\nDo you trust the contents of this project?\n> Yes, I trust this folder'))
+        self.assertFalse(nl.detect_antigravity_first_run_block(
+            'Checked Terms of Service docs and finished the task cleanly.'))
+
+    def test_reconcile_alerts_and_stops_hung_antigravity_first_run_session(self):
+        from agent_hub_host.agent import Bridge, HOST_FAILURE_DETAILS, Journal
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            journal = Journal(root / 'v2-journal.sqlite')
+            self.addCleanup(journal.close_thread)
+            native_id = '11111111-2222-3333-4444-555555555555'
+            killed = {'done': False}
+            exited_at = int(time.time() * 1000)
+
+            def runner(argv, **_kwargs):
+                if argv[1] == 'status':
+                    if killed['done']:
+                        row = {'id': native_id, 'tag': 'task-hub2-sess-tos', 'workspace': str(root),
+                               'engine': 'antigravity', 'phase': 'exited', 'containment_empty': True,
+                               'exit': {'code': 143, 'exited_at_ms': exited_at}}
+                    else:
+                        row = {'id': native_id, 'tag': 'task-hub2-sess-tos', 'workspace': str(root),
+                               'engine': 'antigravity', 'phase': 'running', 'containment_empty': False}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(row), '')
+                if argv[1] == 'capture':
+                    return subprocess.CompletedProcess(
+                        argv, 0, 'Welcome to Antigravity CLI! Choose your color scheme: > terminal [Next]', '')
+                if argv[1] == 'kill':
+                    killed['done'] = True
+                    return subprocess.CompletedProcess(argv, 0, '{}', '')
+                return subprocess.CompletedProcess(argv, 0, '{}', '')
+
+            bridge = Bridge(mock.Mock(), journal, [root], ['antigravity'], executable=sys.executable, runner=runner)
+            bridge._managed_socket = mock.Mock()
+            bridge.launcher.finalize = lambda *_a, **_k: 'finalized'
+            with journal.db:
+                journal.db.execute(
+                    "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive,runtime_deadline,native_dispatch_started) "
+                    "VALUES(?,?,?,?,?,?,?,'running',1,?,1)",
+                    ('op-tos', 'sess-tos', 1, 'd' * 64, str(root), 'task-hub2-sess-tos', native_id, exited_at + 60000))
+            with self.assertLogs('agent_hub_host.agent', level='ERROR') as logs:
+                bridge.reconcile()
+            self.assertTrue(any('FIRST-RUN BLOCKED' in line and 'antigravity_first_run_blocked' in line for line in logs.output))
+            frame = json.loads(bridge._managed_socket.send.call_args.args[0])
+            self.assertEqual(frame['type'], 'host.error')
+            self.assertEqual(frame['stage'], 'host_runtime')
+            self.assertEqual(frame['reason'], 'antigravity_first_run_blocked')
+            self.assertEqual(frame['detail'], HOST_FAILURE_DETAILS['antigravity_first_run_blocked'])
+            self.assertTrue(killed['done'])
+            outbox = journal.db.execute("SELECT payload FROM outbox WHERE key='finish:op-tos'").fetchone()
+            self.assertIsNotNone(outbox)
+            payload = json.loads(outbox['payload'])
+            self.assertEqual(payload['failure_reason'], 'antigravity_first_run_blocked')
+            self.assertEqual(payload['detail'], HOST_FAILURE_DETAILS['antigravity_first_run_blocked'])
+            self.assertNotIn('launch_failed', payload)
