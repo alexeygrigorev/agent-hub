@@ -84,6 +84,12 @@ class FakePane:
                 self.pending = None
             return subprocess.CompletedProcess(argv, 0, text, '')
         if argv[1] == 'send':
+            # Real aplexer 0.1.26 CLI contract (live DESKTOP-FP4OP26 failure):
+            # `--raw` cannot be used with `--hex`.
+            if '--raw' in argv and '--hex' in argv:
+                return subprocess.CompletedProcess(argv, 2, '', "error: the argument '--raw' cannot be used with '--hex'")
+            if '--hex' not in argv:
+                raise AssertionError(argv)
             if self.lag:
                 self.pending = argv[-1]
             else:
