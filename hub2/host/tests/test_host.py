@@ -1666,10 +1666,13 @@ class HostTests(unittest.TestCase):
         self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=rev-parse exit_code=128')),
                          ('implement_worktree_git_failed','Workspace git operation failed. (operation=rev-parse exit_code=128)'))
         self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=PRIVATE reason=timeout')),
-                         ('implement_worktree_git_failed','Workspace git operation failed. (reason=timeout)'))
+                         ('implement_worktree_git_failed','Workspace git operation failed.'))
         self.assertEqual(closed_host_failure(ValueError('implement_worktree_owner_conflict worktree=C:/PRIVATE')),
                          ('implement_worktree_owner_conflict','Launch preparation was refused.'))
         self.assertEqual(closed_host_failure(ValueError('implement_worktree_locked worktree=/PRIVATE lock=x')),
+                         ('implement_worktree_locked','Workspace intake worktree is locked.'))
+        # Free text after a path never supplies facts (review of PR 728).
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_locked worktree=C:/Some User/wt lock=x reason=injected status=injected')),
                          ('implement_worktree_locked','Workspace intake worktree is locked.'))
         self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('implement_worktree_git_failed operation=fetch exit_code=1')),
                          {'failure_reason':'implement_worktree_git_failed',

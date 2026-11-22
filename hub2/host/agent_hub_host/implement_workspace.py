@@ -79,7 +79,15 @@ def _is_plain_directory(root):
         if result.stdout.strip() != 'true':
             raise ValueError('implement_worktree_git_failed operation=rev-parse reason=not_work_tree')
         return False
-    if result.returncode == 128 and 'not a git repository' in (result.stderr or '').lower():
+    # Only Git's discovery miss ("... (or any of the parent directories)" /
+    # "(or any parent up to mount point ...)") proves a plain directory. A
+    # dangling gitfile or GIT_DIR prints "not a git repository: <admin>" and
+    # must stay loud: that is a retired worktree husk, never a plain directory.
+    parts = Path(root).parts
+    husk = any(parts[i:i + 2] == ('.local', 'hub-worktrees') for i in range(len(parts) - 1))
+    if (result.returncode == 128 and 'not a git repository (or any' in (result.stderr or '').lower()
+            and not husk and not os.path.lexists(Path(root) / '.git')
+            and not os.environ.get('GIT_DIR') and not os.environ.get('GIT_WORK_TREE')):
         return True
     raise ValueError(f'implement_worktree_git_failed operation=rev-parse exit_code={int(result.returncode)}')
 

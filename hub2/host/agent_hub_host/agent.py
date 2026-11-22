@@ -347,10 +347,13 @@ def closed_host_failure(error, fallback="host_operation_failed"):
     if type(error) in (ValueError, RuntimeError) and len(error.args) == 1 and type(error.args[0]) is str:
         code, *rest = error.args[0].split(' ') or ['']
         if code in HOST_FAILURE_DETAILS and code != error.args[0]:
+            # Facts lead the message; stop at the first other token so free
+            # text after a path (spaces, lock reasons) can never supply facts.
             for token in rest:
                 key, sep, value = token.partition('=')
-                if sep and key in HOST_FAILURE_FACTS and HOST_FAILURE_FACTS[key].fullmatch(value):
-                    facts.append(f'{key}={value}')
+                if not (sep and key in HOST_FAILURE_FACTS and HOST_FAILURE_FACTS[key].fullmatch(value)):
+                    break
+                facts.append(f'{key}={value}')
     elif type(error) is ApiError and type(error.code) is str:
         code = error.code
     reason = code if type(code) is str and code in HOST_FAILURE_DETAILS else fallback

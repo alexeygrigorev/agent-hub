@@ -104,6 +104,27 @@ class ImplementWorkspaceTests(unittest.TestCase):
                 self.assertEqual(prepare_workspace(directory, purpose, 'intake-home', 'org/home'), directory.resolve())
         self.assertFalse((directory / '.local').exists())
 
+    def test_dangling_gitfile_husk_is_not_a_plain_directory(self):
+        # Review of PR 728: a retired worktree husk whose gitfile points at a
+        # pruned admin dir prints "not a git repository: <admin>" (exit 128);
+        # it must refuse loudly instead of running in place.
+        husk = self.shared / '.local' / 'hub-worktrees' / ('a' * 64)
+        husk.mkdir(parents=True)
+        (husk / '.git').write_text('gitdir: ' + str(self.shared / '.git' / 'worktrees' / 'gone') + '\n')
+        with self.assertRaisesRegex(ValueError, '^implement_worktree_git_failed operation=rev-parse exit_code=128$'):
+            prepare_workspace(husk, 'implement', 'intake-husk', 'org/repo')
+        loose = self.root / 'loose'
+        loose.mkdir()
+        (loose / '.git').write_text('gitdir: ' + str(self.root / 'missing-admin') + '\n')
+        with patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': str(self.root)}):
+            with self.assertRaisesRegex(ValueError, 'implement_worktree_git_failed'):
+                prepare_workspace(loose, 'implement', 'intake-loose', 'org/repo')
+        plain = self.root / 'plain-under-env'
+        plain.mkdir()
+        with patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': str(self.root), 'GIT_WORK_TREE': str(plain)}):
+            with self.assertRaisesRegex(ValueError, 'implement_worktree_git_failed'):
+                prepare_workspace(plain, 'implement', 'intake-env', 'org/repo')
+
     def test_git_failure_other_than_not_a_repository_stays_loud(self):
         directory = self.root / 'odd'
         directory.mkdir()
