@@ -53,6 +53,33 @@ class RecoveryTests(unittest.TestCase):
         self.git(self.repo, 'worktree', 'remove', str(target))
         return tip
 
+    def test_retired_worktree_scratch_husk_does_not_block_same_intake_retry(self):
+        tip = self.retained()
+        scratch = self.target / '.local' / 'tmp' / 'hub2-old' / 'claude'
+        scratch.mkdir(parents=True)
+        (scratch / 'uv.lock').write_text('scratch')
+        recovered = self.prepare()
+        self.assertEqual(recovered, self.target)
+        self.assertEqual(self.git(recovered, 'rev-parse', 'HEAD'), tip)
+        self.assertFalse((recovered / '.local').exists())
+
+    def test_non_scratch_directory_at_target_still_conflicts(self):
+        self.retained()
+        (self.target / '.local' / 'tmp').mkdir(parents=True)
+        (self.target / 'foreign-file').write_text('keep')
+        with self.assertRaisesRegex(ValueError, 'owner_conflict'):
+            self.prepare()
+        self.assertTrue((self.target / 'foreign-file').is_file())
+
+    def test_live_registered_worktree_with_other_owner_still_conflicts(self):
+        target = self.prepare()
+        (target / '.local' / 'tmp').mkdir(parents=True)
+        admin = Path(self.git(target, 'rev-parse', '--absolute-git-dir'))
+        (admin / module._MARKER).write_text(json.dumps({'intake_id': 'x', 'project_id': 'org/project'}))
+        with self.assertRaisesRegex(ValueError, 'owner_conflict'):
+            self.prepare()
+        self.assertTrue(target.is_dir())
+
     def test_cleaned_successor_retains_non_main_commit_branch_and_marker_offline(self):
         tip = self.retained()
         common = Path(self.git(self.repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
