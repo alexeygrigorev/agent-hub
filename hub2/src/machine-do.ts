@@ -164,6 +164,9 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "implement_worktree_preparation_busy": "Launch preparation was refused.",
   "implement_worktree_owner_durability_failed": "Launch preparation was refused.",
   "implement_worktree_branch_missing": "Launch preparation was refused.",
+  "implement_worktree_git_failed": "Workspace git operation failed.",
+  "implement_worktree_locked": "Workspace intake worktree is locked.",
+  "implement_worktree_branch_in_use": "Workspace intake branch is in use by another worktree.",
   "provider_engine_bundle_unavailable": "Launch preparation was refused.",
   "provider_engine_bundle_invalid": "Launch preparation was refused.",
   "provider_engine_version_report_unverified": "Launch preparation was refused.",
@@ -180,6 +183,16 @@ function closedLaunchReason(value:unknown):string {
 }
 function fixedHostDetail(reason:unknown):string {
   return HOST_FAILURE_DETAILS[closedLaunchReason(reason)];
+}
+// Hosts may append closed facts to the fixed detail, e.g.
+// "Workspace git operation failed. (operation=rev-parse exit_code=128)".
+// Only these shapes pass; paths, argv and stderr never reach session detail.
+const HOST_DETAIL_FACT='(?:operation=(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)|exit_code=-?[0-9]{1,6}|reason=[a-z][a-z_]{0,39}|status=[a-z][a-z_]{0,39})';
+const HOST_DETAIL_FACTS=new RegExp(`^ \\(${HOST_DETAIL_FACT}(?: ${HOST_DETAIL_FACT}){0,3}\\)$`);
+function hostDetail(reason:unknown,reported:unknown):string {
+  const fixed=fixedHostDetail(reason);
+  return typeof reported==='string'&&reported.length<=256&&reported.startsWith(fixed)
+    &&HOST_DETAIL_FACTS.test(reported.slice(fixed.length))?reported:fixed;
 }
 
 function isJsonRecord(value: unknown): value is JsonRecord {
@@ -1276,7 +1289,7 @@ export class MachineDO {
       machine_id: row.machine_id,intake_id:row.intake_id, epoch: row.epoch, native_id: body.native_id,
       ...(launch[WORKSPACE_BINDING_FIELD]?{workspace_binding:launch[WORKSPACE_BINDING_FIELD]}:{}),
       ...(launchFailed?{launch_failed:true}:{}),
-      ...(typedFailure?{failure_reason:typedFailure,detail:fixedHostDetail(typedFailure)}:{}),
+      ...(typedFailure?{failure_reason:typedFailure,detail:hostDetail(typedFailure,body.detail)}:{}),
       ...(failureNotification?{after_notification:failureNotification.id}:{}),
       // An accepted STOP remains intent even if its ACK failed or timed out.
       // Freeze it before forwarding; this is never proof of STOP confirmation.
@@ -1399,7 +1412,7 @@ export class MachineDO {
     if(current&&row.native_id!==null)return error('stale_no_dispatch_receipt',409);
     if(current&&['offered','claimed'].includes(row.state)){
       const failureReason = closedLaunchReason(body.failure_reason);
-      const detail = body.detail === undefined ? undefined : fixedHostDetail(failureReason);
+      const detail = body.detail === undefined ? undefined : hostDetail(failureReason,body.detail);
       await this.recordLaunchRefusal(row, failureReason, true, detail);
     }else{
       const settled=current ? ['failed','stopped','expired'].includes(row.state)
@@ -1988,7 +2001,7 @@ export class MachineDO {
       const previous=this.parse(row.evidence_json);
       if(previous===null||isJsonRecord(previous)){
         const evidence=isJsonRecord(previous)?{...previous}:{};
-        const detail=body.detail === undefined ? undefined : fixedHostDetail(body.reason);
+        const detail=body.detail === undefined ? undefined : hostDetail(body.reason,body.detail);
         const diagnostic={operation_id:row.operation_id,attempt:row.attempt,epoch:row.epoch,reason:body.reason,stage:'host_launch',
           ...(detail?{detail}:{})};
         if(JSON.stringify(evidence[HOST_START_DIAGNOSTIC_KEY])!==JSON.stringify(diagnostic)){
@@ -2027,7 +2040,7 @@ export class MachineDO {
 
   private async recordLaunchRefusal(session:SessionRow,failureReason:string,noDispatch=false,detail?:string):Promise<void>{
     failureReason = closedLaunchReason(failureReason);
-    detail = detail === undefined ? undefined : fixedHostDetail(failureReason);
+    detail = detail === undefined ? undefined : hostDetail(failureReason,detail);
     const now=Date.now(),reason='host_launch_refused',payload={operation_id:session.dispatch_id,
       attempt_operation_id:session.operation_id,session_id:session.id,intake_id:session.intake_id,
       machine_id:session.machine_id,epoch:session.epoch,native_id:null,reason,failure_reason:failureReason,
@@ -2609,7 +2622,7 @@ export class MachineDO {
         created_at: new Date(item.created_at).toISOString(),
         ...(typeof payload?.reason === 'string' ? { reason: closedHostReason(payload.reason) } : {}),
         ...(typeof payload?.failure_reason === 'string' ? { failure_reason: closedLaunchReason(payload.failure_reason) } : {}),
-        ...(typeof payload?.detail === 'string' ? { detail: fixedHostDetail(payload?.failure_reason) } : {}),
+        ...(typeof payload?.detail === 'string' ? { detail: hostDetail(payload?.failure_reason,payload.detail) } : {}),
       });
     }
     return json({ session_id: row.id, state: row.state, events });
@@ -2648,7 +2661,7 @@ export class MachineDO {
     const diagnostic=isJsonRecord(evidence)?evidence[HOST_START_DIAGNOSTIC_KEY]:null;
     if(!isJsonRecord(diagnostic)||diagnostic.operation_id!==row.operation_id||diagnostic.attempt!==row.attempt||diagnostic.epoch!==row.epoch
       ||diagnostic.reason!==reason||diagnostic.stage!=='host_launch')return null;
-    const detail=diagnostic.detail === undefined ? undefined : fixedHostDetail(reason);
+    const detail=diagnostic.detail === undefined ? undefined : hostDetail(reason,diagnostic.detail);
     return {stage:'host_launch',...(detail?{detail}:{})};
   }
 

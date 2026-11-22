@@ -1579,10 +1579,22 @@ class HostTests(unittest.TestCase):
             offer2 = self.offer(session_id="sess-wt-in-use", operation_id="op-wt-in-use:0")
             with self.assertLogs("agent_hub_host.agent", level="ERROR"):
                 self.bridge.dispatch({"type": "session.offer", "offer": offer2}, Socket(), None)
-        self.assertEqual(sent[-1]["reason"], "host_operation_failed")
+        self.assertEqual(sent[-1]["reason"], "implement_worktree_branch_in_use")
         self.assertEqual(sent[-1]["stage"], "host_launch")
-        self.assertEqual(sent[-1]["detail"], "Host operation failed.")
+        self.assertEqual(sent[-1]["detail"], "Workspace intake branch is in use by another worktree.")
         self.assertNotIn("/wt/stale", json.dumps(sent[-1]))
+        self.assertNotIn("dead-1", json.dumps(sent[-1]))
+
+        # DESKTOP-FP4OP26 (intake 2699b8d7): the real host error must reach the
+        # session instead of the generic "Host operation failed.".
+        with patch("agent_hub_host.agent.prepare_workspace",
+                   side_effect=ValueError("implement_worktree_git_failed operation=rev-parse exit_code=128")):
+            offer3 = self.offer(session_id="sess-git-failed", operation_id="op-git-failed:0")
+            with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+                self.bridge.dispatch({"type": "session.offer", "offer": offer3}, Socket(), None)
+        self.assertEqual(sent[-1]["reason"], "implement_worktree_git_failed")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["detail"], "Workspace git operation failed. (operation=rev-parse exit_code=128)")
 
     def test_validate_launch_unwraps_missing_implement_worktree_to_parent_checkout(self):
         from agent_hub_host.implement_workspace import _identity_and_ref
@@ -1633,7 +1645,7 @@ class HostTests(unittest.TestCase):
         class Hostile(RuntimeError):
             def __str__(self):
                 raise AssertionError('must never stringify private error')
-        for error in [RuntimeError('opaque_secret'), ValueError('workspace_unavailable path=/PRIVATE/prompt'),
+        for error in [RuntimeError('opaque_secret'), ValueError('opaque_secret path=/PRIVATE/prompt'),
                       TypeError('PRIVATE credential prompt'), Hostile('PRIVATE'),
                       RuntimeError({'private': 'PRIVATE'})]:
             fields = self.bridge._undispatched_failure_fields(error)
@@ -1647,6 +1659,21 @@ class HostTests(unittest.TestCase):
         for code in ['headless_effort_unsupported','implement_worktree_path_untrusted']:
             self.assertEqual(closed_host_failure(ValueError(code)), (code,'Launch preparation was refused.'))
         self.assertEqual(self.bridge._undispatched_failure_fields(None), {})
+        # Typed refusals with parameters keep their code and only closed facts
+        # (fail loudly, intake 2699b8d7); paths and free text are dropped.
+        self.assertEqual(closed_host_failure(ValueError('workspace_unavailable path=/PRIVATE/prompt')),
+                         ('workspace_unavailable','path does not exist; Hub will not create it'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=rev-parse exit_code=128')),
+                         ('implement_worktree_git_failed','Workspace git operation failed. (operation=rev-parse exit_code=128)'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=PRIVATE reason=timeout')),
+                         ('implement_worktree_git_failed','Workspace git operation failed. (reason=timeout)'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_owner_conflict worktree=C:/PRIVATE')),
+                         ('implement_worktree_owner_conflict','Launch preparation was refused.'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_locked worktree=/PRIVATE lock=x')),
+                         ('implement_worktree_locked','Workspace intake worktree is locked.'))
+        self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('implement_worktree_git_failed operation=fetch exit_code=1')),
+                         {'failure_reason':'implement_worktree_git_failed',
+                          'detail':'Workspace git operation failed. (operation=fetch exit_code=1)'})
 
     def test_launch_privacy_actual_undispatched_receipt_has_no_private_payload(self):
         class Hostile(RuntimeError):

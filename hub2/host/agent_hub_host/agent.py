@@ -216,8 +216,11 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'host_operation_failed': 'Host operation failed.',
  'implement_worktree_branch_ambiguous': 'Launch preparation was refused.',
  'implement_worktree_branch_changed': 'Launch preparation was refused.',
+ 'implement_worktree_branch_in_use': 'Workspace intake branch is in use by another worktree.',
  'implement_worktree_branch_missing': 'Launch preparation was refused.',
+ 'implement_worktree_git_failed': 'Workspace git operation failed.',
  'implement_worktree_identity_required': 'Launch preparation was refused.',
+ 'implement_worktree_locked': 'Workspace intake worktree is locked.',
  'implement_worktree_owner_conflict': 'Launch preparation was refused.',
  'implement_worktree_owner_durability_failed': 'Launch preparation was refused.',
  'implement_worktree_owner_invalid': 'Launch preparation was refused.',
@@ -323,15 +326,38 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'workspace_outside_allowlist': 'workspace is outside enrolled roots',
  'workspace_unavailable': 'path does not exist; Hub will not create it'}
 
+# Closed facts a typed refusal may carry after its code ("code k=v ..."). Values
+# are matched against fixed shapes; paths, argv and stderr are never forwarded.
+HOST_FAILURE_FACTS = {
+    'operation': re.compile(r'(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)'),
+    'exit_code': re.compile(r'-?[0-9]{1,6}'),
+    'reason': re.compile(r'[a-z][a-z_]{0,39}'),
+    'status': re.compile(r'[a-z][a-z_]{0,39}'),
+}
+
+
 def closed_host_failure(error, fallback="host_operation_failed"):
-    """Fixed typed codes only; never coerce exceptions or arbitrary attributes."""
-    code = None
+    """Fixed typed codes only; never coerce exceptions or arbitrary attributes.
+
+    A refusal raised as "<code> key=value ..." keeps its typed code and only the
+    whitelisted facts, so the session detail names the real host error (fail
+    loudly) instead of collapsing to the generic host_operation_failed.
+    """
+    code, facts = None, []
     if type(error) in (ValueError, RuntimeError) and len(error.args) == 1 and type(error.args[0]) is str:
-        code = error.args[0]
+        code, *rest = error.args[0].split(' ') or ['']
+        if code in HOST_FAILURE_DETAILS and code != error.args[0]:
+            for token in rest:
+                key, sep, value = token.partition('=')
+                if sep and key in HOST_FAILURE_FACTS and HOST_FAILURE_FACTS[key].fullmatch(value):
+                    facts.append(f'{key}={value}')
     elif type(error) is ApiError and type(error.code) is str:
         code = error.code
     reason = code if type(code) is str and code in HOST_FAILURE_DETAILS else fallback
-    return reason, HOST_FAILURE_DETAILS[reason]
+    detail = HOST_FAILURE_DETAILS[reason]
+    if reason == code and facts:
+        detail = f"{detail} ({' '.join(facts[:4])})"
+    return reason, detail
 
 def native_control_error(error):
     """Closed metadata only; never stringify exception messages or attributes."""
