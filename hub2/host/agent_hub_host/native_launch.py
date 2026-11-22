@@ -538,35 +538,50 @@ def detect_antigravity_first_run_block(screen_text):
 
 _CLAUDE_TRUST_YES = 'yes, i trust this folder'
 _CLAUDE_TRUST_NO = 'no, exit'
+# Claude's main UI after the dialog: footer hints or the busy indicator.
+CLAUDE_READY_MARKERS = ('? for shortcuts', 'esc to interrupt', 'bypass permissions on', 'shift+tab to cycle')
 
 
 def claude_workspace_trust_prompt(screen_text, workspace):
-    """Classify Claude Code's folder-trust dialog for exactly `workspace`.
+    """Classify a captured screen against Claude Code's folder-trust dialog.
 
-    Returns None when the screen is not that dialog, else 'yes' or 'no' for the
-    option the cursor (❯) is on. Claude defaults to "No, exit" for the user's
-    home directory and never persists home trust, so a Hub-delivered Enter
-    there exits the session with code 1 (DESKTOP-FP4OP26, intake 2699b8d7).
-    The path must appear on screen, so another folder's dialog never matches.
+    None: no trust dialog on screen. 'yes'/'no': the dialog is for exactly
+    `workspace` (whitespace-insensitive equality of the path block between
+    "Accessing workspace:" and the safety text) and the cursor is on that
+    option. 'unverified': dialog markers are present but the path or cursor
+    could not be verified; callers must refuse rather than guess.
+    Live DESKTOP-FP4OP26 capture (intake 2699b8d7): "❯ No, exit" is listed
+    first and preselected for the home directory, then "Yes, I trust this folder".
     """
-    if not isinstance(screen_text, str) or not isinstance(workspace, str) or not workspace:
+    if not isinstance(screen_text, str):
         return None
     plain = _ANSI_ESCAPE_RE.sub(' ', screen_text[-16384:])
-    lowered = plain.lower()
-    collapsed = re.sub(r'\s+', ' ', lowered)
-    if 'accessing workspace' not in collapsed or _CLAUDE_TRUST_YES not in collapsed or _CLAUDE_TRUST_NO not in collapsed:
+    collapsed = re.sub(r'\s+', ' ', plain.lower())
+    if _CLAUDE_TRUST_YES not in collapsed and 'accessing workspace' not in collapsed:
         return None
-    if re.sub(r'\s+', '', workspace).lower() not in re.sub(r'\s+', '', lowered):
-        return None
+    if not isinstance(workspace, str) or not workspace or _CLAUDE_TRUST_YES not in collapsed \
+            or _CLAUDE_TRUST_NO not in collapsed:
+        return 'unverified'
+    block = re.search(r'accessing\s+workspace:(.*?)(?:quick\s+safety\s+check|$)', plain, re.IGNORECASE | re.DOTALL)
+    if not block or re.sub(r'\s+', '', block.group(1)) != re.sub(r'\s+', '', workspace):
+        return 'unverified'
+    selected = []
     for line in plain.splitlines():
-        if '\u276f' in line:
-            item = re.sub(r'\s+', ' ', line.replace('\u276f', ' ')).strip().lower()
-            item = re.sub(r'^[0-9]+\.\s*', '', item)
-            if item.startswith(_CLAUDE_TRUST_YES):
-                return 'yes'
-            if item.startswith(_CLAUDE_TRUST_NO):
-                return 'no'
-    return None
+        if '❯' not in line:
+            continue
+        item = re.sub(r'^[0-9]+\.\s*', '', re.sub(r'\s+', ' ', line.replace('❯', ' ')).strip().lower())
+        if item.startswith(_CLAUDE_TRUST_YES):
+            selected.append('yes')
+        elif item.startswith(_CLAUDE_TRUST_NO):
+            selected.append('no')
+    return selected[0] if len(selected) == 1 else 'unverified'
+
+
+def claude_ready_screen(screen_text):
+    if not isinstance(screen_text, str):
+        return False
+    lowered = re.sub(r'\s+', ' ', _ANSI_ESCAPE_RE.sub(' ', screen_text[-16384:]).lower())
+    return any(marker in lowered for marker in CLAUDE_READY_MARKERS)
 
 
 def goal_prompt(prompt, workspace, task_id, first_action_path):
@@ -852,36 +867,67 @@ class NativeLauncher:
             raise RuntimeError("native_response_too_large")
         return result
 
-    def accept_claude_workspace_trust(self, native_id, workspace, *, wait_seconds=15.0, sleep=time.sleep, clock=time.monotonic):
+    def accept_claude_workspace_trust(self, native_id, workspace, *, wait_seconds=30.0, step_seconds=5.0,
+                                      sleep=time.sleep, clock=time.monotonic):
         """Answer Claude's folder-trust dialog for the exact launched workspace.
 
-        Hub placed this pane in an enrolled workspace, so trust is the operator's
-        decision already (as for agy's session-only --settings). Bounded: stop
-        at the ready prompt or after `wait_seconds`. A dialog that is seen but
-        cannot be answered refuses the launch loudly instead of leaving a pane
-        whose first Enter exits it.
+        Hub placed this pane in an enrolled workspace, so trusting it is the
+        operator's decision already. Unlike agy's --settings, Claude persists
+        "Yes" for non-home folders in its project config (home trust is never
+        persisted), which also enables that project's .claude hooks/MCP.
+
+        One key at a time, each verified on screen before the next: Down moves
+        "No, exit" to Yes only after the cursor is re-read as 'no'; Enter is sent
+        only on a verified 'yes'. Success needs a positive Claude ready screen.
+        A dialog that is unverified, does not react, or leaves no ready pane
+        raises claude_workspace_trust_unverified (fail loudly). With neither a
+        dialog nor a ready screen by the deadline the launch proceeds, logged.
         """
+        import logging
+        log = logging.getLogger(__name__)
+
+        def screen():
+            try:
+                result = self.native('capture', native_id, '--screen', '--plain', allow_failure=True, timeout=5)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('claude_workspace_trust_unverified') from None
+            return result.stdout if result.returncode == 0 else ''
+
+        def key(hex_bytes):
+            try:
+                result = self.native('send', native_id, '--raw', '--hex', hex_bytes, allow_failure=True, timeout=5)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('claude_workspace_trust_unverified') from None
+            if result.returncode != 0:
+                raise RuntimeError('claude_workspace_trust_unverified')
+
+        def wait_for(predicate, limit):
+            while True:
+                text = screen()
+                if predicate(text) or clock() >= limit:
+                    return text
+                sleep(0.5)
+
         deadline = clock() + wait_seconds
-        accepted = False
-        while True:
-            screen = self.native('capture', native_id, '--screen', '--plain', allow_failure=True, timeout=5)
-            text = screen.stdout if screen.returncode == 0 else ''
-            choice = claude_workspace_trust_prompt(text, workspace)
-            if choice is None:
-                ready = any(marker in text.lower() for marker in ('? for shortcuts', 'esc to interrupt'))
-                if accepted or ready or clock() >= deadline:
-                    return accepted
-            else:
-                key = '0d' if choice == 'yes' else '1b5b42'
-                if self.native('send', native_id, '--raw', '--hex', key, allow_failure=True, timeout=5).returncode != 0:
-                    raise RuntimeError('claude_workspace_trust_unverified')
-                if choice == 'yes':
-                    accepted = True
-                    import logging
-                    logging.getLogger(__name__).warning('CLAUDE WORKSPACE TRUST ACCEPTED native=%s', native_id)
-                if clock() >= deadline:
-                    raise RuntimeError('claude_workspace_trust_unverified')
-            sleep(0.5)
+        text = wait_for(lambda t: claude_ready_screen(t) or claude_workspace_trust_prompt(t, workspace) is not None, deadline)
+        state = claude_workspace_trust_prompt(text, workspace)
+        if state is None:
+            if not claude_ready_screen(text):
+                log.warning('CLAUDE TRUST CHECK no dialog or ready screen within %ss native=%s', wait_seconds, native_id)
+            return False
+        if state == 'no':
+            key('1b5b42')
+            text = wait_for(lambda t: claude_workspace_trust_prompt(t, workspace) != 'no', clock() + step_seconds)
+            state = claude_workspace_trust_prompt(text, workspace)
+        if state != 'yes':
+            raise RuntimeError('claude_workspace_trust_unverified')
+        key('0d')
+        text = wait_for(lambda t: claude_workspace_trust_prompt(t, workspace) is None and claude_ready_screen(t),
+                        max(deadline, clock() + step_seconds))
+        if claude_workspace_trust_prompt(text, workspace) is not None or not claude_ready_screen(text):
+            raise RuntimeError('claude_workspace_trust_unverified')
+        log.warning('CLAUDE WORKSPACE TRUST ACCEPTED native=%s', native_id)
+        return True
 
     def inventory(self):
         from .native_inventory import collect_native_inventory, CENSUS_TIMEOUT_SECONDS, MAX_CENSUS_BYTES
