@@ -374,6 +374,14 @@ export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker |
 export const ENGINE_PREFLIGHT_FAILURES: ReadonlySet<string> = new Set(['engine_auth_check_unavailable', 'engine_auth_expired']);
 /** How long a preflight-failed engine stays out of the picker on its machine. */
 export const ENGINE_UNHEALTHY_MS = 30 * 60_000;
+/** A launcher refusal this soon after the start means the engine never did real work. */
+export const FAST_START_FAILURE_MS = 3 * 60_000;
+/** Exit 75 (EX_TEMPFAIL) is the maintained launchers' refusal code: e.g. the Codex
+ * wrapper quota gate refusing a dead credential seconds after the start
+ * (2026-11-23). Fast enough, it is an engine start fault, not task work. */
+export function isFastStartRefusal(exitCode: unknown, startedAt: number, endedAt: number): boolean {
+  return exitCode === 75 && Number.isFinite(startedAt) && endedAt - startedAt <= FAST_START_FAILURE_MS;
+}
 
 const REASON_TEXT: Record<string, string> = {
   exit_without_completion_claim: 'the session exited on its own without a completion record',

@@ -4,7 +4,7 @@ import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-comm
 import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
 import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA, validNativeAbsenceEvidence, nativeAbsenceObservation, type Meta, type NativeAbsenceEvidence} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
-import { ENGINE_PREFLIGHT_FAILURES, ENGINE_UNHEALTHY_MS } from './task-completion';
+import { ENGINE_PREFLIGHT_FAILURES, ENGINE_UNHEALTHY_MS, isFastStartRefusal } from './task-completion';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
 import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
@@ -1337,6 +1337,10 @@ export class MachineDO {
     }
     if(typedFailure&&ENGINE_PREFLIGHT_FAILURES.has(typedFailure)&&typeof launch.engine==='string')
       await this.markEngineUnhealthy(launch.engine,typedFailure,row.id,now);
+    else if(!typedFailure&&!launchFailed&&!payload.stop_requested&&nativeDeadline?.exceeded!==true&&typeof launch.engine==='string'
+      &&launch.engine!=='shell'&&isFastStartRefusal(Number(body.exit_code),row.created_at,now))
+      // The launcher refused within seconds (exit 75): route around this engine here too.
+      await this.markEngineUnhealthy(launch.engine,'native_exit_75',row.id,now);
     this.db.transaction(this.ctx, () => {
       const {[WORKSPACE_REPAIR_FIELD]:_repair,...completedLaunch}=launch;
       this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=?,launch_json=? WHERE id=? AND state=?',
@@ -2099,6 +2103,11 @@ export class MachineDO {
     await this.scheduleNext();
     console.error('[hub2] SESSION_LAUNCH_REFUSED',JSON.stringify({session_id:session.id,machine_id:session.machine_id,
       intake_id:session.intake_id,epoch:session.epoch,reason:failureReason}));
+    // An untyped host launch failure is not a workspace/request refusal: do not
+    // keep re-picking that engine on this machine while it keeps failing.
+    const refused=this.parse(session.launch_json) as JsonRecord|null;
+    if(failureReason==='host_operation_failed'&&typeof refused?.engine==='string'&&refused.engine!=='shell')
+      await this.markEngineUnhealthy(refused.engine,failureReason,session.id,now);
   }
 
   private machineView(): Response {

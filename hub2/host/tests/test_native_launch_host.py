@@ -1728,9 +1728,40 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
             self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
 
+    def test_local_default_headless_runs_native_login_through_wrapper(self):
+        """Exit-75 regression (2026-11-23): the default local route never uses the
+        legacy managed profile home, whose credential no Hub2 component refreshes."""
+        calls = []
+
+        def runner(argv, **options):
+            calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace),
+                'command': argv[argv.index('--') + 1:]}), '')
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}}}, runner=runner)
+        self.assertEqual(adapter.config['routes']['codex'], nl.LOCAL_ROUTES['codex'])
+        self.assertIsNone(adapter.config['routes']['codex'].get('profile'))
+        spec = {'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol', 'prompt': 'synthetic prompt',
+                'interactive': False, 'effort': 'medium', 'timeout_seconds': 600}
+        with mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch.object(adapter, 'record_evidence'):
+            adapter.launch('t1', spec)
+        proof.assert_not_called()
+        child = self.child(calls)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.headless_effort_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), 'medium')
+        self.assertEqual(child, [str(self.wrapper.resolve())] + expected[1:])
+        self.assertNotIn('--profile', child)
+        self.assertNotIn('hub-shared-codex', ' '.join(calls[0][0]))
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof:
+            self.assertIn('headless', nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}}}).capabilities()['codex'])
+        proof.assert_not_called()
+
     def test_codex_headless_withdrawn_loudly_when_release_profile_proof_fails(self):
         """A stale headless profile cannot withdraw the separate interactive path."""
-        config = {'routes': {'codex': {'provider': 'codex'}}}
+        config = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}}}
         launcher = nl.NativeLauncher(config)
         with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
                 mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof, \
@@ -1778,7 +1809,7 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
         self.assertEqual(nl.PROVIDER_CAPABILITIES['codex'], original)
 
     def test_codex_partial_withdrawal_recovers_after_cache_expiry_without_mutating_other_routes(self):
-        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}, 'zai': {'provider': 'zai'}}})
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}, 'zai': {'provider': 'zai'}}})
         with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
                 mock.patch.object(nl.time, 'monotonic', return_value=1) as clock, \
                 mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \

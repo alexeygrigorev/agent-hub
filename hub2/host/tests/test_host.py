@@ -262,8 +262,12 @@ class HostTests(unittest.TestCase):
                     self.assertEqual(child[0], '/synthetic/launch-codex.sh')
                     self.assertNotIn('exec', child)
                 else:
-                    self.assertIn('task', child); self.assertIn('run', child)
-                    self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+                    # Local headless Codex uses the native login through the wrapper,
+                    # never the legacy managed profile home (exit-75 regression).
+                    self.assertEqual(child[0], '/synthetic/launch-codex.sh')
+                    self.assertIn('exec', child)
+                    self.assertNotIn('--profile', child)
+                    self.assertNotIn('hub-shared-codex', ' '.join(argv))
 
     def test_existing_journal_schema_adds_persistent_runtime_deadline(self):
         path=self.root/'legacy-journal.sqlite'
