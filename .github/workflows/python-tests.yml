@@ -19,7 +19,8 @@ concurrency:
 jobs:
   hub2-host-python:
     name: hub2-host-python
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +38,8 @@ jobs:
   # equal the unpartitioned canonical collection exactly (scripts/ci/legacy_cli_shards.py).
   legacy-cli-canonical:
     name: legacy-cli-canonical
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +75,8 @@ jobs:
   legacy-cli-shard:
     name: legacy-cli-shard-${{ matrix.shard }}
     needs: legacy-cli-canonical
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -130,8 +133,8 @@ jobs:
     name: legacy-cli-python
     needs: [legacy-cli-canonical, legacy-cli-shard]
     # Always evaluate so a failed, skipped or cancelled upstream job fails this required check.
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
