@@ -42,7 +42,8 @@ jobs:
   # host daemon and the real `hub` CLI zipapp; only `a` and `codex` are stubs.
   # Self-contained on purpose: keep it separate from the `checks` job.
   e2e-start-path:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -83,9 +84,9 @@ jobs:
   # Always-run gate for branch protection: fails explicitly unless the e2e job
   # succeeded (a skipped or cancelled e2e is a failure, never a pass).
   e2e-start-path-gate:
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: [e2e-start-path]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 2
     steps:
       - name: Require e2e-start-path success
@@ -96,7 +97,8 @@ jobs:
           [ "$RESULT" = "success" ] || { echo "::error::e2e-start-path result is $RESULT"; exit 1; }
 
   checks:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -235,7 +237,7 @@ jobs:
         run: |
           node --experimental-transform-types --import ./hub2/tests/node-fixture.mjs --test hub2/tests/intake-context-compat.test.ts hub2/tests/node-public-origin.test.mjs
           npm install --prefix .local/ci-playwright --no-package-lock --no-save playwright@1.64.1
-          node .local/ci-playwright/node_modules/playwright/cli.js install --with-deps chromium
+          node .local/ci-playwright/node_modules/playwright/cli.js install chromium
           node test/hub2-core-ops.browser.mjs
 
       - name: Fail the job if any gate failed

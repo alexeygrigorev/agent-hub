@@ -330,7 +330,7 @@ def test_workflow_keeps_stable_gate_and_original_selector():
     assert "  hub2-host-python:\n    name: hub2-host-python\n" in WORKFLOW
     gate = WORKFLOW.split("  legacy-cli-python:\n", 1)[1]
     assert "    name: legacy-cli-python\n" in gate
-    assert "needs: [legacy-cli-canonical, legacy-cli-shard]" in gate and "if: ${{ always() }}" in gate
+    assert "needs: [legacy-cli-canonical, legacy-cli-shard]" in gate and "if: ${{ always() && (" in gate
     assert "NEEDS_JSON: ${{ toJSON(needs) }}" in gate
     canonical = WORKFLOW.split("  legacy-cli-canonical:\n", 1)[1].split("  legacy-cli-shard:\n", 1)[0]
     for node in m.EXPLICIT_NODES:
