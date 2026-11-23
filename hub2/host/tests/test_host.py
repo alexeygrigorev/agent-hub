@@ -178,14 +178,15 @@ class HostTests(unittest.TestCase):
         self.bridge.heartbeat([], include_native_sessions=False)
         self.assertEqual(captured[-1][1], ['claude'])
         flags = captured[-1][2]
-        self.assertIn('interactive:claude', flags)
+        self.assertIn('modes:v1:claude:hi', flags)
+        self.assertNotIn('interactive:claude', flags)  # superseded by the modes declaration
         self.assertIn(self.auth_observer.return_value[0], flags)
         self.assertIn('credentials:local:headless:claude:claude', flags)
         self.assertIn('credentials:local:interactive:claude:claude', flags)
         self.assertLessEqual(len(flags), 32)
         self.auth_observer.return_value *= 2
         # Leave one auth-observation slot after the complete engine-mode declaration.
-        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(26))}}
+        self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(27))}}
         self.bridge.heartbeat([], include_native_sessions=False)
         self.assertEqual(len(captured[-1][2]),32)
         self.assertEqual(sum(flag.startswith('auth:missing:') for flag in captured[-1][2]),1)
@@ -205,6 +206,41 @@ class HostTests(unittest.TestCase):
         self.bridge.heartbeat([], include_native_sessions=False)
         self.auth_observer.assert_not_called()
         self.assertFalse(any(flag.startswith('credentials:') for flag in captured[-1][2]))
+
+    def test_full_engine_fleet_keeps_repository_identity_and_qualified_workspaces(self):
+        # Intake a59390a6: hetzner-aplexer with zai/zcodex filled all 32 legacy slots with
+        # engine hints, shed repo-identity:v1 and every workspace:repo-* token, and Hub
+        # refused repo-only starts with 503 repository_workspace_unavailable.
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        captured = []
+        self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
+        self.bridge.launcher.config = {'routes': {key: dict(value) for key, value in LOCAL_ROUTES.items()}}
+        self.bridge.launcher.managed_claude_readiness = lambda: True
+        self.auth_observer.return_value = []
+        engines = ['antigravity', 'claude', 'codex', 'go', 'shell', 'zai', 'zcodex']
+        full = {'headless', 'interactive', 'effort', 'goal'}
+        self.bridge.engines = set(engines)
+        self.bridge.launcher.capabilities = lambda: {'antigravity': {'headless', 'interactive', 'effort'},
+            'claude': set(full), 'codex': set(full), 'go': {'headless', 'interactive'}, 'shell': {'headless'},
+            'zai': set(full), 'zcodex': set(full)}
+        qualified = 'workspace:repo-' + 'a' * 59
+        class Advertisement:
+            def tags(self):
+                return ['workspace:relay', qualified]
+        self.bridge.advertisement = Advertisement()
+        self.bridge.heartbeat([], include_native_sessions=False)
+        flags = captured[-1][2]
+        legacy = [flag for flag in flags if not flag.startswith('workspace:')]
+        self.assertLessEqual(len(legacy), 32)
+        for marker in ('repo-identity:v1', 'workspace-preflight:v1', 'managed:hub-claude:opus:medium:v1',
+                       'credentials:local:interactive:claude:claude', 'goal:zcodex', 'effort:zai'):
+            self.assertIn(marker, flags)
+        self.assertIn(qualified, flags)
+        self.assertNotIn('workspace:inventory-overflow', flags)
+        for engine in engines:
+            self.assertNotIn('interactive:' + engine, flags)
+        self.assertIn('modes:v1:zcodex:hi', flags)
+        self.assertIn('modes:v1:shell:h', flags)
 
     def test_optional_wake_negotiation_uses_only_spare_legacy_slots_and_preserves_workspaces(self):
         probes = []

@@ -1873,7 +1873,13 @@ class Bridge:
                  (('headless','h'),('interactive','i')) if mode in available[engine])
                  for engine in engines if re.fullmatch(r'[A-Za-z0-9_.-]{1,48}',engine)
                  and available[engine].intersection({'headless','interactive'})]
-        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})]
+        # A complete modes:v1 declaration supersedes the legacy interactive:<engine>
+        # hint (Hub reads the declaration first). Repeating it spent one of the 32
+        # legacy slots per engine and, with zai/zcodex enrolled, evicted
+        # repo-identity:v1 and every workspace:repo-* token (intake a59390a6).
+        declared = {mode.split(':')[2] for mode in modes}
+        capabilities=['headless']+modes+[cap+':'+engine for engine in engines for cap in sorted(available[engine]-{'headless'})
+                                          if not (cap == 'interactive' and engine in declared)]
         advertisement = getattr(self, 'advertisement', None)
         resource_tags = advertisement.tags() if advertisement is not None else []
         workspace_tags = [tag for tag in resource_tags if tag.startswith('workspace:')]

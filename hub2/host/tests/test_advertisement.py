@@ -189,7 +189,7 @@ class AdvertisementTests(unittest.TestCase):
             self.clone(self.root, 'project-' + str(index))
         bridge.heartbeat([], include_native_sessions=False)
         tags = bridge.client.heartbeat.call_args.args[2]
-        self.assertTrue({'headless', 'interactive:codex', 'effort:codex'} <= set(tags))
+        self.assertTrue({'headless', 'modes:v1:codex:hi', 'effort:codex'} <= set(tags))
         self.assertEqual(len([tag for tag in tags if tag.startswith('workspace:')]), 80)
 
     def test_many_checkouts_with_one_origin_consume_one_qualified_tag(self):
