@@ -305,6 +305,34 @@ test('a legacy uncontrolled failure retries, then falls back to another routing 
   }finally{f.close();}
 });
 
+test('a start that exits 75 within seconds fails over to another route on the first retry, loudly',async()=>{
+  const f=fixture();
+  const errors:string[]=[],original=console.error;
+  console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
+  try{
+    const id=await createIntake(f,'exit75-route-failover');
+    assert.equal((await startManaged(f,id,'k1')).status,201);
+    const b=await run(f,id);
+    // The wrapper quota gate refused a dead credential: exit 75 in ~2 seconds.
+    await finish(f,b,75);
+    f.db().run("UPDATE dispatch_sagas SET routing_json=json_set(routing_json,'$.completion_contract',json('false')) WHERE intake_id=?",id);
+    f.db().run("UPDATE intakes SET final_evidence_json=json_remove(final_evidence_json,'$.completion') WHERE id=?",id);
+    const policy1=JSON.parse(sagas(f,id)[0].routing_json).policy_id as string;
+    age(f,id,61_000);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2);
+    const draw=f.pickerDraws.at(-1);
+    assert.deepEqual(draw.input.exclude_policy_ids,[policy1],'the first retry already excludes the failed route');
+    assert.equal(draw.input.engine,undefined,'the failed engine/model is not re-pinned');
+    assert.notEqual(JSON.parse(activeSaga(f,id).routing_json).policy_id,policy1);
+    const started=events(f,id).filter(e=>e.kind==='task_retry_started').at(-1);
+    assert.equal(started?.body.route_fallback,true);
+    assert.equal(started?.body.fast_failure,true);
+    assert.equal(started?.body.failed_policy_id,policy1);
+    assert.ok(errors.some(line=>line.includes('INTAKE_ROUTE_FAILOVER')&&line.includes(policy1)),errors.join('\n'));
+  }finally{console.error=original;f.close();}
+});
+
 test('uncertain retry starts back off and terminate bounded with an alert',async()=>{
   const f=fixture();
   try{

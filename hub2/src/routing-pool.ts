@@ -9,7 +9,14 @@ import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} fro
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
-export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string };
+export type UnhealthyRoute = { engine: string; model: string; until: number; reason?: string; exit_code?: number | null; session_id?: string };
+export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string;
+  /** Host-observed (engine, model) routes whose last start failed fast; the picker avoids them until `until`. */
+  unhealthy_routes?: UnhealthyRoute[] };
+/** A nonzero exit or launch refusal this soon after the start means the route never did real work. */
+export const FAST_START_FAILURE_MS = 3 * 60 * 1000;
+/** How long one fast start failure keeps a (host, engine, model) candidate out of the pool. */
+export const UNHEALTHY_ROUTE_MS = 30 * 60 * 1000;
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
@@ -285,6 +292,20 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
   pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');
+  // A (host, engine, model) whose recent start failed fast (exit 75 in seconds,
+  // launch refusal) is unhealthy: move to a healthy host of the same route, else
+  // fail over to another route. Like the other observations it never refuses
+  // when nothing healthy survives; the pick diagnostics then name the reason.
+  const unhealthyOn = (id: string, candidate: Candidate): boolean => (machines.get(id)?.unhealthy_routes || []).some(route =>
+    route.engine === candidate.engine && route.model === candidate.model && route.until > snapshot.observed_at);
+  const healthyHosts = new Map(pool.map(row => [row.candidate.id, row.hosts.filter(id => !unhealthyOn(id, row.candidate))]));
+  pool = narrow(pool, row => !row.hosts.length || healthyHosts.get(row.candidate.id)!.length > 0, () => 'candidate_unhealthy');
+  pool = pool.map(row => {
+    const healthy = healthyHosts.get(row.candidate.id)!;
+    if (healthy.length && healthy.length < row.hosts.length)
+      advisories.push({ policy_id: row.candidate.id, account_id: row.candidate.account_id, reason: 'candidate_unhealthy_host_skipped' });
+    return healthy.length ? { ...row, hosts: healthy } : row;
+  });
   // Capability preference is global: a candidate without a capable host must not
   // survive its own advisory fallback when another candidate can satisfy launch.
   // Apply after the other eligibility observations, so capability hints cannot

@@ -22,6 +22,7 @@ import {
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
+import { FAST_START_FAILURE_MS } from './routing-pool';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 // Use exactly the same pending/current-attempt predicate for the bounded
@@ -53,7 +54,7 @@ const COMPLETION_ELIGIBLE = `(i.status IN ('open','failed','completed-awaiting-r
 // completed (which also adopts intakes that failed before this loop existed).
 const FIRST_RETRY_DELAY_MS = 60_000;
 const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id, i.final_evidence_json, i.updated_at,
-    s.updated_at AS saga_updated_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
+    s.updated_at AS saga_updated_at, s.created_at AS saga_created_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
     COALESCE(json_extract(i.final_evidence_json,'$.auto_retry.next_action_at'), s.updated_at + ${FIRST_RETRY_DELAY_MS}) AS retry_due
   FROM intakes i JOIN dispatch_sagas s ON s.session_id=i.session_id AND s.intake_id=i.id AND s.state='complete'
   WHERE i.status='failed' AND i.schedule_id IS NULL AND i.route_registered=1
@@ -67,7 +68,7 @@ const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id,
 const FAILED_RETRY_DUE = `SELECT * FROM (${FAILED_RETRY_CANDIDATES}) ORDER BY retry_due, updated_at, id LIMIT 8`;
 type FailedRetryRow = {
   id: string; project: string; status: string; session_id: string; final_evidence_json: string | null; updated_at: number;
-  saga_updated_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
+  saga_updated_at: number; saga_created_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
 };
 
 const SCHEMA = [
@@ -2274,8 +2275,15 @@ export class ProjectDO {
     if(!fixed)return;
     // The first retry keeps the failed attempt's route (the picker may still
     // move machines); a second retry falls back to another routing policy,
-    // which cannot also pin that policy's engine and model.
-    const routeFallback=depth>0&&typeof route.policy_id==='string';
+    // which cannot also pin that policy's engine and model. A start that failed
+    // fast (launch refusal, a typed host failure, or launcher exit 75 within
+    // FAST_START_FAILURE_MS, e.g. a quota gate refusing a dead credential) never
+    // did real work: re-pinning the same engine/model would just repeat it, so
+    // fail over on the first retry. Ordinary task exits keep the old policy.
+    const evidence=(this.parse(row.final_evidence_json??'{}') as JsonRecord|null)??{};
+    const fastFailure=reason!=='deadline_exceeded'&&row.saga_updated_at-row.saga_created_at<=FAST_START_FAILURE_MS
+      &&(evidence.launch_failed===true||evidence.exit_code===75||typeof evidence.failure_reason==='string');
+    const routeFallback=(depth>0||fastFailure)&&typeof route.policy_id==='string';
     const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
       ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
       interactive:launch.interactive===true,with_goal:launch.with_goal===true,
@@ -2304,7 +2312,12 @@ export class ProjectDO {
       :{state:'retry',reason:'retry_start_uncertain'};}
     if(outcome.state==='started'){
       this.transaction(()=>this.appendEvent(row.id,`retry:${row.saga_operation_id}:${attempt}`,RETRY_ACTOR,'task_retry_started',
-        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:depth>0},Date.now()));
+        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:routeFallback,
+          ...(fastFailure?{fast_failure:true,failed_policy_id:typeof route.policy_id==='string'?route.policy_id:null,
+            failed_machine_id:row.saga_machine_id}:{})},Date.now()));
+      if(fastFailure)console.error('[hub2] INTAKE_ROUTE_FAILOVER',JSON.stringify({intake_id:row.id,previous_session_id:sagaSession,
+        session_id:outcome.session_id??null,failed_policy_id:route.policy_id??null,failed_machine_id:row.saga_machine_id,
+        exit_code:Number.isInteger(evidence.exit_code)?evidence.exit_code:null,reason}));
       return;
     }
     if(outcome.state==='superseded'){

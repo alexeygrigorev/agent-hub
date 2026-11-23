@@ -115,7 +115,8 @@ class NonblockingLaunchTests(unittest.TestCase):
                     self.assertIn('hub.managed=true', argv)
                     self.assertIn('hub.session=s', argv)
                     child = argv[argv.index('--') + 1:]
-                    if engine == 'codex' and __import__('sys').platform == 'win32':
+                    if engine == 'codex':
+                        # Local Codex is the native login (wrapper on Linux), never task run.
                         self.assertIn('exec', child)
                         self.assertIn('--model', child)
                         self.assertNotIn('task', child)

@@ -1118,7 +1118,7 @@ from agent_hub_host.agent import Bridge
 from agent_hub_host.native_launch import NativeLauncher
 from agent_hub_host.advertisement import Advertisement
 bridge=Bridge.__new__(Bridge);bridge.roots=[];bridge.engines={'codex','zai'}
-bridge.launcher=NativeLauncher({'private_provider_homes':False})
+bridge.launcher=NativeLauncher({'private_provider_homes':False,'routes':{'codex':{'provider':'codex','profile':'hub-shared-codex'}}})
 bridge.publish_managed_readiness=lambda:None
 published=[]
 bridge.client=types.SimpleNamespace(heartbeat=lambda labels,engines,capabilities:published.append({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities}))
@@ -1182,4 +1182,34 @@ test('engine mode declarations do not override unrelated global capabilities or 
  }
  snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort','modes:v1:codex:i','modes:v1:codex:hi']});
  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude'],'another positive declaration cannot heal a complete negative');
+});
+
+test('a host route that failed fast is unhealthy: the picker moves host, then fails over route, and says why',()=>{
+ const now=Date.now();
+ const policy={version:9,candidates:[
+  {id:'codex-sol-medium',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
+  {id:'claude-opus-medium',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+ ]};
+ const accounts=new Map(['codex','claude'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['hetzner','other'],
+  quota:{remaining:80,captured_at:now,valid_until:now+900000},fresh:true}]));
+ const sick={engine:'codex',model:'gpt-6.1-sol',until:now+60000,reason:'host_operation_failed',exit_code:75};
+ const machine=(extra={})=>({connected:true,os:'linux',engines:['codex','claude'],capabilities:[],...extra});
+ // Another host still serves the route: Sol stays, only the sick host is skipped.
+ let result=buildRoutingPool({policy,accounts,machines:new Map([['hetzner',machine({unhealthy_routes:[sick]})],['other',machine()]]),observed_at:now},{interactive:false});
+ assert.ok(result.options.filter(o=>o.value.engine==='codex').every(o=>o.value.machine_id==='other'),JSON.stringify(result.options));
+ assert.ok(result.diagnostics.advisories!.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='candidate_unhealthy_host_skipped'));
+ // Only the sick host: the route fails over to another policy and the exclusion names it.
+ result=buildRoutingPool({policy,accounts,machines:new Map([['hetzner',machine({unhealthy_routes:[sick]})]]),observed_at:now},{interactive:false});
+ assert.deepEqual([...new Set(result.options.map(o=>o.value.policy_id))],['claude-opus-medium']);
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='candidate_unhealthy'));
+ // An explicit pin with no healthy alternative is still honored (advisory, never a refusal).
+ result=buildRoutingPool({policy,accounts,machines:new Map([['hetzner',machine({unhealthy_routes:[sick]})]]),observed_at:now},
+  {interactive:false,engine:'codex',model:'gpt-6.1-sol',override_reason:'test'});
+ assert.deepEqual([...new Set(result.options.map(o=>o.value.policy_id))],['codex-sol-medium']);
+ assert.ok(result.diagnostics.advisories!.some(row=>row.reason==='candidate_unhealthy'));
+ // The mark expires, and another model on the same engine is unaffected.
+ for(const route of [{...sick,until:now-1},{...sick,model:'gpt-6-luna'}]){
+  result=buildRoutingPool({policy,accounts,machines:new Map([['hetzner',machine({unhealthy_routes:[route]})]]),observed_at:now},{interactive:false});
+  assert.ok(result.options.some(o=>o.value.policy_id==='codex-sol-medium'));
+ }
 });

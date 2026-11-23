@@ -72,7 +72,8 @@ const DIAGNOSTIC_POLICIES = new Set(['codex-luna-max','codex-sol-medium','claude
 const DIAGNOSTIC_REASONS = new Set(['codex_reserve','quota_below_minimum','goal_not_advertised',
   'engine_not_advertised','capability_not_advertised','central_host_not_approved',
   'central_credentials_unavailable','local_credentials_missing','credential_missing','credential_unknown',
-  'credential_expired','credential_refresh_failed','credential_unavailable','credential_ready','deep_prefers_strong_model','deep_prefers_high_effort']);
+  'credential_expired','credential_refresh_failed','credential_unavailable','credential_ready','deep_prefers_strong_model','deep_prefers_high_effort',
+  'candidate_unhealthy','candidate_unhealthy_host_skipped']);
 const MAX_DRAW_JSON = 65536;
 function storedObject(raw: unknown): Record<string, any> | null {
   if(typeof raw!=='string')return null;

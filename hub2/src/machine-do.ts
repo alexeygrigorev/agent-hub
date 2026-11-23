@@ -11,6 +11,7 @@ import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
 import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
+import { FAST_START_FAILURE_MS, UNHEALTHY_ROUTE_MS, type UnhealthyRoute } from './routing-pool';
 
 const CAPTURE_OUTPUT_BYTES = 64 * 1024;
 // Six JSON bytes per raw control byte, plus the existing bounded binding.
@@ -628,10 +629,43 @@ export class MachineDO {
     const presence=connected?undefined:await this.hostPresence();
     const hostAlert=presence?.alerted_at?{kind:'host_disconnected',recipient:HOST_ALERT_RECIPIENT,
       disconnected_since:presence.disconnected_since,alerted_at:presence.alerted_at,evidence:presence.evidence??null}:undefined;
+    const unhealthyRoutes=this.unhealthyRoutes(machine.machine_id,Date.now());
     return json({machine_id:machine.machine_id,connected,...release,version_mismatch:versionMismatch,
       last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:currentCapabilities,
+      ...(unhealthyRoutes.length?{unhealthy_routes:unhealthyRoutes}:{}),
       ...(presence?{disconnected_since:presence.disconnected_since}:{}),...(hostAlert?{host_alert:hostAlert}:{})});
+  }
+
+  /** (engine, model) routes on this host whose most recent decisive start failed
+   * fast (nonzero exit or launch refusal within FAST_START_FAILURE_MS). Derived
+   * from the sessions this host already records; a later start of the same route
+   * that ran past the threshold clears it. Read-only and bounded. */
+  private unhealthyRoutes(machineId:string,now:number):UnhealthyRoute[]{
+    const rows=this.db.all<{id:string;launch_json:string;state:string;exit_code:number|null;created_at:number;updated_at:number;reason:string|null}>(
+      `SELECT s.id,s.launch_json,s.state,s.exit_code,s.created_at,s.updated_at,a.reason FROM sessions s LEFT JOIN attention a ON a.session_id=s.id
+        WHERE s.machine_id=? AND s.state IN ('running','failed','completed-awaiting-review','stopped','lost') AND s.created_at>=?
+        ORDER BY s.updated_at DESC LIMIT 200`,machineId,now-UNHEALTHY_ROUTE_MS-FAST_START_FAILURE_MS);
+    const decided=new Map<string,UnhealthyRoute|null>();
+    const ordered=rows.map(row=>({row,at:row.state==='running'?now:row.updated_at})).sort((a,b)=>b.at-a.at);
+    for(const {row} of ordered){
+      const launch=this.parse(row.launch_json) as JsonRecord|null;
+      const engine=launch?.engine,model=launch?.model;
+      if(typeof engine!=='string'||typeof model!=='string'||engine==='shell')continue;
+      const key=JSON.stringify([engine,model]);
+      if(decided.has(key))continue;
+      const ran=(row.state==='running'?now:row.updated_at)-row.created_at;
+      // Launcher/start failures only: exit 75 (EX_TEMPFAIL gate refusal), launch
+      // refusals and typed host failures. An ordinary task exit is not a route fault.
+      const startFault=row.reason!==null&&row.reason!=='deadline_exceeded'
+        &&(!row.reason.startsWith('native_exit_')||row.reason==='native_exit_75');
+      const fastFailure=row.state==='failed'&&startFault&&ran<=FAST_START_FAILURE_MS;
+      if(fastFailure){
+        const until=row.updated_at+UNHEALTHY_ROUTE_MS;
+        decided.set(key,until>now?{engine,model,until,reason:row.reason!,exit_code:row.exit_code,session_id:row.id}:null);
+      }else if(ran>FAST_START_FAILURE_MS||row.state==='completed-awaiting-review')decided.set(key,null);
+    }
+    return [...decided.values()].filter((route):route is UnhealthyRoute=>route!==null).slice(0,32);
   }
 
   private managedClaudeSocket(socket:WebSocket):boolean {
@@ -1325,6 +1359,13 @@ export class MachineDO {
         now,now,failureNotification.id);
       this.insertOutbox(`finish:${row.operation_id}`, 'finish', row.operation_id, row.project_id, payload, now);
     });
+    if(state==='failed'&&!payload.stop_requested&&nativeDeadline?.exceeded!==true&&now-row.created_at<=FAST_START_FAILURE_MS
+      &&(typedFailure||launchFailed||Number(body.exit_code)===75)){
+      const route=launch as JsonRecord;
+      console.error('[hub2] CANDIDATE_UNHEALTHY',JSON.stringify({machine_id:row.machine_id,engine:route.engine??null,model:route.model??null,
+        session_id:row.id,intake_id:row.intake_id,exit_code:Number(body.exit_code),reason:typedFailure??(launchFailed?'launch_failed':'native_exit_'+String(body.exit_code)),
+        ran_ms:now-row.created_at,unhealthy_until:now+UNHEALTHY_ROUTE_MS}));
+    }
     await this.ensureDeadline(now+30_000);
     const forwarded = await this.flushOne(`finish:${row.operation_id}`);
     await this.scheduleNext();
@@ -2075,6 +2116,9 @@ export class MachineDO {
     await this.scheduleNext();
     console.error('[hub2] SESSION_LAUNCH_REFUSED',JSON.stringify({session_id:session.id,machine_id:session.machine_id,
       intake_id:session.intake_id,epoch:session.epoch,reason:failureReason}));
+    const refused=this.parse(session.launch_json) as JsonRecord|null;
+    console.error('[hub2] CANDIDATE_UNHEALTHY',JSON.stringify({machine_id:session.machine_id,engine:refused?.engine??null,model:refused?.model??null,
+      session_id:session.id,intake_id:session.intake_id,exit_code:null,reason:failureReason,unhealthy_until:now+UNHEALTHY_ROUTE_MS}));
   }
 
   private machineView(): Response {

@@ -2053,3 +2053,28 @@ test('ordinary send terminal error event rejects legacy loose fields stale epoch
   assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(q.sender) as any).state,'stopped');
  }finally{q.f.database.close();}
 });
+
+test('a fast exit-75 start marks only its (engine, model) unhealthy in the routing view until a healthy run clears it',async()=>{
+ const f=fixture();
+ const now=Date.now();
+ const routing=async()=>await (await f.call('/_internal/routing')).json() as any;
+ await startClaimed(f,'fast-75','11111111-1111-4111-8111-111111111111');
+ f.database.prepare("UPDATE sessions SET state='failed',exit_code=75,created_at=?,updated_at=? WHERE id='fast-75'").run(now-5000,now-3000);
+ f.database.prepare("INSERT OR REPLACE INTO attention(session_id,reason,observed_at) VALUES('fast-75','native_exit_75',?)").run(now-3000);
+ let view=await routing();
+ assert.equal(view.unhealthy_routes?.length,1,JSON.stringify(view));
+ const [route]=view.unhealthy_routes;
+ assert.equal(route.engine,'codex');assert.equal(route.model,'gpt-6.1-sol');
+ assert.equal(route.exit_code,75);assert.equal(route.reason,'native_exit_75');assert.equal(route.session_id,'fast-75');
+ assert.ok(route.until>now&&route.until<=now-3000+30*60_000);
+ // A later ordinary quick task exit is not a route fault and does not clear the mark.
+ await startClaimed(f,'quick-1','22222222-2222-4222-8222-222222222222');
+ f.database.prepare("UPDATE sessions SET state='failed',exit_code=1,created_at=?,updated_at=? WHERE id='quick-1'").run(now-2000,now-1000);
+ f.database.prepare("INSERT OR REPLACE INTO attention(session_id,reason,observed_at) VALUES('quick-1','native_exit_1',?)").run(now-1000);
+ assert.equal((await routing()).unhealthy_routes?.length,1);
+ // A start of the same route that has run past the threshold proves it healthy again.
+ await startClaimed(f,'healthy','33333333-3333-4333-8333-333333333333');
+ f.database.prepare("UPDATE sessions SET created_at=? WHERE id='healthy'").run(now-4*60_000);
+ view=await routing();
+ assert.equal(view.unhealthy_routes,undefined,JSON.stringify(view.unhealthy_routes));
+});
