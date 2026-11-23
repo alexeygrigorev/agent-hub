@@ -230,11 +230,11 @@
     },
     {
       "id": "glm-flash",
-      "model": "glm-5.3-flash",
+      "model": "glm-5.4",
       "provider": "zai",
       "engine": "codex",
       "profile": "zcodex",
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "muse",
@@ -262,11 +262,11 @@
     },
     {
       "id": "glm-flash-zcodex",
-      "model": "glm-5.3-flash",
+      "model": "glm-5.4",
       "provider": "zai",
       "engine": "zcodex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "argon-gemini",

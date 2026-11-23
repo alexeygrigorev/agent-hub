@@ -148,6 +148,16 @@
       "weight": 1,
       "capabilities": [],
       "enabled": true
+    },
+    {
+      "id": "glm-flash-zcodex",
+      "engine": "zcodex",
+      "model": "glm-5.4",
+      "effort": "medium",
+      "account_id": "zai-central",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
     }
   ]
 }
