@@ -1183,3 +1183,23 @@ test('engine mode declarations do not override unrelated global capabilities or 
  snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort','modes:v1:codex:i','modes:v1:codex:hi']});
  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude'],'another positive declaration cannot heal a complete negative');
 });
+
+test('intake 62ccfa1e: an engine that failed its preflight check on a machine is routed around there, never a refusal',async()=>{
+ const policy=pool.filter(row=>['go-muse','claude-sonnet-medium'].includes(row.id));
+ const view=(unhealthy:unknown[])=>({idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:true,
+  engines:['claude','go'],capabilities:['headless'],unhealthy_engines:unhealthy})})});
+ const env=poolEnv({'shared-go':true,claude:true},{'shared-go':90,claude:90},['claude','go'],policy);
+ const failed={engine:'go',reason:'engine_auth_check_unavailable',session_id:'s',failed_at:Date.now(),until:Date.now()+60_000};
+ env.MACHINES=view([failed]);
+ for(const draw of [0,0.5,0.99]){
+  const picked=await pickModelRouteDetailed(env,{interactive:false,machine_id:'h1'},()=>draw);
+  assert.equal(picked.route.engine,'claude','the unhealthy engine is never drawn on that machine');
+  assert.deepEqual(picked.diagnostics.excluded.filter(row=>row.reason==='engine_unhealthy').map(row=>row.policy_id),['go-muse']);
+ }
+ const pinned=await pickModelRouteDetailed(env,{interactive:false,engine:'go'},()=>0);
+ assert.equal(pinned.route.engine,'go','an explicit engine with nothing else left narrows, it does not refuse');
+ assert(pinned.diagnostics.advisories?.some(row=>row.reason==='engine_unhealthy'));
+ env.MACHINES=view([{...failed,until:Date.now()-1}]);
+ const lapsed=await pickModelRouteDetailed(env,{interactive:false},()=>0);
+ assert.equal(lapsed.diagnostics.excluded.some(row=>row.reason==='engine_unhealthy'),false,'an expired hold restores the engine');
+});

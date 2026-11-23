@@ -726,5 +726,30 @@ class HistoryPagingTest(RecoveryAlertTest):
         self.assertIn('mailer_scan_incomplete', conditions)
 
 
+class EngineUnhealthyAlertTest(RecoveryAlertTest):
+    def test_mails_developer_once_per_engine_preflight_failure(self):
+        failed = {'engine': 'go', 'reason': 'engine_auth_check_unavailable', 'session_id': '62867a7a-095d',
+                  'failed_at': 1_800_000_000_000, 'until': 1_800_001_800_000}
+        machines = [{'machine_id': 'hetzner-aplexer', 'connected': True, 'unhealthy_engines': [failed]},
+                    {'machine_id': 'quiet', 'connected': True}]
+        transport = StubTransport(owner='human:x', machines=machines)
+        self.assertEqual(poller.deliver(transport, self.state, self.helper), {'sent': 1, 'errors': 0})
+        to, message = self.log.read_text().splitlines()[0].split('|', 1)
+        self.assertEqual(to, 'dev@dtcdev.click')
+        self.assertIn('Hub2 engine go failed its auth/preflight check on hetzner-aplexer', message)
+        self.assertIn('engine_auth_check_unavailable', message)
+        self.assertIn('repicks another engine', message)
+        self.assertEqual(poller.deliver(transport, self.state, self.helper), {'sent': 0, 'errors': 0})
+        again = dict(machines[0], unhealthy_engines=[dict(failed, failed_at=1_800_000_600_000)])
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=[again]), self.state, self.helper),
+                         {'sent': 1, 'errors': 0}, 'a new failure alerts again')
+
+    def test_malformed_engine_entries_are_ignored(self):
+        machines = [{'machine_id': 'h1', 'unhealthy_engines': [{'engine': 'Go Bad', 'failed_at': 1},
+                     {'engine': 'go', 'failed_at': '1'}, 'x']}]
+        self.assertEqual(poller.deliver(StubTransport(owner='human:x', machines=machines), self.state, self.helper),
+                         {'sent': 0, 'errors': 0})
+
+
 if __name__ == '__main__':
     unittest.main()

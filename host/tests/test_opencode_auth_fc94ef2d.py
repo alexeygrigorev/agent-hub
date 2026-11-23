@@ -200,6 +200,8 @@ def test_stale_runtime_auth_store_is_reimported_from_valid_source(tmp_path):
         if args == ['auth', 'import']:
             assert json.loads(payload) == source
             return None
+        if args == ['auth', 'switch', 'opencode', 'source-login']:
+            return None
         if args[:2] == ['auth', 'list']:
             auth_list_count += 1
             if auth_list_count == 1:
@@ -234,6 +236,8 @@ def test_target_refresh_rejection_reimports_and_never_marks_source_expired(tmp_p
             return source
         if args == ['auth', 'import']:
             assert json.loads(payload) == source
+            return None
+        if args == ['auth', 'switch', 'opencode', 'source-login']:
             return None
         if args[:2] == ['auth', 'list']:
             return [dict(id='opencode', connections=[dict(method='oauth')])]
@@ -276,6 +280,8 @@ def test_native_target_rejection_repairs_the_runtime_store(tmp_path, capsys):
         if args[:2] == ['auth', 'import']:
             import_calls += 1
             return NativeProcess(0, stdout, stderr)
+        if args == ['auth', 'switch', 'opencode', 'source-login']:
+            return NativeProcess(0, stdout, stderr, body=b'Switched account')
         if args[:2] == ['auth', 'list']:
             integrations = [dict(id='opencode', connections=[dict(method='oauth')])]
             return NativeProcess(0, stdout, stderr, body=json.dumps(integrations).encode())
@@ -318,6 +324,8 @@ def test_persistent_target_refresh_rejection_is_expired_after_reimport(tmp_path,
         if args[:2] == ['auth', 'export']:
             return source
         if args == ['auth', 'import']:
+            return None
+        if args == ['auth', 'switch', 'opencode', 'source-login']:
             return None
         if args[:2] == ['auth', 'list']:
             return [dict(id='opencode', connections=[dict(method='oauth')])]
@@ -399,3 +407,73 @@ def test_prepare_logs_only_safe_native_failure_metadata(tmp_path, capsys):
     assert event == {'event': 'opencode_auth_check_unavailable',
                      'reason': 'engine_auth_check_unavailable', 'step': 'auth_export',
                      'failure': 'nonzero_exit', 'exit_code': 17}
+
+
+def test_reimport_switches_target_off_a_revoked_credential(tmp_path, capsys):
+    """Intake 62ccfa1e: import kept the target's old active credential.
+
+    The source rotated to a new device login; the target still had the old
+    credential active, its console session was revoked, opencode-go vanished
+    from model.list and every repair re-imported without changing it.
+    """
+    cfg = config(tmp_path)
+    identity = {'id': 'source-login', 'method': 'device', 'refresh': 'refresh-fixture', 'metadata': None}
+    stale_target(cfg, identity)
+    source = [dict(id='source-login', integrationID='opencode', active=True,
+                   value=dict(type='oauth', methodID='device', access='access-fixture',
+                              refresh='refresh-fixture'))]
+    target = {'active': 'revoked-login'}
+    calls = []
+
+    def native(_cfg, args, _env, payload=None):
+        calls.append(args)
+        if args[:2] == ['auth', 'export']:
+            return source
+        if args == ['auth', 'import']:
+            return None  # Adds the source credential; the old one stays active.
+        if args[:3] == ['auth', 'switch', 'opencode']:
+            target['active'] = args[3]
+            return None
+        if args[:2] == ['auth', 'list']:
+            return [dict(id='opencode', connections=[dict(method='oauth'), dict(method='oauth')])]
+        if args == ['api', 'model.list']:
+            free = [dict(providerID='opencode', id='muse-spark-1.3', enabled=True)]
+            if target['active'] != 'source-login':
+                return dict(data=free)
+            return dict(data=free + [dict(providerID='opencode-go',
+                                          id=auth.MODEL.split('/', 1)[1], enabled=True)])
+        raise AssertionError('unexpected native operation')
+
+    with patch.object(auth, '_verified_recently', return_value=False),             patch.object(auth, '_verification_identity', return_value=None):
+        result = auth.prepare(cfg, native=native)
+
+    assert result == {'status': 'ok', 'reason': 'device_auth_verified'}
+    assert calls.index(['auth', 'switch', 'opencode', 'source-login']) ==         calls.index(['auth', 'import']) + 1
+    logged = capsys.readouterr().out
+    assert json.loads(logged) == {'event': 'opencode_auth_target_reimport',
+                                  'step': 'model_list', 'failure': 'model_unavailable'}
+    assert 'refresh-fixture' not in logged
+
+
+def test_model_missing_after_repair_names_the_model_not_a_bad_response(tmp_path):
+    cfg = config(tmp_path)
+    identity = {'id': 'source-login', 'method': 'device', 'refresh': 'refresh-fixture', 'metadata': None}
+    stale_target(cfg, identity)
+    source = [dict(id='source-login', integrationID='opencode', active=True,
+                   value=dict(type='oauth', methodID='device', access='access-fixture',
+                              refresh='refresh-fixture'))]
+
+    def native(_cfg, args, _env, payload=None):
+        if args[:2] == ['auth', 'export']:
+            return source
+        if args[:2] == ['auth', 'list']:
+            return [dict(id='opencode', connections=[dict(method='oauth')])]
+        if args == ['api', 'model.list']:
+            return dict(data=[dict(providerID='opencode', id='muse-spark-1.3', enabled=True)])
+        return None
+
+    with patch.object(auth, '_verified_recently', return_value=False),             patch.object(auth, '_verification_identity', return_value=None):
+        with pytest.raises(auth.AuthCheckUnavailable) as caught:
+            auth.prepare(cfg, native=native)
+
+    assert str(caught.value) == 'engine_auth_check_unavailable: model_list model_unavailable'

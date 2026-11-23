@@ -1520,3 +1520,40 @@ test('implementation sessions default to a 2h deadline, review keeps 30 min',asy
     assert.equal(JSON.parse(sagas(f,id)[0].launch_spec_json).timeout_seconds,7200);
   }finally{f.close?.();}
 });
+
+test('intake 62ccfa1e: an engine auth/preflight failure alerts and the continuation repicks another engine on that machine',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'preflight-fallback');
+    assert.equal((await start(f,id,'first',{engine:'claude',override_reason:'requester pinned the broken engine'})).status,201);
+    const first=await run(f,id),firstSaga=activeSaga(f,id);
+    assert.equal(JSON.parse(firstSaga.launch_spec_json).engine,'claude');
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:1,native_exit_confirmed:true,failure_reason:'engine_auth_check_unavailable',
+      detail:'Engine authentication check failed before the session started.',evidence:{result:'exit',native_deadline:{exceeded:false}}});
+    assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+    assert.equal(completion(f,id).reason,'engine_auth_check_unavailable');
+    assert.equal(JSON.parse(intakeRow(f,id).final_evidence_json).failure_reason,'engine_auth_check_unavailable');
+    const alert=events(f,id).find(e=>e.kind==='engine_preflight_failed');
+    assert.deepEqual({kind:alert?.body.kind,reason:alert?.body.reason,engine:alert?.body.engine,policy:alert?.body.policy_id,machine:alert?.body.machine_id},
+      {kind:'engine_unhealthy',reason:'engine_auth_check_unavailable',engine:'claude',policy:'sonnet-route',machine:firstSaga.machine_id});
+    await f.project.alarm();
+    const next=sagas(f,id).at(-1),launch=JSON.parse(next.launch_spec_json),route=JSON.parse(next.routing_json);
+    assert.notEqual(next.session_id,first.session_id);
+    assert.equal(launch.engine,'codex','the retry picks a different engine instead of the broken one');
+    assert.notEqual(route.policy_id,'sonnet-route');
+    assert.equal(next.machine_id,firstSaga.machine_id,'the machine holding the workspace is kept');
+  }finally{f.close();}
+});
+
+test('a plain nonzero exit keeps the continuation on the same engine',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'plain-exit');
+    assert.equal((await start(f,id,'first',{engine:'claude',override_reason:'pinned'})).status,201);
+    const first=await run(f,id);
+    await finish(f,first,1);
+    await f.project.alarm();
+    assert.equal(JSON.parse(sagas(f,id).at(-1).launch_spec_json).engine,'claude');
+    assert.equal(events(f,id).some(e=>e.kind==='engine_preflight_failed'),false);
+  }finally{f.close();}
+});

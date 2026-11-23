@@ -4,6 +4,7 @@ import {MachineNativeCommands,NATIVE_COMMAND_SCHEMA} from './machine-native-comm
 import {boundWorkspace,mergeWorkspaceBinding,WORKSPACE_BINDING_FIELD,WORKSPACE_REPAIR_FIELD,WORKSPACE_RECOVERY_TURN_FIELD} from './workspace-binding';
 import {MachineNativeInventory, NATIVE_INVENTORY_SCHEMA, validNativeAbsenceEvidence, nativeAbsenceObservation, type Meta, type NativeAbsenceEvidence} from './machine-native-inventory';
 import { nativeReturncode } from './native-exit';
+import { ENGINE_PREFLIGHT_FAILURES, ENGINE_UNHEALTHY_MS } from './task-completion';
 import { normalizeStartPickerEvidence } from './start-picker-evidence';
 import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
@@ -104,6 +105,8 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "host_launch_queue_full": "Launch preparation was refused.",
   "host_command_queue_full": "Launch preparation was refused.",
   "antigravity_first_run_blocked": "Antigravity is blocked on first-run onboarding or Terms of Service.",
+  "engine_auth_check_unavailable": "Engine authentication check failed before the session started.",
+  "engine_auth_expired": "Engine login expired before the session started.",
   "antigravity_settings_unverified": "Launch preparation was refused.",
   "invalid_native_send": "Launch preparation was refused.",
   "native_prompt_invalid": "Launch preparation was refused.",
@@ -604,6 +607,23 @@ export class MachineDO {
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }
 
+  /** An engine that refused to start on its auth/preflight check is unhealthy
+   * on this machine for a bounded time; the picker routes around it. */
+  private async markEngineUnhealthy(engine:string,reason:string,sessionId:string,now:number):Promise<void>{
+    const health=await this.engineHealth(now);
+    health[engine]={reason,session_id:sessionId,failed_at:now,until:now+ENGINE_UNHEALTHY_MS};
+    if(typeof this.ctx.storage.put==='function')await this.ctx.storage.put('engine_health',health);
+    const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
+    console.error('[hub2] ENGINE_UNHEALTHY',JSON.stringify({machine_id:machine?.machine_id??null,engine,reason,session_id:sessionId,until:now+ENGINE_UNHEALTHY_MS}));
+  }
+
+  private async engineHealth(now:number):Promise<Record<string,{reason:string;session_id:string;failed_at:number;until:number}>>{
+    // SQL-only storage (no KV) has recorded no engine health.
+    if(typeof this.ctx.storage.get!=='function')return {};
+    const stored=await this.ctx.storage.get<Record<string,{reason:string;session_id:string;failed_at:number;until:number}>>('engine_health')??{};
+    return Object.fromEntries(Object.entries(stored).filter(([,entry])=>Number.isSafeInteger(entry?.until)&&entry.until>now));
+  }
+
   private async routingView(passive=false):Promise<Response>{
     const machine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');
     if(!machine)return json({available:false,reason:'machine_not_enrolled'});
@@ -626,11 +646,13 @@ export class MachineDO {
     const currentCapabilities=visibleCapabilities.filter(cap=>cap!==MANAGED_CLAUDE_CAPABILITY
       ||connected&&this.managedClaudeAvailable(machine.machine_id));
     const presence=connected?undefined:await this.hostPresence();
+    const unhealthy=Object.entries(await this.engineHealth(Date.now())).map(([engine,entry])=>({engine,reason:entry.reason,session_id:entry.session_id,failed_at:entry.failed_at,until:entry.until}));
     const hostAlert=presence?.alerted_at?{kind:'host_disconnected',recipient:HOST_ALERT_RECIPIENT,
       disconnected_since:presence.disconnected_since,alerted_at:presence.alerted_at,evidence:presence.evidence??null}:undefined;
     return json({machine_id:machine.machine_id,connected,...release,version_mismatch:versionMismatch,
       last_seen:machine.last_seen,os:machine.os,arch:machine.arch,labels:JSON.parse(machine.labels_json),
       engines:capabilities?JSON.parse(capabilities.engines_json):[],capabilities:currentCapabilities,
+      ...(unhealthy.length?{unhealthy_engines:unhealthy}:{}),
       ...(presence?{disconnected_since:presence.disconnected_since}:{}),...(hostAlert?{host_alert:hostAlert}:{})});
   }
 
@@ -1313,6 +1335,8 @@ export class MachineDO {
       await this.scheduleNext();
       return json({ok:true,state:'lost',native_exit_recorded:true});
     }
+    if(typedFailure&&ENGINE_PREFLIGHT_FAILURES.has(typedFailure)&&typeof launch.engine==='string')
+      await this.markEngineUnhealthy(launch.engine,typedFailure,row.id,now);
     this.db.transaction(this.ctx, () => {
       const {[WORKSPACE_REPAIR_FIELD]:_repair,...completedLaunch}=launch;
       this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=?,launch_json=? WHERE id=? AND state=?',

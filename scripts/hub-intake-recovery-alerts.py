@@ -12,6 +12,10 @@ It also mails each Hub2 host_disconnected alert once per disconnect episode: a
 host that keeps heartbeating (or holds live sessions) without its socket for
 more than 15 minutes (intake 41ef7048 AC2, t1801u). Hub2 publishes those on
 /api/fleet/routing/machines as `host_alert`.
+
+It also mails each engine Hub2 marked unhealthy on a host after that engine
+failed its auth/preflight check, once per failure (intake 62ccfa1e AC2, t1801u):
+`unhealthy_engines` on the same routing view. Hub repicks another engine itself.
 """
 import datetime
 import argparse
@@ -261,6 +265,31 @@ def host_alerts(transport):
         yield 'host:' + machine_id + ':' + str(alert.get('disconnected_since')), machine, alert
 
 
+def engine_alerts(machines):
+    """Yield (key, machine, entry) for engines Hub2 marked unhealthy on a host."""
+    for machine in machines:
+        machine_id = str((machine or {}).get('machine_id', '')) if isinstance(machine, dict) else ''
+        if not machine_id or not all(c.isalnum() or c in '-_.' for c in machine_id):
+            continue
+        for entry in machine.get('unhealthy_engines') or []:
+            if (not isinstance(entry, dict) or not isinstance(entry.get('engine'), str)
+                    or not re.fullmatch(r'[a-z][a-z0-9_-]{0,39}', entry['engine'])
+                    or type(entry.get('failed_at')) is not int):
+                continue
+            yield 'engine:' + machine_id + ':' + entry['engine'] + ':' + str(entry['failed_at']), machine, entry
+
+
+def render_engine(machine, entry):
+    stamp = datetime.datetime.fromtimestamp(entry['failed_at'] / 1000, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    reason = entry.get('reason') if isinstance(entry.get('reason'), str) and re.fullmatch(r'[a-z_]{1,60}', entry['reason']) else 'unknown'
+    session = entry.get('session_id') if isinstance(entry.get('session_id'), str) and re.fullmatch(r'[0-9a-f-]{1,40}', entry['session_id']) else 'unknown'
+    return ('Hub2 engine {engine} failed its auth/preflight check on {machine} at {stamp} ({reason}; session {session}). '
+            'Hub marked it unhealthy on that host and repicks another engine for new starts and recoveries. '
+            'Fix the engine login on the host (OpenCode: opencode auth login opencode --method device); the hold lapses after 30 minutes. '
+            'Status: hub routing-machines.').format(engine=entry['engine'], machine=machine.get('machine_id'),
+                                                     stamp=stamp, reason=reason, session=session)
+
+
 def render_host(machine, alert, now=None):
     since = alert.get('disconnected_since')
     stamp, minutes = '?', '?'
@@ -315,7 +344,9 @@ def alert_rows(transport, result, observer=None):
         observation_error(observer, stage)
         raise
     try:
-        hosts = list(host_alerts(transport))
+        machines = transport.get('/api/fleet/routing/machines').get('machines') or []
+        hosts = list(host_alerts(types.SimpleNamespace(get=lambda _path: {'machines': machines})))
+        engines = list(engine_alerts(machines))
     except Exception:  # Preserve prior intake deliveries and original partial failure.
         result['errors'] += 1
         observation_error(observer, 'mailer_api_error')
@@ -327,6 +358,13 @@ def alert_rows(transport, result, observer=None):
             observation_error(observer, 'mailer_render_error')
             raise
         yield key, message, 'host_disconnected'
+    for key, machine, entry in engines:
+        try:
+            message = render_engine(machine, entry)
+        except BaseException:
+            observation_error(observer, 'mailer_render_error')
+            raise
+        yield key, message, 'engine_unhealthy'
 
 
 def all_alerts(transport, result):

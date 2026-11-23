@@ -9,7 +9,8 @@ import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} fro
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
-export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string };
+export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string;
+  unhealthy_engines?: Array<{ engine: string; reason: string; until: number }> };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
@@ -260,6 +261,20 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return !denied;
   });
   if (!pool.length) throw new HttpError('model_policy_unavailable', 503);
+  // An engine that failed its auth/preflight check on a machine is unhealthy
+  // there (intake 62ccfa1e): route around it, but never refuse when it is all that is left.
+  const unhealthyOn = (id: string, engine: string) => (machines.get(id)?.unhealthy_engines || [])
+    .some(entry => entry?.engine === engine && Number(entry.until) > snapshot.observed_at);
+  const healthy = pool.map(row => ({...row, hosts: row.hosts.filter(id => !unhealthyOn(id, row.candidate.engine))}));
+  const lost = (index: number) => pool[index].hosts.length > 0 && healthy[index].hosts.length === 0;
+  if (healthy.some(row => row.hosts.length > 0)) {
+    for (const [index, row] of pool.entries()) if (lost(index))
+      dropped.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'engine_unhealthy'});
+    pool = healthy.filter((_row, index) => !lost(index));
+  } else {
+    for (const [index, row] of pool.entries()) if (lost(index))
+      advisories.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'engine_unhealthy'});
+  }
   // --with-goal is a launch requirement, not a preference (intake baab076a): a picked
   // engine must run where the host advertises goal:<engine>, or the host refuses it with
   // launcher_capability_unavailable. Filter before the advisory narrows so quota/credential
