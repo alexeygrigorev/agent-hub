@@ -123,9 +123,15 @@ jobs:
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
-    runs-on: [self-hosted, contabo]
-    # 25-minute Python wait + the existing 20-minute non-wait deploy budget.
-    timeout-minutes: 45
+    # Intake e19faefa: this job waits for the Python host tests, which run on the
+    # contabo-hub runner. That runner executes one job at a time, so a waiter on
+    # it blocks the very job it waits for (run 45247689745: legacy-cli-shard-3
+    # started two seconds after the waiting deploy job gave up its slot). The
+    # wait therefore stays on GitHub-hosted, like the root-requiring jobs above.
+    runs-on: ubuntu-latest
+    # 4-hour Python wait + its 1-minute step margin + the existing 20-minute
+    # non-wait deploy budget.
+    timeout-minutes: 261
     environment: production
     steps:
       - uses: actions/checkout@v4
@@ -198,9 +204,11 @@ jobs:
           git checkout --detach --force "$DEPLOY_SHA"
       - name: Require green Python host tests for this main commit
         if: github.event_name == 'push'
-        # Fixed 25-minute observation deadline: Python job's 20 minutes + 5 queue.
+        # Fixed 4-hour observation deadline: on the single-slot contabo-hub runner
+        # every job of the push runs one at a time, and the declared timeouts of
+        # the Python suite alone sum to 125 minutes (20 + 15 + 4x20 + 10).
         # The outer minute is process-start/termination margin, not extra eligibility.
-        timeout-minutes: 26
+        timeout-minutes: 241
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_SHA: ${{ github.sha }}

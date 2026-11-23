@@ -1377,7 +1377,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         # any later stage transports provisioner or release artifacts.
         self.assertIn('git checkout --detach --force "$DEPLOY_SHA"', job)
         # Rollout is gated on the proof: the compat steps run before the
-        # deploy step, ahead of even the 25-minute Python wait.
+        # deploy step, ahead of even the Python host tests wait.
         rebuild_idx = job.index('- name: Rebuild and start the exact deployed previous release on Node24')
         wait_idx = job.index('- name: Require green Python host tests for this main commit')
         deploy_step_idx = job.index('- name: Deploy validated revision through the fixed VM transaction script')

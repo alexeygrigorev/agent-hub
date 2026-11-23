@@ -33,6 +33,11 @@ test('production deploy runs after green main CI (or dispatch), SSH-only and hea
   assert.equal(condition, "github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending))");
   assert.doesNotMatch(condition, /pull_request/);
   assert.match(flow, /Require green Python host tests for this main commit\n        if: github\.event_name == 'push'/);
+  // Intake e19faefa: contabo-hub runs one job at a time and hosts the Python host
+  // tests this job waits for, so a waiter there blocks them (run 45247689745).
+  const deployJob = flow.slice(flow.indexOf('\n  deploy:'), flow.indexOf('\n  rollback_pending:'));
+  assert.match(deployJob, /runs-on: ubuntu-latest/, 'the waiting deploy job must not hold the contabo-hub slot');
+  assert.doesNotMatch(deployJob, /runs-on: \[self-hosted, contabo\]/);
   assert.doesNotMatch(flow, /if: inputs\.release_mode == 'active'/, 'push deploys have no inputs; release_mode must default to active');
   assert.doesNotMatch(flow, /RELEASE_MODE: \$\{\{ inputs\.release_mode \}\}/);
   assert.match(flow, /Alert the deploy owner when an automatic deploy fails\n        if: failure\(\) && github\.event_name == 'push'/);
