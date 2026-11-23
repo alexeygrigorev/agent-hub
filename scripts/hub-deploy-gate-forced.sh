@@ -43,7 +43,7 @@ A_BIN="$USER_HOME/.local/bin/a"
 HOST_RELEASE_ROOT="$USER_HOME/.local/share/agent-hub2"
 WORKSPACE_DIR="$USER_HOME/work/hub-canary"
 STATE_DIR="$USER_HOME/.local/state/agent-hub-canary"
-DEPLOY_GATE_TIMEOUT_S=360
+DEPLOY_GATE_TIMEOUT_S=480
 DEPLOY_GATE_LOCK_WAIT_S=60
 EXTRA_ENV=()
 

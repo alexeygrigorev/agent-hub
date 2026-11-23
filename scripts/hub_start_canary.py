@@ -16,14 +16,14 @@ FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
 HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py")
 
-# Fixed trusted ceilings for pre-commit deploy-gate mode (240s active + 60s cleanup < 360s outer wrapper).
+# Fixed trusted ceilings for pre-commit deploy-gate mode (360s active + 60s cleanup < 480s outer wrapper).
 TRUSTED_CONVERGE_TIMEOUT_S = 90.0
 TRUSTED_RUNNING_TIMEOUT_S = 90.0
 TRUSTED_CAPTURE_TIMEOUT_S = 30.0
 TRUSTED_FULL_CAPTURE_TIMEOUT_S = 120.0
 TRUSTED_STOP_TIMEOUT_S = 45.0
 TRUSTED_CMD_TIMEOUT_S = 45.0
-TRUSTED_ACTIVE_BUDGET_S = 240.0
+TRUSTED_ACTIVE_BUDGET_S = 360.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
 TRUSTED_LOCK_WAIT_S = 60.0
 PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
@@ -809,6 +809,7 @@ WORKSPACE_CONFIG_MAX_BYTES = 4096
 WORKSPACE_CONFIG_UID = 0
 WORKSPACE_CONFIG_TRUST_ROOT = "/"
 ADMISSION_BUDGET_S = 60.0
+YOUNG_HOLD_ADMISSION_BUDGET_S = 195.0
 ADMISSION_RAM_FLOOR_BYTES = 10 * 1024 ** 3
 # Policy CEILINGS for the new worker. The caps that count are the ones the
 # selected Host launcher will actually apply (read_launcher_caps); anything above
@@ -2419,6 +2420,9 @@ def physical_admission_check(admission=None):
     return result
 
 
+QUOTA_QUERY_PROVIDERS = ("claude", "codex", "zai", "go", "gemini")
+
+
 class Canary(PhysicalAdmission):
     def __init__(
         self,
@@ -2574,7 +2578,7 @@ class Canary(PhysicalAdmission):
     # ---- admission collectors (each is a narrow, replaceable seam) ----------
 
     def acquire_quota(self, deadline):
-        rc, out, _ = self.run(["quse", "--json"], deadline=deadline)
+        rc, out, _ = self.run(["quse", *QUOTA_QUERY_PROVIDERS, "--json"], deadline=deadline)
         if rc != 0:
             raise StageFailure("admission", "quota_timeout" if rc == 124 else "quota_acquisition_failed")
         try:
@@ -2605,10 +2609,21 @@ class Canary(PhysicalAdmission):
         """
         held = None
         while True:
+            attempt_deadline = min(deadline, time.monotonic() + ADMISSION_BUDGET_S)
             try:
-                return self.admit(deadline)
+                return self.admit(attempt_deadline)
             except StageFailure as failure:
-                if held is not None and failure.reason == "admission_deadline_exceeded":
+                if held is not None and (
+                    failure.reason == "admission_deadline_exceeded"
+                    or (
+                        time.monotonic() >= deadline
+                        and failure.reason in (
+                            "quota_timeout",
+                            "managed_inflight_timeout",
+                            "native_inventory_timeout",
+                        )
+                    )
+                ):
                     raise held
                 if not is_young_resident_hold(failure) or time.monotonic() + self.poll >= deadline:
                     raise
@@ -3382,7 +3397,7 @@ class Canary(PhysicalAdmission):
         self.current_stage = "admission"
         # Fresh admission before EVERY possible Hub START; refusal happens before
         # any pending state or session exists, so there is nothing to clean up.
-        self.admit_past_young_holds(self.stage_deadline(ADMISSION_BUDGET_S))
+        self.admit_past_young_holds(self.stage_deadline(YOUNG_HOLD_ADMISSION_BUDGET_S))
         self.current_stage = "start"
         ensure_private_dir(self.workspace, stage="start", prefix="workspace")
         self.started_at = time.monotonic()

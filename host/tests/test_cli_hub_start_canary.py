@@ -3893,7 +3893,7 @@ class TrustedCaptureBudgetTests(unittest.TestCase):
         self.assertEqual(self.canary("shell", HUB_CANARY_CAPTURE_TIMEOUT_S="999").capture_timeout, 30)
         self.assertEqual(self.canary(HUB_CANARY_CAPTURE_TIMEOUT_S="17").capture_timeout, 17)
         c = self.canary(HUB_CANARY_ACTIVE_BUDGET_S="999", HUB_CANARY_CLEANUP_BUDGET_S="999")
-        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget), (240, 45, 60))
+        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget), (360, 45, 60))
         self.assertEqual((mod.TRUSTED_RUNNING_TIMEOUT_S, mod.TRUSTED_CONVERGE_TIMEOUT_S), (90, 90))
 
     def test_full_real_marker_after_30_seconds_can_qualify_before_original_clip(self):
@@ -3962,10 +3962,10 @@ class TrustedCaptureBudgetTests(unittest.TestCase):
     def test_execute_capture_expiry_retains_cleanup_and_archive_under_original_bounds(self):
         from scripts import hub_start_canary as mod
         c = self.canary(HUB_CANARY_CLEANUP_BUDGET_S="60"); clock = [0.0]; cleanup = []
-        def converge(): clock[0] = 180
+        def converge(): clock[0] = 300
         def start(): c.start_attempted = True; c.session = SID
         def run(argv, deadline=None):
-            self.assertEqual(deadline, 195); clock[0] += 5
+            self.assertEqual(deadline, 315); clock[0] += 5
             return 0, json.dumps({"command_wait": {"state": "acked", "ack": {"capture": ""}}}), ""
         def clean(deadline=None): cleanup.append(deadline); return "stopped"
         with mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock[0]), \
@@ -3979,9 +3979,9 @@ class TrustedCaptureBudgetTests(unittest.TestCase):
             result = c.execute()
         self.assertEqual((result["ok"], result["stage"], result["reason"], result["cleanup"]),
                          (False, "capture", "empty_capture", "stopped"))
-        self.assertEqual((c.active_deadline, clock[0]), (240, 195))
-        self.assertEqual(cleanup, [255])  # Original <=60s independent cleanup, not renewed active240.
-        archive.assert_called_once_with(deadline=255)
+        self.assertEqual((c.active_deadline, clock[0]), (360, 315))
+        self.assertEqual(cleanup, [375])  # Original <=60s independent cleanup, not renewed active360.
+        archive.assert_called_once_with(deadline=375)
         clear.assert_called_once()
 
 
@@ -4001,7 +4001,7 @@ class TrustedLockBudgetTests(unittest.TestCase):
         self.assertEqual(self.canary(HUB_CANARY_LOCK_WAIT_S="0.1").lock_wait, 0.1)
         self.assertEqual(TrustedCaptureBudgetTests().canary(candidate=False).lock_wait, 120)
         c = self.canary(HUB_CANARY_CLEANUP_BUDGET_S="999")
-        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget, c.capture_timeout), (240, 45, 60, 120))
+        self.assertEqual((c.active_budget, c.stop_timeout, c.cleanup_budget, c.capture_timeout), (360, 45, 60, 120))
         self.assertEqual(mod.TRUSTED_RUNNING_TIMEOUT_S, 90)
 
     def test_existing_lock_acquisition_can_wait_sixteen_seconds_without_new_lock(self):
@@ -4039,7 +4039,7 @@ class TrustedLockBudgetTests(unittest.TestCase):
             self.assertTrue((pathlib.Path(root) / "deploy-gate.lock").is_file())
             self.assertEqual((result["ok"], result["stage"], result["reason"], result["session_id"], result["cleanup"]),
                              (False, "lock", "deploy_gate_lock_busy", None, "not_needed"))
-            self.assertEqual((clock[0], c.active_deadline, c.start_attempted), (60, 240, False))
+            self.assertEqual((clock[0], c.active_deadline, c.start_attempted), (60, 360, False))
             converge.assert_not_called(); start.assert_not_called(); cleanup.assert_not_called()
 
     def test_wait_is_clipped_to_original_active_remaining_and_never_renews_it(self):
@@ -4498,6 +4498,43 @@ class AdmissionTests(unittest.TestCase):
         self.assertIs(caught.exception, refusal)
         self.assertEqual(len(seen), 1)
         self.assertFalse(c.start_attempted)
+
+    def test_young_hold_budget_exceeds_maturity_and_timeout_after_deadline_reports_young_hold(self):
+        mod = self.mod()
+        self.assertGreater(mod.YOUNG_HOLD_ADMISSION_BUDGET_S, mod.MATURE_RESIDENT_AGE_S)
+        self.assertGreaterEqual(mod.TRUSTED_ACTIVE_BUDGET_S, mod.YOUNG_HOLD_ADMISSION_BUDGET_S)
+        c = mod.Canary("full", "adm-test")
+        c.poll = 0.001
+        young = mod.StageFailure("admission", "resident_bound_unknown", admission_diagnostic=dict(self.YOUNG_HOLD))
+        state = {"n": 0}
+
+        def seq_admit(attempt_deadline=None, workspace=None, *, seam="start"):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise young
+            time.sleep(0.06)
+            raise mod.StageFailure("admission", "quota_timeout")
+
+        c.admit = seq_admit
+        with self.assertRaises(mod.StageFailure) as caught:
+            c.admit_past_young_holds(time.monotonic() + 0.04)
+        self.assertIs(caught.exception, young)
+
+    def test_acquire_quota_queries_only_eligible_providers(self):
+        mod = self.mod()
+        c = mod.Canary("full", "quota-argv")
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(argv)
+            return 0, json.dumps({"claude": {"status": "ok", "windows": {"5h": {"percent_remaining": 80}, "7d": {"percent_remaining": 80}}}}), ""
+
+        c.run = fake_run
+        c.acquire_quota(time.monotonic() + 10)
+        self.assertEqual(seen, [["quse", *mod.QUOTA_QUERY_PROVIDERS, "--json"]])
+        self.assertNotIn("grok", seen[0])
+        self.assertNotIn("copilot", seen[0])
+        self.assertNotIn("go-orin", seen[0])
 
     # ---- root workspace config -------------------------------------------------
 
