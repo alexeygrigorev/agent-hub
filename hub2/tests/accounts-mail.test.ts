@@ -485,6 +485,7 @@ test('zai configuration and policy refuse retired account aliases without bannin
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'zcodex'}]}))).status,400);
  // GLM 5.4 (t3897u): the zcodex engine paired with zai-central is the one allowed Z.ai write.
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,200,'zcodex+zai-central is the maintained GLM write');
+ assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,engine:'codex'}]}))).status,400,'zai-central never pairs with an unrelated engine');
  const claude={id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[claude]}))).status,200);
  for(const invalid of [
