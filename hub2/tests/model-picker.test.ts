@@ -1168,7 +1168,7 @@ print(json.dumps(published))
   assert(!partialDeclarations.capabilities.includes('modes:v1:zai:hi'));
   assert(!resourceOnly.capabilities.some((v:string)=>v.startsWith('modes:')),'full accepted tag budget leaves mode authority unknown');
   assert(machine.capabilities.includes('headless'),'existing global hint remains unchanged');
-  assert(machine.capabilities.includes('interactive:codex'));
+  assert(!machine.capabilities.includes('interactive:codex'),'modes:v1 supersedes the legacy hint (intake a59390a6: it evicted repo-identity:v1)');
   assert(machine.capabilities.includes('modes:v1:codex:i'));
   assert(machine.capabilities.includes('modes:v1:zai:hi'));
   assert(!machine.capabilities.includes('headless:codex'));
