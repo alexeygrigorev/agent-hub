@@ -984,3 +984,17 @@ class ReleaseCustodyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReservedFloorConfigTests(unittest.TestCase):
+    def test_default_is_the_production_floor(self):
+        self.assertEqual(resource_admission.reserved_floor_bytes(None), resource_admission.RESERVED_FLOOR_BYTES)
+        self.assertEqual(resource_admission.reserved_floor_bytes({}), resource_admission.RESERVED_FLOOR_BYTES)
+
+    def test_explicit_lower_floor_is_honoured(self):
+        self.assertEqual(resource_admission.reserved_floor_bytes({'reserved_floor_mb': 256}), 256 * 1024 * 1024)
+
+    def test_invalid_values_refuse_instead_of_clamping(self):
+        for bad in (0, -1, True, '256', 256.0, 10 * 1024 + 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                resource_admission.reserved_floor_bytes({'reserved_floor_mb': bad})

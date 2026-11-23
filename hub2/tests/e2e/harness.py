@@ -195,7 +195,10 @@ class Host:
         self.config.write_text(json.dumps({
             "server": server.origin, "token": token, "machine_id": MACHINE,
             "roots": [str(self.workspace_root)], "engines": ["codex"],
-            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state), "private_provider_homes": True}}))
+            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state), "private_provider_homes": True,
+                         # Stub workloads only: the 4 GB shared CI runner cannot satisfy the production
+                         # 10 GiB floor or the 1500 MB per-worker allowance.
+                         "reserved_floor_mb": 256, "memory_mb": 64}}))
         self.config.chmod(0o600)
         self.log_path = root / "host.log"
         self.process = None

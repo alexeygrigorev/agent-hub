@@ -95,6 +95,20 @@ def _validated_cap(raw, default, limit):
     return raw
 
 
+def reserved_floor_bytes(launcher_config):
+    """Physical-RAM floor kept free after a launch reservation.
+
+    Production hosts keep the 10 GiB default. A small CI host (the 4 GB shared
+    runner that drives the stub-workload e2e suites) sets `reserved_floor_mb` in
+    its launcher config; the value is a strict positive int and never clamped."""
+    raw = (launcher_config or {}).get('reserved_floor_mb')
+    if raw is None:
+        return RESERVED_FLOOR_BYTES
+    if type(raw) is not int or not 0 < raw <= RESERVED_FLOOR_BYTES // (1024 * 1024):
+        raise ValueError('launcher_capability_unavailable')
+    return raw * 1024 * 1024
+
+
 def validate_worker_caps(memory_mb, pids):
     """Validate the exact caps the argv will emit; defaults only when absent."""
     return {'memory_mb': _validated_cap(memory_mb, DEFAULT_MEMORY_MB, MAX_MEMORY_MB),
@@ -711,6 +725,7 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         caps = validate_worker_caps((launcher_config or {}).get('memory_mb', None),
                                     (launcher_config or {}).get('pids', None))
     allowance = validate_worker_caps(caps.get('memory_mb'), caps.get('pids'))['memory_mb'] * 1024 * 1024
+    floor = reserved_floor_bytes(getattr(getattr(bridge, 'launcher', None), 'config', None))
     observation = _raw_census_rows(bridge) if census is None else census
     if time.monotonic() > deadline:
         raise _unqualified()
@@ -745,7 +760,7 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         if time.monotonic() > deadline:
             raise _unqualified()
         available = sampler(deadline)  # the physical sample is always taken last
-        if available - (charged + allowance) < RESERVED_FLOOR_BYTES:
+        if available - (charged + allowance) < floor:
             raise RuntimeError('host_launch_queue_full')
         db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
                    'allowance_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?)',

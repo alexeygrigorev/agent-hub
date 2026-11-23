@@ -789,7 +789,7 @@ class Bridge:
                     if throttled:
                         raise
                     return None
-                logging.getLogger(__name__).error('Native launch failed session=%s', session)
+                logging.getLogger(__name__).error('Native launch failed session=%s reason=%s: %s', session, type(error).__name__, str(error)[:200])
                 if current and current['native_dispatch_started']==0:
                     self.settle_undispatched_launch(current, error)
                     if throttled:
