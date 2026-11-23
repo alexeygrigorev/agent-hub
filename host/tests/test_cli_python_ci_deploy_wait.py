@@ -1,6 +1,7 @@
 """Synthetic GitHub metadata/fake-clock only; no network, workflow or deploy."""
 import importlib.util
 from pathlib import Path
+import re
 import unittest
 import subprocess
 import sys
@@ -53,14 +54,27 @@ class PythonDeployWaitTests(unittest.TestCase):
         self.wait(fetch,clock)
         self.assertEqual(clock.now,1440)
 
+    def test_single_slot_runner_duration_is_waited(self):
+        # Run 45247689745: the suite went green 35m08s after the gate started,
+        # 10 minutes after the former 25-minute deadline had refused the deploy.
+        clock=Clock();calls=[]
+        def fetch(*args):
+            calls.append(clock.now)
+            return {'workflow_runs':[run('completed','success') if clock.now>=2108 else run()]}
+        self.wait(fetch,clock)
+        self.assertEqual(clock.now,2110)
+        self.assertGreater(clock.now,25*60)
+        self.assertLess(clock.now,gate.WAIT_SECONDS)
+        self.assertEqual(len(calls),212)
+
     def test_no_matching_run_expires_once_with_clipped_sleeps(self):
         clock=Clock();calls=[]
         def fetch(repo,sha,timeout):
             calls.append(timeout)
             return {'workflow_runs':[]}
         with self.assertRaisesRegex(gate.WaitRefused,'python_ci_wait_deadline'):self.wait(fetch,clock)
-        self.assertEqual(clock.now,1500)
-        self.assertEqual(len(calls),150)
+        self.assertEqual(clock.now,gate.WAIT_SECONDS)
+        self.assertEqual(len(calls),gate.WAIT_SECONDS//gate.POLL_SECONDS)
         self.assertTrue(all(0 < delay <= 10 for delay in clock.sleeps))
         self.assertEqual(calls[-1],10)
 
@@ -87,7 +101,7 @@ class PythonDeployWaitTests(unittest.TestCase):
     def test_late_success_from_blocking_fetch_is_rejected(self):
         clock=Clock()
         def fetch(*args):
-            clock.now=1500
+            clock.now=gate.WAIT_SECONDS
             return {'workflow_runs':[run('completed','success')]}
         with self.assertRaisesRegex(gate.WaitRefused,'python_ci_wait_deadline'):self.wait(fetch,clock)
         self.assertEqual(clock.sleeps,[])
@@ -98,9 +112,23 @@ class PythonDeployWaitTests(unittest.TestCase):
             calls.append(timeout);clock.now += timeout
             return {'workflow_runs':[run()]}
         with self.assertRaisesRegex(gate.WaitRefused,'python_ci_wait_deadline'):self.wait(fetch,clock)
-        self.assertEqual(clock.now,1500)
-        self.assertEqual(sum(calls)+sum(clock.sleeps),1500)
+        self.assertEqual(clock.now,gate.WAIT_SECONDS)
+        self.assertEqual(sum(calls)+sum(clock.sleeps),gate.WAIT_SECONDS)
         self.assertLessEqual(calls[-1],20)
+
+    def test_deadline_covers_the_single_slot_runner_envelope(self):
+        # The Python suite's declared job timeouts (python-tests.yml) run one at
+        # a time on contabo-hub: 20 + 15 + 4x20 + 10 minutes.
+        self.assertGreaterEqual(gate.WAIT_SECONDS,125*60)
+
+    def test_workflow_timeouts_enclose_the_observation_deadline(self):
+        flow=(MODULE.parents[1]/'.github/workflows/deploy.yml').read_text()
+        job=flow[flow.index('\n  deploy:'):flow.index('\n  rollback_pending:')]
+        step=job[job.index('- name: Require green Python host tests for this main commit'):]
+        step_timeout=int(re.search(r'timeout-minutes: (\d+)',step).group(1))
+        job_timeout=int(re.search(r'timeout-minutes: (\d+)',job).group(1))
+        self.assertGreater(step_timeout*60,gate.WAIT_SECONDS)
+        self.assertGreaterEqual(job_timeout,step_timeout+20)
 
     def test_metadata_failure_is_not_turned_into_green_or_retried(self):
         clock=Clock()
