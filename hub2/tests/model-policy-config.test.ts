@@ -72,6 +72,10 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.equal(modelPolicyCandidateViolation(glm54), null);
   assert.equal(isModelPolicyCandidateAllowed(glm54), true);
   assert.equal(modelPolicyCandidateViolation(route({id: 'goz-central', engine: 'goz', model: 'glm-5.4', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  // zai-central never pairs with an unrelated engine (review of 10fade21f): the
+  // account is reachable only through the zai and zcodex Z.ai engines.
+  assert.equal(modelPolicyCandidateViolation(route({id: 'bad-zai-account', engine: 'codex', model: 'glm-5.4', effort: 'medium', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'bad-zai-account', engine: 'claude', model: 'glm-5.4', effort: 'medium', account_id: 'zai-central'})), 'zai_picker_route_forbidden');
   assert.equal(isModelPolicyCandidateAllowed(route({id: 'sneaky', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'zai-central'})), false);
   assert.equal(modelPolicyCandidateViolation(route({id: 'zai-glm', engine: 'zai', model: 'glm-5.3-flash', account_id: 'zai-other'})), 'zai_picker_route_forbidden');
   assert.equal(isModelPolicyCandidateAllowed(route({id: 'sol', engine: 'codex', model: 'gpt-6.1-sol', effort: 'medium', account_id: 'codex'})), true);

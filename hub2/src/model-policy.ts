@@ -54,6 +54,7 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   )) return 'carbon_policy_contract_invalid';
 
   if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
+    || account === 'zai-central' && engine !== 'zai' && engine !== 'zcodex'
     || (engine === 'zai' || engine === 'zcodex') && account !== 'zai-central')
     return 'zai_picker_route_forbidden';
   if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
