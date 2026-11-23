@@ -1157,6 +1157,7 @@ function resourceSettings(request: Request, env: Hub2Env, actor: Actor): Respons
 const QUOTA_ACCOUNT_ENGINES: Record<string, string[]> = {
   claude: ['claude'], codex: ['codex'], gemini: ['gemini'],
   grok: ['grok'], copilot: ['copilot'], 'shared-go': ['opencode'], 'go-orin': ['opencode'],
+  'zai-central': ['zcodex'],
 };
 
 /** Bounded, usage-only view of the accounts referenced by the routing policy. */

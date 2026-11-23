@@ -84,7 +84,9 @@ class CentralRouteBootstrapTests(unittest.TestCase):
                 mock.patch.object(nl.provider_home, 'claude_install_available', return_value=False), \
                 mock.patch.object(nl.sys, 'platform', 'win32'):
             available = adapter.capabilities()
-        self.assertEqual(set(available), {'shell', 'go', 'zai'})
+        # The zcodex engine shares the zai route wiring, so the zcodex binary
+        # advertises both engines (GLM route, t3897u).
+        self.assertEqual(set(available), {'shell', 'go', 'zai', 'zcodex'})
         self.assertEqual({'go', 'claude'}.intersection(available), {'go'})
         self.assertNotIn('codex', available)
 

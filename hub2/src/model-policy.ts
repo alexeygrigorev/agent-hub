@@ -8,15 +8,18 @@ export type ModelPolicyRoute = {
   capabilities?: string[];
 };
 
-// Z.ai policy writes keep the deployed shape (only the canonical `zai` engine on
-// zai-central) so a deploy can still prove the previous stored policy restorable.
-const FORBIDDEN_ZAI_ENGINES = new Set(['zcodex', 'goz']);
+// Z.ai policy writes accept two shapes so a deploy can still prove every
+// previously stored policy restorable: the canonical `zai` engine on zai-central,
+// and — since GLM 5.4 (t3897u, 2026-11-23) — the `zcodex` engine on zai-central.
+// Both are illegal on any other account; shared-zai/zcodex stay retired.
+const FORBIDDEN_ZAI_ENGINES = new Set(['goz']);
 const FORBIDDEN_ZAI_ACCOUNTS = new Set(['shared-zai', 'zcodex']);
-// Standing policy: "No zai-central in the Hub picker". Z.ai has no other allowed
-// account (shared-zai/zcodex alias the same central login), so the runtime picker
-// never selects any Z.ai route, even from a stored policy row.
-const PICKER_EXCLUDED_ZAI_ENGINES = new Set(['zai', 'zcodex', 'goz']);
-const PICKER_EXCLUDED_ZAI_ACCOUNTS = new Set(['zai-central', 'shared-zai', 'zcodex']);
+// Standing policy updated for GLM 5.4 (t3897u): the picker may select Z.ai only
+// through the `zcodex` engine on zai-central. Every other Z.ai shape (the bare
+// `zai`/`goz` engines, the retired shared-zai/zcodex accounts, and zai-central on
+// any other engine) stays excluded from the runtime picker.
+const PICKER_EXCLUDED_ZAI_ENGINES = new Set(['zai', 'goz']);
+const PICKER_EXCLUDED_ZAI_ACCOUNTS = new Set(['shared-zai', 'zcodex']);
 const CLAUDE_PICKER_MODELS = new Set(['sonnet', 'opus']);
 const CARBON_POLICY_ID = 'antigravity-carbon-medium';
 const CARBON_MODEL_ID = 'gemini-4-carbon-medium';
@@ -51,7 +54,7 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   )) return 'carbon_policy_contract_invalid';
 
   if (FORBIDDEN_ZAI_ENGINES.has(engine) || FORBIDDEN_ZAI_ACCOUNTS.has(account)
-    || (engine === 'zai' && account !== 'zai-central'))
+    || (engine === 'zai' || engine === 'zcodex') && account !== 'zai-central')
     return 'zai_picker_route_forbidden';
   if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
     return 'go_orin_picker_route_forbidden';
@@ -71,10 +74,14 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
   return null;
 }
 
-/** True when the runtime picker must never select this route. */
+/** True when the runtime picker must never select this route. The GLM 5.4
+ * zcodex route (t3897u) is the only Z.ai shape the picker may choose. */
 export function isPickerExcludedZaiRoute(candidate: Pick<ModelPolicyRoute, 'engine' | 'account_id'>): boolean {
-  return PICKER_EXCLUDED_ZAI_ENGINES.has(candidate.engine.toLowerCase())
-    || PICKER_EXCLUDED_ZAI_ACCOUNTS.has(candidate.account_id.toLowerCase());
+  const engine = candidate.engine.toLowerCase();
+  const account = candidate.account_id.toLowerCase();
+  return PICKER_EXCLUDED_ZAI_ENGINES.has(engine)
+    || PICKER_EXCLUDED_ZAI_ACCOUNTS.has(account)
+    || account === 'zai-central' && engine !== 'zcodex';
 }
 
 /** Runtime picker eligibility: valid policy data and not an excluded Z.ai route. */
@@ -123,7 +130,7 @@ const NON_LUNA_MODEL_NAMES = new Set([
   "astra","beam-free","claude-fable-5-2","deepseek-flash",
   "deepseek-v4-pro","fable","gemini-4-argon-contributor","gemini-4-argon-medium",
   "gemini-4-carbon-medium","gemini-4-hydrogen-medium","gemini-4-neon-high","gemini-4-neon-low","gemini-4-neon-medium","gemini-4-neon-xhigh","gemini-pro-orchestrator-neon","glm-5-2","glm-5-3",
-  "glm-5-3-flash","glm-5.3-flash","glm-flash","glm-flash-zcodex",
+  "glm-5-3-flash","glm-5.3-flash","glm-5.4","glm-flash","glm-flash-zcodex",
   "gpt-6-astra","gpt-6.1-sol","grok","grok-4-7",
   "grok-4.6","hy3","hy4-preview","kimi-k2-7-code",
   "kimi-k3","longcat-2-0","mimo-v2-5","mimo-v2-5-pro",

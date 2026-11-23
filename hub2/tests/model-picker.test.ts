@@ -48,7 +48,7 @@ const candidates=[
  {id:'astra-high',engine:'codex',model:'gpt-6-astra',effort:'max',account_id:'codex',weight:100,capabilities:[],enabled:true},
  {id:'argon-high',engine:'gemini',model:'gemini-4-argon',effort:'max',account_id:'gemini',weight:100,capabilities:[],enabled:true},
  {id:'luna-medium',engine:'codex',model:'gpt-6-luna',effort:'medium',account_id:'codex',weight:100,capabilities:[],enabled:true},
- {id:'zai-central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:100,capabilities:[],enabled:true},
+ {id:'zai-central',engine:'zai',model:'glm-flash',account_id:'zai-central',weight:100,capabilities:[],enabled:true},
  {id:'haiku',engine:'claude',model:'haiku',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
  {id:'claude-sonnet-high',engine:'claude',model:'sonnet',effort:'max',account_id:'claude',weight:100,capabilities:[],enabled:true},
  {id:'claude-fable-5-2',engine:'claude',model:'fable',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
@@ -712,18 +712,40 @@ test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon 
 });
 
 
-test('No zai-central in the Hub picker: committed policy has no Z.ai route and stored zai-central rows are never selectable', () => {
- assert(!hydrogenPolicy.candidates.some((row:any)=>row.engine==='zai'||row.account_id==='zai-central'));
- // hydrogenFixture still carries a zai-central row with a huge weight, a healthy account and an advertised zai engine.
+test('Every Z.ai shape except the committed GLM 5.4 zcodex route stays out of the picker', () => {
+ assert(hydrogenPolicy.candidates.filter((row:any)=>['zai','goz'].includes(row.engine)||['shared-zai','zcodex'].includes(row.account_id)).length===0);
+ const glm54=hydrogenPolicy.candidates.find((row:any)=>row.account_id==='zai-central');
+ assert.deepEqual([glm54.id,glm54.engine,glm54.model,glm54.effort],['glm-flash-zcodex','zcodex','glm-5.4','medium']);
+ // hydrogenFixture still carries a zai-engine zai-central row with a huge weight, a healthy account and an advertised zai engine.
  const snapshot=hydrogenFixture();
  snapshot.machines.get('h1')!.capabilities!.push('effort:zai');
  for(const purpose of [undefined,'fix','implement','review','think'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily','deep']){
   const result=buildRoutingPool(snapshot,{interactive,purpose,tier});
-  assert(!result.options.some(row=>row.value.engine==='zai'||row.value.account_id==='zai-central'));
+  assert(!result.options.some(row=>row.value.engine==='zai'||row.value.engine==='goz'||['shared-zai','zcodex'].includes(row.value.account_id)));
+  // The committed zcodex candidate is only pooled where a host advertises the engine.
+  assert(result.options.every(row=>row.value.engine!=='zcodex'));
  }
  for(const input of [{engine:'zai'},{model:'glm-5.3-flash'},{model:'zai-glm-flash'},{engine:'zai',model:'glm-5.3-flash',effort:'medium'}]){
   assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,...input}),(e:any)=>e.code==='model_policy_unavailable',JSON.stringify(input));
  }
+});
+
+test('the GLM 5.4 zcodex route is selectable: ordinary, pinned engine and pinned model', () => {
+ const snapshot=hydrogenFixture();
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude','antigravity','go','zcodex'],
+  capabilities:['headless','interactive','effort:codex','effort:claude','effort:antigravity','effort:zcodex']});
+ // Ordinary default pool carries the medium-effort GLM 5.4 route next to the others.
+ const ordinary=buildRoutingPool(snapshot,{interactive:false});
+ const glm54=ordinary.options.filter(row=>row.value.engine==='zcodex');
+ assert.equal(glm54.length,1);
+ assert.deepEqual([glm54[0].value.policy_id,glm54[0].value.model,glm54[0].value.account_id],['glm-flash-zcodex','glm-5.4','zai-central']);
+ // Explicit --engine zcodex pins the route even without other surviving candidates.
+ const pinned=buildRoutingPool(snapshot,{interactive:false,engine:'zcodex'});
+ assert.deepEqual(pinned.options.map(row=>row.value.model),['glm-5.4']);
+ const byModel=buildRoutingPool(snapshot,{interactive:false,model:'glm-5.4'});
+ assert.equal(byModel.options[0].value.policy_id,'glm-flash-zcodex');
+ const byId=buildRoutingPool(snapshot,{interactive:false,model:'glm-flash-zcodex'});
+ assert.equal(byId.options[0].value.model,'glm-5.4');
 });
 
 // ---- Codex reserve (AGENTS.md quota gate): fresh known quota strictly above 15%, fail closed ----

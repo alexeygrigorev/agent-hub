@@ -70,7 +70,9 @@ PROVIDER_BINARIES = {"zai": "zcodex", "codex": "codex", "go": "opencode", "claud
 FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex", "antigravity"}
 # Central account delivery supports these providers in providers.provision().
 # No local profile or account association: the picked account is validated there.
+# The zcodex engine (native GLM route, t3897u) shares the zai provider wiring.
 CENTRAL_ROUTES = {provider: {"provider": provider} for provider in ("codex", "claude", "go", "zai")}
+CENTRAL_ROUTES["zcodex"] = {"provider": "zai"}
 
 LOCAL_ROUTES = {
     # Local Codex runs the host's own native login through the maintained
@@ -82,6 +84,7 @@ LOCAL_ROUTES = {
     "codex": {"provider": "codex", "engine": "codex"},
     "go": {"provider": "go", "profile": "hub-shared-go"},
     "zai": {"provider": "zai", "profile": "hub-zai-central"},
+    "zcodex": {"provider": "zai", "profile": "hub-zai-central"},
     "claude": {"provider": "claude", "engine": "claude"},
     "antigravity": {"provider": "antigravity", "profile": "hub-hub-antigravity"},
 }

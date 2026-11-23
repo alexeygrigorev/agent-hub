@@ -138,11 +138,14 @@ test('1000 simulated draws use one passive observation set and the committed ord
  assert.ok(result.pool.every(row=>Math.abs(row.share-1/6)<1e-12));
  for(const kind of ['accounts','machines']){
   const rows=f.calls.filter(call=>call.kind===kind);
-  assert.equal(rows.length,kind==='accounts'?4:1);
+  // Five accounts: the four legacy routes plus the committed zai-central route.
+  assert.equal(rows.length,kind==='accounts'?5:1);
   assert.ok(rows.every(call=>call.path==='/_internal/routing-snapshot'&&call.method==='GET'));
  }
  assert.equal(result.advisories.filter(row=>row.reason==='local_login_unverified').length,result.pool.length);
  assert.equal(result.advisories.filter(row=>row.reason==='capability_not_advertised').length,result.pool.length);
+ // The committed GLM 5.4 zcodex route stays out of the h1 pool (no zcodex engine, unusable credential).
+ assert.deepEqual(result.excluded.map(row=>[row.policy_id,row.reason]),[['glm-flash-zcodex','credential_missing']]);
  assert.ok(result.advisories.every(row=>['local_login_unverified','capability_not_advertised'].includes(row.reason)));
 });
 
@@ -193,8 +196,10 @@ test('local hint on another host never blesses a pinned host and duplicate hosts
 test('unhealthy observations retained by soft fallback are advisories, never claimed exclusions',async()=>{
  const f=fixture();f.machines.get('h1').capabilities=[];
  const {diagnostics}=buildRoutingPool(await loadRoutingSnapshot(f.env,{interactive:false},true),{interactive:false});
- assert.deepEqual(diagnostics.excluded,[]);
- assert.equal(diagnostics.advisories.filter(row=>row.reason==='credential_missing').length,diagnostics.pool.length);
+ // Only the committed zcodex route is a claimed exclusion: no host advertises its engine
+ // while the six legacy routes survive, so the soft fallback never applies to it.
+ assert.deepEqual(diagnostics.excluded.map(row=>[row.policy_id,row.reason]),[['glm-flash-zcodex','engine_not_advertised']]);
+ assert.equal(diagnostics.advisories.filter(row=>row.reason==='credential_missing').length,diagnostics.pool.length+1);
  assert.equal(diagnostics.advisories.filter(row=>row.reason==='capability_not_advertised').length,diagnostics.pool.length);
  assert.ok(diagnostics.advisories.every(row=>['credential_missing','capability_not_advertised'].includes(row.reason)));
  const only=f.state.policies.filter((row:any)=>row.id==='codex-luna-max');f.state.policies=only;
@@ -217,16 +222,19 @@ test('legacy monitor retains all-bad credential diagnostics while passive simula
  const post=()=>worker.fetch(new Request('https://hub.test/api/model-picker/pick',{method:'POST',
   headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({})}),f.env);
  const failed=await post(),old=await failed.json() as any;
- assert.equal(failed.status,200);assert.equal(old.excluded.length,old.pool.length);
- assert.ok(old.excluded.every((row:any)=>row.reason==='credential_missing'));
+ assert.equal(failed.status,200);
+ // The legacy monitor claims every all-bad-credential route as an exclusion,
+ // plus the committed zcodex route whose credential is equally unusable.
+ assert.equal(old.excluded.filter((row:any)=>row.reason==='credential_missing').length,old.pool.length+1);
+ assert.ok(old.excluded.some((row:any)=>row.policy_id==='glm-flash-zcodex'));
  const passive=await (await f.get('?n=1')).json() as any;
- assert.deepEqual(passive.excluded,[]);
- assert.equal(passive.advisories.filter((row:any)=>row.reason==='credential_missing').length,passive.pool.length);
+ assert.deepEqual(passive.excluded.map((row:any)=>[row.policy_id,row.reason]),[['glm-flash-zcodex','engine_not_advertised']]);
+ assert.equal(passive.advisories.filter((row:any)=>row.reason==='credential_missing').length,passive.pool.length+1);
  assert.equal(passive.advisories.filter((row:any)=>row.reason==='capability_not_advertised').length,passive.pool.length);
  assert.ok(passive.advisories.every((row:any)=>['credential_missing','capability_not_advertised'].includes(row.reason)));
  f.machines.get('h1').capabilities=flags();
  const local=await (await post()).json() as any;
- assert.deepEqual(local.excluded,[],'configured host-owned logins are not reported as central credential failures');
+ assert.deepEqual(local.excluded.map((row:any)=>[row.policy_id,row.reason]),[['glm-flash-zcodex','credential_missing']]);
  assert.equal(local.advisories.filter((row:any)=>row.reason==='local_login_unverified').length,local.pool.length);
  assert.equal(local.advisories.filter((row:any)=>row.reason==='capability_not_advertised').length,local.pool.length);
  assert.ok(local.advisories.every((row:any)=>['local_login_unverified','capability_not_advertised'].includes(row.reason)));
