@@ -18,7 +18,7 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, isFastStartRefusal, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
@@ -53,7 +53,7 @@ const COMPLETION_ELIGIBLE = `(i.status IN ('open','failed','completed-awaiting-r
 // completed (which also adopts intakes that failed before this loop existed).
 const FIRST_RETRY_DELAY_MS = 60_000;
 const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id, i.final_evidence_json, i.updated_at,
-    s.updated_at AS saga_updated_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
+    s.updated_at AS saga_updated_at, s.created_at AS saga_created_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
     COALESCE(json_extract(i.final_evidence_json,'$.auto_retry.next_action_at'), s.updated_at + ${FIRST_RETRY_DELAY_MS}) AS retry_due
   FROM intakes i JOIN dispatch_sagas s ON s.session_id=i.session_id AND s.intake_id=i.id AND s.state='complete'
   WHERE i.status='failed' AND i.schedule_id IS NULL AND i.route_registered=1
@@ -67,7 +67,7 @@ const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id,
 const FAILED_RETRY_DUE = `SELECT * FROM (${FAILED_RETRY_CANDIDATES}) ORDER BY retry_due, updated_at, id LIMIT 8`;
 type FailedRetryRow = {
   id: string; project: string; status: string; session_id: string; final_evidence_json: string | null; updated_at: number;
-  saga_updated_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
+  saga_updated_at: number; saga_created_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
 };
 
 const SCHEMA = [
@@ -1638,6 +1638,8 @@ export class ProjectDO {
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
         stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(preflight?{failure_reason:preflight}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
       if(preflight)this.engineUnhealthyAlert(intake.id,saga,preflight,now);
+      else if(!launchFailed&&!stopRequested&&!deadlineExceeded&&isFastStartRefusal(body.exit_code,saga.created_at,now))
+        this.engineUnhealthyAlert(intake.id,saga,'native_exit_75',now);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -2067,7 +2069,10 @@ export class ProjectDO {
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
       // An engine that failed its preflight check is never pinned again: keep
       // the machine (the workspace lives there) and repick without that route.
-      const repick=ENGINE_PREFLIGHT_FAILURES.has(record.reason)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const span=record.reason==='native_exit_75'?this.db.one<{created_at:number;updated_at:number}>(
+        'SELECT created_at,updated_at FROM dispatch_sagas WHERE operation_id=?',previousSaga.operation_id):undefined;
+      const startRefused=!!span&&isFastStartRefusal(75,span.created_at,span.updated_at);
+      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
       const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
         ...(repick?{exclude_policy_ids:[String(route!.policy_id)]}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
         interactive:launch.interactive===true,with_goal:launch.with_goal===true,
@@ -2295,9 +2300,16 @@ export class ProjectDO {
     if(!fixed)return;
     // The first retry keeps the failed attempt's route (the picker may still
     // move machines); a second retry falls back to another routing policy,
-    // which cannot also pin that policy's engine and model.
-    const preflight=ENGINE_PREFLIGHT_FAILURES.has(String(((this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{}).failure_reason));
-    const routeFallback=(depth>0||preflight)&&typeof route.policy_id==='string';
+    // which cannot also pin that policy's engine and model. An engine that never
+    // started work (typed preflight failure, launch refusal, or launcher exit 75
+    // within FAST_START_FAILURE_MS such as the Codex quota gate refusing a dead
+    // credential) is never re-pinned: fail over on the first retry instead.
+    const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+    const preflight=ENGINE_PREFLIGHT_FAILURES.has(String(evidence.failure_reason));
+    // Only engine start faults: a workspace/request refusal keeps the pinned route.
+    const fastFailure=reason!=='deadline_exceeded'&&(evidence.launch_failed===true&&evidence.failure_reason==='host_operation_failed'
+      ||isFastStartRefusal(evidence.exit_code,row.saga_created_at,row.saga_updated_at));
+    const routeFallback=(depth>0||preflight||fastFailure)&&typeof route.policy_id==='string';
     const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
       ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
       interactive:launch.interactive===true,with_goal:launch.with_goal===true,
@@ -2326,7 +2338,12 @@ export class ProjectDO {
       :{state:'retry',reason:'retry_start_uncertain'};}
     if(outcome.state==='started'){
       this.transaction(()=>this.appendEvent(row.id,`retry:${row.saga_operation_id}:${attempt}`,RETRY_ACTOR,'task_retry_started',
-        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:depth>0},Date.now()));
+        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:routeFallback,
+          ...(fastFailure?{fast_failure:true,failed_policy_id:typeof route.policy_id==='string'?route.policy_id:null,
+            failed_machine_id:row.saga_machine_id}:{})},Date.now()));
+      if(fastFailure)console.error('[hub2] INTAKE_ROUTE_FAILOVER',JSON.stringify({intake_id:row.id,previous_session_id:sagaSession,
+        session_id:outcome.session_id??null,failed_policy_id:route.policy_id??null,failed_machine_id:row.saga_machine_id,
+        exit_code:Number.isInteger(evidence.exit_code)?evidence.exit_code:null,reason}));
       return;
     }
     if(outcome.state==='superseded'){

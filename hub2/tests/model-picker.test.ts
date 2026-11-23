@@ -1118,7 +1118,7 @@ from agent_hub_host.agent import Bridge
 from agent_hub_host.native_launch import NativeLauncher
 from agent_hub_host.advertisement import Advertisement
 bridge=Bridge.__new__(Bridge);bridge.roots=[];bridge.engines={'codex','zai'}
-bridge.launcher=NativeLauncher({'private_provider_homes':False})
+bridge.launcher=NativeLauncher({'private_provider_homes':False,'routes':{'codex':{'provider':'codex','profile':'hub-shared-codex'}}})
 bridge.publish_managed_readiness=lambda:None
 published=[]
 bridge.client=types.SimpleNamespace(heartbeat=lambda labels,engines,capabilities:published.append({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities}))

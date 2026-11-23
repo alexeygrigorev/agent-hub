@@ -352,6 +352,15 @@ test('host launch refusal terminally fails an unclaimed offer with a visible rea
  assert.equal(f.events.at(-1)?.body.epoch,epoch);assert.equal(f.events.at(-1)?.body.reason,'host_launch_refused');
  assert.equal(f.events.at(-1)?.body.failure_reason,'workspace_label_unavailable');
  assert.equal(f.events.at(-1)?.body.launch_failed,true);
+ // A workspace/request refusal is not an engine fault: the engine stays routable.
+ assert.equal((await (await f.call('/_internal/routing')).json() as any).unhealthy_engines,undefined);
+ // An untyped host launch failure marks the engine unhealthy on this machine.
+ const other='untyped-host-failure',otherEpoch=await startOffered(f,other);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:other,
+  operation_id:'op-'+other,epoch:otherEpoch,stage:'host_launch',reason:'opaque_untyped_failure'}));
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(other) as any).reason,'host_operation_failed');
+ const unhealthy=(await (await f.call('/_internal/routing')).json() as any).unhealthy_engines;
+ assert.deepEqual(unhealthy?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','host_operation_failed',other]]);
 });
 
 test('running antigravity first-run block raises named attention and fails finish loudly',async()=>{
@@ -2052,4 +2061,31 @@ test('ordinary send terminal error event rejects legacy loose fields stale epoch
   assert.deepEqual(q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id),stopped);
   assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(q.sender) as any).state,'stopped');
  }finally{q.f.database.close();}
+});
+
+test('a launcher exit 75 within seconds marks the engine unhealthy on the machine; an ordinary task exit does not',async()=>{
+ const errors:string[]=[],original=console.error;
+ console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
+ try{
+  for(const [exit,expected] of [[1,false],[75,true]] as const){
+   const f=fixture(),session='fast-exit-'+exit,epoch=await startOffered(f,session);
+   const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'c-'+exit}),send:()=>{}};
+   f.sockets.push(socket);
+   const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/enrolled/relay'};
+   await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+   const native='11111111-2222-4333-8444-55555555555'+exit;
+   assert.equal((await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:native})).status,201);
+   const admission=f.database.prepare('SELECT observed_at FROM launch_admissions WHERE operation_id=?').get('op-'+session) as any;
+   const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:exit,native_exit_confirmed:true,evidence:{
+    source:'aplexer_status',native_identity:{id:native,tag:'task-hub2-'+session,workspace:binding.resolved_workspace},
+    containment_empty:true,native_exit:{code:exit,exited_at_ms:Date.now()},native_deadline:{deadline_ms:admission.observed_at+1800_000,exceeded:false}}};
+   assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,201);
+   const view=await (await f.call('/_internal/routing')).json() as any;
+   if(expected){
+    assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','native_exit_75',session]]);
+    assert.ok(view.unhealthy_engines[0].until>Date.now()+29*60_000);
+    assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes('native_exit_75')),errors.join('\n'));
+   }else assert.equal(view.unhealthy_engines,undefined,JSON.stringify(view.unhealthy_engines));
+  }
+ }finally{console.error=original;}
 });

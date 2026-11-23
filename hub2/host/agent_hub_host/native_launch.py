@@ -73,7 +73,13 @@ FIRST_ACTION_PROVIDERS = {"zai", "go", "claude", "codex", "antigravity"}
 CENTRAL_ROUTES = {provider: {"provider": provider} for provider in ("codex", "claude", "go", "zai")}
 
 LOCAL_ROUTES = {
-    "codex": {"provider": "codex", "profile": "hub-shared-codex"},
+    # Local Codex runs the host's own native login through the maintained
+    # quota wrapper, exactly like local interactive Codex. The legacy
+    # `hub-shared-codex` profile used a Hub1 managed home whose credential no
+    # Hub2 component refreshes: once its access token expired, every headless
+    # start failed the wrapper's quota gate (401) with exit 75 within seconds.
+    # An explicitly configured profile route keeps the profile path.
+    "codex": {"provider": "codex", "engine": "codex"},
     "go": {"provider": "go", "profile": "hub-shared-go"},
     "zai": {"provider": "zai", "profile": "hub-zai-central"},
     "claude": {"provider": "claude", "engine": "claude"},
@@ -831,11 +837,9 @@ class NativeLauncher:
     def __init__(self, configuration, runner=subprocess.run, aplexer="a", journal=None):
         self.config = {**configuration}
         if not self.config.get("private_provider_homes", False):
+            # Local enrollment means the user's native login for Codex on every
+            # platform; the legacy managed profile has a separate, stale home.
             defaults = {**LOCAL_ROUTES}
-            if sys.platform == 'win32':
-                # Local Windows enrollment means the user's native login. The
-                # legacy managed profile has a separate, potentially stale home.
-                defaults['codex'] = {'provider': 'codex', 'engine': 'codex'}
             self.config["routes"] = {**defaults, **{
                 engine: {**defaults.get(engine, defaults.get(route.get("provider"), {})), **route}
                 for engine, route in configuration.get("routes", {}).items()
@@ -1303,8 +1307,10 @@ class NativeLauncher:
             goal += FIRST_ACTION_INSTRUCTION.format(path=fa_path)
         if provider != 'shell':
             goal = aplexer_prompt(goal)
-        windows_native_codex = sys.platform == 'win32' and provider == 'codex' and not route.get('profile')
-        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive") and not windows_native_codex)
+        # Native-login Codex (no profile) always takes the direct adapter path:
+        # on Linux the verified wrapper replaces the SDK executable below.
+        native_codex = provider == 'codex' and not route.get('profile')
+        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive") and not native_codex)
         if local:
             if codex_wrapper and not self.codex_exec_readiness(route, codex_wrapper):
                 raise RuntimeError('codex_launch_wrapper_unavailable')
