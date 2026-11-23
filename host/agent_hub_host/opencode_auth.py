@@ -44,12 +44,13 @@ class AuthCheckUnavailable(ValueError):
 
     def __init__(self, step='native_check', failure='check_failed', *, exit_code=None,
                  timeout_s=None):
-        self.step = step if step in {'auth_export', 'auth_import', 'auth_list', 'model_list',
-                                     'native_check'} else 'native_check'
+        self.step = step if step in {'auth_export', 'auth_import', 'auth_switch', 'auth_list',
+                                     'model_list', 'native_check'} else 'native_check'
         self.failure = failure if failure in {'nonzero_exit', 'timeout', 'invalid_json',
                                              'invalid_response', 'output_too_large',
                                              'spawn_error', 'unexpected_failure',
-                                             'auth_rejected', 'missing_login'} else 'check_failed'
+                                             'auth_rejected', 'missing_login',
+                                             'model_unavailable', 'connection_mismatch'} else 'check_failed'
         self.exit_code = exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else None
         self.timeout_s = timeout_s if type(timeout_s) is int and 1 <= timeout_s <= 300 else None
         detail = f'engine_auth_check_unavailable: {self.step} {self.failure}'
@@ -74,7 +75,8 @@ class AuthExpired(ValueError):
 
     def __init__(self, reason='device_login_unavailable', *, step='auth_export', exit_code=None):
         self.reason = reason if reason in {'missing_device_login', 'refresh_rejected'} else 'device_login_unavailable'
-        self.step = step if step in {'auth_export', 'auth_import', 'auth_list', 'model_list'} else 'auth_export'
+        self.step = step if step in {'auth_export', 'auth_import', 'auth_switch', 'auth_list',
+                                     'model_list'} else 'auth_export'
         self.exit_code = exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else None
         host = socket.gethostname() or 'unknown host'
         super().__init__(f'engine_auth_expired: OpenCode device login is unavailable; '
@@ -183,6 +185,8 @@ def _native_step(args):
         return 'auth_export'
     if args[:2] == ['auth', 'import']:
         return 'auth_import'
+    if args[:2] == ['auth', 'switch']:
+        return 'auth_switch'
     if args[:2] == ['auth', 'list']:
         return 'auth_list'
     if args[:2] == ['api', 'model.list']:
@@ -323,7 +327,7 @@ def _native(cfg, args, env, payload=None):
             else:
                 error_raw = b''
         if not proc.returncode:
-            if step == 'auth_import':
+            if step in {'auth_import', 'auth_switch'}:
                 return None
             try:
                 if not raw.strip():
@@ -544,6 +548,13 @@ def prepare(cfg, *, native=None):
 
             def import_source():
                 run_native(['auth', 'import'], env, json.dumps(active).encode())
+                # Import adds the source credential but keeps the target's
+                # previously active one. Once the source rotated to a new login,
+                # that old target credential was revoked ("OpencodeConsole.
+                # SignedOut"), opencode-go vanished from model.list, and every
+                # re-import kept it active. Select the source's credential.
+                if isinstance(active[0].get('id'), str) and active[0]['id']:
+                    run_native(['auth', 'switch', 'opencode', active[0]['id']], env)
                 private_fs.atomic_write(receipt, json.dumps({'digest': digest}).encode(), 1024)
 
             def verify_target():
@@ -560,7 +571,7 @@ def prepare(cfg, *, native=None):
                     connections.extend((row.get('id'), item.get('method')) for item in items)
                 if not connections or any(i != 'opencode' or method != 'oauth'
                                           for i, method in connections):
-                    raise _StaleTargetStore('auth_list')
+                    raise _StaleTargetStore('auth_list', 'connection_mismatch')
 
                 models = run_native(['api', 'model.list'], env)
                 if (not isinstance(models, dict) or not isinstance(models.get('data'), list)
@@ -569,7 +580,7 @@ def prepare(cfg, *, native=None):
                 if not any(row.get('providerID') == 'opencode-go'
                            and row.get('id') == MODEL.split('/', 1)[1]
                            and row.get('enabled') is True for row in models['data']):
-                    raise _StaleTargetStore('model_list')
+                    raise _StaleTargetStore('model_list', 'model_unavailable')
 
             def repair_target_store(stale):
                 _report_target_reimport(stale)

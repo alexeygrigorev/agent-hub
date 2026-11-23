@@ -369,10 +369,18 @@ export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker |
   return { cause, detail: clip(detail || 'no detail given', 600), ...(next ? { next_step: clip(next, 400) } : {}) };
 }
 
+/** Host-typed engine auth/preflight refusals: the engine never started work,
+ * so Hub marks it unhealthy on that machine and repicks (intake 62ccfa1e). */
+export const ENGINE_PREFLIGHT_FAILURES: ReadonlySet<string> = new Set(['engine_auth_check_unavailable', 'engine_auth_expired']);
+/** How long a preflight-failed engine stays out of the picker on its machine. */
+export const ENGINE_UNHEALTHY_MS = 30 * 60_000;
+
 const REASON_TEXT: Record<string, string> = {
   exit_without_completion_claim: 'the session exited on its own without a completion record',
   deadline_exceeded: 'the session was killed at its deadline',
   launch_failed: 'the session failed to launch',
+  engine_auth_check_unavailable: 'the engine failed its authentication check before starting; Hub repicks another engine',
+  engine_auth_expired: 'the engine login expired before starting; Hub repicks another engine',
 };
 
 /** One human-readable cause for an unfinished exit: the session's blocker

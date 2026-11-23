@@ -18,7 +18,7 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  BLOCKED_WAIT_MS, COMPLETION_ACTOR, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
@@ -750,10 +750,12 @@ export class ProjectDO {
     if(body.verification_round!==undefined&&verificationRound===undefined)return error('verification_start_stale',409);
     let verificationPrevious:SagaRow|undefined,verificationOriginal:SagaRow|undefined;
     const retryStart=actor?.id===RETRY_ACTOR;
+    // A Hub continuation excludes the route whose engine failed its preflight check.
+    const fallbackStart=retryStart||actor?.id===COMPLETION_ACTOR;
     let excludedPolicyIds:string[]=[];
     const rawExclude=body.exclude_policy_ids;
     if(rawExclude!==undefined){
-      if(actor?.id!==VERIFICATION_ACTOR&&!retryStart)return error('exclude_policy_forbidden',403,'only Hub verifier and retry starts may exclude routing policies');
+      if(actor?.id!==VERIFICATION_ACTOR&&!fallbackStart)return error('exclude_policy_forbidden',403,'only Hub verifier, retry and continuation starts may exclude routing policies');
       if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_policy_exclusions',400);
       excludedPolicyIds=[...new Set(rawExclude as string[])];
     }
@@ -852,7 +854,7 @@ export class ProjectDO {
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
         verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
-      ...(retryStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
+      ...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
       ...(excludedMachineIds?{exclude_machine_ids:excludedMachineIds}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
@@ -925,7 +927,7 @@ export class ProjectDO {
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
           ...(verificationOf!==undefined?{exclude_policy_ids:excludedPolicyIds}:{}),
-          ...(retryStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
+          ...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
           ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
@@ -1580,6 +1582,10 @@ export class ProjectDO {
     const nativeDeadline = evidence.native_deadline as JsonRecord | undefined;
     const deadlineExceeded = nativeDeadline?.exceeded === true;
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
+    // The host names an engine that refused to start on its auth/preflight
+    // check; recovery must repick instead of retrying that engine (intake 62ccfa1e).
+    const preflight = !launchFailed && typeof body.failure_reason === 'string' && ENGINE_PREFLIGHT_FAILURES.has(body.failure_reason)
+      ? body.failure_reason : undefined;
     const duplicate=this.transaction(() => {
       this.pinWorkspaceBinding(saga,binding);
       const currentSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
@@ -1623,14 +1629,15 @@ export class ProjectDO {
           const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
           status=claim?'completed-awaiting-review':'failed';
           completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-            :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed&&!stopRequested,true,now);
+            :preflight??(body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code)),!launchFailed&&!stopRequested,true,now);
         }
       }
       // An uncontrolled failed exit is Hub's own retry candidate: schedule its
       // first (or next, after a Hub retry) bounded attempt with backoff.
       const retryable=status==='failed'&&!completion;
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
-        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
+        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(preflight?{failure_reason:preflight}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
+      if(preflight)this.engineUnhealthyAlert(intake.id,saga,preflight,now);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -1974,6 +1981,16 @@ export class ProjectDO {
     });return json({recorded:true});
   }
 
+  /** Fail loudly (t1801u): an engine refused to start on its auth/preflight
+   * check. Its machine marked it unhealthy; the recovery start repicks. */
+  private engineUnhealthyAlert(intakeId:string,saga:SagaRow,reason:string,now:number):void{
+    const launch=(this.parse(saga.launch_spec_json) as JsonRecord|null)??{},route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'engine_unhealthy',reason,session_id:saga.session_id,machine_id:saga.machine_id,
+      engine:launch.engine??null,model:launch.model??null,policy_id:route.policy_id??null};
+    this.appendEvent(intakeId,'engine-unhealthy:'+saga.operation_id,COMPLETION_ACTOR,'engine_preflight_failed',alert,now);
+    console.error('[hub2] ENGINE_PREFLIGHT_FAILED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
+  }
+
   private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker},receiptKey?:string):void{
     const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS,
       ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{})};
@@ -2048,8 +2065,12 @@ export class ProjectDO {
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
-      const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
-        ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+      // An engine that failed its preflight check is never pinned again: keep
+      // the machine (the workspace lives there) and repick without that route.
+      const repick=ENGINE_PREFLIGHT_FAILURES.has(record.reason)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
+        ...(repick?{exclude_policy_ids:[String(route!.policy_id)]}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+        interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
@@ -2275,7 +2296,8 @@ export class ProjectDO {
     // The first retry keeps the failed attempt's route (the picker may still
     // move machines); a second retry falls back to another routing policy,
     // which cannot also pin that policy's engine and model.
-    const routeFallback=depth>0&&typeof route.policy_id==='string';
+    const preflight=ENGINE_PREFLIGHT_FAILURES.has(String(((this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{}).failure_reason));
+    const routeFallback=(depth>0||preflight)&&typeof route.policy_id==='string';
     const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
       ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
       interactive:launch.interactive===true,with_goal:launch.with_goal===true,

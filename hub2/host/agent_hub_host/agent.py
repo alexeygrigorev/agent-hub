@@ -201,6 +201,8 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'credentials_unavailable': 'Provider credential preparation was refused.',
  'duplicate_receipt_field': 'Launch preparation was refused.',
  'duplicate_terminal_field': 'Launch preparation was refused.',
+ 'engine_auth_check_unavailable': 'Engine authentication check failed before the session started.',
+ 'engine_auth_expired': 'Engine login expired before the session started.',
  'engine_not_allowed': 'Engine is not allowed.',
  'generation_conflict': 'Provider credential preparation was refused.',
  'glm_model_route_refused': 'Launch preparation was refused.',
@@ -335,6 +337,30 @@ HOST_FAILURE_FACTS = {
     'reason': re.compile(r'[a-z][a-z_]{0,39}'),
     'status': re.compile(r'[a-z][a-z_]{0,39}'),
 }
+
+
+# Fixed JSON lines the managed engine bootstrap prints before it refuses to
+# start an engine (agent_hub_host.opencode_auth). Their reason codes only.
+ENGINE_PREFLIGHT_EVENTS = {'opencode_auth_check_unavailable': 'engine_auth_check_unavailable',
+                           'opencode_auth_expired': 'engine_auth_expired'}
+
+
+def engine_preflight_failure(output):
+    """Typed engine auth/preflight refusal from a task's stdout, else None.
+
+    Only a whole line that is exactly one bootstrap event object counts; the
+    line's other fields are never forwarded."""
+    for line in reversed((output or '').splitlines()[-64:]):
+        line = line.strip()
+        if not line.startswith('{"event"'):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get('event') in ENGINE_PREFLIGHT_EVENTS:
+            return ENGINE_PREFLIGHT_EVENTS[value['event']]
+    return None
 
 
 def closed_host_failure(error, fallback="host_operation_failed"):
@@ -1134,6 +1160,8 @@ class Bridge:
                 payload['evidence']['native_deadline']={'deadline_ms':native['deadline_ms'],'exceeded':native.get('deadline_exceeded') is True}
             if row['state']=='aborting':payload['launch_failed']=True
             runtime_failure = getattr(self, '_runtime_failure_reasons', {}).get((row['operation_id'], row['epoch']))
+            if runtime_failure is None and code != 0 and workspace_available:
+                runtime_failure = self._engine_preflight_refusal(row)
             if runtime_failure in HOST_FAILURE_DETAILS:
                 payload['failure_reason'] = runtime_failure
                 payload['detail'] = HOST_FAILURE_DETAILS[runtime_failure]
@@ -1163,6 +1191,37 @@ class Bridge:
                 self.journal.db.execute("INSERT OR REPLACE INTO outbox VALUES(?,?,?)",
                                        (f'finish:{row["operation_id"]}', f'/api/sessions/{row["session_id"]}/finish', canonical(payload)))
             getattr(self, '_runtime_failure_reasons', {}).pop((row['operation_id'], row['epoch']), None)
+
+    def _engine_preflight_refusal(self, row):
+        """An engine that refused to start on its auth/preflight check (intake 62ccfa1e).
+
+        Hub retried the same broken engine because this exit looked like any
+        other nonzero exit. Name it, so Hub marks the engine unhealthy on this
+        machine and repicks. A worker that already proved it was live is a
+        real session, never a preflight refusal."""
+        try:
+            if (Path(row['workspace']) / '.local' / f"first-action-hub2-{row['session_id']}.json").exists():
+                return None
+            from .task_output import capture_task_output
+            reason = engine_preflight_failure(capture_task_output(
+                'hub2-' + row['session_id'], row, row['native_id'], 16384, retained_only=True))
+        except (RuntimeError, ValueError, OSError):
+            return None
+        if reason is None:
+            return None
+        detail = HOST_FAILURE_DETAILS[reason]
+        logging.getLogger(__name__).error(
+            'ENGINE PREFLIGHT FAILED session=%s operation=%s stage=host_runtime reason=%s detail=%s',
+            row['session_id'], row['operation_id'], reason, detail)
+        socket = getattr(self, '_managed_socket', None)
+        if socket is not None:
+            try:
+                socket.send(canonical({'type': 'host.error', 'session_id': row['session_id'],
+                                       'operation_id': row['operation_id'], 'epoch': row['epoch'],
+                                       'stage': 'host_runtime', 'reason': reason, 'detail': detail}))
+            except Exception:
+                pass
+        return reason
 
     def _is_antigravity_native(self, native):
         if not isinstance(native, dict):
