@@ -675,6 +675,19 @@ jobs:
             gh issue create --repo "$REPO" --title "$title" --assignee "$OWNER" --body "$body"
           fi
           echo "::error title=Hub2 auto-deploy failed::main $DEPLOY_SHA is not deployed; deploy owner $OWNER alerted via issue"
+      # Intake e19faefa: a rerun or a later merge that deploys cleanly used to
+      # leave the failure issue open. Runs after the alert step so a problem here
+      # never posts a false deploy-failed alert, and never turns a live deploy
+      # into a failed run: the open issue stays as the signal.
+      - name: Close the auto-opened failure issue once main is confirmed live
+        if: steps.finalize_deploy.outcome == 'success' && (inputs.release_mode || 'active') == 'active'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/close-auto-deploy-failure-issue.py --repo "$REPO" --sha "$DEPLOY_SHA" --run-url "$RUN_URL"
       - name: Remove the temporary SSH key
         if: always()
         run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_known_hosts" "$RUNNER_TEMP/precommit-full-canary.json"

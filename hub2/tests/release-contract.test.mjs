@@ -38,6 +38,14 @@ test('production deploy runs after green main CI (or dispatch), SSH-only and hea
   const deployJob = flow.slice(flow.indexOf('\n  deploy:'), flow.indexOf('\n  rollback_pending:'));
   assert.match(deployJob, /runs-on: ubuntu-latest/, 'the waiting deploy job must not hold the contabo-hub slot');
   assert.doesNotMatch(deployJob, /runs-on: \[self-hosted, contabo\]/);
+  // Intake e19faefa: a deploy that goes live closes the failure issue the alert step
+  // opened, after that step so a problem here never posts a false deploy-failed alert.
+  const alert = flow.indexOf('- name: Alert the deploy owner when an automatic deploy fails');
+  const closeIssue = flow.indexOf('- name: Close the auto-opened failure issue once main is confirmed live');
+  const cleanup = flow.indexOf('- name: Remove the temporary SSH key');
+  assert.ok(alert >= 0 && closeIssue > alert && closeIssue < cleanup);
+  assert.match(flow, /Close the auto-opened failure issue once main is confirmed live\n        if: steps\.finalize_deploy\.outcome == 'success' && \(inputs\.release_mode \|\| 'active'\) == 'active'\n        continue-on-error: true\n/);
+  assert.match(flow, /python3 scripts\/close-auto-deploy-failure-issue\.py --repo "\$REPO" --sha "\$DEPLOY_SHA" --run-url "\$RUN_URL"/);
   assert.doesNotMatch(flow, /if: inputs\.release_mode == 'active'/, 'push deploys have no inputs; release_mode must default to active');
   assert.doesNotMatch(flow, /RELEASE_MODE: \$\{\{ inputs\.release_mode \}\}/);
   assert.match(flow, /Alert the deploy owner when an automatic deploy fails\n        if: failure\(\) && github\.event_name == 'push'/);
