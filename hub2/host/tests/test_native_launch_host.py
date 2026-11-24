@@ -2112,7 +2112,7 @@ class GoBinaryAndPreflightTests(unittest.TestCase):
             root = Path(tmp)
             adapter = nl.NativeLauncher({'private_provider_homes': True,
                                          'routes': {'go': {'provider': 'go'}}},
-                                        aplexer='synthetic-aplexer', runner=lambda *a, **k: None)
+                                        aplexer='synthetic-aplexer')
             with mock.patch.object(nl, 'resolve_engine_binary', return_value=None):
                 with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
                     adapter.launch('task-go-missing', {
