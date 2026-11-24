@@ -1811,7 +1811,7 @@ export class ProjectDO {
     // Fail loudly (intake 42b42c9b): a session that ended on its own with no completion
     // claim and nothing appended (no note, evidence or blocker) produced no visible work.
     // Typed alert to the developer even when a continuation follows; owner is not changed.
-    const silent=!claim&&reason.startsWith('session_')&&reason!=='session_stop_confirmed'&&this.appendsSinceStart(intake,saga).length===0;
+    const silent=!claim&&(reason==='exit_without_completion_claim'||reason.startsWith('native_exit_')||reason.startsWith('session_')&&reason!=='session_stop_confirmed')&&this.appendsSinceStart(intake,saga).length===0;
     if(silent&&record.continuation){
       const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'session_ended_no_output',reason,session_id:saga.session_id,machine_id:saga.machine_id,
         detail:'Session ended with containment empty, no completion claim and no appended output.'};

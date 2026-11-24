@@ -2032,7 +2032,7 @@ test('ordinary send uncertainty joined real Host error event releases other-sess
   await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(again.frame));
   assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed','lost event replay is idempotent');
   const captured=ordinarySendHost(root,q.capture,q.otherNative);
-  assert.equal(captured.effects.capture,1);assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
+  assert.equal(captured.effects.capture,2,'one read-only readiness poll before the single send, plus this capture');assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
   assert.equal((await q.f.call(captured.path,'POST',captured.payload)).status,200);
   assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.capture.id) as any).state,'acked');
   for(const session of[q.sender,q.other])assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');

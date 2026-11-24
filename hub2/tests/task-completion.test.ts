@@ -1557,3 +1557,24 @@ test('a plain nonzero exit keeps the continuation on the same engine',async()=>{
     assert.equal(events(f,id).some(e=>e.kind==='engine_preflight_failed'),false);
   }finally{f.close();}
 });
+
+test('a session that ends on its own with no claim and no appended output raises a typed session_ended_no_output developer alert',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'silent-exit');
+    assert.equal((await start(f,id,'first')).status,201);
+    const binding=await run(f,id);
+    await finish(f,binding,0);await f.project.alarm();
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='session_ended_no_output');
+    assert.equal(alerts.length,1);
+    assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');
+    assert.equal(alerts[0].body.session_id,binding.session_id);
+    // A session that left a note is not silent.
+    const id2=await createIntake(f,'noisy-exit');
+    assert.equal((await start(f,id2,'first')).status,201);
+    const second=await run(f,id2);
+    await f.call('/api/intakes/'+id2+'/events','POST',{key:'note-1',note:'worked on it'});
+    await finish(f,second,0);await f.project.alarm();
+    assert.equal(events(f,id2).filter(e=>e.body?.kind==='session_ended_no_output').length,0);
+  }finally{f.close();}
+});
