@@ -1549,7 +1549,7 @@ class Bridge:
                 # Engines such as Antigravity accept typed text while a turn is running and park it
                 # in a composer queue; a native ack then does not mean the prompt was submitted
                 # (intake 42b42c9b). Verify, and fail loudly instead of reporting delivery.
-                if self.input_left_in_queue(native_id):
+                if self.input_left_in_queue(native_id) and not self.flush_queued_input(native_id):
                     result={'error':'native_input_queued','reason':'native_input_queued'}
                 else:
                     result = {"delivery": "native_acknowledged"}
@@ -1576,6 +1576,14 @@ class Bridge:
             if time.monotonic() >= deadline:
                 return True
             time.sleep(poll_seconds)
+
+    def flush_queued_input(self, native_id):
+        """Ask the engine to submit its queued composer text now (Alt+M = ESC m), then re-verify."""
+        try:
+            self.native('send', native_id, '--hex', '1b6d', timeout=10)
+        except Exception:
+            return False
+        return not self.input_left_in_queue(native_id)
 
     def native_command(self, command):
         identity, native_id = command.get('id'), command.get('native_id')

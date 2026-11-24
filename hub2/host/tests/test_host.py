@@ -1126,6 +1126,17 @@ class HostTests(unittest.TestCase):
             with self.subTest(queued=expected):
                 with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout=screen)):
                     self.assertEqual(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01), expected)
+        # Retry path: alt+m (ESC m) is sent once, then the screen is re-read.
+        for after, flushed in (('Ready\n', True), (queued, False)):
+            with self.subTest(after=flushed):
+                calls = []
+                def native(*args, **kwargs):
+                    calls.append(args)
+                    return types.SimpleNamespace(stdout=after if args[0] == 'capture' else '')
+                with patch.object(self.bridge, 'native', side_effect=native), patch.object(type(self.bridge), 'input_left_in_queue',
+                        side_effect=lambda native_id, **kw: not flushed):
+                    self.assertEqual(self.bridge.flush_queued_input('n1'), flushed)
+                self.assertEqual(calls[0], ('send', 'n1', '--hex', '1b6d'))
         with patch.object(self.bridge, 'native', side_effect=OSError('x')):
             self.assertFalse(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01))
 
