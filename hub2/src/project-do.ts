@@ -839,6 +839,8 @@ export class ProjectDO {
         ||interactive||withGoal)return error('invalid_managed_credential_route',400);
     }
     if (withGoal&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('goal_unavailable', 409);
+    // Hosts advertise shell as headless-only (modes:v1:shell:h); refuse before an intake dispatch is consumed.
+    if (interactive&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('launcher_capability_unavailable_interactive', 409, 'shell supports headless only; interactive is not advertised on any host');
     const capabilities = body.required_capabilities === undefined ? [] : body.required_capabilities;
     if (!Array.isArray(capabilities) || capabilities.length > 32
       || capabilities.some(value => typeof value !== 'string' || value.length < 1 || value.length > 80)) return error('invalid_required_capabilities', 400);
@@ -1806,10 +1808,20 @@ export class ProjectDO {
     if(!claim&&continuable&&!contractOmitted&&!hard&&depth<MAX_AUTO_CONTINUATIONS)
       record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    // Fail loudly (intake 42b42c9b): a session that ended on its own with no completion
+    // claim and nothing appended (no note, evidence or blocker) produced no visible work.
+    // Typed alert to the developer even when a continuation follows; owner is not changed.
+    const silent=!claim&&reason.startsWith('session_')&&reason!=='session_stop_confirmed'&&this.appendsSinceStart(intake,saga).length===0;
+    if(silent&&record.continuation){
+      const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'session_ended_no_output',reason,session_id:saga.session_id,machine_id:saga.machine_id,
+        detail:'Session ended with containment empty, no completion claim and no appended output.'};
+      this.appendEvent(intake.id,'developer-alert:session_ended_no_output:'+saga.session_id,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+      console.error('[hub2] SESSION_ENDED_NO_OUTPUT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intake.id,...alert}));
+    }
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
     if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
-      this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
+      this.raiseDeveloperAlert(intake.id,saga.session_id,silent&&!hard?'session_ended_no_output':hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
         ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{}),
