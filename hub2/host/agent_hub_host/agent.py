@@ -255,6 +255,10 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'invalid_workspace': 'invalid workspace path',
  'launch_outcome_uncertain': 'Launch outcome is uncertain.',
  'launch_specification_required': 'Launch specification is required.',
+ 'launcher_capability_unavailable_headless': 'Engine is not advertised as headless-capable on this host.',
+ 'launcher_capability_unavailable_interactive': 'Engine is not advertised as interactive-capable on this host (e.g. shell supports headless only).',
+ 'launcher_capability_unavailable_goal': 'Engine does not advertise goal mode on this host.',
+ 'launcher_capability_unavailable_effort': 'Engine does not advertise effort selection on this host.',
  'launcher_capability_unavailable': 'Launcher capability is unavailable.',
  'legacy_launch_identity_unverified': 'Launch preparation was refused.',
  'managed_exec_unavailable': 'Managed execution is unavailable.',
@@ -509,7 +513,7 @@ class Bridge:
         if type(with_goal) is not bool or (with_goal and not launch.get('interactive')):raise ValueError('invalid_goal_mode')
         if effort is not None and effort not in {'low','medium','high','xhigh','max'}:raise ValueError('invalid_effort')
         supported=self.launcher.capabilities().get(engine,set())
-        if any(needed and capability not in supported for capability,needed in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)]):raise ValueError('launcher_capability_unavailable')
+        if any(needed and capability not in supported for capability,needed in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)]):raise ValueError('launcher_capability_unavailable_'+next(c for c,n in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)] if n and c not in supported))
         managed = {}
         if 'managed_credential_label' in launch:
             if (launch['managed_credential_label'] != 'hub-claude' or engine != 'claude' or model != 'opus'
