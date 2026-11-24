@@ -50,14 +50,21 @@ export function codeTask(source: unknown): boolean {
   return (source as Record<string, unknown>).code_task !== false;
 }
 
-/** True when the brief says the work is report-only: no code, no PR. Used only
+/** True when the brief says the work is report-only. Used only
  * when the requester did not state code_task; an explicit value always wins.
  * Any sign of code delivery (PR, merge, deploy, implement, fix) keeps the gate. */
 export function readOnlyBrief(title: string, text: string, criteria: string[]): boolean {
   const all = [title, text, ...criteria].join('\n').toLowerCase();
-  const delivery = all.replace(/\b(?:no|without) (?:any )?(?:code|prs?|pull requests?|merges?|deploy(?:ments?)?)\b(?: changes?)?/g, ' ');
+  // Consume the whole coordinated prohibition, not only its first verb.
+  const prohibited = /\b(?:do not|don't|must not|never)\s+(?:push|merge|deploy|implement|refactor|commit)(?:\s*(?:,\s*(?:(?:or|and)\s+)?|(?:or|and)\s+)(?:push|merge|deploy|implement|refactor|commit))*\b/g;
+  const delivery = all.replace(prohibited, ' ').replace(/\b(?:no|without) (?:any )?(?:code|prs?|pull requests?|merges?|deploy(?:ments?)?)\b(?: changes?)?/g, ' ');
+  const readOnly = /\b(read[- ]only|report[- ]only|draft[- ]only|status report|no code|without (?:changing|touching) (?:any )?code|no pr)\b/.test(all) || prohibited.test(all);
+  // A review may name the PR under review. A PR reference is not a request to
+  // deliver code; explicit implementation or delivery verbs still keep the gate.
+  if (readOnly && !/\b(merge[ds]?|deploy(?:ed|ment)?|push|implement|refactor|bug ?fix|commits?)\b/.test(delivery)
+      && !/\b(?:open|create|submit)\s+(?:a\s+|the\s+)?(?:prs?|pull requests?)\b/.test(delivery)) return true;
   if (/\b(pull requests?|prs?|merge[ds]?|deploy(?:ed|ment)?|implement|refactor|bug ?fix|commits?)\b/.test(delivery)) return false;
-  return /\b(read[- ]only|report[- ]only|draft[- ]only|status report|no code|without (?:changing|touching) (?:any )?code|no pr)\b/.test(all);
+  return readOnly;
 }
 
 export function mergeEvidenceError(value: unknown): string | undefined {
@@ -84,6 +91,7 @@ export function mergeEvidenceError(value: unknown): string | undefined {
 
 export function mergeGate(required: boolean, value: unknown, expectedRepository?: string): MergeGateResult {
   if (!required) return {required:false,ok:true,problems:[]};
+  if (value === undefined || value === null) return {required:true,ok:false,problems:['merge_evidence_missing']};
   const shape = mergeEvidenceShapeError(value);
   if (shape) return {required:true,ok:false,problems:[shape]};
   const e = value as Record<string, unknown>, problems: string[] = [];

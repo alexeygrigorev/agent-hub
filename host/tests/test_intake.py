@@ -460,6 +460,16 @@ class TestIntakeCli(unittest.TestCase):
             self.assertEqual(result.code, 'request_failed', raw)
             self.assertNotIn('Bearer', str(result))
 
+    def test_code_task_refusal_names_operator_remedy(self):
+        exc = urllib.error.HTTPError('https://fixture.test', 403, 'private', {},
+            io.BytesIO(b'{"error":"code_task_operator_required"}'))
+        result = intake.http_error(exc, 'PATCH', {'key': 'k', 'code_task': False})
+        self.assertEqual(result.status, 403)
+        self.assertEqual(result.code, 'code_task_operator_required')
+        self.assertIn('hub intake update <intake-id> --code-task false', str(result))
+        self.assertIn('hub intake reevaluate <intake-id>', str(result))
+        self.assertIn('worker recovery cannot grant this permission', str(result))
+
     def test_http_error_passes_capacity_codes_through_on_507(self):
         for raw, expected in ((b'{"error":"record_capacity"}', 'record_capacity'),
                               (b'{"error":"storage_capacity"}', 'storage_capacity'),
