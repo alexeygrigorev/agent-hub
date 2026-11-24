@@ -181,7 +181,7 @@ try{
   assert.equal(after.control.alarm,null,'finished control has no pending mailbox wake');
   if(process.env.HUB2_CORE_PUBLIC_MAIL)assert.equal(after['mailbox:global'].alarm,null,'finished mailbox has no pending alarm');
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');
-  assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id),'machine alarm reflects only unrelated open offers');
+  assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id&&offer.session_id!==verifierId),'machine alarm reflects only unrelated open offers (the verifier may already be offered when the offer list was read on a slow runner): '+JSON.stringify(offers.offers.map(o=>o.session_id)));
   assert.equal(after.account.alarm,null,'released account has no pending alarm');
   const quietBefore=await snapshots();await sleep(120);const quietAfter=await snapshots();for(const k of Object.keys(quietBefore)){assert.equal(quietAfter[k].counts.rows_read,quietBefore[k].counts.rows_read,k+' idle reads');assert.equal(quietAfter[k].counts.rows_written,quietBefore[k].counts.rows_written,k+' idle writes');}
  });
