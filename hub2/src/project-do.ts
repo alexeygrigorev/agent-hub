@@ -2069,9 +2069,10 @@ export class ProjectDO {
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
       // An engine that failed its preflight check is never pinned again: keep
       // the machine (the workspace lives there) and repick without that route.
-      const span=record.reason==='native_exit_75'?this.db.one<{created_at:number;updated_at:number}>(
+      const exitCode=record.reason==='native_exit_75'?75:record.reason==='native_exit_127'?127:undefined;
+      const span=exitCode!==undefined?this.db.one<{created_at:number;updated_at:number}>(
         'SELECT created_at,updated_at FROM dispatch_sagas WHERE operation_id=?',previousSaga.operation_id):undefined;
-      const startRefused=!!span&&isFastStartRefusal(75,span.created_at,span.updated_at);
+      const startRefused=!!span&&isFastStartRefusal(exitCode,span.created_at,span.updated_at);
       const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
       const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
         ...(repick?{exclude_policy_ids:[String(route!.policy_id)]}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
