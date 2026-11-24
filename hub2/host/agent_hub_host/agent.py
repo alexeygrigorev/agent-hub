@@ -1550,42 +1550,66 @@ class Bridge:
                 # Engines such as Antigravity accept typed text while a turn is running and park it
                 # in a composer queue; a native ack then does not mean the prompt was submitted
                 # (intake 42b42c9b). Verify, and fail loudly instead of reporting delivery.
-                if self.input_left_in_queue(native_id) and not self.flush_queued_input(native_id):
-                    result={'error':'native_input_queued','reason':'native_input_queued'}
-                else:
+                observed = self.observe_input_queue(native_id)
+                if observed == 'queued':
+                    observed = self.flush_queued_input(native_id)
+                if observed == 'clear':
                     result = {"delivery": "native_acknowledged"}
+                elif observed == 'queued':
+                    result = {'error': 'native_input_queued', 'reason': 'native_input_queued'}
+                else:
+                    # Unreadable/empty screen: submission is unproven, so never report delivery.
+                    result = {'error': 'command_outcome_uncertain', 'reason': 'command_outcome_uncertain'}
         with db:
             self.finish_command(identity, command, result)
         return result
 
     QUEUED_INPUT_MARKERS = ('Press up to edit queued messages', 'alt+m to send immediately')
 
-    def input_left_in_queue(self, native_id, settle_seconds=8.0, poll_seconds=1.0):
-        """True when the engine screen still shows the just-sent text in its queued-input UI.
+    INPUT_OBSERVE_SECONDS = 8.0
+    INPUT_POLL_SECONDS = 1.0
+    BUSY_WAIT_SECONDS = 90.0
 
-        Queue markers never appear for engines without a composer queue, so an
-        unreadable screen is treated as not queued (the native ack stands).
+    def observe_input_queue(self, native_id, window_seconds=None, poll_seconds=None, clear_frames=2):
+        """Bounded observation of whether the just-sent text sits in the engine's composer queue.
+
+        Returns 'queued' (a queue marker is on the final readable frame), 'clear' (at least
+        `clear_frames` consecutive non-empty frames without any marker) or 'unknown' (capture
+        failed, or only empty/premature frames were seen). Only 'clear' may be reported as delivered.
         """
-        deadline = time.monotonic() + settle_seconds
+        window_seconds = self.INPUT_OBSERVE_SECONDS if window_seconds is None else window_seconds
+        poll_seconds = self.INPUT_POLL_SECONDS if poll_seconds is None else poll_seconds
+        deadline = time.monotonic() + window_seconds
+        clear = 0
+        last = 'unknown'
         while True:
             try:
                 screen = self.native('capture', native_id, '--screen', '--plain', timeout=10).stdout or ''
             except Exception:
-                return False
-            if not any(marker in screen for marker in self.QUEUED_INPUT_MARKERS):
-                return False
+                screen = None
+            if screen is None or not screen.strip():
+                clear, last = 0, 'unknown'
+            elif any(marker in screen for marker in self.QUEUED_INPUT_MARKERS):
+                clear, last = 0, 'queued'
+            else:
+                clear += 1
+                last = 'clear' if clear >= clear_frames else 'unknown'
+                if last == 'clear':
+                    return 'clear'
             if time.monotonic() >= deadline:
-                return True
+                return last
             time.sleep(poll_seconds)
 
     BUSY_MARKERS = ('esc to interrupt', 'ctrl+c to interrupt', 'esc to cancel')
 
-    def wait_until_ready(self, native_id, max_seconds=90.0, poll_seconds=1.0):
+    def wait_until_ready(self, native_id, max_seconds=None, poll_seconds=None):
         """Bounded wait while the engine shows a running-turn indicator (e.g. the bootstrap turn).
 
         Best effort: an unreadable screen or an unknown UI never blocks delivery; the
         post-send queue check and Alt+M retry remain the guarantee. Returns True when ready.
         """
+        max_seconds = self.BUSY_WAIT_SECONDS if max_seconds is None else max_seconds
+        poll_seconds = self.INPUT_POLL_SECONDS if poll_seconds is None else poll_seconds
         deadline = time.monotonic() + max_seconds
         while True:
             try:
@@ -1599,12 +1623,15 @@ class Bridge:
             time.sleep(poll_seconds)
 
     def flush_queued_input(self, native_id):
-        """Ask the engine to submit its queued composer text now (Alt+M = ESC m), then re-verify."""
+        """Ask the engine to submit its queued composer text now (Alt+M = ESC m), then re-observe.
+
+        Returns the new observation ('clear', 'queued' or 'unknown'); a failed key send is 'unknown'.
+        """
         try:
             self.native('send', native_id, '--hex', '1b6d', timeout=10)
         except Exception:
-            return False
-        return not self.input_left_in_queue(native_id)
+            return 'unknown'
+        return self.observe_input_queue(native_id)
 
     def native_command(self, command):
         identity, native_id = command.get('id'), command.get('native_id')

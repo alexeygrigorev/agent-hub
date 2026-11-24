@@ -1118,27 +1118,68 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fence"):
             self.bridge.command({**command, "id": "command-2", "epoch": 2})
 
-    def test_send_left_in_engine_composer_queue_is_not_reported_delivered(self):
-        # Regression (intake 42b42c9b): agy parked the prompt in its queue while busy.
+    def observe(self, frames, **kw):
         import types
+        frames = iter(frames)
+        def native(*args, **kwargs):
+            frame = next(frames)
+            if isinstance(frame, Exception):
+                raise frame
+            return types.SimpleNamespace(stdout=frame)
+        with patch.object(self.bridge, 'native', side_effect=native):
+            return self.bridge.observe_input_queue('n1', window_seconds=kw.get('window', 0.05), poll_seconds=0.001)
+
+    def test_observe_input_queue_is_tristate_and_never_fails_open(self):
         queued = 'busy\nalt+m to send immediately\nPress up to edit queued messages\n'
-        for screen, expected in ((queued, True), ('Ready and awaiting operator input\n', False)):
-            with self.subTest(queued=expected):
-                with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout=screen)):
-                    self.assertEqual(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01), expected)
-        # Retry path: alt+m (ESC m) is sent once, then the screen is re-read.
-        for after, flushed in (('Ready\n', True), (queued, False)):
-            with self.subTest(after=flushed):
-                calls = []
-                def native(*args, **kwargs):
-                    calls.append(args)
-                    return types.SimpleNamespace(stdout=after if args[0] == 'capture' else '')
-                with patch.object(self.bridge, 'native', side_effect=native), patch.object(type(self.bridge), 'input_left_in_queue',
-                        side_effect=lambda native_id, **kw: not flushed):
-                    self.assertEqual(self.bridge.flush_queued_input('n1'), flushed)
-                self.assertEqual(calls[0], ('send', 'n1', '--hex', '1b6d'))
+        repeat = lambda frame: [frame] * 200
+        self.assertEqual(self.observe(['Ready\n', 'Ready\n']), 'clear')
+        self.assertEqual(self.observe(repeat(queued)), 'queued')
+        # Reviewer repro: empty first frame, then the queued frame, must not be read as clear.
+        self.assertEqual(self.observe(['', queued] + repeat(queued)), 'queued')
+        # Capture failure, empty frames or one lone clear frame are uncertain, never clear.
+        self.assertEqual(self.observe(repeat(OSError('boom'))), 'unknown')
+        self.assertEqual(self.observe(repeat('   \n')), 'unknown')
+        self.assertEqual(self.observe(['Ready\n', OSError('x')] + repeat(OSError('x'))), 'unknown')
+        # A marker between clear frames resets the clear streak.
+        self.assertEqual(self.observe(['Ready\n', queued, 'Ready\n'] + repeat(queued)), 'queued')
+
+    def test_flush_queued_input_sends_alt_m_once_and_reobserves(self):
+        import types
+        for after, expected in (('Ready\n', 'clear'), ('alt+m to send immediately\n', 'queued')):
+            calls = []
+            def native(*args, **kwargs):
+                calls.append(args)
+                return types.SimpleNamespace(stdout=after if args[0] == 'capture' else '')
+            with patch.object(self.bridge, 'native', side_effect=native), patch.object(
+                    type(self.bridge), 'observe_input_queue', return_value=expected):
+                self.assertEqual(self.bridge.flush_queued_input('n1'), expected)
+            self.assertEqual(calls[0], ('send', 'n1', '--hex', '1b6d'))
         with patch.object(self.bridge, 'native', side_effect=OSError('x')):
-            self.assertFalse(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01))
+            self.assertEqual(self.bridge.flush_queued_input('n1'), 'unknown')
+
+    def interactive_send(self, observations):
+        offer = self.offer()
+        offer['launch']['interactive'] = True
+        self.bridge.offer(offer)
+        with patch.object(self.bridge, 'wait_until_ready', return_value=True), \
+                patch.object(self.bridge, 'observe_input_queue', side_effect=list(observations)), \
+                patch.object(self.bridge, 'flush_queued_input', return_value=observations[-1] if len(observations) > 1 else 'unknown'):
+            return self.bridge.command({"id": "send-q", "session_id": "session-1", "epoch": 1, "kind": "send", "text": "hello"})
+
+    def test_command_reports_delivery_only_when_submission_is_observed(self):
+        # Command-level regression for the reviewed fail-open (intake 42b42c9b).
+        self.assertEqual(self.interactive_send(['clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_queued_text_is_a_typed_negative_not_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'queued']),
+                         {'error': 'native_input_queued', 'reason': 'native_input_queued'})
+
+    def test_command_flush_that_submits_the_queued_text_is_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_unreadable_screen_after_send_is_uncertain_not_delivery(self):
+        self.assertEqual(self.interactive_send(['unknown']),
+                         {'error': 'command_outcome_uncertain', 'reason': 'command_outcome_uncertain'})
 
     def test_send_waits_for_the_running_turn_to_finish_before_typing(self):
         import types

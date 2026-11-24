@@ -1781,6 +1781,9 @@ export class MachineDO {
     const diagnostic=this.nativeControlDiagnostic(result,row.kind);
     delete result.native_control_stage; delete result.native_control_error;
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
+    // Typed negative send outcome: the engine holds the text in its composer queue, so it is neither delivered nor acked.
+    const sendRejected=row.kind==='send'&&result.error==='native_input_queued'&&result.reason==='native_input_queued'&&Object.keys(result).length===2;
+    if(row.kind==='send'&&result.error!==undefined&&!sendRejected)return error('invalid_command_ack',400);
     if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
       ||result.output!==undefined))return error('invalid_command_ack',400);
     if(capture&&!captureFailed&&(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>CAPTURE_OUTPUT_BYTES))return error('invalid_capture_output',400);
@@ -1820,7 +1823,7 @@ export class MachineDO {
     const resultJson = JSON.stringify(result);
     if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
-    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed) && row.result_json === resultJson)) {
+    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed||sendRejected) && row.result_json === resultJson)) {
       if(row.result_json!==resultJson)return error('command_ack_conflict',409);
       if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.scheduleNext();}
       return json({acknowledged:true,duplicate:true});
@@ -1840,7 +1843,7 @@ export class MachineDO {
       }
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND (state='pending' OR (?=1 AND state IN ('wake_pending','wake_failed'))) AND epoch=?",
-        unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId,wakeBinding?1:0, row.epoch);
+        unconfirmed||captureFailed||sendRejected?'failed':'acked', resultJson, now, commandId,wakeBinding?1:0, row.epoch);
     }
     if(row.kind==='stop'&&result.stopped===true)await this.scheduleNext();
     if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.wakes.sweep();await this.scheduleNext();}
