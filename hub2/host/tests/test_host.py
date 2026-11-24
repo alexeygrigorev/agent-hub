@@ -1140,6 +1140,16 @@ class HostTests(unittest.TestCase):
         with patch.object(self.bridge, 'native', side_effect=OSError('x')):
             self.assertFalse(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01))
 
+    def test_send_waits_for_the_running_turn_to_finish_before_typing(self):
+        import types
+        screens = iter(['Working... esc to interrupt\n', 'Working... esc to interrupt\n', 'Ready\n'])
+        with patch.object(self.bridge, 'native', side_effect=lambda *a, **k: types.SimpleNamespace(stdout=next(screens))):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=5, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout='esc to interrupt')):
+            self.assertFalse(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+
     def test_headless_send_is_refused_without_native_effect(self):
         self.bridge.offer(self.offer())
         with self.assertRaisesRegex(ValueError, "headless"):
@@ -2844,7 +2854,7 @@ class OrdinarySendUncertaintyTests(unittest.TestCase):
             'session_id':'sender','message_id':'send-once','epoch':7,'operation_id':'op',
             'native_id':'11111111-2222-4333-8444-555555555555','command_kind':'send','command_state':'done'})
         self.assertEqual(self.dispatch(),frames)
-        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
         row=self.journal.db.execute('SELECT * FROM commands').fetchone()
         self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),self.negative)
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
@@ -2874,7 +2884,7 @@ class OrdinarySendUncertaintyTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT state FROM commands').fetchone()[0],'done')
         self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
         self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
-        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
         client=FakeClient();self.journal.flush(client)
         self.assertEqual(client.calls,[])
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)

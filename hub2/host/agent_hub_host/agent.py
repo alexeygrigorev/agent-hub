@@ -1539,6 +1539,7 @@ class Bridge:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
                 raise ValueError("invalid_command_text")
+            self.wait_until_ready(native_id)
             try:
                 self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
             except Exception:
@@ -1575,6 +1576,26 @@ class Bridge:
                 return False
             if time.monotonic() >= deadline:
                 return True
+            time.sleep(poll_seconds)
+
+    BUSY_MARKERS = ('esc to interrupt', 'ctrl+c to interrupt', 'esc to cancel')
+
+    def wait_until_ready(self, native_id, max_seconds=90.0, poll_seconds=1.0):
+        """Bounded wait while the engine shows a running-turn indicator (e.g. the bootstrap turn).
+
+        Best effort: an unreadable screen or an unknown UI never blocks delivery; the
+        post-send queue check and Alt+M retry remain the guarantee. Returns True when ready.
+        """
+        deadline = time.monotonic() + max_seconds
+        while True:
+            try:
+                screen = (self.native('capture', native_id, '--screen', '--plain', timeout=10).stdout or '').lower()
+            except Exception:
+                return True
+            if not any(marker in screen for marker in self.BUSY_MARKERS):
+                return True
+            if time.monotonic() >= deadline:
+                return False
             time.sleep(poll_seconds)
 
     def flush_queued_input(self, native_id):
