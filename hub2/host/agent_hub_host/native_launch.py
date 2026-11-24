@@ -1422,11 +1422,15 @@ class NativeLauncher:
             if codex_wrapper:
                 # Only the SDK executable changes; model, effort and prompt argv stay.
                 child[0] = codex_wrapper
-            elif provider == 'go' or self.runner is subprocess.run:
+            elif self.runner is subprocess.run:
                 resolved_bin = resolve_engine_binary(provider)
                 if not resolved_bin:
                     raise RuntimeError('engine_binary_unavailable')
                 child[0] = resolved_bin
+            elif provider == 'go':
+                resolved_bin = resolve_engine_binary(provider)
+                if resolved_bin:
+                    child[0] = resolved_bin
         objective = None
         if specification.get("interactive") and not local:
             child = interactive_argv(provider, child, goal, model=specification["model"],
