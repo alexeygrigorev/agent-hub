@@ -1691,7 +1691,10 @@ class HostTests(unittest.TestCase):
             fields = self.bridge._undispatched_failure_fields(error)
             self.assertEqual(fields, {'failure_reason':'native_dispatch_not_started',
                                      'detail':'Native launch did not start.'})
-            self.assertEqual(closed_host_failure(error), ('host_operation_failed','Host operation failed.'))
+            reason, detail = closed_host_failure(error)
+            self.assertEqual(reason, 'host_operation_failed')
+            self.assertRegex(detail, r'^Host operation failed\. \(error_class=[a-z_]+\)$')
+            self.assertNotIn('PRIVATE', detail)
         self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('workspace_unavailable')),
                          {'failure_reason':'workspace_unavailable','detail':'path does not exist; Hub will not create it'})
         self.assertEqual(closed_host_failure(ApiError('PRIVATE',code='provider_auth_failed')),
@@ -1747,7 +1750,7 @@ class HostTests(unittest.TestCase):
                 self.bridge.dispatch({'type':'session.offer','offer':offer},Socket(),None)
         self.assertEqual(sent[-1]['reason'],'host_operation_failed')
         self.assertEqual(sent[-1]['stage'],'host_launch')
-        self.assertEqual(sent[-1]['detail'],'Host operation failed.')
+        self.assertEqual(sent[-1]['detail'],'Host operation failed. (error_class=runtime_error)')
         self.assertNotIn('PRIVATE',json.dumps(sent))
 
     # --- Same-journal pre-dispatch physical RAM admission (intake 111b251b). ---

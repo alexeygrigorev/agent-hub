@@ -341,6 +341,7 @@ HOST_FAILURE_FACTS = {
     'exit_code': re.compile(r'-?[0-9]{1,6}'),
     'reason': re.compile(r'[a-z][a-z_]{0,39}'),
     'status': re.compile(r'[a-z][a-z_]{0,39}'),
+    'error_class': re.compile(r'(?:timeout|os_error|runtime_error|value_error|key_error|unclassified)'),
 }
 
 
@@ -392,6 +393,12 @@ def closed_host_failure(error, fallback="host_operation_failed"):
     detail = HOST_FAILURE_DETAILS[reason]
     if reason == code and facts:
         detail = f"{detail} ({' '.join(facts[:4])})"
+    elif reason == fallback == 'host_operation_failed':
+        # Exception text is private (5d97ab95); the class from a closed set is not.
+        kind = next((name for name, cls in (('timeout', (subprocess.TimeoutExpired, TimeoutError)), ('os_error', OSError),
+                                            ('runtime_error', RuntimeError), ('value_error', ValueError),
+                                            ('key_error', (KeyError, IndexError, TypeError))) if isinstance(error, cls)), 'unclassified')
+        detail = f"{detail} (error_class={kind})"
     return reason, detail
 
 def native_control_error(error):
