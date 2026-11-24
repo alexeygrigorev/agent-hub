@@ -196,7 +196,7 @@ function fixedHostDetail(reason:unknown):string {
 // Hosts may append closed facts to the fixed detail, e.g.
 // "Workspace git operation failed. (operation=rev-parse exit_code=128)".
 // Only these shapes pass; paths, argv and stderr never reach session detail.
-const HOST_DETAIL_FACT='(?:operation=(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)|exit_code=-?[0-9]{1,6}|reason=[a-z][a-z_]{0,39}|status=[a-z][a-z_]{0,39})';
+const HOST_DETAIL_FACT='(?:operation=(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)|exit_code=-?[0-9]{1,6}|reason=[a-z][a-z_]{0,39}|status=[a-z][a-z_]{0,39}|error_class=(?:timeout|os_error|runtime_error|value_error|key_error|unclassified))';
 const HOST_DETAIL_FACTS=new RegExp(`^ \\(${HOST_DETAIL_FACT}(?: ${HOST_DETAIL_FACT}){0,3}\\)$`);
 function hostDetail(reason:unknown,reported:unknown):string {
   const fixed=fixedHostDetail(reason);
