@@ -1012,7 +1012,7 @@ export class ProjectDO {
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
         const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
           :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
@@ -2079,15 +2079,19 @@ export class ProjectDO {
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
-      // An engine that failed its preflight check is never pinned again: keep
-      // the machine (the workspace lives there) and repick without that route.
+      // Repick immediately for an engine start fault, or after a repeated
+      // unclaimed native crash. Preserve the checkout and the bounded budget,
+      // and carry exclusions so a later crash cannot select a broken route again.
       const exitCode=record.reason==='native_exit_75'?75:record.reason==='native_exit_127'?127:undefined;
       const span=exitCode!==undefined?this.db.one<{created_at:number;updated_at:number}>(
         'SELECT created_at,updated_at FROM dispatch_sagas WHERE operation_id=?',previousSaga.operation_id):undefined;
       const startRefused=!!span&&isFastStartRefusal(exitCode,span.created_at,span.updated_at);
-      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const repeatedCrash=record.depth>0&&/^native_exit_-?[1-9][0-9]*$/.test(record.reason);
+      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused||repeatedCrash)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const excluded=Array.isArray(route?.exclude_policy_ids)?route.exclude_policy_ids.filter((id):id is string=>typeof id==='string'):[];
+      if(repick&&!excluded.includes(String(route!.policy_id)))excluded.push(String(route!.policy_id));
       const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
-        ...(repick?{exclude_policy_ids:[String(route!.policy_id)]}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+        ...(repick?{exclude_policy_ids:excluded}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
         interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
