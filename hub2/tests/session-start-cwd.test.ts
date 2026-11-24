@@ -59,6 +59,15 @@ test('--cwd is the launch workspace; the repository only names the project', asy
   assert.equal(started.body.workspace, '/home/user/work/2026-11-10-task');
 });
 
+test('review task_kind survives the session router and invalid kinds create no intake', async () => {
+  const f = fixture();
+  assert.equal((await f.start({repo:'org/app',purpose:'review',task_kind:'review'})).status,201);
+  assert.equal(f.projectCalls.find(call=>call.path.endsWith('/start'))!.body.task_kind,'review');
+  const bad=fixture();
+  assert.equal((await bad.start({repo:'org/app',task_kind:'unknown'})).status,400);
+  assert.equal(bad.projectCalls.length,0);
+});
+
 test('repo-only launch workspace comes from the canonical registry origin', async () => {
   const f = fixture();
   assert.equal((await f.start({ repo: 'org/app' })).status, 201);

@@ -1530,6 +1530,80 @@ test('hub intake close succeeds on an already-accepted verified intake while unv
   }finally{f.close();}
 });
 
+test('review-only work accepts a verifier pass without merge evidence, including legacy purpose-only sessions',async()=>{
+  for(const fields of [{task_kind:'review'},{purpose:'review'},{task_kind:'review',purpose:'review'}]){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'review-role',true);
+      assert.equal((await start(f,id,'review-start',fields)).status,201);
+      f.reopen();
+      const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+      assert.equal(state.code_task,false);assert.equal(state.merge_gate.ok,true);
+      assert.equal((await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'not-required',evidence:mergeProof})).status,409);
+      const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+      await f.project.alarm();
+      const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+      assert.equal(intakeRow(f,id).status,'accepted');
+      assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+    }finally{f.close();}
+  }
+});
+
+test('an internal verifier or a review after implementation does not exempt code work',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'mixed-review-code',true);
+    await start(f,id,'implementation');const first=await run(f,id);
+    await claim(f,id,first.session_id);await finish(f,first,0);await f.project.alarm();
+    let state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.code_task,true,'internal verifier cannot disable code merge gate');
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'failed');
+    // An operator may reopen for a manual review; the implementation history
+    // still requires evidence and is not rewritten by the new session role.
+    await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-mixed',status:'open'});
+    assert.equal((await start(f,id,'manual-review',{purpose:'review',task_kind:'review'})).status,201);
+    state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.code_task,true);assert.deepEqual(state.merge_gate.problems,['merge_evidence_missing']);
+  }finally{f.close();}
+});
+
+test('a review task_kind survives automatic recovery without acquiring a merge gate',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'review-role-recovery',true);
+    await start(f,id,'first',{task_kind:'review'});const first=await run(f,id);
+    await finish(f,first,1);await f.project.alarm();
+    const next=activeSaga(f,id);
+    assert.notEqual(next.session_id,first.session_id);
+    assert.equal(JSON.parse(next.launch_spec_json).task_kind,'review');
+    assert.equal((await json(await f.call('/api/intakes/'+id+'/merge-state'))).code_task,false);
+  }finally{f.close();}
+});
+
+test('worker code-task refusals name the operator remedy and alert once across retry keys and sessions',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'refused-classification',true);
+    const before=intakeRow(f,id).source_json;
+    for(const [index,session] of ['first','first','recovery'].entries()){
+      const actor={id:'session:'+session,kind:'agent',resource_id:id,scopes:['intake:append']};
+      const response=await f.call('/api/intakes/'+id,'PATCH',{key:'denial-'+index,code_task:false},actor);
+      assert.equal(response.status,403);const refusal=await json(response);
+      assert.equal(refusal.error,'code_task_operator_required');assert.equal(refusal.retryable,false);
+      assert.equal(refusal.operator_command,`hub intake update ${id} --code-task false; hub intake reevaluate ${id}`);
+      f.reopen();
+    }
+    assert.equal(intakeRow(f,id).source_json,before,'refusal never changes classification');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='code_task_operator_required').length,1);
+    const other=await createIntake(f,'other-classification');
+    const foreign={id:'session:first',kind:'agent',resource_id:id,scopes:['intake:append']};
+    assert.equal((await f.call('/api/intakes/'+other,'PATCH',{key:'foreign-denial',code_task:false},foreign)).status,403);
+    assert.equal(events(f,other).filter(e=>e.kind==='developer_alert_raised').length,0);
+    assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'operator-classify',code_task:false})).status,200);
+  }finally{f.close();}
+});
+
 test('review prohibitions consume coordinated delivery verbs and PR references are read-only',()=>{
   for (const prohibition of ['do not push, merge or deploy', 'do not merge, push, or deploy',
     'must not deploy or merge', "don't push and merge", 'never merge']) {

@@ -572,7 +572,7 @@ export class ProjectDO {
     if(!key||Object.keys(body).some(k=>!['key','evidence'].includes(k))||!body.evidence)return error('invalid_merge_evidence',400);
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
     if(!intake)return error('intake_not_found',404);
-    if(!codeTask(this.parse(intake.source_json)))return error('merge_gate_not_required',409);
+    if(!this.intakeCodeTask(intake))return error('merge_gate_not_required',409);
     const problem=mergeEvidenceShapeError(body.evidence);
     if(problem)return error('invalid_merge_evidence',400,problem);
     const actor=actorFrom(request);
@@ -657,8 +657,25 @@ export class ProjectDO {
     return found;
   }
 
+  private intakeCodeTask(intake:IntakeRow):boolean{
+    const source=this.parse(intake.source_json) as JsonRecord|null;
+    if(!codeTask(source))return false;
+    // Older intakes may have no classification. Keep code delivery fail-closed,
+    // but recognize an explicitly read-only brief before requiring a merge.
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    if(source?.code_task===undefined&&readOnlyBrief(intake.title,intake.text,Array.isArray(criteria)?criteria as string[]:[]))return false;
+    const work=this.db.all<{launch_spec_json:string;routing_json:string}>('SELECT launch_spec_json,routing_json FROM dispatch_sagas WHERE intake_id=?',intake.id)
+      .filter(row=>(this.parse(row.routing_json) as JsonRecord|null)?.acceptance_verification!==true);
+    // Internal verifiers are reviews of code work; they must never exempt their
+    // implementation intake. A mixed implementation/review history stays gated.
+    return !work.length||!work.every(row=>{
+      const launch=this.parse(row.launch_spec_json) as JsonRecord|null;
+      return launch?.task_kind==='review'||launch?.task_kind===undefined&&launch?.purpose==='review';
+    });
+  }
+
   private intakeMergeGate(intake:IntakeRow){
-    const required=codeTask(this.parse(intake.source_json));
+    const required=this.intakeCodeTask(intake);
     if(!required)return mergeGateAll(false,[]);
     // Citations: the intake text and worker-written records (notes, DONE records),
     // never merge observations or Hub's own refusal/alert records, which quote the URL.
@@ -717,11 +734,25 @@ export class ProjectDO {
     const replay=this.idempotent(scope,key,digest);if(replay instanceof Response)return replay;
     const result=this.transaction(()=>{
       const row=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!row)return error('intake_not_found',404);
+      if(body.code_task!==undefined&&!hasScope(actor,'operator:admin')){
+        const ownWorker=actor?.kind==='agent'&&actor.resource_id===row.id&&actor.id.startsWith('session:')&&hasScope(actor,'intake:append');
+        if(!ownWorker&&!this.canProject(actor,row.project,'intake:write'))return error('forbidden',403);
+        const operatorCommand=`hub intake update ${row.id} --code-task ${body.code_task}; hub intake reevaluate ${row.id}`;
+        if(ownWorker){
+          const alertKey='code-task-operator-required:'+row.id;
+          if(!this.db.one('SELECT 1 FROM intake_events WHERE event_key=?',alertKey)){
+            this.appendEvent(row.id,alertKey,COMPLETION_ACTOR,'developer_alert_raised',{
+              recipient:DEVELOPER_ALERT_RECIPIENT,kind:'code_task_operator_required',reason:'code_task_operator_required',
+              session_id:actor!.id.slice('session:'.length),operator_command:operatorCommand,retryable:false},Date.now());
+          }
+        }
+        return json({error:'code_task_operator_required',missing_scope:'operator:admin',retryable:false,
+          operator_command:operatorCommand,detail:`Only an operator can reclassify this intake. Ask the operator to run: ${operatorCommand}. Worker recovery cannot grant this permission.`},403);
+      }
       if(!this.canProject(actor,row.project,'intake:write'))return error('forbidden',403);
       if(replay)return json({intake:this.viewIntake(row),duplicate:true});
       if(body.project!==undefined&&body.project!==row.project&&!this.canProject(actor,body.project as string,'intake:write'))return error('forbidden',403);
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
-      if(body.code_task!==undefined&&!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can reclassify an intake');
       if(body.parent_intake_id!==undefined&&!hasScope(actor,'operator:admin'))return forbiddenScope('operator:admin','only an operator can set parent_intake_id');
       let nextParentId=row.parent_intake_id;
       if(body.parent_intake_id!==undefined){
@@ -879,6 +910,8 @@ export class ProjectDO {
     const modelInput = body.model;
     const effortInput = body.effort;
     const purpose = sessionPurpose(body.purpose);
+    const taskKind=body.task_kind;
+    if(taskKind!==undefined&&(typeof taskKind!=='string'||!['implement','review','ask','goal'].includes(taskKind)))return error('invalid_task_kind',400);
     const intakeWorktree = body.intake_worktree === undefined ? undefined : body.intake_worktree;
     if (intakeWorktree !== undefined && intakeWorktree !== 'detached' && intakeWorktree !== 'successor')
       return error('invalid_intake_worktree', 400);
@@ -928,6 +961,7 @@ export class ProjectDO {
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
+      ...(taskKind!==undefined?{task_kind:taskKind}:{}),
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
         verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
@@ -1055,6 +1089,7 @@ export class ProjectDO {
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
+      ...(taskKind!==undefined?{task_kind:taskKind}:{}),
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
@@ -1786,7 +1821,7 @@ export class ProjectDO {
     const priorVerifier=previous&&previous!==origin?previous:undefined;
     const gaps=[...(verdict?.gaps??[])];
     let mergeBlocked=false,passed=verdict?.verdict==='pass';
-    if(passed&&codeTask(this.parse(intake.source_json))){
+    if(passed){
       const gate=this.intakeMergeGate(intake);
       if(!gate.ok){
         passed=false;mergeBlocked=true;
@@ -2204,6 +2239,7 @@ export class ProjectDO {
         ...(repick?{exclude_policy_ids:excluded}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
         interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
+        ...(launch.task_kind!==undefined?{task_kind:launch.task_kind}:{}),
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
@@ -2442,6 +2478,7 @@ export class ProjectDO {
       ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
       interactive:launch.interactive===true,with_goal:launch.with_goal===true,
       purpose:launch.purpose??'implement',override_reason:'hub_failed_intake_retry',
+      ...(launch.task_kind!==undefined?{task_kind:launch.task_kind}:{}),
       ...(Array.isArray(route.required_capabilities)?{required_capabilities:route.required_capabilities}:{}),
       ...(routeFallback?{exclude_policy_ids:[String(route.policy_id)]}:{}),
       ...(shell?{exclude_machine_ids:[row.saga_machine_id]}:{}),
