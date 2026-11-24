@@ -1550,7 +1550,7 @@ test('intake 62ccfa1e: an engine auth/preflight failure alerts and the continuat
 
 test('Muse exit 127 restarts on a healthy route; further crashes exhaust the budget with a visible developer alert',async()=>{
   const muse={id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',effort:null,account_id:'shared-go',weight:1,capabilities:[],enabled:true};
-  const f=fixture([muse,candidates[0]]);
+  const f=fixture([muse,candidates[0],candidates[3]]);
   try{
     const id=await createIntake(f,'muse-127-recovery');
     assert.equal((await start(f,id,'first',{engine:'go',override_reason:'canary Muse failure'})).status,201);
@@ -1564,14 +1564,16 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
     await f.project.alarm();
     const next=activeSaga(f,id);
     assert.notEqual(next.session_id,first.session_id);
-    assert.equal(JSON.parse(next.launch_spec_json).engine,'codex');
-    assert.equal(JSON.parse(next.routing_json).policy_id,'sol-route');
+    assert.notEqual(JSON.parse(next.launch_spec_json).engine,'go');
+    assert.notEqual(JSON.parse(next.routing_json).policy_id,'go-muse');
+    assert.deepEqual(JSON.parse(next.routing_json).exclude_policy_ids,['go-muse']);
     assert.match(JSON.parse(next.launch_spec_json).prompt,/native_exit_127/);
     for(let attempt=1;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
       await finish(f,await run(f,id),1);
       await f.project.alarm();
     }
     assert.equal(sagas(f,id).length,1+MAX_AUTO_CONTINUATIONS);
+    assert.equal(new Set(sagas(f,id).map(s=>JSON.parse(s.routing_json).policy_id)).size,3,'failed routes are never selected again');
     const view=await json(await f.call('/api/intakes/'+id));
     assert.equal(view.intake.status,'failed');
     assert.equal(view.task.owner,'dev@dtcdev.click');
@@ -1587,7 +1589,41 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
   }finally{f.close();}
 });
 
-test('a plain nonzero exit keeps the continuation on the same engine',async()=>{
+test('21a07a26 path: repeated Muse exit 1 changes route before exhausting controlled recovery',async()=>{
+  const muse={id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',effort:null,account_id:'shared-go',weight:1,capabilities:[],enabled:true};
+  const f=fixture([muse,candidates[0]]);
+  try{
+    const id=await createIntake(f,'21a07a26-repeated-crash');
+    assert.equal((await start(f,id,'first',{engine:'go',override_reason:'reproduce native failure'})).status,201);
+    for(let attempt=0;attempt<2;attempt++){
+      const binding=await run(f,id);
+      assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'go');
+      assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{
+        source:'aplexer_retirement',containment_empty:true,native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:'/srv/work/feature'},
+        native_exit:{code:1,exited_at_ms:Date.now()}}})).status,200);
+      f.reopen();
+      await f.project.alarm();
+    }
+    assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'codex');
+    assert.equal(sagas(f,id).length,3,'the second recovery uses the last available attempt on a different route');
+    const final=await run(f,id);
+    await finish(f,final,1);
+    await f.project.alarm();
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);
+    assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal(alerts[0].body.reason,'native_exit_1');
+    assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');
+    const view=await json(await f.call('/api/intakes/'+id));
+    assert.equal(view.intake.status,'failed');
+    assert.equal(view.task.owner,'dev@dtcdev.click');
+    assert.match(view.task.current_state,/native_exit_1/);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,3);
+  }finally{f.close();}
+});
+
+test('a plain nonzero exit keeps the first continuation on the same engine',async()=>{
   const f=fixture();
   try{
     const id=await createIntake(f,'plain-exit');
