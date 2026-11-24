@@ -1118,6 +1118,17 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fence"):
             self.bridge.command({**command, "id": "command-2", "epoch": 2})
 
+    def test_send_left_in_engine_composer_queue_is_not_reported_delivered(self):
+        # Regression (intake 42b42c9b): agy parked the prompt in its queue while busy.
+        import types
+        queued = 'busy\nalt+m to send immediately\nPress up to edit queued messages\n'
+        for screen, expected in ((queued, True), ('Ready and awaiting operator input\n', False)):
+            with self.subTest(queued=expected):
+                with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout=screen)):
+                    self.assertEqual(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01), expected)
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertFalse(self.bridge.input_left_in_queue('n1', settle_seconds=0.05, poll_seconds=0.01))
+
     def test_headless_send_is_refused_without_native_effect(self):
         self.bridge.offer(self.offer())
         with self.assertRaisesRegex(ValueError, "headless"):

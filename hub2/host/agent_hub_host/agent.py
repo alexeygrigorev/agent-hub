@@ -1546,10 +1546,36 @@ class Bridge:
                 # Errors after it cannot prove that no input was delivered.
                 result={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
             else:
-                result = {"delivery": "native_acknowledged"}
+                # Engines such as Antigravity accept typed text while a turn is running and park it
+                # in a composer queue; a native ack then does not mean the prompt was submitted
+                # (intake 42b42c9b). Verify, and fail loudly instead of reporting delivery.
+                if self.input_left_in_queue(native_id):
+                    result={'error':'native_input_queued','reason':'native_input_queued'}
+                else:
+                    result = {"delivery": "native_acknowledged"}
         with db:
             self.finish_command(identity, command, result)
         return result
+
+    QUEUED_INPUT_MARKERS = ('Press up to edit queued messages', 'alt+m to send immediately')
+
+    def input_left_in_queue(self, native_id, settle_seconds=8.0, poll_seconds=1.0):
+        """True when the engine screen still shows the just-sent text in its queued-input UI.
+
+        Queue markers never appear for engines without a composer queue, so an
+        unreadable screen is treated as not queued (the native ack stands).
+        """
+        deadline = time.monotonic() + settle_seconds
+        while True:
+            try:
+                screen = self.native('capture', native_id, '--screen', '--plain', timeout=10).stdout or ''
+            except Exception:
+                return False
+            if not any(marker in screen for marker in self.QUEUED_INPUT_MARKERS):
+                return False
+            if time.monotonic() >= deadline:
+                return True
+            time.sleep(poll_seconds)
 
     def native_command(self, command):
         identity, native_id = command.get('id'), command.get('native_id')
