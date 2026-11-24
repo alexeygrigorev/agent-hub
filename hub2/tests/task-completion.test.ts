@@ -8,7 +8,7 @@ import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage.ts';
 import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
-import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,MAX_VERIFICATION_ATTEMPTS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker,verificationPrompt} from '../src/task-completion';
+import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,MAX_DEADLINE_CONTINUATIONS,MAX_VERIFICATION_ATTEMPTS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker,verificationPrompt} from '../src/task-completion';
 
 const admin={id:'human:completion-owner',kind:'operator',scopes:['operator:admin']};
 const candidates=[
@@ -294,18 +294,18 @@ test('continuations are bounded per requester start; deadline exits get more tim
   try{
     const id=await createIntake(f,'bounded');
     assert.equal((await start(f,id,'first')).status,201);
-    for(let attempt=0;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
+    for(let attempt=0;attempt<=MAX_DEADLINE_CONTINUATIONS;attempt++){
       const binding=await run(f,id);
       await finish(f,binding,124,true);
       await f.project.alarm();
     }
     const all=sagas(f,id);
-    assert.equal(all.length,1+MAX_AUTO_CONTINUATIONS);
-    assert.deepEqual(all.map(s=>JSON.parse(s.launch_spec_json).timeout_seconds),[1800,3600,7200]);
+    assert.equal(all.length,1+MAX_DEADLINE_CONTINUATIONS);
+    assert.deepEqual(all.map(s=>JSON.parse(s.launch_spec_json).timeout_seconds),[1800,3600,7200,7200,7200]);
     assert.equal(intakeRow(f,id).status,'failed');
-    assert.equal(completion(f,id).continuation,undefined);assert.equal(completion(f,id).depth,MAX_AUTO_CONTINUATIONS);
-    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Task NOT finished/);assert.match(f.mail[0].body,/continued it 2 times/);
-    await f.project.alarm();assert.equal(sagas(f,id).length,3,'no unbounded restart loop');
+    assert.equal(completion(f,id).continuation,undefined);assert.equal(completion(f,id).depth,MAX_DEADLINE_CONTINUATIONS);
+    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Task NOT finished/);assert.match(f.mail[0].body,/continued it 4 times/);
+    await f.project.alarm();assert.equal(sagas(f,id).length,5,'no unbounded restart loop');
     // Exhaustion raises a loud developer alert (dev@, not the requester) and the developer owns the intake.
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
     assert.equal(alerts.length,1);assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');assert.equal(alerts[0].body.kind,'recovery_exhausted');
@@ -315,7 +315,7 @@ test('continuations are bounded per requester start; deadline exits get more tim
     assert.equal((await start(f,id,'human-restart')).status,201);
     await finish(f,await run(f,id),0);
     await f.project.alarm();
-    assert.equal(sagas(f,id).length,5);
+    assert.equal(sagas(f,id).length,7);
   }finally{f.close();}
 });
 
@@ -739,12 +739,12 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
     const finished=await m.call('/api/sessions/'+binding.session_id+'/finish',timeoutBody);
     assert.equal(finished.status,201);
     const attention=m.db().one('SELECT reason,observed_at FROM attention WHERE session_id=?',binding.session_id);
-    assert.equal(attention?.reason,'deadline_exceeded','timeout retirement raises a visible session alert');
+    assert.equal(attention?.reason,'native_deadline_exceeded','timeout retirement raises a visible session alert');
     const shownBefore=await json(await f.call('/api/intakes/'+id));
     assert.equal(shownBefore.intake.status,'failed');
     assert.notEqual(shownBefore.intake.dispatch.state,'complete','failed/timed-out dispatch view must not report complete');
     assert.equal(completion(f,id).outcome,'unfinished');
-    assert.equal(completion(f,id).reason,'deadline_exceeded');
+    assert.equal(completion(f,id).reason,'native_deadline_exceeded');
     assert.equal(completion(f,id).continuation.state,'pending');
     // Closing as done/closed or archiving without an explicit cancellation/supersede reason is refused.
     assert.equal((await f.call('/api/intakes/'+id,'POST',{key:'bad-close',status:'done'})).status,409);
@@ -753,7 +753,7 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
     const shownAfter=await json(await f.call('/api/intakes/'+id));
     assert(['queued','running'].includes(shownAfter.intake.status),'recovery continuation started');
     assert.equal(sagas(f,id).length,2);
-    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===binding.session_id&&e.body.reason==='deadline_exceeded'));
+    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===binding.session_id&&e.body.reason==='native_deadline_exceeded'));
 
     // Historical d3e6c4b0-class intakes closed/left unrecovered by aplexer_retirement in the last 14 days reopen on startup.
     const retiredTimeout=await createIntake(f,'d3e6c4b0-timeout');await start(f,retiredTimeout,'first');const b1=await run(f,retiredTimeout);
@@ -766,7 +766,7 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
       JSON.stringify({source:'aplexer_retirement',exit_code:0,native_exit_confirmed:true,native_deadline:{deadline_ms:now+1000,exceeded:false}}),now-86400_000,retiredZero);
     f.reopen();
     for(const [reopenedId,expectedReason,prevStatus,sessionId] of [
-      [retiredTimeout,'deadline_exceeded','archived',b1.session_id],
+      [retiredTimeout,'native_deadline_exceeded','archived',b1.session_id],
       [retiredZero,'exit_without_completion_claim','completed-awaiting-review',b2.session_id],
     ] as const){
       const view=(await json(await f.call('/api/intakes/'+reopenedId))).intake;
@@ -1576,5 +1576,50 @@ test('a session that ends on its own with no claim and no appended output raises
     await f.call('/api/intakes/'+id2+'/events','POST',{key:'note-1',note:'worked on it'});
     await finish(f,second,0);await f.project.alarm();
     assert.equal(events(f,id2).filter(e=>e.body?.kind==='session_ended_no_output').length,0);
+  }finally{f.close();}
+});
+
+// Intake 92e496e1: an interactive fix session killed at its hard runtime deadline
+// (8246f41e shape: native exit 129 SIGHUP, lifetime exactly timeout_seconds) is
+// typed native_deadline_exceeded, recovered automatically beyond the ordinary
+// budget, and named in the alert; a memcg OOM is typed oom.
+const hupFinish=async(f:F,binding:any,native_exit:object,extra:object={})=>{
+  const r=await f.call('/_internal/finish','POST',{...binding,exit_code:129,native_exit_confirmed:true,...extra,
+    evidence:{source:'aplexer_status',containment_empty:true,native_exit,native_deadline:{deadline_ms:Date.now()-5,exceeded:true}}});
+  assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+};
+test('a SIGHUP exit at the 2 h deadline is native_deadline_exceeded, not host_operation_failed, and recovers past the ordinary budget',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'deadline-hup');await start(f,id,'first',{interactive:true,purpose:'fix',timeout_seconds:7200});
+    let current=await run(f,id);
+    for(let n=0;n<4;n++){
+      // 8246f41e: host also journalled the aborting kill as a host operation failure.
+      await hupFinish(f,current,{code:129,exited_at_ms:Date.now(),oom_killed:false,signal:null},{failure_reason:'host_operation_failed'});
+      assert.equal(completion(f,id).reason,'native_deadline_exceeded');
+      assert.match(completion(f,id).cause,/hard runtime deadline/);
+      assert.equal(completion(f,id).continuation?.state,'pending',`renewal ${n+1} is automatic`);
+      await f.project.alarm();
+      assert.equal(sagas(f,id).length,n+2);
+      const launch=JSON.parse(sagas(f,id).at(-1).launch_spec_json);
+      assert.equal(launch.timeout_seconds,7200);assert.equal(launch.interactive,true);
+      current=await run(f,id);
+    }
+    await hupFinish(f,current,{code:129,exited_at_ms:Date.now(),oom_killed:false,signal:null});
+    assert.equal(completion(f,id).continuation,undefined,'deadline renewals are bounded');
+    const alert=events(f,id).find(e=>e.kind==='developer_alert_raised'&&e.body.kind==='recovery_exhausted');
+    assert.equal(alert?.body.reason,'native_deadline_exceeded');assert.match(alert?.body.cause,/hard runtime deadline/);
+    assert(!events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.reason==='host_operation_failed'));
+  }finally{f.close();}
+});
+test('a workload memcg OOM exit is typed oom and continued',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'oom-exit');await start(f,id,'first');const current=await run(f,id);
+    const r=await f.call('/_internal/finish','POST',{...current,exit_code:137,native_exit_confirmed:true,
+      evidence:{source:'aplexer_status',containment_empty:true,native_exit:{code:137,exited_at_ms:Date.now(),oom_killed:true,signal:null},native_deadline:{exceeded:false}}});
+    assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+    assert.equal(completion(f,id).reason,'oom');assert.match(completion(f,id).cause,/memory cap/);
+    assert.equal(completion(f,id).continuation?.state,'pending');
   }finally{f.close();}
 });
