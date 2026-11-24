@@ -2601,14 +2601,20 @@ export class ProjectDO {
     if (!['intake','session'].includes(String(kind)) || typeof target !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(target)
       || typeof actorId !== 'string' || !/^session:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(actorId) || typeof own !== 'string' || !boundedString(own, 180))
       return error('invalid_evidence_read', 400);
-    const command = `hub ${kind === 'session' ? 'sessions' : 'intake'} show ${target}`;
+    // A refusal echoes only the caller's own reference: an uncited target's full id is never disclosed.
+    const shown = typeof b.ref === 'string' && /^[0-9a-f-]{6,36}$/.test(b.ref) && target.startsWith(b.ref) ? b.ref : target.slice(0, 8);
+    const command = `hub ${kind === 'session' ? 'sessions' : 'intake'} show ${shown}`;
     const refuse = (reason: string, why: string) => json({
       error: 'evidence_not_referenced', reason, missing_scope: 'intake:read', operator_command: command,
-      detail: `${kind} ${target} is outside this worker's intake (missing scope intake:read): ${why}; ask an operator to run \`${command}\` and append the facts to your intake`,
+      detail: `${kind} ${shown} is outside this worker's intake (missing scope intake:read): ${why}; ask an operator to run \`${command}\` and append the facts to your intake`,
     }, 403);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', own);
     if (!row) return refuse('own_intake_not_in_project', 'evidence reads are limited to the worker\'s own project');
-    if (!row.owner_actor_id || row.owner_actor_id.startsWith('session:'))
+    // The text's author decides, not the row owner: a schedule occurrence copies its parent's text,
+    // so the parent's author must also be a requester.
+    const parent = row.schedule_id && row.parent_intake_id ? this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', row.parent_intake_id) : undefined;
+    const authors = [row.owner_actor_id, ...(row.schedule_id ? [parent?.owner_actor_id] : [])];
+    if (authors.some(a => !a || a.startsWith('session:')))
       return refuse('intake_authored_by_worker', 'only a requester-authored intake grants evidence reads');
     const reference = evidenceReferences(`${row.original_title ?? row.title}\n${row.original_text ?? row.text}`).find(ref => target.startsWith(ref));
     if (!reference) return refuse('not_referenced', 'the intake text does not name it');

@@ -282,8 +282,12 @@ const router = {
               const grant = await evidenceGrant(env, control, actor, 'intake', decodeURIComponent(intakeId), routeDenied);
               if (grant instanceof Response) return grant;
               const evidencePath = '/api/intakes/' + encodeURIComponent(grant.route.id) + (sub[1] ? '/' + sub[1] : '');
+              // Keep the read's own paging (history after/limit); the project is always the worker's own.
+              const query = new URLSearchParams();
+              for (const key of ['after', 'limit']) { const v = url.searchParams.get(key); if (v !== null) query.set(key, v); }
+              query.set('project', route.owner);
               return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,
-                'https://project.internal' + evidencePath + '?project=' + encodeURIComponent(route.owner), grant.actor));
+                'https://project.internal' + evidencePath + '?' + query.toString(), grant.actor));
             }
           }
           return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
@@ -650,7 +654,7 @@ async function evidenceGrant(env: Hub2Env, control: DurableObjectStub, actor: Ac
   if (!route || route.resource_id !== project) return denied;
   const decided = await env.PROJECTS.get(env.PROJECTS.idFromName(project)).fetch(new Request(
     'https://project.hub2.internal/_internal/evidence-read', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, target_id: route.id, actor_id: actor.id, intake_id: actor.resource_id }) }));
+      body: JSON.stringify({ kind, target_id: route.id, ref, actor_id: actor.id, intake_id: actor.resource_id }) }));
   if (!decided.ok) return decided;
   return { route, actor: { id: actor.id, kind: 'agent', resource_id: route.id, client_id: 'evidence-read',
     scopes: [kind === 'session' ? 'session:read' : 'intake:read'] } };

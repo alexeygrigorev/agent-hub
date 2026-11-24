@@ -38,7 +38,8 @@ function fixture(){
    body:JSON.stringify({kind:'session',id,owner:MACHINE,resource_id:projectId,participants:[],bound_intake_id:intake})}));
   assert.equal(r.status,200,'register '+id);
  };
- return{env,tokens,direct,registerSession,machineCalls,close:()=>{controlSql.close();for(const s of projectSqls.values())s.close();}};
+ const sql=(id:string)=>{project(id);return projectSqls.get(id)!;};
+ return{env,tokens,direct,registerSession,machineCalls,sql,close:()=>{controlSql.close();for(const s of projectSqls.values())s.close();}};
 }
 const data=async(r:Response)=>await r.json() as any;
 const workerActor=(session:string,intake:string,project=PROJECT)=>({id:'session:'+session,kind:'agent',resource_id:intake,generation:'worker:1:op',
@@ -88,7 +89,7 @@ test('bound worker reads sessions and intakes its own intake cites, read-only an
  // Uncited same-project session: typed refusal naming the exact operator command.
  const refused=await call('/api/sessions/'+S_UNCITED.slice(0,8));assert.equal(refused.status,403);
  const rb=await data(refused);assert.equal(rb.error,'evidence_not_referenced');assert.equal(rb.reason,'not_referenced');
- assert.equal(rb.missing_scope,'intake:read');assert.equal(rb.operator_command,'hub sessions show '+S_UNCITED);assert.match(rb.detail,/hub sessions show /);
+ assert.equal(rb.missing_scope,'intake:read');assert.equal(rb.operator_command,'hub sessions show '+S_UNCITED.slice(0,8));assert.doesNotMatch(JSON.stringify(rb),new RegExp(S_UNCITED),'uncited full id never disclosed');assert.match(rb.detail,/hub sessions show /);
  // Cited but in another project: Control's original denial, never an evidence grant.
  const crossed=await call('/api/sessions/'+S_FOREIGN.slice(0,8));assert.equal(crossed.status,403);
  assert.notEqual((await data(crossed)).error,'evidence_not_referenced');
@@ -102,15 +103,27 @@ test('bound worker reads sessions and intakes its own intake cites, read-only an
    const r=await call('/api/intakes/'+ref+path,method,body);assert.ok([403,404].includes(r.status),path+' '+r.status);
   }
  }
+ // Other reads of a cited intake are not part of the evidence path.
+ for(const path of ['/context','/audit','/merge-state','/links']){
+  const r=await call('/api/intakes/'+evidence.id+path);assert.ok([403,404,405].includes(r.status),path+' '+r.status);
+ }
+ // History paging survives the evidence forward (after/limit are honoured, not reset to page one).
+ for(let i=0;i<5;i++)assert.equal((await f.direct(PROJECT,'/api/intakes/'+evidence.id+'/append','POST',{key:'pg-'+i,note:'page '+i},admin)).status,201);
+ const all=(await data(await call('/api/intakes/'+evidence.id+'/history'))).events;assert.ok(all.length>=6);
+ const page1=await data(await call('/api/intakes/'+evidence.id.slice(0,8)+'/history?after=0&limit=2'));
+ assert.equal(page1.events.length,2);assert.equal(page1.next,page1.events[1].seq);
+ const page2=await data(await call('/api/intakes/'+evidence.id.slice(0,8)+'/history?after='+page1.next+'&limit=2'));
+ assert.equal(page2.events.length,2);assert.ok(page2.events[0].seq>page1.next,'second page starts after the cursor');
  const uncitedIntake=await call('/api/intake/tasks/'+uncited.id.slice(0,8));assert.equal(uncitedIntake.status,403);
- const ub=await data(uncitedIntake);assert.equal(ub.error,'evidence_not_referenced');assert.equal(ub.operator_command,'hub intake show '+uncited.id);
+ const ub=await data(uncitedIntake);assert.equal(ub.error,'evidence_not_referenced');assert.equal(ub.operator_command,'hub intake show '+uncited.id.slice(0,8));assert.doesNotMatch(JSON.stringify(ub),new RegExp(uncited.id),'uncited full id never disclosed');
  const foreignIntake=await call('/api/intake/tasks/'+foreign.id.slice(0,8));assert.equal(foreignIntake.status,403);
  assert.notEqual((await data(foreignIntake)).error,'evidence_not_referenced');
 
  // Audited once per target on the reader's own intake, read-only, attributed to the worker session.
  const history=await data(await f.direct(PROJECT,'/api/intakes/'+fix.id+'/history','GET',undefined,admin));
- const reads=(JSON.stringify(history).match(/evidence_read/g)||[]).length;
- assert.ok(reads>=3,'audit events present');
+ const audits=(history.events as any[]).filter(e=>e.kind==='evidence_read');
+ // Exactly one audit record per target, however many reads.
+ assert.deepEqual(audits.map(e=>(e.body??e.payload??e).target_id).sort(),[S_CITED,S_FULL,evidence.id].sort());
  const text=JSON.stringify(history);
  for(const id of [S_CITED,S_FULL,evidence.id])assert.match(text,new RegExp(id));
  assert.doesNotMatch(text,new RegExp(S_UNCITED));assert.match(text,new RegExp('session:'+WORKER));
@@ -122,4 +135,21 @@ test('bound worker reads sessions and intakes its own intake cites, read-only an
  const childToken='synthetic-child-worker-'+'c'.repeat(32);f.tokens.set(childToken,workerActor(CHILD_WORKER,child.id));
  const minted=await call('/api/sessions/'+S_CITED.slice(0,8),'GET',undefined,childToken);assert.equal(minted.status,403);
  assert.equal((await data(minted)).reason,'intake_authored_by_worker');
+});
+
+test('a schedule occurrence of a worker-authored parent grants nothing even when an operator owns the schedule',async t=>{
+ const f=fixture();t.after(f.close);
+ const {default:worker}=await import('../src/worker');
+ const create=async(key:string,text:string,actor:unknown=admin)=>{const r=await f.direct(PROJECT,'/api/intakes?project='+PROJECT,'POST',{key,title:'T '+key,text,acceptance_criteria:['A']},actor);assert.equal(r.status,201,key);return(await data(r)).intake;};
+ const requester=await create('req','root');
+ const planted=await create('planted',`cite ${S_CITED.slice(0,8)}`,workerActor(WORKER,requester.id));
+ const evidence=await create('ev','x');await f.registerSession(S_CITED,PROJECT,evidence.id);
+ const occurrence=await create('occ',planted.text);
+ const token='synthetic-occ-worker-'+'o'.repeat(32);f.tokens.set(token,workerActor(CHILD_WORKER,occurrence.id));
+ const read=()=>worker.fetch(new Request('http://127.0.0.1/api/sessions/'+S_CITED.slice(0,8),{headers:{Authorization:'Bearer '+token}}),f.env);
+ // An operator-authored standalone copy is a requester intake.
+ assert.equal((await read()).status,200);
+ // The same row as the schedule runner writes it (operator owner, parent's text copied) is refused.
+ f.sql(PROJECT).prepare('UPDATE intakes SET schedule_id=?,parent_intake_id=? WHERE id=?').run('schedule-1',planted.id,occurrence.id);
+ const r=await read();assert.equal(r.status,403);assert.equal((await data(r)).reason,'intake_authored_by_worker');
 });
