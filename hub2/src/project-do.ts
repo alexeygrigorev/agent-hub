@@ -1916,6 +1916,12 @@ export class ProjectDO {
     return depth;
   }
 
+  /** The typed refusal already raised the actionable developer alert. */
+  private codeTaskRefusalAlerted(intakeId:string,why:{cause:string}|undefined):boolean{
+    return /\bcode_task_operator_required\b/.test(why?.cause??'')
+      &&!!this.db.one('SELECT 1 FROM intake_events WHERE event_key=?','code-task-operator-required:'+intakeId);
+  }
+
   /** Records the task outcome of a terminal attempt (inside its transaction) and
    * schedules at most one follow-up action: a continuation or a delivery. */
   private completionOutcome(intake:IntakeRow,saga:SagaRow,claim:CompletionClaim|undefined,reason:string,continuable:boolean,deliver:boolean,now:number):CompletionRecord{
@@ -1947,7 +1953,7 @@ export class ProjectDO {
     }
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
-    if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
+    if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason)&&!this.codeTaskRefusalAlerted(intake.id,unfinished))
       this.raiseDeveloperAlert(intake.id,saga.session_id,silent&&!hard?'session_ended_no_output':hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
@@ -2378,7 +2384,7 @@ export class ProjectDO {
           JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
         this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
           {...reopened,next:completion.continuation?'continue':'developer_alert'},now);
-        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':'recovery_exhausted',completion.reason,depth,now,why);
+        if(!completion.continuation&&!this.codeTaskRefusalAlerted(intake.id,why))this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':'recovery_exhausted',completion.reason,depth,now,why);
       }
     });
   }

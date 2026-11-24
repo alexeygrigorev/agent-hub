@@ -1604,6 +1604,33 @@ test('worker code-task refusals name the operator remedy and alert once across r
   }finally{f.close();}
 });
 
+test('a typed code-task denial does not raise another blocker alert on exit or a later recovery attempt',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'typed-refusal-exit',true);
+    for(let attempt=0;attempt<2;attempt++){
+      if(attempt)assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-denial',status:'open'})).status,200);
+      assert.equal((await start(f,id,'denied-'+attempt)).status,201);
+      const current=await run(f,id);
+      const actor={id:'session:'+current.session_id,kind:'agent',resource_id:id,scopes:['intake:append']};
+      assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'refuse-'+attempt,code_task:false},actor)).status,403);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'block-'+attempt,event:{kind:'task_blocked',session_id:current.session_id,
+        cause:'permission',detail:'code_task_operator_required: only an operator can reclassify',next_step:'Operator runs hub intake update --code-task false'}},actor);
+      await finish(f,current,1);f.reopen();await f.project.alarm();
+      assert.equal(intakeRow(f,id).status,'failed');
+      assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,1);
+      assert.equal(sagas(f,id).length,attempt+1,'permission refusal never launches a recovery');
+    }
+    // A different permission failure remains actionable even on the same intake.
+    await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-other-denial',status:'open'});
+    await start(f,id,'other-denial');const other=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'other-block',event:{kind:'task_blocked',session_id:other.session_id,
+      cause:'permission',detail:'Access denied to a different service',next_step:'Owner repairs service access'}});
+    await finish(f,other,1);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,2);
+  }finally{f.close();}
+});
+
 test('review prohibitions consume coordinated delivery verbs and PR references are read-only',()=>{
   for (const prohibition of ['do not push, merge or deploy', 'do not merge, push, or deploy',
     'must not deploy or merge', "don't push and merge", 'never merge']) {
@@ -1632,6 +1659,8 @@ test('read-only briefs are not code tasks, and an operator can reclassify and re
       assert.equal(r.status,201);return (await json(r)).intake.id as string;};
     const report=await make('ro1','DTC migration status','Read-only report, no code.',['Report states migration status']);
     assert.equal(JSON.parse(intakeRow(f,report).source_json).code_task,false,'report-only brief is classified non-code');
+    f.db().run("UPDATE intakes SET source_json='{}' WHERE id=?",report);
+    assert.equal((await json(await f.call('/api/intakes/'+report+'/merge-state'))).code_task,false,'legacy absent provenance still recognizes a read-only brief');
     const draft=await make('ro2','Draft email','Draft-only email task.',['Draft is written']);
     assert.equal(JSON.parse(intakeRow(f,draft).source_json).code_task,false);
     const code=await make('ro3','Fix bug','Implement fix and open a PR; read-only follow-up later.',['PR merged']);
