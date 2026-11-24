@@ -987,12 +987,54 @@ test('a permission blocker is not continued: Hub alerts the developer at once an
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
     assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'blocked');assert.equal(alerts[0].body.reason,'blocked_permission');
     assert.match(alerts[0].body.cause,/HTTP 403/);assert.equal(alerts[0].body.depth,0);
+    const blockerRow=events(f,id).find(e=>e.kind==='worker_append'&&e.body.evidence?.kind==='task_blocked');
+    assert.equal(alerts[0].body.blocker_event?.seq,blockerRow?.seq);
+    assert.equal(typeof alerts[0].body.blocker_event?.age_ms,'number');
     const task=(await json(await f.call('/api/intakes/'+id))).task;
     assert.equal(task.owner,'dev@dtcdev.click');assert.match(task.current_state,/Cause: blocked \(permission\): hub model-policy returns HTTP 403/);
+    assert.match(task.current_state,new RegExp(`Blocker event: seq ${blockerRow?.seq}, age `));
     assert(events(f,id).some(e=>e.kind==='task_unfinished'&&e.body.next==='deliver'&&/HTTP 403/.test(e.body.cause)));
     await f.project.alarm();
     assert.equal(sagas(f,id).length,1,'no continuation was started');
     assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Cause: blocked \(permission\)/);assert.match(f.mail[0].body,/does not restart a session into a permission blocker/);
+  }finally{f.close();}
+});
+
+test('42b42c9b regression: a crash after progress supersedes an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'stale-blocker-42b42c9b');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read on sessions 4027e3ec/5e0a9c29');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'progress-1',note:'worked around 403 and delivered PR 742; re-review approved'});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined,'stale blocker superseded by later progress must not block recovery');
+    assert.equal(record.continuation?.state,'pending');
+    assert.match(record.cause,/worked around 403 and delivered PR 742/);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started within budget');
+  }finally{f.close();}
+});
+
+test('a crash after non-blocker evidence clears an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'cleared-blocker');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'cleared-1',event:{kind:'blocker_cleared',session_id:first.session_id}});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined);
+    assert.equal(record.continuation?.state,'pending');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started after blocker cleared');
   }finally{f.close();}
 });
 
