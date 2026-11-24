@@ -175,6 +175,7 @@ export class ProjectDO {
       if (['/_internal/finish-dead-letter','/_internal/stopped-finish'].includes(url.pathname) && request.method==='POST')
         return await terminalReceipt(request,this.db,fn=>this.transaction(fn),(...args)=>this.appendEvent(...args),id=>this.intakeContext(id));
       if(url.pathname==='/_internal/session-wake'&&request.method==='POST')return await this.sessionWakeInternal(request);
+      if(url.pathname==='/_internal/evidence-read'&&request.method==='POST')return await this.evidenceRead(request);
       if (url.pathname === '/_internal/finish' && request.method === 'POST') return await this.finishInternal(request);
       if (url.pathname === '/_internal/started' && request.method === 'POST') return await this.startedInternal(request);
       if ((url.pathname === '/_internal/stopped' || url.pathname === '/_internal/reaped') && request.method === 'POST') return await this.stoppedInternal(request);
@@ -2604,6 +2605,35 @@ export class ProjectDO {
     return forbiddenScope('intake:read', `read of intake ${intake.id} needs intake:read with project:${intake.project}, the intake's own or child-intake worker session, or operator:admin`);
   }
 
+  /**
+   * Edge-only check (worker.ts) for a bound worker session reading a session or intake that is not
+   * its own. Granted only when the worker's own intake was authored by a requester (not a worker
+   * session) and its original title/text names the target by full id or 8+ hex prefix. Read-only:
+   * the edge forwards exactly one GET with an actor scoped to that one object. Each first grant per
+   * target is audited on the reader's intake; refusals are typed and name the operator command.
+   */
+  private async evidenceRead(request: Request): Promise<Response> {
+    const b = await bodyObject(request, 4096);
+    const kind = b.kind, target = b.target_id, actorId = b.actor_id, own = b.intake_id;
+    if (!['intake','session'].includes(String(kind)) || typeof target !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(target)
+      || typeof actorId !== 'string' || !/^session:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(actorId) || typeof own !== 'string' || !boundedString(own, 180))
+      return error('invalid_evidence_read', 400);
+    const command = `hub ${kind === 'session' ? 'sessions' : 'intake'} show ${target}`;
+    const refuse = (reason: string, why: string) => json({
+      error: 'evidence_not_referenced', reason, missing_scope: 'intake:read', operator_command: command,
+      detail: `${kind} ${target} is outside this worker's intake (missing scope intake:read): ${why}; ask an operator to run \`${command}\` and append the facts to your intake`,
+    }, 403);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', own);
+    if (!row) return refuse('own_intake_not_in_project', 'evidence reads are limited to the worker\'s own project');
+    if (!row.owner_actor_id || row.owner_actor_id.startsWith('session:'))
+      return refuse('intake_authored_by_worker', 'only a requester-authored intake grants evidence reads');
+    const reference = evidenceReferences(`${row.original_title ?? row.title}\n${row.original_text ?? row.text}`).find(ref => target.startsWith(ref));
+    if (!reference) return refuse('not_referenced', 'the intake text does not name it');
+    this.transaction(() => this.appendEvent(row.id, `intake:${row.id}:evidence_read:${kind}:${target}`, actorId, 'evidence_read',
+      { kind: kind as string, target_id: target, reference, read_only: true }, Date.now()));
+    return json({ granted: true, kind, target_id: target, reference });
+  }
+
   private canReadIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
     if (this.canProject(actor, intake.project, 'intake:read')) return true;
     if (!actor || !hasScope(actor, 'intake:read')) return false;
@@ -2634,6 +2664,16 @@ function criteriaError(value: unknown): Response | null {
 
 /** A t-id citation is a token like t3416u: t + digits + optional letter, not embedded in a longer word. */
 const T_ID_CITATION = /(?<![A-Za-z0-9])t\d+[a-z]?(?![A-Za-z0-9])/i;
+
+/** Session/intake ids an intake's text names as evidence: full ids or 8-hex short ids (bounded). */
+export function evidenceReferences(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.toLowerCase().matchAll(/(?<![0-9a-z])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})(?![0-9a-z])/g)) {
+    found.add(m[1]);
+    if (found.size >= 64) break;
+  }
+  return [...found];
+}
 
 /** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */
 function normalizeCriteria(body: Record<string, unknown>): void {
