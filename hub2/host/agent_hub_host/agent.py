@@ -203,6 +203,7 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'duplicate_terminal_field': 'Launch preparation was refused.',
  'engine_auth_check_unavailable': 'Engine authentication check failed before the session started.',
  'engine_auth_expired': 'Engine login expired before the session started.',
+ 'engine_binary_unavailable': 'Engine binary or managed launcher is unavailable on this host.',
  'engine_not_allowed': 'Engine is not allowed.',
  'generation_conflict': 'Provider credential preparation was refused.',
  'glm_model_route_refused': 'Launch preparation was refused.',

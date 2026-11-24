@@ -371,16 +371,21 @@ export function taskBlocker(evidence: unknown, sessionId: string): TaskBlocker |
 
 /** Host-typed engine auth/preflight refusals: the engine never started work,
  * so Hub marks it unhealthy on that machine and repicks (intake 62ccfa1e). */
-export const ENGINE_PREFLIGHT_FAILURES: ReadonlySet<string> = new Set(['engine_auth_check_unavailable', 'engine_auth_expired']);
+export const ENGINE_PREFLIGHT_FAILURES: ReadonlySet<string> = new Set([
+  'engine_auth_check_unavailable',
+  'engine_auth_expired',
+  'engine_binary_unavailable',
+  'codex_launch_wrapper_unavailable',
+]);
 /** How long a preflight-failed engine stays out of the picker on its machine. */
 export const ENGINE_UNHEALTHY_MS = 30 * 60_000;
 /** A launcher refusal this soon after the start means the engine never did real work. */
 export const FAST_START_FAILURE_MS = 3 * 60_000;
-/** Exit 75 (EX_TEMPFAIL) is the maintained launchers' refusal code: e.g. the Codex
- * wrapper quota gate refusing a dead credential seconds after the start
- * (2026-11-23). Fast enough, it is an engine start fault, not task work. */
+/** Exit 75 (EX_TEMPFAIL) and exit 127 (command not found) are fast start
+ * refusals: e.g. a quota gate or a missing/broken engine binary seconds after
+ * the start. Fast enough, it is an engine start fault, not task work. */
 export function isFastStartRefusal(exitCode: unknown, startedAt: number, endedAt: number): boolean {
-  return exitCode === 75 && Number.isFinite(startedAt) && endedAt - startedAt <= FAST_START_FAILURE_MS;
+  return (exitCode === 75 || exitCode === 127) && Number.isFinite(startedAt) && endedAt - startedAt <= FAST_START_FAILURE_MS;
 }
 
 const REASON_TEXT: Record<string, string> = {
@@ -389,6 +394,8 @@ const REASON_TEXT: Record<string, string> = {
   launch_failed: 'the session failed to launch',
   engine_auth_check_unavailable: 'the engine failed its authentication check before starting; Hub repicks another engine',
   engine_auth_expired: 'the engine login expired before starting; Hub repicks another engine',
+  engine_binary_unavailable: 'the engine binary or managed launcher is unavailable on the host; Hub repicks another engine',
+  codex_launch_wrapper_unavailable: 'the Codex launch wrapper is unavailable on the host; Hub repicks another engine',
 };
 
 /** One human-readable cause for an unfinished exit: the session's blocker

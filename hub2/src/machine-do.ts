@@ -1339,8 +1339,8 @@ export class MachineDO {
       await this.markEngineUnhealthy(launch.engine,typedFailure,row.id,now);
     else if(!typedFailure&&!launchFailed&&!payload.stop_requested&&nativeDeadline?.exceeded!==true&&typeof launch.engine==='string'
       &&launch.engine!=='shell'&&isFastStartRefusal(Number(body.exit_code),row.created_at,now))
-      // The launcher refused within seconds (exit 75): route around this engine here too.
-      await this.markEngineUnhealthy(launch.engine,'native_exit_75',row.id,now);
+      // The launcher refused within seconds (exit 75/127): route around this engine here too.
+      await this.markEngineUnhealthy(launch.engine,'native_exit_'+String(body.exit_code),row.id,now);
     this.db.transaction(this.ctx, () => {
       const {[WORKSPACE_REPAIR_FIELD]:_repair,...completedLaunch}=launch;
       this.db.run('UPDATE sessions SET state=?, evidence_json=?, evidence_digest=?, exit_code=?, updated_at=?,native_id=?,launch_json=? WHERE id=? AND state=?',

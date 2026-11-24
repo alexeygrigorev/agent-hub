@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -1004,6 +1005,62 @@ def repinnable_execute_profile(name, table):
     return match.group('managed')
 
 
+def repinnable_launcher_script(name, table):
+    """(launcher_path, managed_dir) for a generated engine-launch/<label>.sh, or None."""
+    if (not name.startswith('hub-') or name == MANAGED_PROFILE or not isinstance(table, dict)
+            or set(table) != {'engine', 'command'} or not isinstance(table['command'], list)
+            or len(table['command']) != 2 or not all(isinstance(part, str) for part in table['command'])):
+        return None
+    label = name[4:]
+    if table['command'][1] != label:
+        return None
+    launcher = Path(table['command'][0])
+    if launcher.parent.name != 'engine-launch' or launcher.name != label + '.sh':
+        return None
+    if not launcher.is_file() or launcher.is_symlink():
+        return None
+    try:
+        raw = launcher.read_bytes()[:8193]
+    except OSError:
+        return None
+    if len(raw) > 8192:
+        return None
+    lines = raw.decode('utf-8', errors='replace').splitlines()
+    if len(lines) != 2 or lines[0] != '#!/bin/sh':
+        return None
+    try:
+        parts = shlex.split(lines[1])
+    except ValueError:
+        return None
+    if len(parts) != 5 or parts[0] != 'exec' or parts[2] != '-c' or parts[4] != '$@':
+        return None
+    match = EXECUTE_CODE.fullmatch(parts[3])
+    if not match or '.pyz' not in parts[3]:
+        return None
+    return launcher, match.group('managed')
+
+
+def _repin_launcher_script(launcher, target, label, managed, *, engine=None):
+    command = release_execute_command(target, label, managed, engine=engine)
+    body = '#!/bin/sh\nexec ' + shlex.quote(command[0]) + ' -c ' + shlex.quote(command[-2]) + ' "$@"\n'
+    encoded = body.encode('utf-8')
+    if launcher.read_bytes() == encoded:
+        return False
+    temporary = launcher.with_name(launcher.name + '.hub2-repin')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o700)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o700)
+        os.replace(temporary, launcher)
+    finally:
+        temporary.unlink(missing_ok=True)
+    sync_directory(launcher.parent)
+    return True
+
+
 def repin_managed_profiles(target):
     """Point every other generated managed execute() profile at this release.
 
@@ -1027,9 +1084,13 @@ def repin_managed_profiles(target):
         block, after = rest.split(MANAGED_END)
         profiles = tomllib.loads(block).get('profiles', {})
         changed = []
+        script_targets = []
         for name, table in profiles.items():
             managed = repinnable_execute_profile(name, table)
             if managed is None:
+                found_script = repinnable_launcher_script(name, table)
+                if found_script is not None:
+                    script_targets.append((name, table['engine'], found_script[0], found_script[1]))
                 continue
             command = release_execute_command(target, name[4:], managed, engine=table['engine'])
             if command == table['command']:
@@ -1042,15 +1103,22 @@ def repin_managed_profiles(target):
                 continue
             block = block[:index] + 'command = ' + json.dumps(command) + '\n' + block[index + len(old_line):]
             changed.append(name)
-        if not changed:
-            return []
+        for name, engine, launcher, managed in script_targets:
+            managed_root = Path(managed)
+            lock = managed_lock(managed_root) if (managed_root / 'reconcile.lock').is_file() else contextlib.nullcontext()
+            with lock:
+                if _repin_launcher_script(launcher, target, name[4:], managed, engine=engine):
+                    changed.append(name)
+        config_changed = [name for name in changed if name not in {item[0] for item in script_targets}]
+        if not config_changed:
+            return changed
         updated = before + MANAGED_BEGIN + block + MANAGED_END + after
         parsed = tomllib.loads(updated).get('profiles', {})
         if any(parsed.get(name, {}).get('command') != release_execute_command(
                 target, name[4:], repinnable_execute_profile(name, profiles[name]),
-                engine=parsed.get(name, {}).get('engine')) for name in changed):
+                engine=parsed.get(name, {}).get('engine')) for name in config_changed):
             return []
-        managed_root = Path(repinnable_execute_profile(changed[0], profiles[changed[0]]))
+        managed_root = Path(repinnable_execute_profile(config_changed[0], profiles[config_changed[0]]))
         lock = managed_lock(managed_root) if (managed_root / 'reconcile.lock').is_file() else contextlib.nullcontext()
         with lock:
             with path.open('rb') as stream:

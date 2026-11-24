@@ -180,6 +180,42 @@ def resolve_windows_program(program, environ=None):
     return found if found and ntpath.isabs(found) else program
 
 
+def _is_executable_file(path):
+    candidate = Path(path)
+    if not candidate.is_file():
+        return False
+    return True if os.name == 'nt' else os.access(candidate, os.X_OK)
+
+
+def resolve_engine_binary(provider, environ=None):
+    """Resolve an engine binary by PATH, managed install, or known nvm path."""
+    binary = PROVIDER_BINARIES.get(provider, "")
+    if not binary:
+        return None
+    env = os.environ if environ is None else environ
+    found = shutil.which(binary) if environ is None else shutil.which(binary, path=env.get('PATH'))
+    if found:
+        return found
+    if provider != 'go':
+        return None
+    managed_root = Path(env.get('AGENT_HUB_MANAGED_DIR') or (Path.home() / '.config' / 'agent-hub' / 'managed-engines'))
+    exe_name = binary + ('.exe' if os.name == 'nt' else '')
+    if managed_root.is_dir():
+        for match in sorted(managed_root.glob('shared-go-*/engine/node_modules/@opencode/cli-*/bin/' + exe_name), reverse=True):
+            if _is_executable_file(match):
+                return str(match)
+    if os.name != 'nt':
+        nvm_root = Path.home() / '.nvm' / 'versions' / 'node'
+        if nvm_root.is_dir():
+            for match in sorted(nvm_root.glob('*/bin/' + binary), reverse=True):
+                if _is_executable_file(match):
+                    return str(match)
+        for standard in (Path.home() / '.local' / 'bin' / binary, Path('/usr/local/bin') / binary):
+            if _is_executable_file(standard):
+                return str(standard)
+    return None
+
+
 def windows_codex_command(argv):
     """Execute the installed npm entry with Node, without shell expansion."""
     if sys.platform != 'win32' or ntpath.basename(argv[0]).lower() not in {'codex', 'codex.cmd', 'codex.ps1', 'codex.exe'}:
@@ -1101,7 +1137,8 @@ class NativeLauncher:
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
             supported = set(PROVIDER_CAPABILITIES.get(provider, set()))
-            available = bool(shutil.which(PROVIDER_BINARIES.get(provider, "")))
+            binary_path = resolve_engine_binary(provider)
+            available = bool(binary_path)
             if self.config.get('private_provider_homes') and provider == 'claude':
                 available = provider_home.claude_install_available()
             if provider == 'codex':
@@ -1111,6 +1148,14 @@ class NativeLauncher:
                 if not available and self._codex_withdrawn_reason == 'profile_release_mismatch':
                     supported.discard('headless')
                     available = bool(supported)
+            elif provider == 'go' and not self.config.get('private_provider_homes', False) and route.get('profile') == 'hub-shared-go':
+                if self._go_advertisable(route):
+                    if not binary_path:
+                        supported.discard('interactive')
+                    available = bool(supported)
+                else:
+                    supported.discard('headless')
+                    available = bool(supported) and bool(binary_path)
             if supported and available:
                 result[engine] = set(supported)
         return result
@@ -1154,6 +1199,58 @@ class NativeLauncher:
             else:
                 print('RECOVERED hub2-host: codex advertised again', file=sys.stderr, flush=True)
         return reason is None
+
+    def go_profile_readiness(self, route):
+        """True when the local hub-shared-go profile and its launcher python/archive exist."""
+        if os.name == 'nt' or not isinstance(route, dict) or route.get('profile') != 'hub-shared-go':
+            return True
+        if self.runner is not subprocess.run and 'APLEXER_CONFIG' not in os.environ:
+            return True
+        config_path = Path(os.environ.get('APLEXER_CONFIG') or (Path.home() / '.config' / 'aplexer' / 'config.toml'))
+        if not config_path.is_file():
+            return 'APLEXER_CONFIG' not in os.environ
+        try:
+            import tomllib
+            parsed = tomllib.loads(config_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return False
+        table = (parsed.get('profiles') or {}).get('hub-shared-go')
+        command = table.get('command') if isinstance(table, dict) else None
+        if not isinstance(command, list) or not command or not isinstance(command[0], str):
+            return False
+        entry = Path(command[0])
+        if not _is_executable_file(entry):
+            return False
+        if entry.suffix == '.sh':
+            import shlex
+            try:
+                lines = entry.read_text(encoding='utf-8').splitlines()
+                parts = shlex.split(lines[1]) if len(lines) >= 2 else []
+            except (OSError, ValueError):
+                return False
+            if len(parts) < 4 or parts[0] != 'exec' or not _is_executable_file(parts[1]):
+                return False
+            if parts[2] == '-c':
+                for match in re.finditer(r"sys\.path\.insert\(0,\s*'([^']+)'\)", parts[3]):
+                    if match.group(1).endswith('.pyz') and not Path(match.group(1)).is_file():
+                        return False
+        return True
+
+    def _go_advertisable(self, route):
+        now = time.monotonic()
+        cached = getattr(self, '_go_ready_cache', None)
+        if cached is None or now - cached[0] > 30:
+            cached = (now, bool(self.go_profile_readiness(route)))
+            self._go_ready_cache = cached
+        ready = cached[1]
+        if getattr(self, '_go_withdrawn', False) is not (not ready):
+            self._go_withdrawn = not ready
+            if not ready:
+                print('ALERT hub2-host: engine_binary_unavailable (hub-shared-go): headless capability withdrawn',
+                      file=sys.stderr, flush=True)
+            else:
+                print('RECOVERED hub2-host: go advertised again', file=sys.stderr, flush=True)
+        return ready
 
     def windows_credential_artifacts(self):
         """A held Windows artifact owner, not consumer enrollment/readiness.
@@ -1317,12 +1414,19 @@ class NativeLauncher:
         if local:
             if codex_wrapper and not self.codex_exec_readiness(route, codex_wrapper):
                 raise RuntimeError('codex_launch_wrapper_unavailable')
+            if provider == 'go' and not self.go_profile_readiness(route):
+                raise RuntimeError('engine_binary_unavailable')
             child = self.profile_command(task_id, specification, route, goal)
         else:
             child = adapter_argv(provider, goal, specification["model"])
             if codex_wrapper:
                 # Only the SDK executable changes; model, effort and prompt argv stay.
                 child[0] = codex_wrapper
+            elif provider == 'go' or self.runner is subprocess.run:
+                resolved_bin = resolve_engine_binary(provider)
+                if not resolved_bin:
+                    raise RuntimeError('engine_binary_unavailable')
+                child[0] = resolved_bin
         objective = None
         if specification.get("interactive") and not local:
             child = interactive_argv(provider, child, goal, model=specification["model"],

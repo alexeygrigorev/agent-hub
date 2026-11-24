@@ -2057,3 +2057,65 @@ class AntigravityFirstRunBlockTests(unittest.TestCase):
             self.assertEqual(payload['failure_reason'], 'antigravity_first_run_blocked')
             self.assertEqual(payload['detail'], HOST_FAILURE_DETAILS['antigravity_first_run_blocked'])
             self.assertNotIn('launch_failed', payload)
+
+
+class GoBinaryAndPreflightTests(unittest.TestCase):
+    def test_resolve_engine_binary_finds_managed_opencode_without_shell_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            managed = Path(tmp) / 'managed'
+            opencode = managed / 'shared-go-rev1/engine/node_modules/@opencode/cli-linux-x64/bin/opencode'
+            opencode.parent.mkdir(parents=True)
+            opencode.write_text('#!/bin/sh\nexit 0\n')
+            opencode.chmod(0o700)
+            with mock.patch.object(nl.shutil, 'which', return_value=None), \
+                 mock.patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(managed), 'PATH': '/usr/bin:/bin'}):
+                self.assertEqual(nl.resolve_engine_binary('go'), str(opencode))
+
+    def test_resolve_engine_binary_finds_nvm_opencode_without_shell_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            nvm_bin = home / '.nvm/versions/node/v24.13.1/bin/opencode'
+            nvm_bin.parent.mkdir(parents=True)
+            nvm_bin.write_text('#!/bin/sh\nexit 0\n')
+            nvm_bin.chmod(0o700)
+            with mock.patch.object(nl.shutil, 'which', return_value=None), \
+                 mock.patch.object(Path, 'home', return_value=home), \
+                 mock.patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(home / 'none'), 'PATH': '/usr/bin:/bin'}):
+                self.assertEqual(nl.resolve_engine_binary('go'), str(nvm_bin))
+
+    def test_broken_shared_go_launcher_withdraws_headless_and_refuses_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / 'engine-launch/shared-go.sh'
+            launcher.parent.mkdir(parents=True)
+            missing_python = root / 'releases/deleted/bin/python'
+            launcher.write_text('#!/bin/sh\nexec ' + str(missing_python) + ' -c "pass" "$@"\n')
+            launcher.chmod(0o700)
+            config = root / 'config.toml'
+            config.write_text('[profiles.hub-shared-go]\nengine = "opencode"\ncommand = ["'
+                              + str(launcher) + '", "shared-go"]\n')
+            adapter = nl.NativeLauncher({'private_provider_homes': False,
+                                         'routes': {'go': nl.LOCAL_ROUTES['go']}},
+                                        aplexer='synthetic-aplexer', runner=lambda *a, **k: None)
+            with mock.patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}), \
+                 mock.patch.object(nl, 'resolve_engine_binary', return_value='/usr/local/bin/opencode'):
+                caps = adapter.capabilities()
+                self.assertEqual(caps.get('go'), {'interactive'})
+                with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
+                    adapter.launch('task-go-broken', {
+                        'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
+                        'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
+                    })
+
+    def test_non_local_launch_refuses_missing_binary_and_uses_resolved_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = nl.NativeLauncher({'private_provider_homes': True,
+                                         'routes': {'go': {'provider': 'go'}}},
+                                        aplexer='synthetic-aplexer', runner=lambda *a, **k: None)
+            with mock.patch.object(nl, 'resolve_engine_binary', return_value=None):
+                with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
+                    adapter.launch('task-go-missing', {
+                        'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
+                        'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
+                    })

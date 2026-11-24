@@ -1584,7 +1584,7 @@ export class ProjectDO {
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
     // The host names an engine that refused to start on its auth/preflight
     // check; recovery must repick instead of retrying that engine (intake 62ccfa1e).
-    const preflight = !launchFailed && typeof body.failure_reason === 'string' && ENGINE_PREFLIGHT_FAILURES.has(body.failure_reason)
+    const preflight = typeof body.failure_reason === 'string' && ENGINE_PREFLIGHT_FAILURES.has(body.failure_reason)
       ? body.failure_reason : undefined;
     const duplicate=this.transaction(() => {
       this.pinWorkspaceBinding(saga,binding);
@@ -1639,7 +1639,7 @@ export class ProjectDO {
         stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(preflight?{failure_reason:preflight}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
       if(preflight)this.engineUnhealthyAlert(intake.id,saga,preflight,now);
       else if(!launchFailed&&!stopRequested&&!deadlineExceeded&&isFastStartRefusal(body.exit_code,saga.created_at,now))
-        this.engineUnhealthyAlert(intake.id,saga,'native_exit_75',now);
+        this.engineUnhealthyAlert(intake.id,saga,'native_exit_'+String(body.exit_code),now);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
