@@ -1118,6 +1118,9 @@ async function defineTests() {
       try{if(writes===1)await held;await semanticWriter(value,handle);}finally{active--;}
     }});t.after(async()=>{release();await (f.observer as any).queue;await f.observer.close();rmSync(directory,{recursive:true,force:true});});
     const first=f.observer.begin();await f.observer.finish(first,'observation');
+    // The held writer must be physically running before its wait expires; on a slow runner the 25 ms timeout can otherwise elapse before the writer starts.
+    for(let i=0;i<200&&writes<1;i++)await new Promise(r=>setTimeout(r,10));
+    assert.equal(writes,1,'first writer started and is held');
     const expired=await f.observer.snapshot(NONCE);assert.equal(expired.available,false);
     const second=f.observer.begin();await f.observer.finish(second,'alert');
     assert.equal((f.observer as any).journal.started_total,2);
