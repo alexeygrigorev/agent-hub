@@ -8,6 +8,7 @@ import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage.ts';
 import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
+import {mergeGate,mergeGateAll,readOnlyBrief} from '../src/merge-gate';
 import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,MAX_VERIFICATION_ATTEMPTS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker,verificationPrompt} from '../src/task-completion';
 
 const admin={id:'human:completion-owner',kind:'operator',scopes:['operator:admin']};
@@ -1234,7 +1235,7 @@ test('merge-state is readable by operators and the intake worker only, and names
     await start(f,id,'first');const first=await run(f,id);
     const worker={id:'session:'+first.session_id,kind:'agent',resource_id:id,scopes:['intake:read','intake:append']};
     let state=await json(await f.call('/api/intakes/'+id+'/merge-state','GET',undefined,worker));
-    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.match(state.merge_gate.problems[0],/JSON object/);
+    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.equal(state.merge_gate.problems[0],'merge_evidence_missing');
     assert.match(state.next_step,/hub intake merge-check/);
     const posted=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'worker-proof',evidence:mergeProof},worker);
     assert.equal(posted.status,201,await posted.clone().text());
@@ -1482,6 +1483,26 @@ test('hub intake close succeeds on an already-accepted verified intake while unv
     assert.equal(badLegacyClose.status,409);
     assert.equal((await json(badLegacyClose)).error,'review_required');
   }finally{f.close();}
+});
+
+test('review prohibitions consume coordinated delivery verbs and PR references are read-only',()=>{
+  for (const prohibition of ['do not push, merge or deploy', 'do not merge, push, or deploy',
+    'must not deploy or merge', "don't push and merge", 'never merge']) {
+    assert.equal(readOnlyBrief('Review PR 742', `Read-only: ${prohibition}. Review the exact PR head.`,
+      ['Post an APPROVE or REQUEST_CHANGES verdict comment with file:line findings.']), true, prohibition);
+  }
+  assert.equal(readOnlyBrief('Review', 'Do not push, merge or deploy.', ['Post a verdict.']),true);
+  assert.equal(readOnlyBrief('Review PR 743', 'Do not push, merge or deploy.', ['Post a verdict on the PR.']),true);
+  assert.equal(readOnlyBrief('Fix bug', 'Implement fix and open a PR; read-only follow-up later.', ['PR merged']),false);
+  assert.equal(readOnlyBrief('Delivery', 'Do not deploy. Implement the change and open a PR.', ['PR checks green']),false);
+  assert.equal(readOnlyBrief('Delivery', 'Read-only follow-up. Merge the PR.', ['Result']),false);
+});
+
+test('absent merge evidence is typed separately from malformed evidence and non-code work',()=>{
+  assert.deepEqual(mergeGate(true,undefined).problems,['merge_evidence_missing']);
+  assert.deepEqual(mergeGateAll(true,[]).problems,['merge_evidence_missing']);
+  assert.deepEqual(mergeGate(true,[]).problems,['merge evidence must be a JSON object']);
+  assert.deepEqual(mergeGate(false,undefined),{required:false,ok:true,problems:[]});
 });
 
 test('read-only briefs are not code tasks, and an operator can reclassify and reevaluate',async()=>{
