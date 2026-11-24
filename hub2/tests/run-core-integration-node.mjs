@@ -135,8 +135,8 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),200,'finish retry');
   if(workerCheck)expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry second independent lost Project finish response after revoked worker replay');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,exit_code:1},hostToken),409,'finish conflict');
-  if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');assert.equal(final.intake.status,'completed-awaiting-review');assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
+  if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   assert.equal('occupied' in expect(await api('/api/account/quota'),200,'account view has no per-session slots').account,false);
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');
   assert.equal(offers.offers.some(offer=>offer.session_id===started.id),false,'finished session must not remain offered');
