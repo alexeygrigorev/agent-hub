@@ -2090,3 +2090,24 @@ test('a launcher exit 75 within seconds marks the engine unhealthy on the machin
   }
  }finally{console.error=original;}
 });
+
+test('engine_binary_unavailable launch failure marks engine unhealthy and preserves failure_reason',async()=>{
+ const errors:string[]=[],original=console.error;
+ console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
+ try{
+  const f=fixture(),session='preflight-bin-missing',epoch=await startOffered(f,session);
+  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'c-bin'}),send:()=>{}};
+  f.sockets.push(socket);
+  const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/enrolled/relay'};
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+  const finish={operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,failure_reason:'engine_binary_unavailable'};
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+  const view=await (await f.call('/_internal/routing')).json() as any;
+  assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','engine_binary_unavailable',session]]);
+  const attention=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+  assert.equal(attention?.reason,'engine_binary_unavailable');
+  const forwarded=f.events.find((req:any)=>req.path.includes('/_internal/reaped'));
+  assert.equal(forwarded?.body?.failure_reason,'engine_binary_unavailable');
+  assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes('engine_binary_unavailable')),errors.join('\n'));
+ }finally{console.error=original;}
+});

@@ -31,6 +31,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "workspace_label_ambiguous": "Workspace label is ambiguous.",
   "native_launch_route_missing": "Native launch route is unavailable.",
   "codex_launch_wrapper_unavailable": "Codex launch wrapper is unavailable.",
+  "engine_binary_unavailable": "Engine binary or managed launcher is unavailable on this host.",
   "claude_workspace_trust_unverified": "Claude folder-trust prompt could not be answered.",
   "launcher_capability_unavailable": "Launcher capability is unavailable.",
   "managed_exec_unavailable": "Managed execution is unavailable.",
@@ -2106,7 +2107,7 @@ export class MachineDO {
     // An untyped host launch failure is not a workspace/request refusal: do not
     // keep re-picking that engine on this machine while it keeps failing.
     const refused=this.parse(session.launch_json) as JsonRecord|null;
-    if(failureReason==='host_operation_failed'&&typeof refused?.engine==='string'&&refused.engine!=='shell')
+    if((failureReason==='host_operation_failed'||ENGINE_PREFLIGHT_FAILURES.has(failureReason))&&typeof refused?.engine==='string'&&refused.engine!=='shell')
       await this.markEngineUnhealthy(refused.engine,failureReason,session.id,now);
   }
 
