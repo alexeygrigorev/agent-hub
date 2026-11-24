@@ -3889,6 +3889,27 @@ class ManagedProfileRepinTests(unittest.TestCase):
                 'from agent_hub_host.provisioning import execute; execute()', 'shared-codex'])
             self.assertEqual(profiles['mine']['command'], ['x'])
 
+    def test_stale_engine_launch_script_is_repinned_to_the_release(self):
+        import shlex
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed = root / 'managed'
+            launcher = managed / 'engine-launch' / 'shared-go.sh'
+            config, target, _ = self.write(root, [('hub-shared-go', 'opencode', [str(launcher), 'shared-go'])])
+            launcher.parent.mkdir(parents=True)
+            stale = self.stale(str(root / 'releases' / OLD_SHA / 'hub.pyz'), str(managed), 'shared-go')
+            launcher.write_text('#!/bin/sh\nexec ' + shlex.quote(str(root / 'releases' / OLD_SHA / 'bin/python'))
+                                + ' -c ' + shlex.quote(stale[-2]) + ' "$@"\n')
+            launcher.chmod(0o700)
+            with patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}):
+                self.assertEqual(updater.repin_managed_profiles(target), ['hub-shared-go'])
+                self.assertEqual(updater.repin_managed_profiles(target), [])
+            text = launcher.read_text()
+            self.assertIn(str(target / 'bin/python'), text)
+            self.assertIn(str(target / 'hub.pyz'), text)
+            self.assertNotIn(OLD_SHA, text)
+            self.assertEqual(launcher.stat().st_mode & 0o777, 0o700)
+
     def test_three_argument_execute_generator_keeps_conservative_generic_output(self):
         target = Path('/synthetic/release')
         managed = '/synthetic/managed'

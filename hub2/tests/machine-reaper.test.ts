@@ -2067,7 +2067,7 @@ test('a launcher exit 75 within seconds marks the engine unhealthy on the machin
  const errors:string[]=[],original=console.error;
  console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
  try{
-  for(const [exit,expected] of [[1,false],[75,true]] as const){
+  for(const [exit,expected] of [[1,false],[75,true],[127,true]] as const){
    const f=fixture(),session='fast-exit-'+exit,epoch=await startOffered(f,session);
    const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'c-'+exit}),send:()=>{}};
    f.sockets.push(socket);
@@ -2082,9 +2082,10 @@ test('a launcher exit 75 within seconds marks the engine unhealthy on the machin
    assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,201);
    const view=await (await f.call('/_internal/routing')).json() as any;
    if(expected){
-    assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','native_exit_75',session]]);
+    const reason='native_exit_'+exit;
+    assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex',reason,session]]);
     assert.ok(view.unhealthy_engines[0].until>Date.now()+29*60_000);
-    assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes('native_exit_75')),errors.join('\n'));
+    assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes(reason)),errors.join('\n'));
    }else assert.equal(view.unhealthy_engines,undefined,JSON.stringify(view.unhealthy_engines));
   }
  }finally{console.error=original;}
