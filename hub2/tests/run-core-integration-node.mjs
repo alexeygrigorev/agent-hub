@@ -135,7 +135,15 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),200,'finish retry');
   if(workerCheck)expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry second independent lost Project finish response after revoked worker replay');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,exit_code:1},hostToken),409,'finish conflict');
-  const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');assert.equal(final.intake.status,'completed-awaiting-review');assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
+  // The completion claim makes independent verification due immediately, so the Project's own alarm may
+  // legitimately start the verifier (intake -> 'queued', new session) before this read on a loaded runner.
+  // That is the product's committed next state, not a lost finish: accept it only with the verification-start event as proof.
+  const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');
+  const finalHistory=expect(await api(`/api/intakes/${created.id}/history`),200,'final intake history').events;
+  assert(finalHistory.some(e=>e.kind==='finish_evidence_received'&&e.body.session_id===started.id),'finish evidence committed');
+  if(final.intake.status!=='completed-awaiting-review'){assert.equal(final.intake.status,'queued','unexpected status after finish');
+   assert(finalHistory.some(e=>e.kind==='task_verification_started'&&e.body.original_session_id===started.id),'queued only when the verifier already started');}
+  assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
   if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   assert.equal('occupied' in expect(await api('/api/account/quota'),200,'account view has no per-session slots').account,false);
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');

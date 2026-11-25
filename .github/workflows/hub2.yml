@@ -38,6 +38,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Repeat-run proof for the core integration gate (flake regressions). Runs on
+  # manual dispatch and on PRs whose title contains "[core-stress]".
+  core-node-stress:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[core-stress]') && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, contabo]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install locked toolchain
+        run: npm ci
+      - name: Core integration suite x20
+        env:
+          HUB2_CORE_WORKER: "1"
+        run: |
+          for i in $(seq 1 20); do
+            echo "::group::core run $i/20"
+            npm run test:core --prefix hub2 || { echo "core run $i failed"; exit 1; }
+            echo "::endgroup::"
+          done
+
   # Fix plan 1.1 (RC1): one integrated start through the real server, the real
   # host daemon and the real `hub` CLI zipapp; only `a` and `codex` are stubs.
   # Self-contained on purpose: keep it separate from the `checks` job.
