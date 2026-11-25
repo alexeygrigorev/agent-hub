@@ -122,7 +122,6 @@ def scan_open_paths(targets: Iterable[Path]) -> tuple[set[Path], bool]:
         while True:
             if cur in resolved_targets:
                 found.add(resolved_targets[cur])
-                return
             if cur.parent == cur:
                 return
             cur = cur.parent
@@ -353,7 +352,10 @@ def plan_managed_engines_retention(
                 candidates.append((entry, 'managed_engines', 'superseded_managed_engine_unreferenced'))
 
     # Safe regenerable package caches inside managed-engines/*/home/.cache/{uv,pip} & .npm
+    queued_parents = {p.resolve(strict=False) for p, _, _ in candidates}
     for entry in sorted(managed_root.iterdir()):
+        if entry.resolve(strict=False) in queued_parents:
+            continue
         home_dir = entry / 'home'
         if not home_dir.is_dir():
             continue
@@ -393,7 +395,13 @@ def run_hygiene(
 ) -> dict[str, Any]:
     home = home or Path.home()
     state_dir = state_dir or (home / '.local' / 'state' / 'hub-disk-hygiene')
-    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        fallback_base = Path(runtime) if runtime and os.path.isdir(runtime) else Path('/dev/shm')
+        state_dir = fallback_base / f'hub-disk-hygiene-{os.getuid()}'
+        state_dir.mkdir(parents=True, exist_ok=True)
     log_path = state_dir / 'hygiene.log'
     now_s = time.time() if now_s is None else now_s
     deny = tuple(denylist) if denylist is not None else default_denylist(home)
@@ -489,8 +497,20 @@ def run_hygiene(
         *[f"  {a['status']} {a['category']} {a['bytes']}B {a['path']} ({a['reason']})" for a in actions],
         daily_line,
     ]
-    with open(log_path, 'a', encoding='utf-8') as fh:
-        fh.write('\n'.join(log_lines) + '\n')
+    try:
+        with open(log_path, 'a', encoding='utf-8') as fh:
+            fh.write('\n'.join(log_lines) + '\n')
+    except OSError:
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        fallback_base = Path(runtime) if runtime and os.path.isdir(runtime) else Path('/dev/shm')
+        fallback_dir = fallback_base / f'hub-disk-hygiene-{os.getuid()}'
+        try:
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            log_path = fallback_dir / 'hygiene.log'
+            with open(log_path, 'a', encoding='utf-8') as fh:
+                fh.write('\n'.join(log_lines) + '\n')
+        except OSError:
+            pass
 
     return {
         'mode': mode_str,
