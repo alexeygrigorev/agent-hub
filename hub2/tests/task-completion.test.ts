@@ -1597,6 +1597,7 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
     const id=await createIntake(f,'muse-127-recovery');
     assert.equal((await start(f,id,'first',{engine:'go',override_reason:'canary Muse failure'})).status,201);
     const first=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-0',note:'attempt 0 progress'});
     const response=await f.call('/_internal/finish','POST',{...first,exit_code:127,native_exit_confirmed:true,evidence:{
       source:'aplexer_retirement',containment_empty:true,native_identity:{id:first.native_id,tag:'task-hub2-'+first.session_id,workspace:'/srv/work/feature'},
       native_exit:{code:127,exited_at_ms:Date.now()}}});
@@ -1611,7 +1612,9 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
     assert.deepEqual(JSON.parse(next.routing_json).exclude_policy_ids,['go-muse']);
     assert.match(JSON.parse(next.launch_spec_json).prompt,/native_exit_127/);
     for(let attempt=1;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
-      await finish(f,await run(f,id),1);
+      const binding=await run(f,id);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
+      await finish(f,binding,1);
       await f.project.alarm();
     }
     assert.equal(sagas(f,id).length,1+MAX_AUTO_CONTINUATIONS);
@@ -1640,6 +1643,7 @@ test('21a07a26 path: repeated Muse exit 1 changes route before exhausting contro
     for(let attempt=0;attempt<2;attempt++){
       const binding=await run(f,id);
       assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'go');
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
       assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{
         source:'aplexer_retirement',containment_empty:true,native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:'/srv/work/feature'},
         native_exit:{code:1,exited_at_ms:Date.now()}}})).status,200);
@@ -1649,6 +1653,7 @@ test('21a07a26 path: repeated Muse exit 1 changes route before exhausting contro
     assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'codex');
     assert.equal(sagas(f,id).length,3,'the second recovery uses the last available attempt on a different route');
     const final=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-final',note:'final attempt progress'});
     await finish(f,final,1);
     await f.project.alarm();
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
