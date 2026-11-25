@@ -261,17 +261,28 @@ def publish(args, observer=None):
     # The subprocess does not own the state lock: an independent monitor remains
     # runnable if the publisher is blocked, killed or otherwise stopped.
     started = now_ms()
-    try:
-        # No observer channel/identity reaches the Hub/provider subprocess.
-        env = {k: v for k, v in os.environ.items() if not k.startswith('HUB_ALERT_')}
-        result = subprocess.run([str(args.hub), 'quota', 'publish'], capture_output=True, text=True, timeout=args.publish_timeout, env=env)
-    except subprocess.TimeoutExpired:
-        raise Failure('cli_timeout') from None
-    except UnicodeError:
-        raise Failure('result_invalid') from None
-    except OSError:
-        raise Failure('cli_unavailable') from None
-    if result.returncode:
+    # No observer channel/identity reaches the Hub/provider subprocess.
+    env = {k: v for k, v in os.environ.items() if not k.startswith('HUB_ALERT_')}
+    deadline = time.monotonic() + args.publish_timeout
+    result = None
+    for attempt in range(2):
+        remaining = max(1, int(math.ceil(deadline - time.monotonic())))
+        try:
+            result = subprocess.run([str(args.hub), 'quota', 'publish'], capture_output=True, text=True, timeout=remaining, env=env)
+        except subprocess.TimeoutExpired:
+            if attempt == 0 and deadline - time.monotonic() > 2:
+                time.sleep(0.5)
+                continue
+            raise Failure('cli_timeout') from None
+        except UnicodeError:
+            raise Failure('result_invalid') from None
+        except OSError:
+            raise Failure('cli_unavailable') from None
+        if result.returncode == 0:
+            break
+        if attempt == 0 and deadline - time.monotonic() > 2:
+            time.sleep(0.5)
+            continue
         raise Failure('cli_failed')
     published = receipt(result.stdout)
     with locked(args.state):

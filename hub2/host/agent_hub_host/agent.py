@@ -764,7 +764,11 @@ class Bridge:
             task_id, tag = "hub2-" + session, "task-hub2-" + session
             launch['worker_context']={key:offer[key] for key in ('session_id','epoch','intake_id','project_id')}
             launch['worker_context']['machine_id']=self.machine_id
-            if launch['engine']!='shell' and self.launcher.config.get('private_provider_homes', False) and not launch.get('managed_credential_label'):
+            local_accounts = {'codex': 'codex', 'claude': 'claude', 'go': 'shared-go', 'zai': 'zai-central', 'zcodex': 'zai-central', 'antigravity': 'gemini'}
+            needs_central = self.launcher.config.get('private_provider_homes', False) or (
+                launch.get('account_id') and launch.get('account_id') != local_accounts.get(launch['engine'])
+            )
+            if launch['engine']!='shell' and needs_central and not launch.get('managed_credential_label'):
                 from .providers import provision
                 launch['provider_home']=provision(self.client,offer,launch,self.journal.directory,self.launcher.config.get('routes'))
             if acknowledge:

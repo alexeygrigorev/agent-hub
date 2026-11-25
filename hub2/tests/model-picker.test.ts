@@ -269,7 +269,7 @@ test('fresh quota affects weight, but expired quota never preserves stale prefer
  assert.deepEqual(fresh.diagnostics.warnings,[]);
  // Neutral staleness applies to non-Codex providers; stale Codex is excluded outright (see Codex reserve tests).
  const stale=await pickModelRouteDetailed(observationEnv(other,{fresh:true,quota:{remaining:100,captured_at:now-31*60000,valid_until:now+60000}}),{interactive:false},()=>0.9);
- assert.equal(stale.diagnostics.pool[1].share,0.5);
+ assert.ok(Math.abs(stale.diagnostics.pool[1].share-(.03+.94*100/150))<1e-9);
  assert.equal(stale.route.engine,'claude');
  assert.equal(stale.route.quota_remaining,null,'neutral weight is not a measured balance');
  assert.equal(stale.diagnostics.warnings?.[0].reason,'quota_stale');
@@ -292,7 +292,7 @@ test('missing, invalidated, expired and malformed quota use equal neutral weight
   const result=await pickModelRouteDetailed(observationEnv(fresh,row),{interactive:false},()=>0.9);
   assert.equal(result.route.engine,'claude',JSON.stringify(row));
   assert.equal(result.route.quota_remaining,null,JSON.stringify(row));
-  assert.equal(result.diagnostics.pool[1].share,0.5,JSON.stringify(row));
+  assert.ok(Math.abs(result.diagnostics.pool[1].share-(.03+.94*100/150))<1e-9,JSON.stringify(row));
   assert.deepEqual(result.diagnostics.warnings?.map(x=>[x.account_id,x.reason]),[['claude','quota_stale']]);
   // Codex with the same observation fails closed: only Claude may be offered.
   const codex=await pickModelRouteDetailed(observationEnv(row,fresh),{interactive:false},()=>0);

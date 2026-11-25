@@ -2119,3 +2119,18 @@ class GoBinaryAndPreflightTests(unittest.TestCase):
                         'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
                         'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
                     })
+
+    def test_central_provider_home_bypasses_local_profile_when_private_provider_homes_false(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = nl.NativeLauncher({'private_provider_homes': False,
+                                         'routes': {'go': nl.LOCAL_ROUTES['go']}},
+                                        aplexer='synthetic-aplexer')
+            with mock.patch.object(nl, 'resolve_engine_binary', return_value=None):
+                with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
+                    # provider_home set -> bypasses local hub-shared-go profile and resolves binary directly
+                    adapter.launch('task-go-orin', {
+                        'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
+                        'account_id': 'go-orin', 'provider_home': str(root / 'manifest.json'),
+                        'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
+                    })

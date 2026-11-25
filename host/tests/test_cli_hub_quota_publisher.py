@@ -740,6 +740,29 @@ class ContractTests(unittest.TestCase):
         # rendering leave 19s for interpreter and local durable state I/O.
         self.assertLess(8 + 2*1 + 2*8, 45)
 
+    def test_transient_cli_failed_retries_once_and_succeeds(self):
+        attempts = []
+        class FakeRun:
+            def __init__(self, rc, stdout):
+                self.returncode = rc
+                self.stdout = stdout
+        def fake_run(cmd, **kw):
+            attempts.append(cmd)
+            if len(attempts) == 1:
+                return FakeRun(1, '')
+            return FakeRun(0, json.dumps({'published': ['gemini', 'zai-central'], 'skipped': {}}))
+        parent = ROOT / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as tmp:
+            state = Path(tmp) / 'state.json'
+            ns = mock.MagicMock(hub=Path(tmp) / 'hub', state=state, publish_timeout=30, stale_seconds=840)
+            with mock.patch.object(helper.subprocess, 'run', side_effect=fake_run), \
+                 mock.patch.object(helper.time, 'sleep'):
+                out = helper.publish(ns)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(out['status'], 'published')
+        self.assertEqual(out['accounts'], ['gemini', 'zai-central'])
+
 
 if __name__ == '__main__':
     unittest.main()
