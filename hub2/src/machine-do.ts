@@ -10,7 +10,7 @@ import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
-import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
+import { CLAIMED_WITHOUT_NATIVE_GRACE_MS, HOST_LAUNCH_QUEUE_LEASE_MS, HOST_LAUNCH_QUEUE_MAX_MS, HOST_LAUNCH_QUEUED_REASON, LAUNCH_DEADLINE_SQL, launchDeadline, HOST_INVENTORY_LOST_MS, inactiveReason, isLiveActiveSession, LIVE_SNAPSHOT_TTL_MS, SESSION_REAP_INTERVAL_MS, type LiveSession } from './session-liveness';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CAPTURE_OUTPUT_BYTES = 64 * 1024;
@@ -183,7 +183,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "provider_fable_smoke_failed": "Launch preparation was refused.",
   "provider_sdk_install_refused": "Launch preparation was refused."
 };
-const HOST_EVENT_REASONS=new Set([...Object.keys(HOST_FAILURE_DETAILS),"host_launch_refused","native_process_absent","launch_timeout_no_native","stop_confirmed","native_exit","stop_unconfirmed","host_inventory_lost","host_operation_failed","native_mail_outcome_uncertain","connected","dead","idle","host_no_response","host_inventory_stale","native_inventory_absent","legacy_launch_unobserved","machine_not_enrolled"]);
+const HOST_EVENT_REASONS=new Set([...Object.keys(HOST_FAILURE_DETAILS),HOST_LAUNCH_QUEUED_REASON,"host_launch_refused","native_process_absent","launch_timeout_no_native","stop_confirmed","native_exit","stop_unconfirmed","host_inventory_lost","host_operation_failed","native_mail_outcome_uncertain","connected","dead","idle","host_no_response","host_inventory_stale","native_inventory_absent","legacy_launch_unobserved","machine_not_enrolled"]);
 function closedHostReason(value:unknown):string {
   return typeof value==='string' && HOST_EVENT_REASONS.has(value) ? value : 'host_operation_failed';
 }
@@ -548,9 +548,11 @@ export class MachineDO {
     this.nativeCommands.expire(now);
     await this.wakes.sweep();
     const wakeMachine=this.db.one<MachineRow>('SELECT * FROM machines LIMIT 1');if(wakeMachine)await this.notifyPendingCommands(wakeMachine.machine_id);
+    // A start the host reports as queued holds a lease (backpressure), so it is
+    // neither reaped nor allowed to starve older expired rows out of the batch.
     const expired = this.db.all<SessionRow>(
-      "SELECT * FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL AND created_at<=? ORDER BY created_at,id LIMIT 100",
-      now-CLAIMED_WITHOUT_NATIVE_GRACE_MS);
+      `SELECT s.* FROM sessions s WHERE s.state IN ('staged','offered','claimed') AND s.native_id IS NULL AND s.created_at<=? AND ${LAUNCH_DEADLINE_SQL}<=? ORDER BY s.created_at,s.id LIMIT 100`,
+      now-CLAIMED_WITHOUT_NATIVE_GRACE_MS, now);
     for (const session of expired) await this.recordLaunchTimeout(session, now);
     this.db.run("UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE kind='stop' AND state='pending' AND created_at<=?",
       JSON.stringify({stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}),now,now-60_000);
@@ -913,6 +915,10 @@ export class MachineDO {
       await this.ackOffer(socket, body,env);
       return;
     }
+    if (body.type === 'offer_queued') {
+      await this.recordHostQueued(socket, body, env);
+      return;
+    }
     if (body.type === 'workspace.preflight.result') {
       if (typeof body.request_id === 'string') {
         const resolve = this.preflightWaiters.get(body.request_id);
@@ -1043,6 +1049,8 @@ export class MachineDO {
       this.db.transaction(this.ctx, () => {
         if(newlyBound)this.db.run('UPDATE sessions SET launch_json=? WHERE id=?',JSON.stringify({...launch,[WORKSPACE_BINDING_FIELD]:binding}),row.id);
         this.db.run("UPDATE sessions SET state='claimed', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered' AND epoch=?", now, row.id, row.epoch);
+        // A start that waited in the host queue gets the full launch grace from its claim.
+        this.db.run('UPDATE attention SET observed_at=? WHERE session_id=? AND reason=? AND operation_id=?',now,row.id,HOST_LAUNCH_QUEUED_REASON,row.operation_id);
         this.db.run('INSERT OR IGNORE INTO launch_admissions VALUES(?,?,?,?)', row.operation_id,row.id,row.epoch,now);
         this.insertOutbox(`claim:${row.operation_id}`, 'claim', row.operation_id, row.project_id,
           claim, now);
@@ -1173,6 +1181,7 @@ export class MachineDO {
     this.db.transaction(this.ctx,()=>{
       this.db.run("UPDATE sessions SET state='running', native_id=?, offer_expires_at=NULL, updated_at=? WHERE id=? AND state='claimed'",
         body.native_id,now,sessionId);
+      this.db.run('DELETE FROM attention WHERE session_id=? AND reason=?',sessionId,HOST_LAUNCH_QUEUED_REASON);
       this.db.run(`INSERT INTO native_sessions(session_id,native_id,phase,last_activity_at,exit_code,containment_empty,observed_at)
         VALUES(?,?,'running',?,NULL,0,?) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id,
         phase='running',last_activity_at=excluded.last_activity_at,exit_code=NULL,containment_empty=0,observed_at=excluded.observed_at`,
@@ -1569,7 +1578,7 @@ export class MachineDO {
     const wakeDue=this.wakes.due();
     const next = this.db.one<{ due: number | null }>(`SELECT MIN(due) AS due FROM (
       SELECT MIN(offer_expires_at) AS due FROM sessions WHERE state='offered' AND offer_expires_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM machine_outbox b WHERE b.id='expiry:'||sessions.id||':'||sessions.epoch AND b.state='pending')
-      UNION ALL SELECT MIN(created_at+?) AS due FROM sessions WHERE state IN ('staged','offered','claimed') AND native_id IS NULL
+      UNION ALL SELECT MIN(MAX(s.created_at+?,${LAUNCH_DEADLINE_SQL})) AS due FROM sessions s WHERE s.state IN ('staged','offered','claimed') AND s.native_id IS NULL
       UNION ALL SELECT MIN(MAX(updated_at,COALESCE((SELECT observed_at FROM machine_liveness WHERE singleton=1),0))+?) AS due
         FROM sessions WHERE state='running' AND native_id IS NOT NULL
       UNION ALL SELECT MIN(created_at+60000) AS due FROM session_commands WHERE kind='stop' AND state='pending'
@@ -2414,6 +2423,8 @@ export class MachineDO {
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       if(!current||current.epoch!==session.epoch||current.operation_id!==session.operation_id
         ||!['staged','offered','claimed'].includes(current.state)||current.native_id!==null||Date.now()-current.created_at<CLAIMED_WITHOUT_NATIVE_GRACE_MS)return false;
+      // Host-queued starts wait under backpressure until their lease lapses.
+      if(Date.now()<launchDeadline(current,this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?',current.id)))return false;
       this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND state IN ('staged','offered','claimed') AND native_id IS NULL",now,session.id);
       this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=?",session.operation_id,session.id,session.epoch);
       this.settlePendingCommands(session,now,reason,null);
@@ -2673,7 +2684,8 @@ export class MachineDO {
   private sessionView(row: SessionRow): JsonRecord {
     const launch=this.parse(row.launch_json) as JsonRecord;
     const picker=normalizeStartPickerEvidence(launch._hub_picker);
-    const attention=this.db.one<{reason:string;observed_at:number}>('SELECT reason,observed_at FROM attention WHERE session_id=?',row.id);
+    const attentionRow=this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?',row.id);
+    const attention=attentionRow?{reason:attentionRow.reason,observed_at:attentionRow.observed_at}:undefined;
     const diagnostic=attention?this.hostStartDiagnostic(row,attention.reason):null;
     return {id:row.id,state:row.state,intake_id:row.intake_id,project_id:row.project_id,machine_id:row.machine_id,
       epoch:row.epoch,operation_id:row.operation_id,native_id:row.native_id,engine:launch.engine,model:launch.model,
@@ -2687,7 +2699,44 @@ export class MachineDO {
       created_at:new Date(row.created_at).toISOString(),updated_at:new Date(row.updated_at).toISOString(),
       last_activity_at:this.db.one<{last_activity_at:number|null}>('SELECT last_activity_at FROM native_sessions WHERE session_id=?',row.id)?.last_activity_at??null,
       interactive:launch.interactive,evidence:this.sessionEvidence(row),
+      ...this.hostQueueView(row,attentionRow),
       attention:attention?{...attention,reason:closedHostReason(attention.reason),...(diagnostic??{})}:null};
+  }
+
+  /** A start waiting behind the host launch cap reads as queued on the host, not failed. */
+  private hostQueueView(row:SessionRow,attention:{reason:string;operation_id:string|null;observed_at:number}|undefined):JsonRecord{
+    if(!['offered','claimed'].includes(row.state)||row.native_id!==null)return {};
+    if(!attention||attention.reason!==HOST_LAUNCH_QUEUED_REASON||attention.operation_id!==row.operation_id)return {};
+    const deadline=launchDeadline(row,attention);
+    if(deadline<=Date.now())return {};
+    return {start_state:row.state==='offered'?'queued_on_host':'launching_after_host_queue',
+      host_queue:{state:row.state==='offered'?'queued':'claimed',machine_id:row.machine_id,
+        last_reported_at:new Date(attention.observed_at).toISOString(),lease_until:new Date(deadline).toISOString()}};
+  }
+
+  /** Host backpressure: the host holds this offer (or its RAM admission) until a launch slot frees. */
+  private async recordHostQueued(socket:WebSocket,body:JsonRecord,env:Hub2Env):Promise<void>{
+    if(typeof body.session_id!=='string'||!Number.isSafeInteger(body.epoch))return;
+    const attachment=await this.authorizedAttachment(socket,'machine:offer',true,env).catch(()=>undefined);
+    if(!attachment?.machine_id)return;
+    const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',body.session_id,attachment.machine_id);
+    if(!row||row.epoch!==body.epoch||(typeof body.operation_id==='string'&&body.operation_id!==row.operation_id)
+      ||!['offered','claimed'].includes(row.state)||row.native_id!==null)return;
+    const now=Date.now(),cap=row.created_at+HOST_LAUNCH_QUEUE_MAX_MS;
+    if(now>=cap)return;  // bounded: the ordinary launch timeout takes over
+    const expires=row.state==='offered'?Math.max(row.offer_expires_at??0,Math.min(cap,now+HOST_LAUNCH_QUEUE_LEASE_MS)):null;
+    const prior=this.db.one<{reason:string}>('SELECT reason FROM attention WHERE session_id=?',row.id);
+    this.db.transaction(this.ctx,()=>{
+      this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
+        row.id,HOST_LAUNCH_QUEUED_REASON,row.operation_id,now);
+      if(expires!==null)this.db.run("UPDATE sessions SET offer_expires_at=? WHERE id=? AND epoch=? AND state='offered'",expires,row.id,row.epoch);
+    });
+    await this.ensureDeadline(Math.min(cap,now+HOST_LAUNCH_QUEUE_LEASE_MS));
+    await this.scheduleNext();
+    if(prior?.reason!==HOST_LAUNCH_QUEUED_REASON)console.info('[hub2] HOST_LAUNCH_QUEUED',JSON.stringify({session_id:row.id,machine_id:row.machine_id,
+      intake_id:row.intake_id,epoch:row.epoch,state:row.state,cause:typeof body.cause==='string'?body.cause.slice(0,40):null,
+      depth:Number.isSafeInteger(body.depth)?body.depth:null}));
+    try{socket.send(JSON.stringify({type:'offer_queued',session_id:row.id,epoch:row.epoch,...(expires!==null?{expires_at:expires}:{})}));}catch{}
   }
 
   private sessionEvidence(row:SessionRow):unknown{

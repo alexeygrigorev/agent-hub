@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agent_hub_host.agent import Bridge, Journal
 from agent_hub_host.client import ApiError
@@ -226,7 +226,8 @@ class NonblockingLaunchTests(unittest.TestCase):
             journal = Journal(Path(temp) / 'journal.sqlite')
             incoming = queue.Queue()
             release, lock = threading.Event(), threading.Lock()
-            started, entered, failures = [], [], []
+            started, entered, failures, sent = [], [], [], []
+            dropped = set()
             class Socket:
                 def __enter__(self):
                     entered.append(1)
@@ -239,8 +240,16 @@ class NonblockingLaunchTests(unittest.TestCase):
                     return json.dumps(value)
                 def send(self, raw):
                     frame = json.loads(raw)
+                    with lock: sent.append(frame)
                     if frame['type'] == 'offer_ack':
+                        # The Hub is slow under the burst: the first claim ACK of s0 goes unanswered.
+                        if frame['session_id'] == 's0' and 's0' not in dropped:
+                            dropped.add('s0')
+                            return
                         incoming.put({'type': 'ack', 'session_id': frame['session_id'], 'epoch': frame['epoch']})
+                    elif frame['type'] == 'offer_queued':
+                        incoming.put({'type': 'offer_queued', 'session_id': frame['session_id'], 'epoch': frame['epoch'],
+                                      'expires_at': int(time.time() * 1000) + 600_000})
             bridge = Bridge.__new__(Bridge)
             bridge.client = SimpleNamespace(socket=lambda _: Socket(), request=lambda *a: {})
             bridge.journal = journal
@@ -258,8 +267,12 @@ class NonblockingLaunchTests(unittest.TestCase):
                 finally: journal.close_thread()
             total = 40  # larger than the 32-slot host launch queue
             for n in range(total):
-                incoming.put({'type': 'session.offer', 'offer': {'session_id': f's{n}'}})
+                incoming.put({'type': 'session.offer', 'offer': {'session_id': f's{n}', 'epoch': 1, 'operation_id': f'op{n}',
+                                                                 'expires_at': int(time.time() * 1000) + 60_000}})
             thread = threading.Thread(target=serve)
+            ack_wait = patch('agent_hub_host.agent.CLAIM_ACK_WAIT_SECONDS', 0.2)
+            ack_wait.start()
+            self.addCleanup(ack_wait.stop)
             thread.start()
             try:
                 deadline = time.monotonic() + 3
@@ -270,6 +283,12 @@ class NonblockingLaunchTests(unittest.TestCase):
                 while time.monotonic() < deadline and len(started) < total: time.sleep(0.02)
                 self.assertEqual(sorted(started), sorted(f's{n}' for n in range(total)))
                 self.assertEqual(len(entered), 1, 'queue pressure dropped the host connection')
+                # The excess beyond the 32 slots was reported to the Hub as queued on the host.
+                queued = {frame['session_id'] for frame in sent if frame['type'] == 'offer_queued'}
+                self.assertEqual(queued, {f's{n}' for n in range(32, total)})
+                self.assertTrue(all(frame['cause'] == 'launch_slots' and frame['epoch'] == 1 for frame in sent if frame['type'] == 'offer_queued'))
+                # The unanswered claim ACK was re-sent, not failed as claim_ack_unverified.
+                self.assertEqual(sum(1 for frame in sent if frame['type'] == 'offer_ack' and frame['session_id'] == 's0'), 2)
             finally:
                 release.set()
                 incoming.put(StopServe())
