@@ -206,7 +206,7 @@ jobs:
         if: github.event_name == 'push'
         # Fixed 4-hour observation deadline: on the single-slot contabo-hub runner
         # every job of the push runs one at a time, and the declared timeouts of
-        # the Python suite alone sum to 125 minutes (20 + 15 + 4x20 + 10).
+        # the Python suite alone sum to 165 minutes (20 + 15 + 4x30 + 10).
         # The outer minute is process-start/termination margin, not extra eligibility.
         timeout-minutes: 241
         env:

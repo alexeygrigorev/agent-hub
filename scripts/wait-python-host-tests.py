@@ -10,7 +10,7 @@ import time
 
 # One fixed observation deadline, sized for the contabo-hub runner: it executes
 # one job at a time, so the Python suite's declared job timeouts alone sum to
-# 125 minutes (20 + 15 + 4x20 + 10) and the earlier 25 minutes expired before
+# 165 minutes (20 + 15 + 4x30 + 10) and the earlier 25 minutes expired before
 # a normal merge went green (run 45247689745, intake e19faefa).
 WAIT_SECONDS = 4 * 60 * 60
 POLL_SECONDS = 10

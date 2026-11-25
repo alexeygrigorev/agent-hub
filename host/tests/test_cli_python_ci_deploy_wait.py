@@ -118,8 +118,8 @@ class PythonDeployWaitTests(unittest.TestCase):
 
     def test_deadline_covers_the_single_slot_runner_envelope(self):
         # The Python suite's declared job timeouts (python-tests.yml) run one at
-        # a time on contabo-hub: 20 + 15 + 4x20 + 10 minutes.
-        self.assertGreaterEqual(gate.WAIT_SECONDS,125*60)
+        # a time on contabo-hub: 20 + 15 + 4x30 + 10 minutes.
+        self.assertGreaterEqual(gate.WAIT_SECONDS,165*60)
 
     def test_workflow_timeouts_enclose_the_observation_deadline(self):
         flow=(MODULE.parents[1]/'.github/workflows/deploy.yml').read_text()

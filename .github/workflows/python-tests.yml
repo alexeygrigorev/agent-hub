@@ -77,7 +77,9 @@ jobs:
     needs: legacy-cli-canonical
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, contabo]
-    timeout-minutes: 20
+    # Shard 3 carries the slow hub_acceptance_10 tests: ~15.5 min on an idle runner,
+    # and past 20 min on the shared contabo runners under load (25 Nov 2026).
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
