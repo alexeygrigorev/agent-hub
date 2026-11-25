@@ -4,12 +4,12 @@ import itertools
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +33,28 @@ class ExternalIncludesApprovalTest(unittest.TestCase):
             self.assertEqual(data['x'], 1)
             self.assertEqual(data['projects']['/w'], {'hasTrustDialogAccepted': True, 'hasClaudeMdExternalIncludesApproved': True})
             self.assertTrue(data['projects']['/v']['hasClaudeMdExternalIncludesApproved'])
+
+    def test_worktree_approves_canonical_main_checkout(self):
+        # Claude reads the flag under the main checkout for a linked worktree
+        # (live repro 25 Nov 2026: worktree-only approval still showed the dialog).
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            main = base / 'repo'
+            subprocess.run(['git', 'init', '-q', str(main)], check=True)
+            subprocess.run(['git', '-C', str(main), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                            'commit', '-q', '--allow-empty', '-m', 'i'], check=True)
+            tree = main / '.local' / 'hub-worktrees' / 'abc'
+            subprocess.run(['git', '-C', str(main), 'worktree', 'add', '-q', '--detach', str(tree)], check=True)
+            config = base / 'cfg'
+            config.mkdir()
+            (config / '.claude.json').write_text(json.dumps({'projects': {str(main): {
+                'hasClaudeMdExternalIncludesApproved': False, 'hasClaudeMdExternalIncludesWarningShown': True}}}))
+            self.assertEqual(cg.claude_project_keys(tree), [str(tree), str(main)])
+            self.assertEqual(cg.claude_project_keys(main / 'sub'), [str(main / 'sub'), str(main)])
+            self.assertTrue(cg.approve_external_includes(str(config), tree))
+            projects = json.loads((config / '.claude.json').read_text())['projects']
+            self.assertTrue(projects[str(tree)]['hasClaudeMdExternalIncludesApproved'])
+            self.assertTrue(projects[str(main)]['hasClaudeMdExternalIncludesApproved'])
 
     def test_malformed_config_untouched(self):
         with tempfile.TemporaryDirectory() as directory:

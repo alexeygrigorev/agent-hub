@@ -85,13 +85,51 @@ def goal_store(row, config_dir, expected_thread, objective_hash):
         return None
 
 
+def claude_project_keys(workspace):
+    """Project-config keys Claude reads for ``workspace``: the exact path plus
+    its canonical git root.
+
+    Claude keys ``projects`` by the canonical root (findCanonicalGitRoot): the
+    enclosing git root, and for a linked worktree the main checkout that owns
+    its common dir. Hub worktrees are linked worktrees, so an approval stored
+    only under the worktree path is never read (exit 129, 14 and 25 Nov 2026).
+    """
+    workspace = Path(workspace)
+    keys = [str(workspace)]
+    for root in (workspace, *workspace.parents):
+        marker = root / '.git'
+        if marker.is_dir():
+            canonical = root
+        elif marker.is_file():
+            canonical = root
+            try:
+                line = marker.read_text('utf-8').strip()
+                if line.startswith('gitdir:'):
+                    gitdir = (root / line[7:].strip()).resolve()
+                    common = (gitdir / (gitdir / 'commondir').read_text('utf-8').strip()).resolve()
+                    if gitdir.parent == common / 'worktrees' and common.name == '.git':
+                        canonical = common.parent
+            except (OSError, ValueError):
+                pass
+        else:
+            continue
+        for key in (str(root), str(canonical)):
+            if key not in keys:
+                keys.append(key)
+        break
+    return keys
+
+
 def approve_external_includes(config_dir, workspace):
     """Pre-accept Claude's "Allow external CLAUDE.md imports?" dialog for a workspace.
 
     Hub worktrees live under the repo checkout, so an ancestor CLAUDE.md that
     imports @AGENTS.md is an external import. The dialog swallows the /goal
-    send and the session dies of SIGHUP (exit 129). Best effort: unreadable or
-    non-object config is left untouched.
+    send and the session dies of SIGHUP (exit 129). Claude reads the flag
+    under the canonical git root (the main checkout for a worktree), where an
+    earlier default "No" leaves it false, so every key in
+    claude_project_keys is approved. Best effort: unreadable or non-object
+    config is left untouched.
     """
     try:
         path = (Path(config_dir) / '.claude.json') if config_dir else (Path.home() / '.claude.json')
@@ -102,12 +140,16 @@ def approve_external_includes(config_dir, workspace):
         projects = config.setdefault('projects', {}) if isinstance(config, dict) else None
         if not isinstance(projects, dict):
             return False
-        entry = projects.setdefault(str(workspace), {})
-        if not isinstance(entry, dict):
-            return False
-        if entry.get('hasClaudeMdExternalIncludesApproved') is True:
+        changed = False
+        for key in claude_project_keys(workspace):
+            entry = projects.setdefault(key, {})
+            if not isinstance(entry, dict):
+                return False
+            if entry.get('hasClaudeMdExternalIncludesApproved') is not True:
+                entry['hasClaudeMdExternalIncludesApproved'] = True
+                changed = True
+        if not changed:
             return True
-        entry['hasClaudeMdExternalIncludesApproved'] = True
         temp = path.with_name(path.name + '.hub-%d.tmp' % os.getpid())
         mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
