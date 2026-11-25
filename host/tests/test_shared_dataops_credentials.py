@@ -46,11 +46,23 @@ class SharedDataopsCredentialTests(unittest.TestCase):
             dapier = Path(root) / 'operator' / 'dapier'
             dapier.mkdir(parents=True)
             (dapier / 'session.json').write_text('{}', encoding='utf-8')
+            shared = Path(root) / 'agent-hub/shared/dapier'
+            shared.mkdir(parents=True)
+            (shared / 'session.json').write_text('{}', encoding='utf-8')
             self.env(root, False)
             link = Path(root) / 'home' / '.config' / 'dapier'
             self.assertTrue(link.is_symlink())
             self.assertEqual(link.resolve(), Path(root) / 'agent-hub/shared/dapier')
             self.assertNotEqual(link.resolve(), dapier.resolve())
+
+    def test_old_host_symlink_is_retargeted_even_before_shared_pairing(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / 'home'
+            link = home / '.config/dapier'
+            link.parent.mkdir(parents=True)
+            link.symlink_to(Path(root) / 'expired-host/dapier', target_is_directory=True)
+            self.env(root, False)
+            self.assertEqual(link.resolve(), Path(root) / 'agent-hub/shared/dapier')
 
 
 if __name__ == '__main__':

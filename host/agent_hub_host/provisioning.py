@@ -2732,6 +2732,8 @@ def link_operator_dapier_session(home):
     from .dapier_credentials import shared_root
     source = shared_root() / 'dapier'
     target = Path(home) / '.config' / 'dapier'
+    if not (source / 'session.json').is_file() and not target.is_symlink():
+        return
     if target.is_symlink():
         if Path(os.readlink(target)) == source:
             return
