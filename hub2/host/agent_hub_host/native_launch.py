@@ -1484,6 +1484,9 @@ class NativeLauncher:
             child_env.setdefault("RUST_LOG", "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_tool_lifecycle=info")
         if specification.get("child_config_file"):
             child_env["HUB2_CONFIG"] = specification["child_config_file"]
+        from .dapier_credentials import session_environment, shared_root
+        if os.name != 'nt':
+            child_env.update(session_environment(shared_root(), child_env.get('PATH', os.environ.get('PATH'))))
         claude_config_dir = child_env.get('CLAUDE_CONFIG_DIR')
         if objective is not None and provider == 'claude':
             # An explicit default directory changes Claude's global onboarding

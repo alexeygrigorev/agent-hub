@@ -1959,6 +1959,8 @@ class Bridge:
             return False
 
     def heartbeat(self,labels,include_native_sessions=True):
+        from .dapier_credentials import request_maintenance
+        request_maintenance()
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
         # One complete mode declaration per engine; old generic/scoped hints keep
