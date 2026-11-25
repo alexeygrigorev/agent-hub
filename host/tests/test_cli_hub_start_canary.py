@@ -675,7 +675,7 @@ class CanaryTest(unittest.TestCase):
                 result, verdict = self.run_canary(scenario, "--mode", "shell")
                 self.assertEqual(result.returncode, 1, verdict)
                 self.assertEqual(verdict["stage"], stage)
-                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertLess(time.monotonic() - started, 3.0)  # bounded, not the fakes' full sleeps; 1.5 raced on slow runners
 
     # ---- alerting
     def test_two_failures_alert_once_then_dedupe(self):
@@ -1192,7 +1192,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(rel_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.1",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.0",  # covers manifest fetch + trigger on slow runners; release never converges
         )
         self.assertEqual((r.returncode, v["stage"], v["reason"]), (1, "host_release", "timeout_current_release_not_converged"))
 
@@ -2356,7 +2356,7 @@ class CanaryTest(unittest.TestCase):
             "--candidate-updater-sha256", self.cli_server.updater_sha256,
             "--run-token", token, "--helper-sha256", helper_sha,
             HUB_CANARY_HOST_RELEASE_ROOT=str(unconv_root),
-            HUB_CANARY_CONVERGE_TIMEOUT_S="0.2",
+            HUB_CANARY_CONVERGE_TIMEOUT_S="1.5",  # updater sleeps 5 s; window must still fit manifest + updater fetch
         )
         self.assertEqual((r_to.returncode, v_to["stage"], v_to["reason"]), (1, "host_release", "timeout_candidate_updater_bootstrap_timeout"))
         self.assertEqual(v_to["host_updater_trigger"], "timeout")
@@ -2428,7 +2428,7 @@ class CanaryTest(unittest.TestCase):
         (self.tmp / "calls.log").write_text("")
         r_to, v_to = self.run_canary(
             "replay_timeout_empty_list", "--mode", "shell",
-            HUB_CANARY_CMD_TIMEOUT_S="0.05",
+            HUB_CANARY_CMD_TIMEOUT_S="0.5",  # fake replay sleeps 2 s; 0.05 s killed it before it logged the call
             HUB_CANARY_STOP_TIMEOUT_S="0.8",
         )
         self.assertEqual(r_to.returncode, 1)

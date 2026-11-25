@@ -75,7 +75,11 @@ class OpsInstallTests(unittest.TestCase):
                     'OPS_INTAKE': '12345678-1234-4123-a123-123456789012',
                     'PYTHONDONTWRITEBYTECODE': '1', 'GIT_CONFIG_NOSYSTEM': '1',
                     'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_ALLOW_PROTOCOL': 'file',
-                    'GIT_TERMINAL_PROMPT': '0'}
+                    'GIT_TERMINAL_PROMPT': '0',
+                    # Runners without a lingering systemd user (no /run/user/<uid>) cannot
+                    # open the controller role lock; keep it inside the synthetic HOME.
+                    'OPS_LOCK_DIR': str(self.home / 'run')}
+        (self.home / 'run').mkdir(mode=0o700)
         self.views = {}
 
     def cleanup_owned(self):
