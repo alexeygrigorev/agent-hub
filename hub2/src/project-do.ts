@@ -1768,20 +1768,33 @@ export class ProjectDO {
   }
 
   /** Worker appends written after this attempt's start, newest first. */
-  private appendsSinceStart(intake:IntakeRow,saga:SagaRow):JsonRecord[]{
+  private appendRowsSinceStart(intake:IntakeRow,saga:SagaRow):Array<{seq:number;at:number;body:JsonRecord}>{
     const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
     if(started===undefined)return [];
-    return this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)
-      .map(row=>(this.parse(row.body_json) as JsonRecord|null)??{});
+    return this.db.all<{seq:number;at:number;body_json:string}>(
+      "SELECT seq,at,body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)
+      .map(row=>({seq:row.seq,at:row.at,body:(this.parse(row.body_json) as JsonRecord|null)??{}}));
   }
 
-  /** Why this attempt ended unfinished: its own blocker record, else the newest note. */
-  private unfinishedCause(intake:IntakeRow,saga:SagaRow,reason:string):{cause:string;blocker?:TaskBlocker}{
-    const appends=this.appendsSinceStart(intake,saga);
-    let blocker:TaskBlocker|undefined;
-    for(const body of appends){blocker=taskBlocker(body.evidence,saga.session_id);if(blocker)break;}
-    const note=appends.find(body=>typeof body.note==='string'&&body.note.trim())?.note as string|undefined;
-    return {cause:exitCause(reason,blocker,note),...(blocker?{blocker}:{})};
+  private appendsSinceStart(intake:IntakeRow,saga:SagaRow):JsonRecord[]{
+    return this.appendRowsSinceStart(intake,saga).map(row=>row.body);
+  }
+
+  /** Why this attempt ended unfinished: a current blocker record (not superseded
+   * by later progress notes or evidence), else the newest note. */
+  private unfinishedCause(intake:IntakeRow,saga:SagaRow,reason:string):{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}}{
+    const rows=this.appendRowsSinceStart(intake,saga);
+    let blocker:TaskBlocker|undefined,blockerEvent:{seq:number;at:number}|undefined;
+    for(const row of rows){
+      const current=taskBlocker(row.body.evidence,saga.session_id);
+      if(current){blocker=current;blockerEvent={seq:row.seq,at:row.at};break;}
+      const hasNote=typeof row.body.note==='string'&&row.body.note.trim().length>0;
+      const ev=row.body.evidence;
+      const hasProgressEvidence=!!ev&&typeof ev==='object'&&!Array.isArray(ev)&&(ev as JsonRecord).kind!=='task_blocked';
+      if(hasNote||hasProgressEvidence)break;
+    }
+    const note=rows.find(row=>typeof row.body.note==='string'&&row.body.note.trim())?.body.note as string|undefined;
+    return {cause:exitCause(reason,blocker,note),...(blocker?{blocker}:{}),...(blockerEvent?{blockerEvent}:{})};
   }
 
   /** Consecutive Hub-started continuations since the last requester start. */
@@ -2017,13 +2030,24 @@ export class ProjectDO {
     console.error('[hub2] ENGINE_PREFLIGHT_FAILED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
 
-  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker},receiptKey?:string):void{
+  private formatBlockerAge(ms:number):string{
+    const secs=Math.max(0,Math.floor(ms/1000));
+    if(secs<60)return `${secs}s`;
+    const mins=Math.floor(secs/60),remSecs=secs%60;
+    if(mins<60)return remSecs?`${mins}m${remSecs}s`:`${mins}m`;
+    const hours=Math.floor(mins/60),remMins=mins%60;
+    return remMins?`${hours}h${remMins}m`:`${hours}h`;
+  }
+
+  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}},receiptKey?:string):void{
+    const blockerEvent=why?.blocker&&why?.blockerEvent?{seq:why.blockerEvent.seq,at:why.blockerEvent.at,age_ms:Math.max(0,now-why.blockerEvent.at)}:undefined;
     const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:continuationLimit(reason),
-      ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{})};
+      ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{}),...(blockerEvent?{blocker_event:blockerEvent}:{})};
     this.appendEvent(intakeId,'developer-alert:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+    const blockerRef=blockerEvent?` Blocker event: seq ${blockerEvent.seq}, age ${this.formatBlockerAge(blockerEvent.age_ms)}.`:'';
     this.appendEvent(intakeId,'developer-owner:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
-      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${continuationLimit(reason)} recovery sessions used).${why?` Cause: ${why.cause}`:''}`,
+      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${continuationLimit(reason)} recovery sessions used).${why?` Cause: ${why.cause}`:''}${blockerRef}`,
       next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
     console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
@@ -2270,7 +2294,7 @@ export class ProjectDO {
   /** Terminal retry state, written CAS-style so the scan stops selecting the
    * intake; `alert` escalates to the developer exactly once per intake. All
    * writes, including the alert's journal events, live in one transaction. */
-  private markRetryTerminal(row:FailedRetryRow,state:string,now:number,why:{cause:string;blocker?:TaskBlocker},alert?:string):void{
+  private markRetryTerminal(row:FailedRetryRow,state:string,now:number,why:{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}},alert?:string):void{
     this.transaction(()=>{
       const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
       if(!current||current.status!=='failed'||current.session_id!==row.session_id)return;

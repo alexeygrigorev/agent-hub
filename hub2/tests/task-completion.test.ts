@@ -990,12 +990,54 @@ test('a permission blocker is not continued: Hub alerts the developer at once an
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
     assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'blocked');assert.equal(alerts[0].body.reason,'blocked_permission');
     assert.match(alerts[0].body.cause,/HTTP 403/);assert.equal(alerts[0].body.depth,0);
+    const blockerRow=events(f,id).find(e=>e.kind==='worker_append'&&e.body.evidence?.kind==='task_blocked');
+    assert.equal(alerts[0].body.blocker_event?.seq,blockerRow?.seq);
+    assert.equal(typeof alerts[0].body.blocker_event?.age_ms,'number');
     const task=(await json(await f.call('/api/intakes/'+id))).task;
     assert.equal(task.owner,'dev@dtcdev.click');assert.match(task.current_state,/Cause: blocked \(permission\): hub model-policy returns HTTP 403/);
+    assert.match(task.current_state,new RegExp(`Blocker event: seq ${blockerRow?.seq}, age `));
     assert(events(f,id).some(e=>e.kind==='task_unfinished'&&e.body.next==='deliver'&&/HTTP 403/.test(e.body.cause)));
     await f.project.alarm();
     assert.equal(sagas(f,id).length,1,'no continuation was started');
     assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Cause: blocked \(permission\)/);assert.match(f.mail[0].body,/does not restart a session into a permission blocker/);
+  }finally{f.close();}
+});
+
+test('42b42c9b regression: a crash after progress supersedes an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'stale-blocker-42b42c9b');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read on sessions 4027e3ec/5e0a9c29');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'progress-1',note:'worked around 403 and delivered PR 742; re-review approved'});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined,'stale blocker superseded by later progress must not block recovery');
+    assert.equal(record.continuation?.state,'pending');
+    assert.match(record.cause,/worked around 403 and delivered PR 742/);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started within budget');
+  }finally{f.close();}
+});
+
+test('a crash after non-blocker evidence clears an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'cleared-blocker');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'cleared-1',event:{kind:'blocker_cleared',session_id:first.session_id}});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined);
+    assert.equal(record.continuation?.state,'pending');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started after blocker cleared');
   }finally{f.close();}
 });
 
@@ -1555,6 +1597,7 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
     const id=await createIntake(f,'muse-127-recovery');
     assert.equal((await start(f,id,'first',{engine:'go',override_reason:'canary Muse failure'})).status,201);
     const first=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-0',note:'attempt 0 progress'});
     const response=await f.call('/_internal/finish','POST',{...first,exit_code:127,native_exit_confirmed:true,evidence:{
       source:'aplexer_retirement',containment_empty:true,native_identity:{id:first.native_id,tag:'task-hub2-'+first.session_id,workspace:'/srv/work/feature'},
       native_exit:{code:127,exited_at_ms:Date.now()}}});
@@ -1569,7 +1612,9 @@ test('Muse exit 127 restarts on a healthy route; further crashes exhaust the bud
     assert.deepEqual(JSON.parse(next.routing_json).exclude_policy_ids,['go-muse']);
     assert.match(JSON.parse(next.launch_spec_json).prompt,/native_exit_127/);
     for(let attempt=1;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
-      await finish(f,await run(f,id),1);
+      const binding=await run(f,id);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
+      await finish(f,binding,1);
       await f.project.alarm();
     }
     assert.equal(sagas(f,id).length,1+MAX_AUTO_CONTINUATIONS);
@@ -1598,6 +1643,7 @@ test('21a07a26 path: repeated Muse exit 1 changes route before exhausting contro
     for(let attempt=0;attempt<2;attempt++){
       const binding=await run(f,id);
       assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'go');
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
       assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{
         source:'aplexer_retirement',containment_empty:true,native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:'/srv/work/feature'},
         native_exit:{code:1,exited_at_ms:Date.now()}}})).status,200);
@@ -1607,6 +1653,7 @@ test('21a07a26 path: repeated Muse exit 1 changes route before exhausting contro
     assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'codex');
     assert.equal(sagas(f,id).length,3,'the second recovery uses the last available attempt on a different route');
     const final=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-final',note:'final attempt progress'});
     await finish(f,final,1);
     await f.project.alarm();
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
