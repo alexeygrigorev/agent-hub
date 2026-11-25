@@ -7001,9 +7001,26 @@ class AdmissionTests(unittest.TestCase):
         root, scope = os.stat(self.tmp / "cgroup"), os.stat(self.tmp / "cgroup" / group.lstrip("/"))
         self.assertNotEqual(root.st_ino, scope.st_ino)
 
+        inode_keys = ("cgroup_namespace_inode", "mount_namespace_inode", "cgroup_root_inode")
+
+        def rebase(identity):
+            # Every world rebuilds the synthetic kernel objects, and the filesystem need not reuse
+            # the freed inode numbers (ext4 on a busy runner does not). Re-express values that were
+            # "the first world's inode" (+0 or the +1 contradiction) against this world's objects.
+            if not isinstance(identity, dict):
+                return identity
+            cur, out = self.provided_identity(), dict(identity)
+            for k in inode_keys:
+                v = out.get(k)
+                if type(v) is int and v - full[k] in (0, 1):
+                    out[k] = cur[k] + (v - full[k])
+            return out
+
         def admit(identity, mem=self.FLOOR, **world):
             census = [census_row(1, 4550, group, containment_cgroup_identity=identity)]
-            return self.provided_world([row], census, mem=mem, **world)
+            c = self.provided_world([row], census, mem=mem, **world)
+            census[0] = census_row(1, 4550, group, containment_cgroup_identity=rebase(identity))  # read lazily via the captured list
+            return c
 
         admit(full).admit()  # complete correct identity
         admit({"boot_id": "boot-1"}).admit()  # boot-only compatible form: coordinates freshly proven, never invented
@@ -7021,9 +7038,9 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(key + ": final-only provided mutation"):
                 census = [census_row(1, 4550, group, containment_cgroup_identity=partial)]
                 c = self.provided_world([row], census, mem=self.FLOOR)
-                seen = []
-                c.read_census = lambda d: seen.append(1) or ([census_row(1, 4550, group, containment_cgroup_identity=partial)] if len(seen) == 1
-                                                           else [census_row(1, 4550, group, containment_cgroup_identity=dict(partial, **{key: full[key] + 1}))])
+                seen, now = [], rebase(partial)
+                c.read_census = lambda d: seen.append(1) or ([census_row(1, 4550, group, containment_cgroup_identity=now)] if len(seen) == 1
+                                                           else [census_row(1, 4550, group, containment_cgroup_identity=dict(now, **{key: now[key] + 1}))])
                 self.assertHold(c, "resident_fallback_changed")
         # The SDK root coordinates describe the cgroup MOUNT ROOT: the workload scope's inode is never the right object.
         self.assertHold(admit({"boot_id": "boot-1", "cgroup_root_inode": scope.st_ino}), "resident_identity_unknown")
