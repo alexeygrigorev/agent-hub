@@ -21,7 +21,11 @@ install -m755 "$here/lib/session-ctl.sh" "$here/lib/watchdog.sh" "$dest/"
 install -m755 "$here/lib/session-ctl.sh" "$companion"
 # Mails dev@ for intakes Hub could not recover itself (developer_alert_raised).
 install -m755 "$here/../scripts/hub-intake-recovery-alerts.py" "$dest/"
+install -m755 "$here/../hub2/host/agent_hub_host/disk_hygiene.py" "$dest/disk_hygiene.py"
+install -m755 "$here/../hub2/host/agent_hub_host/disk_alert.py" "$dest/disk_alert.py"
 install -m644 "$here"/systemd/hub-intake-recovery-alerts.service "$here"/systemd/hub-intake-recovery-alerts.timer "$HOME/.config/systemd/user/"
+install -m644 "$here"/systemd/hub-disk-hygiene.service "$here"/systemd/hub-disk-hygiene.timer "$HOME/.config/systemd/user/"
+install -m644 "$here"/systemd/hub-disk-alert.service "$here"/systemd/hub-disk-alert.timer "$HOME/.config/systemd/user/"
 install -m755 "$here/lib/send.sh" "$HOME/bin/orch-send"
 install -m755 "$here/lib/send.sh" "$HOME/bin/oncall-send"
 install -m644 "$here"/systemd/ops-watchdog.service "$here"/systemd/ops-watchdog.timer "$HOME/.config/systemd/user/"
@@ -41,4 +45,6 @@ systemctl --user set-environment PATH="$dest/guard-bin:$(systemctl --user show-e
 systemctl --user daemon-reload
 systemctl --user enable --now ops-watchdog.timer
 systemctl --user enable --now hub-intake-recovery-alerts.timer
-echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer, hub-intake-recovery-alerts.timer"
+systemctl --user enable --now hub-disk-hygiene.timer
+systemctl --user enable --now hub-disk-alert.timer
+echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer, hub-intake-recovery-alerts.timer, hub-disk-hygiene.timer, hub-disk-alert.timer"

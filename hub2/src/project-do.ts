@@ -1386,6 +1386,26 @@ export class ProjectDO {
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;
+    if (launchRefused && body.failure_reason === 'disk_below_floor') {
+      const nextAttempt = saga.attempt + 1;
+      const retryAt = now + 30_000;
+      const backpressured = this.transaction(() => {
+        const current = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', saga.operation_id);
+        if (!current || current.state !== saga.state || current.attempt_operation_id !== saga.attempt_operation_id || current.epoch !== saga.epoch) return false;
+        if (!['offered', 'claimed', 'admitted'].includes(current.state)) return false;
+        this.db.run(
+          "UPDATE dispatch_sagas SET state='pending_machine', attempt=?, attempt_operation_id=?, next_action_at=?, last_reason='disk_below_floor', updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+          nextAttempt, `${saga.operation_id}:${nextAttempt}`, retryAt, now, saga.operation_id, saga.state, saga.attempt_operation_id, saga.epoch,
+        );
+        this.db.run("UPDATE intakes SET status='queued', updated_at=? WHERE id=? AND session_id=?", now, intake.id, saga.session_id);
+        this.appendEvent(intake.id, `backpressure:${saga.attempt_operation_id}:${saga.epoch}`, `machine:${saga.machine_id}`, 'session_launch_backpressure',
+          { session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch, reason: 'disk_below_floor', retry_at: retryAt }, now);
+        return true;
+      });
+      if (!backpressured) return error('stale_stopped_receipt', 409);
+      await this.scheduleNext();
+      return json({ queued: true, backpressure: true, reason: 'disk_below_floor', session_id: saga.session_id, retry_at: retryAt });
+    }
     const applied=this.transaction(()=>{
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
       if(!current||current.state!==saga.state||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch)return false;

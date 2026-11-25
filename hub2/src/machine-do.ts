@@ -108,6 +108,7 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "command_id_conflict": "Launch preparation was refused.",
   "duplicate_terminal_field": "Launch preparation was refused.",
   "host_launch_queue_full": "Launch preparation was refused.",
+  "disk_below_floor": "Disk free space is below the configured admission floor.",
   "host_command_queue_full": "Launch preparation was refused.",
   "antigravity_first_run_blocked": "Antigravity is blocked on first-run onboarding or Terms of Service.",
   "engine_auth_check_unavailable": "Engine authentication check failed before the session started.",
@@ -2087,10 +2088,11 @@ export class MachineDO {
     const applied=this.db.transaction(this.ctx,()=>{
       const current=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',session.id);
       if(!current||!['offered','claimed'].includes(current.state)||current.native_id!==null||current.operation_id!==session.operation_id||current.epoch!==session.epoch)return false;
-      this.db.run("UPDATE sessions SET state='failed',updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state IN ('offered','claimed')",
-        now,session.id,session.operation_id,session.epoch);
-      this.db.run("UPDATE machine_session_operations SET state='failed' WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
-        session.operation_id,session.id,session.epoch);
+      const targetState = failureReason === 'disk_below_floor' ? 'expired' : 'failed';
+      this.db.run("UPDATE sessions SET state=?,updated_at=? WHERE id=? AND operation_id=? AND epoch=? AND state IN ('offered','claimed')",
+        targetState,now,session.id,session.operation_id,session.epoch);
+      this.db.run("UPDATE machine_session_operations SET state=? WHERE operation_id=? AND session_id=? AND epoch=? AND state='current'",
+        targetState,session.operation_id,session.id,session.epoch);
       this.db.run('INSERT INTO attention(session_id,reason,operation_id,message_id,observed_at) VALUES(?,?,?,NULL,?) ON CONFLICT(session_id) DO UPDATE SET reason=excluded.reason,operation_id=excluded.operation_id,message_id=NULL,observed_at=excluded.observed_at',
         session.id,failureReason,session.operation_id,now);
       if (detail && current.evidence_digest === null) {
