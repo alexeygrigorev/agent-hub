@@ -196,6 +196,8 @@ def http_error(exc, method, payload):
         detail += '; limit must be a positive integer; min 1, max 50 (larger values clamp)'
     if code == 'invalid_search':
         detail += '; search must be 1-128 characters'
+    if code == 'code_task_operator_required':
+        detail += '; ask an operator to run hub intake update <intake-id> --code-task false, then hub intake reevaluate <intake-id>; worker recovery cannot grant this permission'
     if code == 'done_evidence_required':
         detail += '; append a DONE note with commit SHA or deploy run URL, Live check: command/URL, and Result: output before closing'
     if code == 'cancel_reason_required':

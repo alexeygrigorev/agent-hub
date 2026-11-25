@@ -9,6 +9,7 @@ import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
 import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,MAX_DEADLINE_CONTINUATIONS,MAX_VERIFICATION_ATTEMPTS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker,verificationPrompt} from '../src/task-completion';
+import {mergeGate,mergeGateAll,readOnlyBrief} from '../src/merge-gate';
 
 const admin={id:'human:completion-owner',kind:'operator',scopes:['operator:admin']};
 const candidates=[
@@ -1279,7 +1280,7 @@ test('merge-state is readable by operators and the intake worker only, and names
     await start(f,id,'first');const first=await run(f,id);
     const worker={id:'session:'+first.session_id,kind:'agent',resource_id:id,scopes:['intake:read','intake:append']};
     let state=await json(await f.call('/api/intakes/'+id+'/merge-state','GET',undefined,worker));
-    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.match(state.merge_gate.problems[0],/JSON object/);
+    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.equal(state.merge_gate.problems[0],'merge_evidence_missing');
     assert.match(state.next_step,/hub intake merge-check/);
     const posted=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'worker-proof',evidence:mergeProof},worker);
     assert.equal(posted.status,201,await posted.clone().text());
@@ -1529,6 +1530,165 @@ test('hub intake close succeeds on an already-accepted verified intake while unv
   }finally{f.close();}
 });
 
+test('review-only work accepts a verifier pass without merge evidence, including legacy purpose-only sessions',async()=>{
+  for(const fields of [{task_kind:'review'},{purpose:'review'},{task_kind:'review',purpose:'review'}]){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'review-role',true);
+      assert.equal((await start(f,id,'review-start',fields)).status,201);
+      f.reopen();
+      const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+      assert.equal(state.code_task,false);assert.equal(state.merge_gate.ok,true);
+      assert.equal((await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'not-required',evidence:mergeProof})).status,409);
+      const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+      await f.project.alarm();
+      const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+      assert.equal(intakeRow(f,id).status,'accepted');
+      assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+    }finally{f.close();}
+  }
+});
+
+test('an internal verifier or a review after implementation does not exempt code work',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'mixed-review-code',true);
+    await start(f,id,'implementation');const first=await run(f,id);
+    await claim(f,id,first.session_id);await finish(f,first,0);await f.project.alarm();
+    let state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.code_task,true,'internal verifier cannot disable code merge gate');
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'failed');
+    // An operator may reopen for a manual review; the implementation history
+    // still requires evidence and is not rewritten by the new session role.
+    await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-mixed',status:'open'});
+    assert.equal((await start(f,id,'manual-review',{purpose:'review',task_kind:'review'})).status,201);
+    state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.code_task,true);assert.deepEqual(state.merge_gate.problems,['merge_evidence_missing']);
+  }finally{f.close();}
+});
+
+test('a review task_kind survives automatic recovery without acquiring a merge gate',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'review-role-recovery',true);
+    await start(f,id,'first',{task_kind:'review'});const first=await run(f,id);
+    await finish(f,first,1);await f.project.alarm();
+    const next=activeSaga(f,id);
+    assert.notEqual(next.session_id,first.session_id);
+    assert.equal(JSON.parse(next.launch_spec_json).task_kind,'review');
+    assert.equal((await json(await f.call('/api/intakes/'+id+'/merge-state'))).code_task,false);
+  }finally{f.close();}
+});
+
+test('worker code-task refusals name the operator remedy and alert once across retry keys and sessions',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'refused-classification',true);
+    const before=intakeRow(f,id).source_json;
+    for(const [index,session] of ['first','first','recovery'].entries()){
+      const actor={id:'session:'+session,kind:'agent',resource_id:id,scopes:['intake:append']};
+      const response=await f.call('/api/intakes/'+id,'PATCH',{key:'denial-'+index,code_task:false},actor);
+      assert.equal(response.status,403);const refusal=await json(response);
+      assert.equal(refusal.error,'code_task_operator_required');assert.equal(refusal.retryable,false);
+      assert.equal(refusal.operator_command,`hub intake update ${id} --code-task false; hub intake reevaluate ${id}`);
+      f.reopen();
+    }
+    assert.equal(intakeRow(f,id).source_json,before,'refusal never changes classification');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='code_task_operator_required').length,1);
+    const other=await createIntake(f,'other-classification');
+    const foreign={id:'session:first',kind:'agent',resource_id:id,scopes:['intake:append']};
+    assert.equal((await f.call('/api/intakes/'+other,'PATCH',{key:'foreign-denial',code_task:false},foreign)).status,403);
+    assert.equal(events(f,other).filter(e=>e.kind==='developer_alert_raised').length,0);
+    assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'operator-classify',code_task:false})).status,200);
+  }finally{f.close();}
+});
+
+test('a typed code-task denial does not raise another blocker alert on exit or a later recovery attempt',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'typed-refusal-exit',true);
+    for(let attempt=0;attempt<2;attempt++){
+      if(attempt)assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-denial',status:'open'})).status,200);
+      assert.equal((await start(f,id,'denied-'+attempt)).status,201);
+      const current=await run(f,id);
+      const actor={id:'session:'+current.session_id,kind:'agent',resource_id:id,scopes:['intake:append']};
+      assert.equal((await f.call('/api/intakes/'+id,'PATCH',{key:'refuse-'+attempt,code_task:false},actor)).status,403);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'block-'+attempt,event:{kind:'task_blocked',session_id:current.session_id,
+        cause:'permission',detail:'code_task_operator_required: only an operator can reclassify',next_step:'Operator runs hub intake update --code-task false'}},actor);
+      await finish(f,current,1);f.reopen();await f.project.alarm();
+      assert.equal(intakeRow(f,id).status,'failed');
+      assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,1);
+      assert.equal(sagas(f,id).length,attempt+1,'permission refusal never launches a recovery');
+    }
+    // A different permission failure remains actionable even on the same intake.
+    await f.call('/api/intakes/'+id,'PATCH',{key:'reopen-other-denial',status:'open'});
+    await start(f,id,'other-denial');const other=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'other-block',event:{kind:'task_blocked',session_id:other.session_id,
+      cause:'permission',detail:'Access denied to a different service',next_step:'Owner repairs service access'}});
+    await finish(f,other,1);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,2);
+  }finally{f.close();}
+});
+
+test('review prohibitions consume coordinated delivery verbs and PR references are read-only',()=>{
+  for (const prohibition of ['do not push, merge or deploy', 'do not merge, push, or deploy',
+    'must not deploy or merge', "don't push and merge", 'never merge']) {
+    assert.equal(readOnlyBrief('Review PR 742', `Read-only: ${prohibition}. Review the exact PR head.`,
+      ['Post an APPROVE or REQUEST_CHANGES verdict comment with file:line findings.']), true, prohibition);
+  }
+  assert.equal(readOnlyBrief('Review', 'Do not push, merge or deploy.', ['Post a verdict.']),true);
+  assert.equal(readOnlyBrief('Review PR 743', 'Do not push, merge or deploy.', ['Post a verdict on the PR.']),true);
+  assert.equal(readOnlyBrief('Fix bug', 'Implement fix and open a PR; read-only follow-up later.', ['PR merged']),false);
+  assert.equal(readOnlyBrief('Delivery', 'Do not deploy. Implement the change and open a PR.', ['PR checks green']),false);
+  assert.equal(readOnlyBrief('Delivery', 'Read-only follow-up. Merge the PR.', ['Result']),false);
+});
+
+test('the four real review briefs of intakes 757e3124, 169e24be, d1af7e3d and aa36d9d3 are read-only, not code delivery',()=>{
+  const briefs:{id:string;title:string;text:string;ac:string[]}[]=[
+ {
+  "id": "757e3124",
+  "title": "Review PR 742 exact head 675783ee (desktop no-work fixes, 42b42c9b)",
+  "text": "Independent review of exact head 675783ee of PR https://github.com/alexeygrigorev/agent-hub/pull/742 (DESKTOP-FP4OP26 no-work fixes), parent intake 42b42c9b. Check against ACs 1-4 and the binding AC5-9 note on 42b42c9b (Orin a-d): no native_acknowledged while text sits in the agy composer queue (typed native_input_queued), host waits for the running turn / flushes queue before reporting, Windows headless capture shows progress while running, Claude interactive path includes #730, typed launcher_capability_unavailable_<capability>, host_operation_failed error_class without exception text, session_ended_no_output developer alert, shell-interactive refused at start. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (Review: approved sha=... or REQUEST_CHANGES with file:line findings) and a note on intake 42b42c9b.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head 675783ee as a PR 742 comment and a note on parent intake 42b42c9b, covering ACs 1-4 and AC5-9 (note) of 42b42c9b."
+  ]
+ },
+ {
+  "id": "169e24be",
+  "title": "Re-review PR 742 exact head e6499961 (desktop no-work fixes, 42b42c9b)",
+  "text": "Independent review of exact head e6499961 of PR https://github.com/alexeygrigorev/agent-hub/pull/742 (DESKTOP-FP4OP26 no-work fixes), parent intake 42b42c9b. Check against ACs 1-4 and the binding AC5-9 note on 42b42c9b (Orin a-d): no native_acknowledged while text sits in the agy composer queue (typed native_input_queued), host waits for the running turn / flushes queue before reporting, Windows headless capture shows progress while running, Claude interactive path includes #730, typed launcher_capability_unavailable_<capability>, host_operation_failed error_class without exception text, session_ended_no_output developer alert, shell-interactive refused at start. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (Review: approved sha=... or REQUEST_CHANGES with file:line findings) and a note on intake 42b42c9b.\nRe-review: the previous review of 675783ee requested changes (two P1: fail-open send verification in agent.py, and native_input_queued projected as delivered in machine-do.ts). Verify both are fixed with command-level and host-to-server regression tests.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head e6499961 as a PR 742 comment and a note on parent intake 42b42c9b, covering ACs 1-4 and AC5-9 (note) of 42b42c9b."
+  ]
+ },
+ {
+  "id": "d1af7e3d",
+  "title": "Review PR 743 exact head dd5eb2b5 (worker context refusals, 37e34dcd)",
+  "text": "Independent review of exact head dd5eb2b5 of PR https://github.com/alexeygrigorev/agent-hub/pull/743 (fix(worker-auth): typed worker context refusals; read-only evidence read), parent intake 37e34dcd. Security-sensitive: confirm no worker can fall back to a human/host profile, no paths/tokens/untrusted input in messages, and the evidence-read path is read-only, scoped to sessions cited by the worker own intake, and audited. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (APPROVE or REQUEST_CHANGES with file:line findings) and a note on intake 37e34dcd.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head dd5eb2b5 as a PR 743 comment and a note on parent intake 37e34dcd, covering ACs 2-3 of 37e34dcd."
+  ]
+ },
+ {
+  "id": "aa36d9d3",
+  "title": "Review PR 741 exact head 400f9a9a (auto-restart failover, 36ce7c2e)",
+  "text": "Independent review of exact head 400f9a9a of PR https://github.com/alexeygrigorev/agent-hub/pull/741 (fix(hub2): fail over controlled sessions after repeated crashes), parent intake 36ce7c2e (Alexey t2983u, auto-restart of failed sessions). The previous acceptance covered 891fd592; implementer session 95fd5cd9 changed the source to fix 3 red checks, so the new head needs a fresh review. Read-only: do not push, merge or deploy.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head 400f9a9a (gh pr review on PR 741 and a note on parent intake 36ce7c2e), checking the CI-fix changes and that ACs 3-5 of 36ce7c2e (auto-restart on another route, loud alert, regression test for 21a07a26) are still met."
+  ]
+ }
+];
+  for(const b of briefs)assert.equal(readOnlyBrief(b.title,b.text,b.ac),true,b.id);
+});
+
+test('absent merge evidence is typed separately from malformed evidence and non-code work',()=>{
+  assert.deepEqual(mergeGate(true,undefined).problems,['merge_evidence_missing']);
+  assert.deepEqual(mergeGateAll(true,[]).problems,['merge_evidence_missing']);
+  assert.deepEqual(mergeGate(true,[]).problems,['merge evidence must be a JSON object']);
+  assert.deepEqual(mergeGate(false,undefined),{required:false,ok:true,problems:[]});
+});
+
 test('read-only briefs are not code tasks, and an operator can reclassify and reevaluate',async()=>{
   const f=fixture();
   try{
@@ -1537,6 +1697,8 @@ test('read-only briefs are not code tasks, and an operator can reclassify and re
       assert.equal(r.status,201);return (await json(r)).intake.id as string;};
     const report=await make('ro1','DTC migration status','Read-only report, no code.',['Report states migration status']);
     assert.equal(JSON.parse(intakeRow(f,report).source_json).code_task,false,'report-only brief is classified non-code');
+    f.db().run("UPDATE intakes SET source_json='{}' WHERE id=?",report);
+    assert.equal((await json(await f.call('/api/intakes/'+report+'/merge-state'))).code_task,false,'legacy absent provenance still recognizes a read-only brief');
     const draft=await make('ro2','Draft email','Draft-only email task.',['Draft is written']);
     assert.equal(JSON.parse(intakeRow(f,draft).source_json).code_task,false);
     const code=await make('ro3','Fix bug','Implement fix and open a PR; read-only follow-up later.',['PR merged']);
