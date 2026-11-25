@@ -356,7 +356,7 @@ class Tests(unittest.TestCase):
     def test_valid_original_business_runs_once_with_bad_or_missing_client(self):
         # Genuine committed quota bytes: execute its actual main AND publish.
         raw=(ROOT/'scripts/hub-quota-publish.py').read_bytes()
-        self.assertEqual(hashlib.sha256(raw).hexdigest(),'737eb2e9ddf290b97e03340671973b2813d290eb14725be02b32a08e166380f1')
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),'319c93fd0b4f7239a3bb0d69f083a0e938122f02446e2e7c36035cbc61b9bc21')
         for client,digest in [(b'changed','0'*64),(None,'0'*64),(b'',hashlib.sha256(b'').hexdigest()),
                 ('not-bytes','0'*64),(b'x'*262145,'0'*64)]:
             selected=prelude.SelectedQuota('quota_publish',raw,hashlib.sha256(raw).hexdigest(),client,digest,())
