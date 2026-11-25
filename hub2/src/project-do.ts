@@ -175,6 +175,7 @@ export class ProjectDO {
       if (['/_internal/finish-dead-letter','/_internal/stopped-finish'].includes(url.pathname) && request.method==='POST')
         return await terminalReceipt(request,this.db,fn=>this.transaction(fn),(...args)=>this.appendEvent(...args),id=>this.intakeContext(id));
       if(url.pathname==='/_internal/session-wake'&&request.method==='POST')return await this.sessionWakeInternal(request);
+      if(url.pathname==='/_internal/evidence-read'&&request.method==='POST')return await this.evidenceRead(request);
       if (url.pathname === '/_internal/finish' && request.method === 'POST') return await this.finishInternal(request);
       if (url.pathname === '/_internal/started' && request.method === 'POST') return await this.startedInternal(request);
       if ((url.pathname === '/_internal/stopped' || url.pathname === '/_internal/reaped') && request.method === 'POST') return await this.stoppedInternal(request);
@@ -839,6 +840,8 @@ export class ProjectDO {
         ||interactive||withGoal)return error('invalid_managed_credential_route',400);
     }
     if (withGoal&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('goal_unavailable', 409);
+    // Hosts advertise shell as headless-only (modes:v1:shell:h); refuse before an intake dispatch is consumed.
+    if (interactive&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('launcher_capability_unavailable_interactive', 409, 'shell supports headless only; interactive is not advertised on any host');
     const capabilities = body.required_capabilities === undefined ? [] : body.required_capabilities;
     if (!Array.isArray(capabilities) || capabilities.length > 32
       || capabilities.some(value => typeof value !== 'string' || value.length < 1 || value.length > 80)) return error('invalid_required_capabilities', 400);
@@ -1010,7 +1013,7 @@ export class ProjectDO {
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
         const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
           :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
@@ -1819,10 +1822,20 @@ export class ProjectDO {
     if(!claim&&continuable&&!contractOmitted&&!hard&&depth<MAX_AUTO_CONTINUATIONS)
       record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    // Fail loudly (intake 42b42c9b): a session that ended on its own with no completion
+    // claim and nothing appended (no note, evidence or blocker) produced no visible work.
+    // Typed alert to the developer even when a continuation follows; owner is not changed.
+    const silent=!claim&&(reason==='exit_without_completion_claim'||reason.startsWith('native_exit_')||reason.startsWith('session_')&&reason!=='session_stop_confirmed')&&this.appendsSinceStart(intake,saga).length===0;
+    if(silent&&record.continuation){
+      const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'session_ended_no_output',reason,session_id:saga.session_id,machine_id:saga.machine_id,
+        detail:'Session ended with containment empty, no completion claim and no appended output.'};
+      this.appendEvent(intake.id,'developer-alert:session_ended_no_output:'+saga.session_id,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+      console.error('[hub2] SESSION_ENDED_NO_OUTPUT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intake.id,...alert}));
+    }
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
     if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
-      this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
+      this.raiseDeveloperAlert(intake.id,saga.session_id,silent&&!hard?'session_ended_no_output':hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
         ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{}),
@@ -2091,14 +2104,19 @@ export class ProjectDO {
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
-      // An engine that failed its preflight check is never pinned again: keep
-      // the machine (the workspace lives there) and repick without that route.
-      const span=record.reason==='native_exit_75'?this.db.one<{created_at:number;updated_at:number}>(
+      // Repick immediately for an engine start fault, or after a repeated
+      // unclaimed native crash. Preserve the checkout and the bounded budget,
+      // and carry exclusions so a later crash cannot select a broken route again.
+      const exitCode=record.reason==='native_exit_75'?75:record.reason==='native_exit_127'?127:undefined;
+      const span=exitCode!==undefined?this.db.one<{created_at:number;updated_at:number}>(
         'SELECT created_at,updated_at FROM dispatch_sagas WHERE operation_id=?',previousSaga.operation_id):undefined;
-      const startRefused=!!span&&isFastStartRefusal(75,span.created_at,span.updated_at);
-      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const startRefused=!!span&&isFastStartRefusal(exitCode,span.created_at,span.updated_at);
+      const repeatedCrash=record.depth>0&&/^native_exit_-?[1-9][0-9]*$/.test(record.reason);
+      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused||repeatedCrash)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const excluded=Array.isArray(route?.exclude_policy_ids)?route.exclude_policy_ids.filter((id):id is string=>typeof id==='string'):[];
+      if(repick&&!excluded.includes(String(route!.policy_id)))excluded.push(String(route!.policy_id));
       const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
-        ...(repick?{exclude_policy_ids:[String(route!.policy_id)]}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+        ...(repick?{exclude_policy_ids:excluded}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
         interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
@@ -2611,6 +2629,41 @@ export class ProjectDO {
     return forbiddenScope('intake:read', `read of intake ${intake.id} needs intake:read with project:${intake.project}, the intake's own or child-intake worker session, or operator:admin`);
   }
 
+  /**
+   * Edge-only check (worker.ts) for a bound worker session reading a session or intake that is not
+   * its own. Granted only when the worker's own intake was authored by a requester (not a worker
+   * session) and its original title/text names the target by full id or 8+ hex prefix. Read-only:
+   * the edge forwards exactly one GET with an actor scoped to that one object. Each first grant per
+   * target is audited on the reader's intake; refusals are typed and name the operator command.
+   */
+  private async evidenceRead(request: Request): Promise<Response> {
+    const b = await bodyObject(request, 4096);
+    const kind = b.kind, target = b.target_id, actorId = b.actor_id, own = b.intake_id;
+    if (!['intake','session'].includes(String(kind)) || typeof target !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(target)
+      || typeof actorId !== 'string' || !/^session:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(actorId) || typeof own !== 'string' || !boundedString(own, 180))
+      return error('invalid_evidence_read', 400);
+    // A refusal echoes only the caller's own reference: an uncited target's full id is never disclosed.
+    const shown = typeof b.ref === 'string' && /^[0-9a-f-]{6,36}$/.test(b.ref) && target.startsWith(b.ref) ? b.ref : target.slice(0, 8);
+    const command = `hub ${kind === 'session' ? 'sessions' : 'intake'} show ${shown}`;
+    const refuse = (reason: string, why: string) => json({
+      error: 'evidence_not_referenced', reason, missing_scope: 'intake:read', operator_command: command,
+      detail: `${kind} ${shown} is outside this worker's intake (missing scope intake:read): ${why}; ask an operator to run \`${command}\` and append the facts to your intake`,
+    }, 403);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', own);
+    if (!row) return refuse('own_intake_not_in_project', 'evidence reads are limited to the worker\'s own project');
+    // The text's author decides, not the row owner: a schedule occurrence copies its parent's text,
+    // so the parent's author must also be a requester.
+    const parent = row.schedule_id && row.parent_intake_id ? this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', row.parent_intake_id) : undefined;
+    const authors = [row.owner_actor_id, ...(row.schedule_id ? [parent?.owner_actor_id] : [])];
+    if (authors.some(a => !a || a.startsWith('session:')))
+      return refuse('intake_authored_by_worker', 'only a requester-authored intake grants evidence reads');
+    const reference = evidenceReferences(`${row.original_title ?? row.title}\n${row.original_text ?? row.text}`).find(ref => target.startsWith(ref));
+    if (!reference) return refuse('not_referenced', 'the intake text does not name it');
+    this.transaction(() => this.appendEvent(row.id, `intake:${row.id}:evidence_read:${kind}:${target}`, actorId, 'evidence_read',
+      { kind: kind as string, target_id: target, reference, read_only: true }, Date.now()));
+    return json({ granted: true, kind, target_id: target, reference });
+  }
+
   private canReadIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
     if (this.canProject(actor, intake.project, 'intake:read')) return true;
     if (!actor || !hasScope(actor, 'intake:read')) return false;
@@ -2641,6 +2694,16 @@ function criteriaError(value: unknown): Response | null {
 
 /** A t-id citation is a token like t3416u: t + digits + optional letter, not embedded in a longer word. */
 const T_ID_CITATION = /(?<![A-Za-z0-9])t\d+[a-z]?(?![A-Za-z0-9])/i;
+
+/** Session/intake ids an intake's text names as evidence: full ids or 8-hex short ids (bounded). */
+export function evidenceReferences(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.toLowerCase().matchAll(/(?<![0-9a-z])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})(?![0-9a-z])/g)) {
+    found.add(m[1]);
+    if (found.size >= 64) break;
+  }
+  return [...found];
+}
 
 /** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */
 function normalizeCriteria(body: Record<string, unknown>): void {

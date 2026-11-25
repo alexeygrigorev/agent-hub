@@ -33,6 +33,10 @@ const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = {
   "codex_launch_wrapper_unavailable": "Codex launch wrapper is unavailable.",
   "engine_binary_unavailable": "Engine binary or managed launcher is unavailable on this host.",
   "claude_workspace_trust_unverified": "Claude folder-trust prompt could not be answered.",
+  "launcher_capability_unavailable_headless": "Engine is not advertised as headless-capable on this host.",
+  "launcher_capability_unavailable_interactive": "Engine is not advertised as interactive-capable on this host (for example shell supports headless only).",
+  "launcher_capability_unavailable_goal": "Engine does not advertise goal mode on this host.",
+  "launcher_capability_unavailable_effort": "Engine does not advertise effort selection on this host.",
   "launcher_capability_unavailable": "Launcher capability is unavailable.",
   "managed_exec_unavailable": "Managed execution is unavailable.",
   "invalid_offer_identity": "Offer identity is invalid.",
@@ -192,7 +196,7 @@ function fixedHostDetail(reason:unknown):string {
 // Hosts may append closed facts to the fixed detail, e.g.
 // "Workspace git operation failed. (operation=rev-parse exit_code=128)".
 // Only these shapes pass; paths, argv and stderr never reach session detail.
-const HOST_DETAIL_FACT='(?:operation=(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)|exit_code=-?[0-9]{1,6}|reason=[a-z][a-z_]{0,39}|status=[a-z][a-z_]{0,39})';
+const HOST_DETAIL_FACT='(?:operation=(?:rev-parse|fetch|worktree|for-each-ref|symbolic-ref|ls-remote|other)|exit_code=-?[0-9]{1,6}|reason=[a-z][a-z_]{0,39}|status=[a-z][a-z_]{0,39}|error_class=(?:timeout|os_error|runtime_error|value_error|key_error|unclassified))';
 const HOST_DETAIL_FACTS=new RegExp(`^ \\(${HOST_DETAIL_FACT}(?: ${HOST_DETAIL_FACT}){0,3}\\)$`);
 function hostDetail(reason:unknown,reported:unknown):string {
   const fixed=fixedHostDetail(reason);
@@ -1777,6 +1781,9 @@ export class MachineDO {
     const diagnostic=this.nativeControlDiagnostic(result,row.kind);
     delete result.native_control_stage; delete result.native_control_error;
     const captureFailed=row.kind==='capture'&&result.error!==undefined;
+    // Typed negative send outcome: the engine holds the text in its composer queue, so it is neither delivered nor acked.
+    const sendRejected=row.kind==='send'&&result.error==='native_input_queued'&&result.reason==='native_input_queued'&&Object.keys(result).length===2;
+    if(row.kind==='send'&&result.error!==undefined&&!sendRejected)return error('invalid_command_ack',400);
     if(captureFailed&&(typeof result.error!=='string'||!/^[a-z_]{1,80}$/.test(result.error)
       ||result.output!==undefined))return error('invalid_command_ack',400);
     if(capture&&!captureFailed&&(typeof result.output!=='string'||new TextEncoder().encode(result.output).length>CAPTURE_OUTPUT_BYTES))return error('invalid_capture_output',400);
@@ -1816,7 +1823,7 @@ export class MachineDO {
     const resultJson = JSON.stringify(result);
     if(new TextEncoder().encode(resultJson).length>resultLimit)return error('command_ack_too_large',413);
     const unconfirmed=row.kind==='stop'&&result.stopped===false&&result.error==='stop_unconfirmed';
-    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed) && row.result_json === resultJson)) {
+    if (row.state === 'acked' || (row.state === 'failed' && (unconfirmed||captureBinding||captureFailed||sendRejected) && row.result_json === resultJson)) {
       if(row.result_json!==resultJson)return error('command_ack_conflict',409);
       if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.scheduleNext();}
       return json({acknowledged:true,duplicate:true});
@@ -1836,7 +1843,7 @@ export class MachineDO {
       }
     } else {
       this.db.run("UPDATE session_commands SET state=?,result_json=?,updated_at=? WHERE id=? AND (state='pending' OR (?=1 AND state IN ('wake_pending','wake_failed'))) AND epoch=?",
-        unconfirmed||captureFailed?'failed':'acked', resultJson, now, commandId,wakeBinding?1:0, row.epoch);
+        unconfirmed||captureFailed||sendRejected?'failed':'acked', resultJson, now, commandId,wakeBinding?1:0, row.epoch);
     }
     if(row.kind==='stop'&&result.stopped===true)await this.scheduleNext();
     if(wakeBinding){await this.wakes.reconcile(sessionId,String(wakeBinding.id));await this.wakes.sweep();await this.scheduleNext();}

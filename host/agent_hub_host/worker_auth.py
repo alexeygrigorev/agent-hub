@@ -20,10 +20,39 @@ from . import private_fs
 LAUNCH = re.compile(r'(?:task-)?hub-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
 
 
+# Fixed, typed diagnostics; never include paths, tokens or untrusted input.
+# "host re-issuance required" appears only where a fresh host-issued attempt
+# context is actually the fix (missing, expired, invalid or unsafe file).
+_REISSUE = '; host re-issuance required.'
+WORKER_CONTEXT_REASONS = {
+    'worker_env_override_forbidden': (
+        '{variable} is set in this Hub2 worker session; workers may not select another Hub '
+        'profile, token or server. Unset {variable} and retry (re-issuance will not help).'),
+    'worker_profile_io_forbidden': (
+        'Hub2 workers may not read or write the human or host Hub profile; use the '
+        'per-attempt worker context (re-issuance will not help).'),
+    'context_missing': 'No Hub2 worker context is published for this attempt' + _REISSUE,
+    'context_expired': 'The Hub2 worker context for this attempt has expired' + _REISSUE,
+    'context_invalid': 'The Hub2 worker context for this attempt is malformed or mismatched' + _REISSUE,
+    'context_unsafe': 'The Hub2 worker context file failed private-file safety checks' + _REISSUE,
+    'context_changed': ('The Hub2 worker context changed during this command (attempt re-issued); '
+                        'retry the command.'),
+}
+# Only these names are ever interpolated; anything else collapses to a fixed label.
+OVERRIDE_VARIABLES = ('HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE', 'HUB_URL', 'HUB_BASE_URL',
+                      'HUB_TOKEN', 'HUB_JOB_TOKEN')
+
+
 class WorkerContextError(ValueError):
-    """A fixed diagnostic; never include paths, tokens or untrusted input."""
-    def __init__(self):
-        super().__init__('Worker context unavailable or unsafe; host re-issuance required.')
+    """A typed, fixed diagnostic; never include paths, tokens or untrusted input."""
+    def __init__(self, reason='context_invalid', variable=None):
+        if reason not in WORKER_CONTEXT_REASONS:
+            reason = 'context_invalid'
+        if variable not in OVERRIDE_VARIABLES:
+            variable = 'A Hub profile override variable' if reason == 'worker_env_override_forbidden' else None
+        self.reason, self.variable = reason, variable
+        super().__init__('Worker context refused (' + reason + '): '
+                         + WORKER_CONTEXT_REASONS[reason].format(variable=variable))
 
 
 V2_LAUNCH = re.compile(r'task-hub2-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
@@ -38,7 +67,7 @@ def is_v2_worker():
 
 def refuse_v2_profile_io():
     if is_v2_worker():
-        raise WorkerContextError()
+        raise WorkerContextError('worker_profile_io_forbidden')
 
 
 def _unique_object(pairs):
@@ -61,12 +90,16 @@ def _origin(value):
 
 
 def _v2_context():
+    # A profile selector override is reported first and by name: it is the
+    # caller's environment, not the host-issued context, that must change.
+    for key in ('HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE'):
+        if os.environ.get(key):
+            raise WorkerContextError('worker_env_override_forbidden', key)
     match = V2_LAUNCH.fullmatch(os.environ.get('APLEXER_TAG', ''))
     workspace = os.environ.get('APLEXER_WORKSPACE', '')
     selector = os.environ.get('HUB2_CONFIG', '')
-    if (not match or not workspace or not selector or os.environ.get('HUB_CONFIG_FILE')
-            or os.environ.get('HUB_WORKER_CONFIG_FILE')):
-        raise WorkerContextError()
+    if not match or not workspace or not selector:
+        raise WorkerContextError('context_missing')
     root, path = Path(workspace), Path(selector)
     if (not root.is_absolute() or not path.is_absolute()
             or workspace != str(root) or selector != str(path)
@@ -104,15 +137,22 @@ def _v2_context():
     token, expiry = data['token'], data['expires_at']
     if (not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9._~-]{32,256}', token)
             or type(expiry) not in (int, float) or not math.isfinite(expiry)
-            or not time.time() < expiry <= time.time() + 86405):
+            or expiry > time.time() + 86405):
         raise WorkerContextError()
+    if not time.time() < expiry:
+        raise WorkerContextError('context_expired')
     origin = _origin(data['server'])
     for key in ('HUB_URL', 'HUB_BASE_URL'):
-        if os.environ.get(key) and _origin(os.environ[key]) != origin:
-            raise WorkerContextError()
+        if os.environ.get(key):
+            try:
+                same = _origin(os.environ[key]) == origin
+            except (ValueError, TypeError):
+                same = False
+            if not same:
+                raise WorkerContextError('worker_env_override_forbidden', key)
     for key in ('HUB_TOKEN', 'HUB_JOB_TOKEN'):
         if os.environ.get(key) and os.environ[key] != token:
-            raise WorkerContextError()
+            raise WorkerContextError('worker_env_override_forbidden', key)
     return {'base_url': data['server'].rstrip('/'), 'access_token': token,
             'client_kind': 'agent', '_hub2_worker': worker, '_hub2_expires_at': expiry}
 
@@ -122,13 +162,20 @@ def load_v2_context():
         return None
     try:
         return _v2_context()
-    except (OSError, ValueError, TypeError, OverflowError, KeyError, UnicodeError, RecursionError):
-        raise WorkerContextError() from None
+    except WorkerContextError as exc:
+        raise WorkerContextError(exc.reason, exc.variable) from None
+    except FileNotFoundError:
+        raise WorkerContextError('context_missing') from None
+    except OSError:
+        # Symlinks, foreign owners, loose modes, hard links: private_fs refusals.
+        raise WorkerContextError('context_unsafe') from None
+    except (ValueError, TypeError, OverflowError, KeyError, UnicodeError, RecursionError):
+        raise WorkerContextError('context_invalid') from None
 
 
 def validate_v2_request(profile):
     if '_hub2_worker' in profile and load_v2_context() != profile:
-        raise WorkerContextError()
+        raise WorkerContextError('context_changed')
 
 
 def config_path():
@@ -209,7 +256,7 @@ def provision(workspace, launch_id, request):
 def refresh_guard():
     """Serialize CLI processes sharing one rotating worker refresh token."""
     if is_v2_worker():
-        raise WorkerContextError()
+        raise WorkerContextError('worker_profile_io_forbidden')
     path = None if os.environ.get('HUB_CONFIG_FILE') else config_path()
     if path is None:
         yield

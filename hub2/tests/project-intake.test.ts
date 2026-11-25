@@ -1245,3 +1245,14 @@ test('scoped worker session creates child intakes and starts child sessions whil
  assert.equal((await body(deniedStart)).missing_scope,'session:start');
  f.sql.close();f.collectorSql.close();
 });
+
+test('shell interactive start is refused with a typed capability reason before any dispatch is consumed',async()=>{
+ const f=fixture();
+ try{
+  const own=await intake(f,'shell-interactive');
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true});
+  assert.equal(refused.status,409);
+  assert.equal((await body(refused)).error,'launcher_capability_unavailable_interactive');
+  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,0);
+ }finally{f.sql.close();f.collectorSql.close();}
+});

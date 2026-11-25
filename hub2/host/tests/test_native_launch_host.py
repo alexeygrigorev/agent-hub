@@ -1801,7 +1801,7 @@ class CodexQuotaWrapperLaunchTests(unittest.TestCase):
             self.assertNotIn('task', self.child(calls))
             self.assertEqual(proof.call_count, 1, 'interactive launch uses no additional headless proof')
             offer['launch']['interactive'] = False
-            with self.assertRaisesRegex(ValueError, 'launcher_capability_unavailable'):
+            with self.assertRaisesRegex(ValueError, 'launcher_capability_unavailable_headless'):
                 bridge.validate_launch(offer)
             with self.assertRaisesRegex(RuntimeError, 'codex_launch_wrapper_unavailable'):
                 adapter.launch('t1', dict(spec, interactive=False))

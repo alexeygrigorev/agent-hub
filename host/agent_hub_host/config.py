@@ -464,7 +464,7 @@ def save_config(data: dict):
     """Legacy host save (host.json, or HUB_CONFIG_FILE override). Untouched."""
     from .worker_auth import config_path, is_v2_worker, WorkerContextError
     if is_v2_worker():
-        raise WorkerContextError()
+        raise WorkerContextError('worker_profile_io_forbidden')
     worker = None if os.environ.get('HUB_CONFIG_FILE') else config_path()
     _save_to(worker if worker is not None else get_config_path(), data)
 

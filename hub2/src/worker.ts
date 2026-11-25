@@ -274,7 +274,22 @@ const router = {
           const relation = await relationForward(request, env, control, actor, internalPath);
           if (relation instanceof Response) return relation;
           const forwarded = await env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
-          // Not the worker's own or parent intake: report Control's named refusal, not the project miss.
+          // Not the worker's own or parent intake: a GET of an intake its own intake text cites as
+          // evidence is read-only granted; otherwise report Control's named refusal, not the project miss.
+          if (routeDenied && intakeId && (forwarded.status === 404 || forwarded.status === 403)) {
+            const sub = internalPath.match(/^\/api\/intakes\/[^/]+(?:\/(history))?$/);
+            if (request.method === 'GET' && sub) {
+              const grant = await evidenceGrant(env, control, actor, 'intake', decodeURIComponent(intakeId), routeDenied);
+              if (grant instanceof Response) return grant;
+              const evidencePath = '/api/intakes/' + encodeURIComponent(grant.route.id) + (sub[1] ? '/' + sub[1] : '');
+              // Keep the read's own paging (history after/limit); the project is always the worker's own.
+              const query = new URLSearchParams();
+              for (const key of ['after', 'limit']) { const v = url.searchParams.get(key); if (v !== null) query.set(key, v); }
+              query.set('project', route.owner);
+              return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,
+                'https://project.internal' + evidencePath + '?' + query.toString(), grant.actor));
+            }
+          }
           return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
         }
         if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
@@ -360,6 +375,7 @@ const router = {
             ? actor.resource_id
             : requestUrl(request).searchParams.get('machine_id');
         let sessionPath = path;
+        let sessionActor = actor;
         if (!machineId && actor.kind !== 'machine') {
           const response = await control.fetch(
             await forwardRequest(
@@ -368,10 +384,17 @@ const router = {
               actor,
             ),
           );
-          if (!response.ok) return response;
-          const { route } = (await response.json()) as {
-            route: { id: string; owner: string };
-          };
+          let route: { id: string; owner: string };
+          if (!response.ok) {
+            // Read-only evidence path: only `show` and `events` GETs, never commands, capture or send.
+            if (response.status !== 403 || request.method !== 'GET' || (session[2] && session[2] !== 'events') || !boundWorker(actor)) return response;
+            const grant = await evidenceGrant(env, control, actor, 'session', decodeURIComponent(session[1]), response);
+            if (grant instanceof Response) return grant;
+            route = grant.route;
+            sessionActor = grant.actor;
+          } else {
+            ({ route } = (await response.json()) as { route: { id: string; owner: string } });
+          }
           machineId = route.owner;
           sessionPath = path.replace('/' + session[1], '/' + route.id);
         }
@@ -384,7 +407,7 @@ const router = {
           await forwardRequest(
             request,
             `https://machine.hub2.internal${sessionPath}${requestUrl(request).search}`,
-            actor,
+            sessionActor,
             undefined,
             undefined,
             safetyMode || undefined,
@@ -609,6 +632,32 @@ function secureStatic(response: Response): Response {
     statusText: response.statusText,
     headers,
   });
+}
+
+// Sanctioned least-privilege evidence read (intake 37e34dcd): a bound worker session may read a
+// session or intake that its own requester-authored intake text names as evidence. Control
+// resolves the id with a routing-only service identity, the target must be in the worker's own
+// project, the worker's Project object decides and audits, and the edge then forwards exactly one
+// GET with an actor whose only scope is reading that one object. Anything else keeps the denial.
+const EVIDENCE_ROUTER: Actor = { id: 'service:evidence-read', kind: 'operator', scopes: ['routing:read'] };
+function boundWorker(actor: Actor): boolean {
+  return actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id && hasScope(actor, 'intake:read');
+}
+async function evidenceGrant(env: Hub2Env, control: DurableObjectStub, actor: Actor, kind: 'session' | 'intake',
+  ref: string, denied: Response): Promise<{ route: { id: string; owner: string; resource_id: string }; actor: Actor } | Response> {
+  const project = actor.scopes.find(s => s.startsWith('worker_project:'))?.slice('worker_project:'.length);
+  if (!project || !boundWorker(actor)) return denied;
+  const looked = await control.fetch(new Request(CONTROL + '/api/routes/' + kind + '/' + encodeURIComponent(ref),
+    { headers: { 'x-hub2-actor': JSON.stringify(EVIDENCE_ROUTER) } }));
+  if (!looked.ok) return denied;
+  const { route } = (await looked.json()) as { route: { id: string; owner: string; resource_id: string } };
+  if (!route || route.resource_id !== project) return denied;
+  const decided = await env.PROJECTS.get(env.PROJECTS.idFromName(project)).fetch(new Request(
+    'https://project.hub2.internal/_internal/evidence-read', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, target_id: route.id, ref, actor_id: actor.id, intake_id: actor.resource_id }) }));
+  if (!decided.ok) return decided;
+  return { route, actor: { id: actor.id, kind: 'agent', resource_id: route.id, client_id: 'evidence-read',
+    scopes: [kind === 'session' ? 'session:read' : 'intake:read'] } };
 }
 
 async function forwardRequest(

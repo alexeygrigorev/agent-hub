@@ -167,10 +167,26 @@ class TaskOutputTest(unittest.TestCase):
         self.assertEqual(command[command.index('--output-dir')+1],str(self.root.joinpath(*spec['_task_output']['parts'])))
         self.assertNotEqual(spec['_task_output']['parts'],self.binding['parts'])
 
-    def test_unsupported_platform_keeps_existing_launch_path(self):
-        with mock.patch.object(os,'supports_dir_fd',set()):
-            self.assertIsNone(output.prepare_output(self.task,self.spec,'local','codex','prompt'))
-            self.assertIsNone(self.capture())
+    def test_windows_without_dir_fd_still_retains_and_reads_stdout(self):
+        # Regression (intake 42b42c9b): Windows lacks dir_fd/O_NOFOLLOW; headless capture was
+        # empty while running and task_output_unavailable after exit.
+        with mock.patch.object(output,'_dirfd_supported',return_value=False):
+            spec=dict(self.spec,operation_id='attempt-win')
+            binding=output.prepare_output('hub2-session-2',spec,'local','codex','prompt')
+            self.assertIsNotNone(binding)
+            self.assertTrue(self.root.joinpath(*binding['parts']).is_dir())
+            self.assertEqual(self.capture(),'actual child output\n')
+            self.assertEqual(self.retained(),'actual child output\n')
+            self.assertEqual(output.capture_tail('x'*70000),'x'*65536)
+
+    def test_windows_fallback_never_follows_links(self):
+        with mock.patch.object(output,'_dirfd_supported',return_value=False):
+            log=self.directory/'stdout.log';log.unlink()
+            outside=self.root.parent/'outside-secret.txt';outside.write_text('secret')
+            self.addCleanup(lambda:outside.unlink(missing_ok=True))
+            try:log.symlink_to(outside)
+            except OSError:self.skipTest('symlinks unavailable')
+            with self.assertRaises(RuntimeError):self.retained()
 
     def retained(self):
         for path in (self.root/'.local'/('launch-'+self.task+'.json'),self.directory/'START.json'):

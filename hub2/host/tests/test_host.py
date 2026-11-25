@@ -1118,6 +1118,79 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fence"):
             self.bridge.command({**command, "id": "command-2", "epoch": 2})
 
+    def observe(self, frames, **kw):
+        import types
+        frames = iter(frames)
+        def native(*args, **kwargs):
+            frame = next(frames)
+            if isinstance(frame, Exception):
+                raise frame
+            return types.SimpleNamespace(stdout=frame)
+        with patch.object(self.bridge, 'native', side_effect=native):
+            return self.bridge.observe_input_queue('n1', window_seconds=kw.get('window', 0.05), poll_seconds=0.001)
+
+    def test_observe_input_queue_is_tristate_and_never_fails_open(self):
+        queued = 'busy\nalt+m to send immediately\nPress up to edit queued messages\n'
+        repeat = lambda frame: [frame] * 200
+        self.assertEqual(self.observe(['Ready\n', 'Ready\n']), 'clear')
+        self.assertEqual(self.observe(repeat(queued)), 'queued')
+        # Reviewer repro: empty first frame, then the queued frame, must not be read as clear.
+        self.assertEqual(self.observe(['', queued] + repeat(queued)), 'queued')
+        # Capture failure, empty frames or one lone clear frame are uncertain, never clear.
+        self.assertEqual(self.observe(repeat(OSError('boom'))), 'unknown')
+        self.assertEqual(self.observe(repeat('   \n')), 'unknown')
+        self.assertEqual(self.observe(['Ready\n', OSError('x')] + repeat(OSError('x'))), 'unknown')
+        # A marker between clear frames resets the clear streak.
+        self.assertEqual(self.observe(['Ready\n', queued, 'Ready\n'] + repeat(queued)), 'queued')
+
+    def test_flush_queued_input_sends_alt_m_once_and_reobserves(self):
+        import types
+        for after, expected in (('Ready\n', 'clear'), ('alt+m to send immediately\n', 'queued')):
+            calls = []
+            def native(*args, **kwargs):
+                calls.append(args)
+                return types.SimpleNamespace(stdout=after if args[0] == 'capture' else '')
+            with patch.object(self.bridge, 'native', side_effect=native), patch.object(
+                    type(self.bridge), 'observe_input_queue', return_value=expected):
+                self.assertEqual(self.bridge.flush_queued_input('n1'), expected)
+            self.assertEqual(calls[0], ('send', 'n1', '--hex', '1b6d'))
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertEqual(self.bridge.flush_queued_input('n1'), 'unknown')
+
+    def interactive_send(self, observations):
+        offer = self.offer()
+        offer['launch']['interactive'] = True
+        self.bridge.offer(offer)
+        with patch.object(self.bridge, 'wait_until_ready', return_value=True), \
+                patch.object(self.bridge, 'observe_input_queue', side_effect=list(observations)), \
+                patch.object(self.bridge, 'flush_queued_input', return_value=observations[-1] if len(observations) > 1 else 'unknown'):
+            return self.bridge.command({"id": "send-q", "session_id": "session-1", "epoch": 1, "kind": "send", "text": "hello"})
+
+    def test_command_reports_delivery_only_when_submission_is_observed(self):
+        # Command-level regression for the reviewed fail-open (intake 42b42c9b).
+        self.assertEqual(self.interactive_send(['clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_queued_text_is_a_typed_negative_not_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'queued']),
+                         {'error': 'native_input_queued', 'reason': 'native_input_queued'})
+
+    def test_command_flush_that_submits_the_queued_text_is_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_unreadable_screen_after_send_is_uncertain_not_delivery(self):
+        self.assertEqual(self.interactive_send(['unknown']),
+                         {'error': 'command_outcome_uncertain', 'reason': 'command_outcome_uncertain'})
+
+    def test_send_waits_for_the_running_turn_to_finish_before_typing(self):
+        import types
+        screens = iter(['Working... esc to interrupt\n', 'Working... esc to interrupt\n', 'Ready\n'])
+        with patch.object(self.bridge, 'native', side_effect=lambda *a, **k: types.SimpleNamespace(stdout=next(screens))):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=5, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout='esc to interrupt')):
+            self.assertFalse(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+
     def test_headless_send_is_refused_without_native_effect(self):
         self.bridge.offer(self.offer())
         with self.assertRaisesRegex(ValueError, "headless"):
@@ -1691,7 +1764,10 @@ class HostTests(unittest.TestCase):
             fields = self.bridge._undispatched_failure_fields(error)
             self.assertEqual(fields, {'failure_reason':'native_dispatch_not_started',
                                      'detail':'Native launch did not start.'})
-            self.assertEqual(closed_host_failure(error), ('host_operation_failed','Host operation failed.'))
+            reason, detail = closed_host_failure(error)
+            self.assertEqual(reason, 'host_operation_failed')
+            self.assertRegex(detail, r'^Host operation failed\. \(error_class=[a-z_]+\)$')
+            self.assertNotIn('PRIVATE', detail)
         self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('workspace_unavailable')),
                          {'failure_reason':'workspace_unavailable','detail':'path does not exist; Hub will not create it'})
         self.assertEqual(closed_host_failure(ApiError('PRIVATE',code='provider_auth_failed')),
@@ -1747,7 +1823,7 @@ class HostTests(unittest.TestCase):
                 self.bridge.dispatch({'type':'session.offer','offer':offer},Socket(),None)
         self.assertEqual(sent[-1]['reason'],'host_operation_failed')
         self.assertEqual(sent[-1]['stage'],'host_launch')
-        self.assertEqual(sent[-1]['detail'],'Host operation failed.')
+        self.assertEqual(sent[-1]['detail'],'Host operation failed. (error_class=runtime_error)')
         self.assertNotIn('PRIVATE',json.dumps(sent))
 
     # --- Same-journal pre-dispatch physical RAM admission (intake 111b251b). ---
@@ -2819,7 +2895,7 @@ class OrdinarySendUncertaintyTests(unittest.TestCase):
             'session_id':'sender','message_id':'send-once','epoch':7,'operation_id':'op',
             'native_id':'11111111-2222-4333-8444-555555555555','command_kind':'send','command_state':'done'})
         self.assertEqual(self.dispatch(),frames)
-        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
         row=self.journal.db.execute('SELECT * FROM commands').fetchone()
         self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),self.negative)
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
@@ -2849,7 +2925,7 @@ class OrdinarySendUncertaintyTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT state FROM commands').fetchone()[0],'done')
         self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
         self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
-        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
         client=FakeClient();self.journal.flush(client)
         self.assertEqual(client.calls,[])
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)

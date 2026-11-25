@@ -255,6 +255,10 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'invalid_workspace': 'invalid workspace path',
  'launch_outcome_uncertain': 'Launch outcome is uncertain.',
  'launch_specification_required': 'Launch specification is required.',
+ 'launcher_capability_unavailable_headless': 'Engine is not advertised as headless-capable on this host.',
+ 'launcher_capability_unavailable_interactive': 'Engine is not advertised as interactive-capable on this host (e.g. shell supports headless only).',
+ 'launcher_capability_unavailable_goal': 'Engine does not advertise goal mode on this host.',
+ 'launcher_capability_unavailable_effort': 'Engine does not advertise effort selection on this host.',
  'launcher_capability_unavailable': 'Launcher capability is unavailable.',
  'legacy_launch_identity_unverified': 'Launch preparation was refused.',
  'managed_exec_unavailable': 'Managed execution is unavailable.',
@@ -337,6 +341,7 @@ HOST_FAILURE_FACTS = {
     'exit_code': re.compile(r'-?[0-9]{1,6}'),
     'reason': re.compile(r'[a-z][a-z_]{0,39}'),
     'status': re.compile(r'[a-z][a-z_]{0,39}'),
+    'error_class': re.compile(r'(?:timeout|os_error|runtime_error|value_error|key_error|unclassified)'),
 }
 
 
@@ -388,6 +393,12 @@ def closed_host_failure(error, fallback="host_operation_failed"):
     detail = HOST_FAILURE_DETAILS[reason]
     if reason == code and facts:
         detail = f"{detail} ({' '.join(facts[:4])})"
+    elif reason == fallback == 'host_operation_failed':
+        # Exception text is private (5d97ab95); the class from a closed set is not.
+        kind = next((name for name, cls in (('timeout', (subprocess.TimeoutExpired, TimeoutError)), ('os_error', OSError),
+                                            ('runtime_error', RuntimeError), ('value_error', ValueError),
+                                            ('key_error', (KeyError, IndexError, TypeError))) if isinstance(error, cls)), 'unclassified')
+        detail = f"{detail} (error_class={kind})"
     return reason, detail
 
 def native_control_error(error):
@@ -509,7 +520,7 @@ class Bridge:
         if type(with_goal) is not bool or (with_goal and not launch.get('interactive')):raise ValueError('invalid_goal_mode')
         if effort is not None and effort not in {'low','medium','high','xhigh','max'}:raise ValueError('invalid_effort')
         supported=self.launcher.capabilities().get(engine,set())
-        if any(needed and capability not in supported for capability,needed in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)]):raise ValueError('launcher_capability_unavailable')
+        if any(needed and capability not in supported for capability,needed in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)]):raise ValueError('launcher_capability_unavailable_'+next(c for c,n in [('headless',not launch.get('interactive')),('interactive',launch.get('interactive')),('goal',with_goal),('effort',effort is not None)] if n and c not in supported))
         managed = {}
         if 'managed_credential_label' in launch:
             if (launch['managed_credential_label'] != 'hub-claude' or engine != 'claude' or model != 'opus'
@@ -1528,6 +1539,7 @@ class Bridge:
             text = command.get("text")
             if not isinstance(text, str) or len(text.encode()) > 16384:
                 raise ValueError("invalid_command_text")
+            self.wait_until_ready(native_id)
             try:
                 self.native("send", native_id, "--stdin", "--enter", input=text, timeout=60)
             except Exception:
@@ -1535,10 +1547,91 @@ class Bridge:
                 # Errors after it cannot prove that no input was delivered.
                 result={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
             else:
-                result = {"delivery": "native_acknowledged"}
+                # Engines such as Antigravity accept typed text while a turn is running and park it
+                # in a composer queue; a native ack then does not mean the prompt was submitted
+                # (intake 42b42c9b). Verify, and fail loudly instead of reporting delivery.
+                observed = self.observe_input_queue(native_id)
+                if observed == 'queued':
+                    observed = self.flush_queued_input(native_id)
+                if observed == 'clear':
+                    result = {"delivery": "native_acknowledged"}
+                elif observed == 'queued':
+                    result = {'error': 'native_input_queued', 'reason': 'native_input_queued'}
+                else:
+                    # Unreadable/empty screen: submission is unproven, so never report delivery.
+                    result = {'error': 'command_outcome_uncertain', 'reason': 'command_outcome_uncertain'}
         with db:
             self.finish_command(identity, command, result)
         return result
+
+    QUEUED_INPUT_MARKERS = ('Press up to edit queued messages', 'alt+m to send immediately')
+
+    INPUT_OBSERVE_SECONDS = 8.0
+    INPUT_POLL_SECONDS = 1.0
+    BUSY_WAIT_SECONDS = 90.0
+
+    def observe_input_queue(self, native_id, window_seconds=None, poll_seconds=None, clear_frames=2):
+        """Bounded observation of whether the just-sent text sits in the engine's composer queue.
+
+        Returns 'queued' (a queue marker is on the final readable frame), 'clear' (at least
+        `clear_frames` consecutive non-empty frames without any marker) or 'unknown' (capture
+        failed, or only empty/premature frames were seen). Only 'clear' may be reported as delivered.
+        """
+        window_seconds = self.INPUT_OBSERVE_SECONDS if window_seconds is None else window_seconds
+        poll_seconds = self.INPUT_POLL_SECONDS if poll_seconds is None else poll_seconds
+        deadline = time.monotonic() + window_seconds
+        clear = 0
+        last = 'unknown'
+        while True:
+            try:
+                screen = self.native('capture', native_id, '--screen', '--plain', timeout=10).stdout or ''
+            except Exception:
+                screen = None
+            if screen is None or not screen.strip():
+                clear, last = 0, 'unknown'
+            elif any(marker in screen for marker in self.QUEUED_INPUT_MARKERS):
+                clear, last = 0, 'queued'
+            else:
+                clear += 1
+                last = 'clear' if clear >= clear_frames else 'unknown'
+                if last == 'clear':
+                    return 'clear'
+            if time.monotonic() >= deadline:
+                return last
+            time.sleep(poll_seconds)
+
+    BUSY_MARKERS = ('esc to interrupt', 'ctrl+c to interrupt', 'esc to cancel')
+
+    def wait_until_ready(self, native_id, max_seconds=None, poll_seconds=None):
+        """Bounded wait while the engine shows a running-turn indicator (e.g. the bootstrap turn).
+
+        Best effort: an unreadable screen or an unknown UI never blocks delivery; the
+        post-send queue check and Alt+M retry remain the guarantee. Returns True when ready.
+        """
+        max_seconds = self.BUSY_WAIT_SECONDS if max_seconds is None else max_seconds
+        poll_seconds = self.INPUT_POLL_SECONDS if poll_seconds is None else poll_seconds
+        deadline = time.monotonic() + max_seconds
+        while True:
+            try:
+                screen = (self.native('capture', native_id, '--screen', '--plain', timeout=10).stdout or '').lower()
+            except Exception:
+                return True
+            if not any(marker in screen for marker in self.BUSY_MARKERS):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_seconds)
+
+    def flush_queued_input(self, native_id):
+        """Ask the engine to submit its queued composer text now (Alt+M = ESC m), then re-observe.
+
+        Returns the new observation ('clear', 'queued' or 'unknown'); a failed key send is 'unknown'.
+        """
+        try:
+            self.native('send', native_id, '--hex', '1b6d', timeout=10)
+        except Exception:
+            return 'unknown'
+        return self.observe_input_queue(native_id)
 
     def native_command(self, command):
         identity, native_id = command.get('id'), command.get('native_id')

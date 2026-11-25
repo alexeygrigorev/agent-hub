@@ -1969,10 +1969,14 @@ try:
  counts=json.loads(effects.read_text()) if effects.exists() else {'send':0,'capture':0}
  def fake_native(kind,*args,**kwargs):
   counts[kind]+=1;effects.write_text(json.dumps(counts))
+  if mode=='queued':
+   if kind=='send':return subprocess.CompletedProcess([],0,'','')
+   return subprocess.CompletedProcess([],0,'busy\\nalt+m to send immediately\\nPress up to edit queued messages\\n','')
   if kind=='send':raise subprocess.TimeoutExpired('synthetic owned input',60)
   assert kind=='capture'
   return subprocess.CompletedProcess([],0,'actual owned fixture capture\\n','')
  bridge.native=fake_native
+ bridge.INPUT_OBSERVE_SECONDS=0.05;bridge.INPUT_POLL_SECONDS=0.005;bridge.BUSY_WAIT_SECONDS=0.05
  if mode=='executing':
   with journal.db:bridge.begin_command(command['id'],hashlib.sha256(canonical(command).encode()).hexdigest())
  frames=[]
@@ -2012,6 +2016,25 @@ async function sendQueueFixture(){
  return{f,sender,other,native,otherNative,epoch,send,capture,socket,frames};
 }
 
+test('a send the engine left in its composer queue is a failed/unconfirmed send end to end, idempotent on replay and in history',async()=>{
+ const q=await sendQueueFixture();let root:string|undefined;
+ try{
+  const base=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(base,{recursive:true,mode:0o700});root=mkdtempSync(join(base,'queued-send-'));
+  const report=ordinarySendHost(root,q.send,q.native,'queued');
+  assert.deepEqual(report.result,{error:'native_input_queued',reason:'native_input_queued'});
+  assert.notEqual(report.payload?.result?.delivery,'native_acknowledged');
+  assert.equal((await q.f.call(report.path,'POST',report.payload)).status,200);
+  const row=q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any;
+  assert.equal(row.state,'failed','typed negative is never stored as acked');
+  const listing=await(await q.f.call('/api/sessions/'+q.sender+'/commands?command_id='+q.send.id,'GET',undefined,captureOperator)).json() as any;
+  assert.equal(listing.commands[0].state,'failed');assert.equal(listing.commands[0].ack.error,'native_input_queued');
+  const replay=await q.f.call('/api/sessions/'+q.sender+'/send','POST',{key:'ordinary-send-once',body:'synthetic input'},captureOperator);
+  const legacy=await replay.json() as any;assert.equal(legacy.delivery,'unconfirmed');assert.equal(legacy.state,'failed');
+  assert.equal((await q.f.call(report.path,'POST',report.payload)).status,200,'idempotent replay of the same ack');
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed');
+ }finally{q.f.database.close();if(root)rmSync(root,{recursive:true,force:true});}
+});
+
 test('ordinary send uncertainty joined real Host error event releases other-session capture without delivery or custody change',async()=>{
  const q=await sendQueueFixture();let root:string|undefined;
  try{
@@ -2032,7 +2055,7 @@ test('ordinary send uncertainty joined real Host error event releases other-sess
   await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(again.frame));
   assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed','lost event replay is idempotent');
   const captured=ordinarySendHost(root,q.capture,q.otherNative);
-  assert.equal(captured.effects.capture,1);assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
+  assert.equal(captured.effects.capture,2,'one read-only readiness poll before the single send, plus this capture');assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
   assert.equal((await q.f.call(captured.path,'POST',captured.payload)).status,200);
   assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.capture.id) as any).state,'acked');
   for(const session of[q.sender,q.other])assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
