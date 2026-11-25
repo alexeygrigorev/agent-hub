@@ -2727,7 +2727,7 @@ def shared_dataops_dir():
 
 def link_operator_dapier_session(home):
     """Compatibility entry point: managed Dapier always uses Hub's store."""
-    if os.name == 'nt':
+    if os.name == 'nt' or sys.platform == 'win32':
         return
     from .dapier_credentials import shared_root
     source = shared_root() / 'dapier'

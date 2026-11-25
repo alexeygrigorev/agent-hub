@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -66,16 +67,22 @@ def read_session(root, now):
     return value
 
 
+def _is_windows():
+    return os.name == "nt" or sys.platform == "win32"
+
+
 def session_environment(root, path=None):
     """Pin only dapier's XDG directory via a command wrapper, not other CLIs."""
-    if os.name == "nt":
+    if _is_windows():
         return {}
     root = Path(root).resolve()
     directory = root / "bin"
     search = os.pathsep.join(p for p in (path or os.defpath).split(os.pathsep)
-                             if Path(p).resolve() != directory)
+                             if p and Path(p).resolve() != directory)
     binary = shutil.which("dapier", path=search)
-    binary = binary or "/usr/bin/dapier"
+    if not binary:
+        local_dapier = Path.home() / ".local/bin/dapier"
+        binary = str(local_dapier) if local_dapier.is_file() else "/usr/bin/dapier"
     # A standalone stdlib wrapper survives host upgrades and never reads host
     # session.json, even for native profiles inheriting the operator's HOME.
     code = ("#!/usr/bin/env python3\nimport fcntl, json, os, sys, time\nfrom pathlib import Path\n"
@@ -141,7 +148,7 @@ def maintain(root=None, now=None, refresher=rotate, notifier=notify):
     Failure returns a fixed slug and retries notification until acknowledged.
     Neither errors nor state files contain credential values or remote bodies.
     """
-    if os.name == "nt":
+    if _is_windows():
         return "unsupported"
     import fcntl
     root = Path(root or shared_root()).resolve()
@@ -202,7 +209,7 @@ def maintain(root=None, now=None, refresher=rotate, notifier=notify):
 def request_maintenance():
     """Bounded background work, independent of heartbeat and session starts."""
     global _THREAD
-    if os.name == "nt":
+    if _is_windows():
         return
     with _LOCK:
         if _THREAD is not None and _THREAD.is_alive():
