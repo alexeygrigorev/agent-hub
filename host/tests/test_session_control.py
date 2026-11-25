@@ -1098,7 +1098,6 @@ class TestSessionControlCli(unittest.TestCase):
         refusals = [
             ('POST', '/api/bus/send'),
             ('GET', '/api/bus/claims'),
-            ('GET', '/api/webhooks'),
             ('POST', '/api/prompts'),
             ('GET', '/api/conversations'),
             ('GET', '/api/fleet/tasks'),

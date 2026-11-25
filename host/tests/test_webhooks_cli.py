@@ -56,6 +56,31 @@ class WebhookCliSecretHygiene(unittest.TestCase):
                 'name': 'oncall-dev', 'target_label': 'oncall-engineer',
                 'template': 'Alert: {{payload.subject}}'}))
 
+    def test_hub2_job_create_reads_fixed_launch_file_and_keeps_secret_private(self):
+        calls = []
+        def request(method, path, payload=None):
+            calls.append((method, path, payload))
+            return {'id': 'job-route', 'secret': 'whsec_private_job'}
+        with tempfile.TemporaryDirectory() as tmp:
+            launch_file = os.path.join(tmp, 'launch.json')
+            secret_file = os.path.join(tmp, 'secret')
+            launch = {'project': 'AI-Shipping-Labs/website', 'workspace': '/work/drafts', 'machine': 'hetzner-aplexer'}
+            with open(launch_file, 'w', encoding='utf-8') as stream:
+                json.dump(launch, stream)
+            out, err = self._run(['webhooks', 'create', '--name', 'drafts', '--launch-file', launch_file,
+                                  '--secret-file', secret_file], request)
+            self.assertEqual(calls[0][2]['launch'], launch)
+            self.assertEqual(calls[0][2]['target_label'], 'job')
+            self.assertNotIn('whsec_private_job', out + err)
+
+    def test_hub2_webhook_management_reaches_authenticated_api_without_legacy_override(self):
+        from agent_hub_host import session_control
+        with patch.dict(os.environ, {'HUB_ALLOW_LEGACY_ROUTES': '', 'HUB_TOKEN': 'fixture-token'}), \
+                patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.example'}), \
+                patch.object(session_control.api, 'safe_http_json', return_value={'webhooks': []}) as send:
+            self.assertEqual(session_control.request('GET', '/api/webhooks'), {'webhooks': []})
+        self.assertEqual(send.call_args.args[0].full_url, 'https://hub.example/api/webhooks')
+
     def test_create_stdout_secret_prints_secret_exactly_once(self):
         def request(method, path, payload=None):
             return {'id': 'route-3', 'url_path': '/webhooks/route-3', 'secret': 'whsec_stdout1'}

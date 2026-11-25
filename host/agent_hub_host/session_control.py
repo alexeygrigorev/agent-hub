@@ -88,7 +88,7 @@ def sanitize_start_detail(value):
 # coordinated patches never false-block; HUB_ALLOW_LEGACY_ROUTES=1 bypasses
 # the gate for Hub1-only test environments.
 HUB2_UNSUPPORTED_PREFIXES = (
-    '/api/bus/', '/api/device/', '/api/ops/', '/api/webhooks', '/api/prompts',
+    '/api/bus/', '/api/device/', '/api/ops/', '/api/prompts',
     '/api/session-schedules', '/api/driver', '/api/conversations',
     '/api/fleet/tasks', '/api/fleet/plan', '/api/fleet/launches', '/api/fleet/probe',
     '/api/fleet/reservations', '/api/fleet/accounts', '/api/fleet/limits',
@@ -98,7 +98,6 @@ HUB2_UNSUPPORTED_PREFIXES = (
 )
 HUB2_UNSUPPORTED_HINTS = {
     '/api/bus/': 'messaging moved to the Hub2 mailbox /api/messages; use `hub msg send --to human:me|session:<id>|agent:<name>` (web Inbox) or `hub sessions send <id>` to type into a bound session',
-    '/api/webhooks': 'webhooks retired with Hub1',
     '/api/prompts': 'prompt library retired with Hub1',
     '/api/fleet/routing/host-release': 'Hub2 hosts follow the published /cli/host-release.json; use `hub host-release --machine <id> --sha <sha>` to see its rollout',
     '/api/fleet/routing/launcher-release': 'launcher pins were Hub1-only; Hub2 launchers ship inside the published host release',

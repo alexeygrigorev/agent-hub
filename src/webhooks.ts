@@ -170,7 +170,7 @@ export function renderTemplate(template: string | null, bodyText: string, vars: 
 export type WebhookOptions = { maxBatch?: number };
 
 export class WebhookService {
-  private sql: SqlStorage;
+  protected sql: SqlStorage;
   private txn: (fn: () => any) => any;
   private now: () => number;
   private maxBatch: number;
@@ -370,7 +370,7 @@ export class WebhookService {
     });
   }
 
-  private async verifyRouteAuth(request: Request, route: any, bodyText: string): Promise<Response | null> {
+  protected async verifyRouteAuth(request: Request, route: any, bodyText: string): Promise<Response | null> {
     const stored = String(route.secret_storage || '');
     if (route.auth_mode === 'hmac') {
       const key = await this.unwrapHmacKey(route.id, stored);

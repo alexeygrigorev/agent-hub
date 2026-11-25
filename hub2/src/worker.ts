@@ -43,6 +43,9 @@ const router = {
       const authResponse = await publicAuthentication(request, env);
       if (authResponse) return authResponse;
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
+      if (/^\/webhooks\/[0-9a-f-]{36}(?:\/deliveries\/[0-9a-f-]{36})?$/.test(path)) {
+        return control.fetch(await forwardRequest(request, CONTROL + path));
+      }
       if (path === '/webhooks/oncall' && request.method === 'POST') {
         return control.fetch(await forwardRequest(request, CONTROL + '/_oncall/ingest'));
       }
@@ -91,6 +94,10 @@ const router = {
           scopes: actor.scopes, isAdmin: true,
         }, 200, noStore);
         return control.fetch(await forwardRequest(request, CONTROL + '/_auth/me'));
+      }
+      if (path === '/api/webhooks' || path.startsWith('/api/webhooks/')) {
+        if (!admin(actor)) return error('forbidden', 403);
+        return control.fetch(await forwardRequest(request, CONTROL + path + requestUrl(request).search, actor));
       }
       if (path === '/api/resource-settings') return resourceSettings(request, env, actor);
       // GrokBot <1% quota export (intake 408b585e): Control enforces read-any /
@@ -755,7 +762,7 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
  * it through the normal model-picker and dispatch path.
  * Every refusal names a reason; nothing here waits on a machine.
  */
-async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
+export async function startSession(request: Request, env: Hub2Env, actor: Actor, draftOnly = false): Promise<Response> {
   if (!admin(actor) && !hasScope(actor, 'session:start'))
     return forbiddenScope('session:start', 'grant session:start or operator:admin to start sessions');
   let body: JsonRecord;
@@ -859,6 +866,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const title = (name ?? brief?.split('\n')[0] ?? 'Interactive session').slice(0, 200);
   const intake = existingIntake ? { response: new Response(null, { status: 200 }), data: { id: existingIntake } as JsonRecord } : await call('/api/intakes', {
     key: `${key}:intake`, title,
+    ...(draftOnly ? { code_task: false } : {}),
     text: brief ?? 'Interactive session started with `hub sessions start`; await operator input.',
     acceptance_criteria: ['The session started on a host, did the requested work and ended cleanly.'],
   });

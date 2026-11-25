@@ -1,3 +1,4 @@
+import { Hub2Webhooks, HUB2_WEBHOOK_SCHEMA } from './webhooks';
 import { DeploymentCredentials } from './deployment-credentials';
 import { isDeploymentActor } from './types';
 import {PickerAlerts,PICKER_ALERT_SCHEMA} from './picker-alerts';
@@ -134,19 +135,21 @@ export class ControlDO {
   private pickerObserverDirty = false;
   private pickerObserverEpoch = PICKER_COVERAGE_EPOCH;
 
+  private webhooks: Hub2Webhooks;
   constructor(private readonly ctx: DurableObjectState, env: Hub2Env) {
     this.db = new MeteredDb(ctx.storage.sql);
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 8, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA],async()=>{
+    this.ready=initializeSchema(ctx, this.db, 9, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA,HUB2_WEBHOOK_SCHEMA],async()=>{
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
         catch{this.invalidatePickerCoverage();}
       }
       await this.scheduleWake();
-    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,8));
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,9));
+    this.webhooks=new Hub2Webhooks(ctx,this.db,this.env);
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
@@ -160,6 +163,7 @@ export class ControlDO {
     const url = new URL(request.url);
     try {
       await this.ready;
+      const webhookResponse=await this.webhooks.route(request);if(webhookResponse)return webhookResponse;
       if(url.pathname==='/_internal/picker/draw'&&request.method==='POST')return await this.committedPickerDraw(request);
       if(url.pathname.startsWith('/api/picker-alerts'))return await this.pickerAlertRequest(request,url);
       const workerResponse=await this.workers.fetch(request);if(workerResponse)return workerResponse;
@@ -1685,6 +1689,7 @@ export class ControlDO {
   private async scheduleWake():Promise<void>{
     const row=this.db.one<{next_attempt:number}>('SELECT next_attempt FROM mailbox_wakes ORDER BY next_attempt,owner LIMIT 1');
     this.db.alarmOperation();if(row)await this.ctx.storage.setAlarm(Math.max(Date.now()+1,row.next_attempt));else await this.ctx.storage.deleteAlarm();
+    if(this.webhooks)await this.webhooks.wake();
   }
   async alarm():Promise<void>{
     await this.ready;
@@ -1699,6 +1704,7 @@ export class ControlDO {
       }catch{this.db.run('UPDATE mailbox_wakes SET attempt=attempt+1,next_attempt=? WHERE owner=? AND revision=?',Date.now()+Math.min(300000,1000*2**Math.min(row.attempt,8)),row.owner,row.revision);}
     }
     await this.scheduleWake();
+    await this.webhooks.pump();
   }
 
 }

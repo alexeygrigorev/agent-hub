@@ -117,3 +117,83 @@ Runbook pointer: [ops/orchestrator/README.md](../ops/orchestrator/README.md)
 (orchestrator-main / oncall-engineer operations). Scheduled prompts on the
 same delivery queue (intake AC8-AC10) are specified in the intake and will be
 documented here when they ship.
+
+## Hub2 draft-job routes (AISL recording preparation)
+
+The Hub2 adapter restores the same `/api/webhooks` management surface and
+`/webhooks/<route id>` producer endpoint. It imports the original
+`WebhookService`: token verification, request bounds, durable rate buckets,
+rendering, audit and `session_deliveries` idempotency remain the same owners.
+Control schema migration 9 adds those tables and job launch metadata. A host
+running with schema migration `defer` returns `webhook_schema_not_ready` until
+the migration is applied; it must not accept a receipt it cannot persist.
+
+Hub2 currently supports token-authenticated draft-job routes. Old Hub1 session
+labels, HMAC routes and prompt-library bindings are not silently migrated.
+Create a new route with an operator credential and a fixed launch JSON file:
+
+```json
+{"project":"AI-Shipping-Labs/website","workspace":"/home/alexey/git/ai-shipping-labs-workshops-raw","machine":"hetzner-aplexer"}
+```
+
+```bash
+hub webhooks create --name aisl-workshop-preparation \
+  --launch-file /private/path/aisl-launch.json \
+  --template-file ops/workshop-preparation.prompt.md \
+  --secret-file /private/path/aisl-webhook.secret
+```
+
+Keep the resulting route URL and token in AISL's `RECORDING_PREPARATION_HUB_URL`
+and `RECORDING_PREPARATION_HUB_TOKEN` integration settings (confirm current key
+names against the website settings registry). Route config is operator-only.
+The producer cannot supply a project, machine, credential, model or launch
+parameter; only the operator-authored template renders its source fields.
+Draft jobs use Opus with high effort, as required by
+`workshop-followup-materials`. Missing quota or host availability remains a
+durable pending delivery and retries every minute, at most five attempts.
+AISL monitors the receipt independently and raises existing staff alerts.
+
+For each delivery the adapter calls Hub2's existing session-start saga with
+one stable start key derived from the durable delivery UUID. Retries and host
+restarts reuse that intake/session. Receiving a webhook does not mean the job
+started: `pending` is queued in the webhook, `queued` means Hub accepted a
+session start, and `running` requires the native-start evidence in intake
+stats. `finished` requires the intake's independently verified `accepted`
+state, never process exit or a worker's completion claim alone.
+
+Producers use the same route token to read:
+
+```text
+GET /webhooks/<route id>/deliveries/<delivery id>
+X-Webhook-Token: <route secret>
+```
+
+The response contains `delivery_id`, `session_id`, `status`, `started_at`,
+`finished_at`, `artifacts` and `last_error`. Times are UTC ISO 8601. A route
+cannot read another route's receipt. No prompt, transcript or secret is
+returned. An unavailable observation returns 503 instead of inventing state.
+
+Job outputs stay under a unique `.local/` directory in the raw-workshops
+checkout. The job appends a `recording_preparation_drafts` evidence record to
+its own intake, containing the delivery UUID plus a two-output manifest:
+`video_chapters` and `workshops_raw_summary`, each with a relative `.local/`
+`path` and SHA256. The normal Hub acceptance verifier checks those files before
+accepting the task. The producer requires both output references and start /
+finish timestamps; a bare successful process is insufficient. Never embed a
+private S3 URL or staff credential in output, audit or the manifest.
+
+Operational bounds: Stage 1 is 60 minutes from recording availability to S3
+upload and the host email's Relay delivery confirmation. Stage 2 starts within
+5 minutes of transcript availability and finishes within 60 minutes. Website
+watchdogs evaluate local deadlines every minute with four minutes of observation grace, independently of provider
+network calls; reconciliation and alert observation have a documented maximum
+5-minute scheduler tolerance. Missing integration configuration, refused
+starts, stalled uploads, unsuccessful mail, and unfinished jobs all alert the
+existing staff operations channel. These are monitored objectives, not a
+promise that unavailable external providers finish successfully within them.
+
+Deploy website support before publishing the Dapier workflow or configuring
+the route. Provision the website API token privately in the job's runtime so
+`asl` can fetch `/api/events/<slug>/preparation-source`. Validate with a
+synthetic source in a separate test route; never replay an actual recording
+into live operator mail or trigger attendee publication as a smoke test.

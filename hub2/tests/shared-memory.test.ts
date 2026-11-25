@@ -117,12 +117,12 @@ test('offline export extractor produces bounded private batches and matching ser
 test('schema v4 upgrades in place without changing existing control records',async()=>{
  const f=fixture();await f.call('/api/intake/rules');
  f.c.database.exec("INSERT INTO named_agents(id,display_name,enabled) VALUES('existing','Existing',1)");
- for(const table of ['memory_rules','memory_messages','memory_asks','memory_legacy','picker_receipts','picker_alert_counters','picker_alert_deliveries','picker_draws','picker_coverage'])f.c.database.exec('DROP TABLE '+table);
+ for(const table of ['webhook_routes','webhook_jobs','webhook_audit','webhook_rate_buckets','session_deliveries','memory_rules','memory_messages','memory_asks','memory_legacy','picker_receipts','picker_alert_counters','picker_alert_deliveries','picker_draws','picker_coverage'])f.c.database.exec('DROP TABLE '+table);
  f.c.database.exec('DROP INDEX memory_intake_owners; UPDATE hub2_schema SET version=4');
  const upgraded=new ControlDO(f.c.ctx,f.env);
  const response=await upgraded.fetch(new Request('https://control.test/api/intake/rules',{headers:{'x-hub2-actor':JSON.stringify(admin)}}));
  assert.equal(response.status,200);assert.deepEqual((await data(response)).operator_rules,[]);
- assert.equal((f.c.database.prepare('SELECT version FROM hub2_schema').get() as any).version,8);
+ assert.equal((f.c.database.prepare('SELECT version FROM hub2_schema').get() as any).version,9);
  assert.equal((f.c.database.prepare("SELECT display_name FROM named_agents WHERE id='existing'").get() as any).display_name,'Existing');
 });
 

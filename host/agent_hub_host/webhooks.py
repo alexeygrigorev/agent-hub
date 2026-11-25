@@ -79,8 +79,14 @@ def execute(args: argparse.Namespace):
     if cmd == 'create':
         payload = {
             'name': args.name,
-            'target_label': args.session,
+            'target_label': args.session or 'job',
         }
+        if getattr(args, 'launch_file', None):
+            raw = session_control.read_file(args.launch_file, max_chars=4096, field='Launch config')
+            try:
+                payload['launch'] = json.loads(raw)
+            except json.JSONDecodeError:
+                raise session_control.SessionInputError('--launch-file must contain JSON') from None
         if args.template_file:
             payload['template'] = session_control.read_file(args.template_file, max_chars=4096, field='Template')
         elif args.template:
@@ -207,8 +213,9 @@ def add_parser(sub) -> None:
     commands = root.add_subparsers(dest='webhooks_cmd', required=True)
     create = commands.add_parser('create', help='Create a route; the secret is shown exactly once')
     create.add_argument('--name', required=True, help='Route slug (lowercase, 2-64 chars)')
-    create.add_argument('--session', required=True, dest='session',
+    create.add_argument('--session', required=False, dest='session',
                         help='Target session label (friendly name), qualified alias (workspace:tag) or Hub UUID')
+    create.add_argument('--launch-file', help='Hub2 fixed draft-job target JSON: project, workspace, machine')
     template_src = create.add_mutually_exclusive_group()
     template_src.add_argument('--template-file', help='UTF-8 template file (max 4096 chars)')
     template_src.add_argument('--template', help='Inline template ({{payload}}, {{payload_json}}, {{payload.field}})')
