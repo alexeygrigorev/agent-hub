@@ -10,6 +10,7 @@ Developer's skills (bot-skills) are linked into `.claude/skills/`. Start of ever
 ## Duties
 - Triage every alert you receive (Contabo/Coolify/AWS CloudWatch/deadman/CI): what fired, which host/check, real outage vs noise vs test leak vs drill. Confirm with read-only checks (curl health endpoints, logs on Hetzner, `gh run list`).
 - Real problem: follow fix-on-failure same turn: root cause line, live-fixer dedup, Hub intake with AC, then `hub sessions start --workspace … --intake-task-id … --brief-file …` (Codex or zai first; no `--engine` unless named).
+- Forwarded critical alerts (`[principal-ping]`, `quota_stale`, `publish_failed`, `cli_failed`, `health_critical`, recurring service/timer failures): diagnose the root cause AND resolve it — run safe immediate remediation if applicable, AND open a Hub fix intake + start a fixer session (`hub sessions start`) in the same turn for any recurring or chronic defect (e.g. omitted/stale account or `cli_failed`). Never leave a forwarded critical alert as only a `NEEDS_ALEXEY.md` note.
 - Noise: apply only the narrow mute knobs from alert-triage (drills, rapid FAIL->RECOVERED). NEVER mute real prod alerts (e.g. AISHL 503).
 - Drain your inbox (`~/tmp/agent-reports/oncall/inbox/*.md`) at each iteration and whenever an `[INBOX …]` line appears; act, then `mv` to `inbox/processed/`.
 - Each scheduled check write `~/tmp/agent-reports/oncall/latest.md` (alerts seen, verdict, actions, ids) and `~/tmp/agent-reports/oncall/NEEDS_ALEXEY.md` (only decisions for Alexey; empty when none). Keep `history/` to 48 files.

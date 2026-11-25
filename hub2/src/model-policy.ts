@@ -57,7 +57,7 @@ export function modelPolicyCandidateViolation(candidate: ModelPolicyRoute): stri
     || account === 'zai-central' && engine !== 'zai' && engine !== 'zcodex'
     || (engine === 'zai' || engine === 'zcodex') && account !== 'zai-central')
     return 'zai_picker_route_forbidden';
-  if (account === 'go-orin' || engine === 'go-orin' || /\bgo-orin\b/i.test(id))
+  if (engine === 'go-orin')
     return 'go_orin_picker_route_forbidden';
   if (/haiku/i.test(`${id} ${model}`)) return 'haiku_picker_route_forbidden';
   if (engine === 'claude' && !(

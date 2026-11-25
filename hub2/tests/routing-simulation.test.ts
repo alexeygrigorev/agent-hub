@@ -76,7 +76,7 @@ test('exploration retains the five-percent eligibility boundary and cannot resto
 test('exploration preserves stale-neutral headroom, quota influence and underlying deep multipliers',async()=>{
  const f=skewedFixture();f.accountRows.get('shared-go').fresh=false;
  const stale=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
- assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.82*50/420.9))<1e-12);
+ assert.ok(Math.abs(stale.pool.find(row=>row.policy_id==='go-muse')!.share-(.03+.82*100/470.9))<1e-12);
  assert.ok(stale.warnings.some(row=>row.account_id==='shared-go'&&row.reason==='quota_stale'));
  f.accountRows.get('shared-go').fresh=true;
  const ordinary=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
@@ -138,14 +138,14 @@ test('1000 simulated draws use one passive observation set and the committed ord
  assert.ok(result.pool.every(row=>Math.abs(row.share-1/6)<1e-12));
  for(const kind of ['accounts','machines']){
   const rows=f.calls.filter(call=>call.kind===kind);
-  // Five accounts: the four legacy routes plus the committed zai-central route.
-  assert.equal(rows.length,kind==='accounts'?5:1);
+  // Six accounts: the four legacy routes plus zai-central and go-orin.
+  assert.equal(rows.length,kind==='accounts'?6:1);
   assert.ok(rows.every(call=>call.path==='/_internal/routing-snapshot'&&call.method==='GET'));
  }
  assert.equal(result.advisories.filter(row=>row.reason==='local_login_unverified').length,result.pool.length);
  assert.equal(result.advisories.filter(row=>row.reason==='capability_not_advertised').length,result.pool.length);
- // The committed GLM 5.4 zcodex route stays out of the h1 pool (no zcodex engine, unusable credential).
- assert.deepEqual(result.excluded.map(row=>[row.policy_id,row.reason]),[['glm-flash-zcodex','credential_missing']]);
+ // The committed go-orin and GLM 5.4 zcodex routes stay out of the h1 pool (unusable credentials).
+ assert.deepEqual(result.excluded.map(row=>[row.policy_id,row.reason]),[['go-orin-muse','credential_unavailable'],['glm-flash-zcodex','credential_missing']]);
  assert.ok(result.advisories.every(row=>['local_login_unverified','capability_not_advertised'].includes(row.reason)));
 });
 
@@ -199,9 +199,9 @@ test('unhealthy observations retained by soft fallback are advisories, never cla
  // Only the committed zcodex route is a claimed exclusion: no host advertises its engine
  // while the six legacy routes survive, so the soft fallback never applies to it.
  assert.deepEqual(diagnostics.excluded.map(row=>[row.policy_id,row.reason]),[['glm-flash-zcodex','engine_not_advertised']]);
- assert.equal(diagnostics.advisories.filter(row=>row.reason==='credential_missing').length,diagnostics.pool.length+1);
+ assert.equal(diagnostics.advisories.filter(row=>row.reason==='credential_missing'||row.reason==='credential_unavailable').length,diagnostics.pool.length+1);
  assert.equal(diagnostics.advisories.filter(row=>row.reason==='capability_not_advertised').length,diagnostics.pool.length);
- assert.ok(diagnostics.advisories.every(row=>['credential_missing','capability_not_advertised'].includes(row.reason)));
+ assert.ok(diagnostics.advisories.every(row=>['credential_missing','credential_unavailable','capability_not_advertised'].includes(row.reason)));
  const only=f.state.policies.filter((row:any)=>row.id==='codex-luna-max');f.state.policies=only;
  // Soft credential fallback cannot restore a hard-excluded automatic Luna.
  await assert.rejects(simulateModelRoutes(f.env,{interactive:false},1,()=>0),
@@ -225,16 +225,16 @@ test('legacy monitor retains all-bad credential diagnostics while passive simula
  assert.equal(failed.status,200);
  // The legacy monitor claims every all-bad-credential route as an exclusion,
  // plus the committed zcodex route whose credential is equally unusable.
- assert.equal(old.excluded.filter((row:any)=>row.reason==='credential_missing').length,old.pool.length+1);
+ assert.equal(old.excluded.filter((row:any)=>row.reason==='credential_missing'||row.reason==='credential_unavailable').length,old.pool.length+1);
  assert.ok(old.excluded.some((row:any)=>row.policy_id==='glm-flash-zcodex'));
  const passive=await (await f.get('?n=1')).json() as any;
  assert.deepEqual(passive.excluded.map((row:any)=>[row.policy_id,row.reason]),[['glm-flash-zcodex','engine_not_advertised']]);
- assert.equal(passive.advisories.filter((row:any)=>row.reason==='credential_missing').length,passive.pool.length+1);
+ assert.equal(passive.advisories.filter((row:any)=>row.reason==='credential_missing'||row.reason==='credential_unavailable').length,passive.pool.length+1);
  assert.equal(passive.advisories.filter((row:any)=>row.reason==='capability_not_advertised').length,passive.pool.length);
- assert.ok(passive.advisories.every((row:any)=>['credential_missing','capability_not_advertised'].includes(row.reason)));
+ assert.ok(passive.advisories.every((row:any)=>['credential_missing','credential_unavailable','capability_not_advertised'].includes(row.reason)));
  f.machines.get('h1').capabilities=flags();
  const local=await (await post()).json() as any;
- assert.deepEqual(local.excluded.map((row:any)=>[row.policy_id,row.reason]),[['glm-flash-zcodex','credential_missing']]);
+ assert.deepEqual(local.excluded.map((row:any)=>[row.policy_id,row.reason]),[['go-orin-muse','credential_unavailable'],['glm-flash-zcodex','credential_missing']]);
  assert.equal(local.advisories.filter((row:any)=>row.reason==='local_login_unverified').length,local.pool.length);
  assert.equal(local.advisories.filter((row:any)=>row.reason==='capability_not_advertised').length,local.pool.length);
  assert.ok(local.advisories.every((row:any)=>['local_login_unverified','capability_not_advertised'].includes(row.reason)));
@@ -288,4 +288,24 @@ test('simulation with the real policy draws zero Codex when the account is fresh
  assert.ok(!Object.keys(stale.counts).some(id=>id.startsWith('codex-')));
  // Explicit Codex with an excluded account is a typed refusal, never a restored route.
  await assert.rejects(()=>simulateModelRoutes(f.env,{interactive:false,engine:'codex'},1,()=>0),(e:any)=>e.code==='model_policy_unavailable');
+});
+
+test('stale quota never under-weights an engine and go-orin min_remaining reserve is enforced',async()=>{
+ const f=fixture();
+ const now=Date.now();
+ f.accountRows.set('go-orin',{account:{enabled:true,min_remaining:20},credential_usable:true,credential_status:'ready',
+  quota:{remaining:89,captured_at:now,valid_until:now+900000},fresh:true,hosts:['h1']});
+ f.accountRows.get('shared-go').fresh=false;
+ const active=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ const goOrin=active.pool.find(row=>row.policy_id==='go-orin-muse')!;
+ const sharedGo=active.pool.find(row=>row.policy_id==='go-muse')!;
+ assert.ok(goOrin,'go-orin-muse is in the routable pool');
+ assert.ok(sharedGo.weight>goOrin.weight,'stale shared-go (100) is not under-weighted vs go-orin (89-20=69)');
+ assert.ok(goOrin.weight>active.pool.find(row=>row.policy_id==='codex-sol-medium')!.weight,'go-orin effective headroom 69 > codex 50');
+
+ // At or below min_remaining=20 reserve, go-orin is excluded so the assistant is not starved.
+ f.accountRows.get('go-orin').quota.remaining=20;
+ const reserved=await simulateModelRoutes(f.env,{interactive:false},1,()=>0);
+ assert.ok(!reserved.pool.some(row=>row.policy_id==='go-orin-muse'));
+ assert.ok(reserved.excluded.some(row=>row.policy_id==='go-orin-muse'&&row.reason==='quota_below_minimum'));
 });

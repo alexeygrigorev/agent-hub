@@ -29,7 +29,7 @@ export type PickDiagnostics = {
 const CODEX_RESERVE = 15;
 const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
 const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
-const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
+const NEUTRAL_QUOTA = 100;   // stale/unknown observations never under-weight an engine vs fresh accounts
 const MIN_SHARE = 0.03;     // per eligible candidate; the remaining mass follows headroom
 const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
@@ -228,9 +228,15 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return matching.length ? matching : hosts;
   };
   dropped.push(...reserveDropped);
+  const reserveFor = (candidate: Candidate): number => {
+    const raw = accounts.get(candidate.account_id)?.account?.min_remaining;
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0;
+  };
   const scored = live.map(candidate => {
     const left = headroom(candidate);
-    const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
+    const reserve = reserveFor(candidate);
+    const effectiveLeft = left === null ? NEUTRAL_QUOTA : Math.max(0.01, left - reserve);
+    const base = Math.max(0.0001, candidate.weight) * effectiveLeft * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
     const originalHosts = hostsFor(candidate), observedHosts = originalHosts.filter(id=>!localMissing(candidate,id));
     const hosts = observedHosts.length ? observedHosts : originalHosts;
     const localHosts = observedHosts.filter(id => local(candidate,id));
@@ -298,7 +304,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     ? centralReady(row.candidate)?'central_host_not_approved':'central_credentials_unavailable'
     : row.knownLocalMissing?'local_credentials_missing'
     :'credential_' + (accounts.get(row.candidate.account_id)?.credential_status || 'unavailable'));
-  pool = narrow(pool, row => row.left === null || row.left >= MIN_HEADROOM, () => 'quota_below_minimum');
+  pool = narrow(pool, row => row.left === null || (row.left >= MIN_HEADROOM && (reserveFor(row.candidate) <= 0 || row.left > reserveFor(row.candidate))), () => 'quota_below_minimum');
   pool = narrow(pool, row => row.hosts.some(id => machines.get(id)?.engines?.includes(row.candidate.engine)), () => 'engine_not_advertised');
   // Capability preference is global: a candidate without a capable host must not
   // survive its own advisory fallback when another candidate can satisfy launch.

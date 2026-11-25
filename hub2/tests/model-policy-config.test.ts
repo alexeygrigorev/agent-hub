@@ -83,8 +83,7 @@ test('the Hub policy validator accepts the committed pool and rejects banned can
   assert.deepEqual(zaiRoutes.map(c => [c.id, c.engine, c.model, c.account_id]),
     [['glm-flash-zcodex', 'zcodex', 'glm-5.4', 'zai-central']],
     'the committed policy carries exactly the GLM 5.4 zcodex route');
-  assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin'})), 'go_orin_picker_route_forbidden');
-  assert.equal(modelPolicyCandidateViolation(route({id: 'go-orin', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
+  assert.equal(modelPolicyCandidateViolation(route({id: 'go-orin-muse', engine: 'go', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin'})), null);
   assert.equal(modelPolicyCandidateViolation(route({id: 'opencode-go', engine: 'go-orin', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'shared-go'})), 'go_orin_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'haiku', effort: 'medium'})), 'haiku_picker_route_forbidden');
   assert.equal(modelPolicyCandidateViolation(route({engine: 'claude', model: 'opus', effort: 'medium'})), null);
@@ -231,6 +230,6 @@ test('Astra policy writes require review-only capability for both id and model a
 test('The committed Z.ai route is the GLM 5.4 zcodex candidate and Go stays on Muse', () => {
   assert.deepEqual(policy.candidates.filter(candidate => /glm/i.test(candidate.model)),
     [{id: 'glm-flash-zcodex', engine: 'zcodex', model: 'glm-5.4', effort: 'medium', account_id: 'zai-central', weight: 1, capabilities: [], enabled: true}]);
-  assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'go').map(candidate => candidate.model),
-    ['opencode-go/muse-spark-1.3-contributor']);
+  assert.deepEqual(policy.candidates.filter(candidate => candidate.engine === 'go').map(candidate => [candidate.account_id, candidate.model]),
+    [['shared-go', 'opencode-go/muse-spark-1.3-contributor'], ['go-orin', 'opencode-go/muse-spark-1.3-contributor']]);
 });

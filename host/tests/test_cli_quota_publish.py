@@ -113,28 +113,40 @@ class QuotaPublishTests(unittest.TestCase):
         patch = [b for m, b in calls if m == 'PATCH'][0]
         self.assertEqual((patch['capacity'], patch['enabled'], patch['min_remaining']), (qp.DEFAULT_CAPACITY, False, 5))
 
-    def test_assistant_only_go_orin_and_grok_publish_quota_but_stay_disabled(self):
-        for key, account, provider in (('go-orin', 'go-orin', 'go'), ('grok', 'grok', 'grok')):
-            with self.subTest(key=key):
-                calls = []
-                def req_new(method, path, body=None):
-                    calls.append((method, path, body)); return {}
-                quse = {key: {'status': 'ok', 'windows': {'5h': {'percent_remaining': 88.0, 'reset_at': None}}}}
-                out = qp.publish(quse=quse, request=req_new, now_ms=5, enable=True)
-                self.assertEqual(out['published'], [account] + (['grokbot'] if key == 'grok' else []))
-                self.assertEqual([c[0] for c in calls[:3]], ['GET', 'PATCH', 'PUT'])
-                self.assertEqual(calls[1][2]['provider'], provider)
-                self.assertFalse(calls[1][2]['enabled'])
-                self.assertEqual(calls[2][2]['remaining'], 88.0)
+    def test_assistant_only_grok_stays_disabled_and_go_orin_is_routable(self):
+        calls = []
+        def req_grok(method, path, body=None):
+            calls.append((method, path, body)); return {}
+        quse_grok = {'grok': {'status': 'ok', 'windows': {'5h': {'percent_remaining': 88.0, 'reset_at': None}}}}
+        out = qp.publish(quse=quse_grok, request=req_grok, now_ms=5, enable=True)
+        self.assertEqual(out['published'], ['grok', 'grokbot'])
+        self.assertFalse(calls[1][2]['enabled'])
 
-                # Even if an existing assistant-only account was somehow enabled, publish disables it.
-                calls.clear()
-                def req_enabled(method, path, body=None):
-                    calls.append((method, path, body))
-                    return {'account': {'enabled': 1, 'capacity': 8, 'min_remaining': 0}} if method == 'GET' else {}
-                qp.publish(quse=quse, request=req_enabled, now_ms=5, enable=True)
-                self.assertEqual([c[0] for c in calls[:3]], ['GET', 'PATCH', 'PUT'])
-                self.assertFalse(calls[1][2]['enabled'])
+        # go-orin is now routable with default assistant reserve min_remaining=20 (t4007u).
+        calls.clear()
+        def req_orin(method, path, body=None):
+            calls.append((method, path, body)); return {}
+        quse_orin = {'go-orin': {'status': 'ok', 'windows': {'5h': {'percent_remaining': 88.0, 'reset_at': None}}}}
+        out = qp.publish(quse=quse_orin, request=req_orin, now_ms=5, enable=True)
+        self.assertEqual(out['published'], ['go-orin'])
+        self.assertEqual([c[0] for c in calls[:3]], ['GET', 'PATCH', 'PUT'])
+        self.assertEqual(calls[1][2]['provider'], 'go')
+        self.assertTrue(calls[1][2]['enabled'])
+        self.assertEqual(calls[1][2]['min_remaining'], 20)
+        self.assertEqual(calls[2][2]['remaining'], 88.0)
+
+    def test_shared_go_uses_managed_quota_fallback_when_quse_errors(self):
+        calls = []
+        def req(method, path, body=None):
+            calls.append((method, path, body))
+            return {'account': {'enabled': 1, 'capacity': 8, 'min_remaining': 0}} if method == 'GET' else {}
+        quse = {'go': {'status': 'error', 'error': 'no-credentials'}}
+        managed = {'shared-go': {'account': 'shared-go', 'provider': 'go', 'quota': {'remaining': 97.5, 'reset_at': 100000}}}
+        out = qp.publish(quse=quse, request=req, now_ms=5, managed_quotas=managed)
+        self.assertEqual(out['published'], ['shared-go'])
+        self.assertNotIn('shared-go', out['skipped'])
+        self.assertEqual(calls[-1][2]['remaining'], 97.5)
+        self.assertEqual(calls[-1][2]['source'], 'hub-managed')
 
     def test_grok_publish_mirrors_grokbot_report_every_run(self):
         now = 1794340000000

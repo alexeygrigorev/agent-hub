@@ -1410,7 +1410,7 @@ class NativeLauncher:
         # Native-login Codex (no profile) always takes the direct adapter path:
         # on Linux the verified wrapper replaces the SDK executable below.
         native_codex = provider == 'codex' and not route.get('profile')
-        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not self.config.get("private_provider_homes", False) and not specification.get("interactive") and not native_codex)
+        local = provider == 'shell' or bool(specification.get('managed_credential_label')) or (not specification.get('provider_home') and not self.config.get("private_provider_homes", False) and not specification.get("interactive") and not native_codex)
         if local:
             if codex_wrapper and not self.codex_exec_readiness(route, codex_wrapper):
                 raise RuntimeError('codex_launch_wrapper_unavailable')

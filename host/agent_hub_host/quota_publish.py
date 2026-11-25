@@ -18,7 +18,9 @@ ACCOUNTS = {
     'go': ('shared-go', 'go'), 'go-orin': ('go-orin', 'go'), 'zai': ('zai-central', 'zai'),
 }
 # Assistant-only accounts are tracked for quota visibility, never enabled for Hub coding-session routing.
-ASSISTANT_ONLY_ACCOUNTS = frozenset(('grok', 'go-orin'))
+# go-orin is routable alongside shared-go with a default assistant reserve (t4007u).
+ASSISTANT_ONLY_ACCOUNTS = frozenset(('grok',))
+DEFAULT_MIN_REMAINING = {'go-orin': 20}
 VALID_MS = 15 * 60 * 1000
 # Concurrent sessions per account. Capacity 1 turned every second start into account_saturated,
 # which Hub reports as quota_unavailable even with headroom.
@@ -103,35 +105,97 @@ def _report_grokbot(body, request, result):
     result['published'].append(GROKBOT_REPORT)
 
 
-def publish(quse=None, request=intake.request, now_ms=None, enable=False):
+def _managed_quota_evidence(managed_by_account, account, now_ms):
+    """Fallback to Hub-managed engine quota (e.g. shared-go) when quse omits or errors."""
+    row = managed_by_account.get(account)
+    if not isinstance(row, dict):
+        return None
+    q = row.get('quota')
+    if not isinstance(q, dict):
+        return None
+    left = q.get('remaining')
+    if type(left) not in (int, float) or not 0 <= left <= 100 or not math.isfinite(left):
+        return None
+    reset_ms = q.get('reset_at')
+    if reset_ms is not None and (type(reset_ms) is not int or reset_ms <= now_ms):
+        return None
+    return {
+        'remaining': float(left),
+        'captured_at': now_ms,
+        'valid_until': min(now_ms + VALID_MS, reset_ms) if reset_ms is not None else now_ms + VALID_MS,
+        'reset_at': reset_ms,
+        'source': 'hub-managed',
+    }
+
+
+def _load_managed_quotas():
+    try:
+        from . import provisioning
+        rows = provisioning.quotas().get('accounts', [])
+        return {r['account']: r for r in rows if isinstance(r, dict) and isinstance(r.get('account'), str)}
+    except Exception:
+        return {}
+
+
+def _request_with_retry(request, method, path, payload=None, attempts=2):
+    import urllib.error
+    for attempt in range(attempts):
+        try:
+            return request(method, path, payload)
+        except urllib.error.HTTPError as exc:
+            if attempt + 1 < attempts and exc.code in (408, 429, 500, 502, 503, 504):
+                time.sleep(0.5)
+                continue
+            raise
+        except Exception as exc:
+            if attempt + 1 < attempts and type(exc).__name__ in ('IntakeTransportError', 'URLError', 'TimeoutError'):
+                time.sleep(0.5)
+                continue
+            raise
+
+
+def publish(quse=None, request=intake.request, now_ms=None, enable=False, managed_quotas=None):
     quse = read_quse() if quse is None else quse
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     if not isinstance(quse, dict) or type(now_ms) is not int or now_ms < 0:
         raise ValueError('invalid_quota_snapshot')
     result = {'published': [], 'skipped': {}}
+    managed_cache = managed_quotas
     for key, (account, provider) in ACCOUNTS.items():
         body = evidence(quse.get(key), now_ms)
+        if body is None:
+            if managed_cache is None and key == 'go':
+                managed_cache = _load_managed_quotas()
+            if isinstance(managed_cache, dict):
+                body = _managed_quota_evidence(managed_cache, account, now_ms)
         if body is None:
             entry = quse.get(key)
             state = entry.get('status') if isinstance(entry, dict) else None
             result['skipped'][account] = 'quota_' + (state if state in {'stale', 'error', 'unavailable'} else 'unmeasured')
             continue
         base = f'/api/accounts/{account}/api/account'
-        current = request('GET', base)
-        existing = current.get('account')
-        assistant_only = account in ASSISTANT_ONLY_ACCOUNTS
-        grow = bool(existing) and (existing.get('capacity') or 0) < DEFAULT_CAPACITY
-        if assistant_only:
-            if not existing or grow or existing.get('enabled'):
-                request('PATCH', base, {'provider': provider, 'enabled': False,
+        try:
+            current = _request_with_retry(request, 'GET', base)
+            existing = current.get('account')
+            assistant_only = account in ASSISTANT_ONLY_ACCOUNTS
+            grow = bool(existing) and (existing.get('capacity') or 0) < DEFAULT_CAPACITY
+            min_rem = (existing or {}).get('min_remaining')
+            if min_rem is None:
+                min_rem = DEFAULT_MIN_REMAINING.get(account, 0)
+            if assistant_only:
+                if not existing or grow or existing.get('enabled'):
+                    _request_with_retry(request, 'PATCH', base, {'provider': provider, 'enabled': False,
+                                            'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),
+                                            'min_remaining': min_rem})
+            elif not existing or grow or (enable and not existing.get('enabled')):
+                # Routable by default: pools Hub reports must be usable by engine pickers (model-roulette).
+                _request_with_retry(request, 'PATCH', base, {'provider': provider, 'enabled': bool(existing.get('enabled')) if existing and not enable else True,
                                         'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),
-                                        'min_remaining': (existing or {}).get('min_remaining') or 0})
-        elif not existing or grow or (enable and not existing.get('enabled')):
-            # Routable by default: pools Hub reports must be usable by engine pickers (model-roulette).
-            request('PATCH', base, {'provider': provider, 'enabled': bool(existing.get('enabled')) if existing and not enable else True,
-                                    'capacity': max((existing or {}).get('capacity') or 0, DEFAULT_CAPACITY),
-                                    'min_remaining': (existing or {}).get('min_remaining') or 0})
-        request('PUT', base + '/quota', body)
+                                        'min_remaining': min_rem})
+            _request_with_retry(request, 'PUT', base + '/quota', body)
+        except Exception:
+            result['skipped'][account] = 'publish_error'
+            continue
         result['published'].append(account)
         if account == 'grok':
             _report_grokbot(body, request, result)
