@@ -78,9 +78,9 @@ def session_environment(root, path=None):
     binary = binary or "/usr/bin/dapier"
     # A standalone stdlib wrapper survives host upgrades and never reads host
     # session.json, even for native profiles inheriting the operator's HOME.
-    code = ("#!/usr/bin/env python3\nimport json, os, sys, time\nfrom pathlib import Path\n"
+    code = ("#!/usr/bin/env python3\nimport fcntl, json, os, sys, time\nfrom pathlib import Path\n"
             + "root = Path(" + repr(str(root)) + ")\n"
-            + "try:\n    p = root / 'dapier/session.json'\n    s = json.loads(p.read_text())\n"
+            + "try:\n    lock = open(root / '.dapier.lock', 'a')\n    os.chmod(lock.name, 0o600)\n    fcntl.flock(lock, fcntl.LOCK_EX)\n    os.set_inheritable(lock.fileno(), True)\n    p = root / 'dapier/session.json'\n    s = json.loads(p.read_text())\n"
             + "    assert not p.is_symlink() and not p.stat().st_mode & 0o077\n"
             + "    assert s.get('email') == " + repr(IDENTITY) + "\n"
             + "    assert s.get('kind') == 'device' and isinstance(s.get('token'), str) and s['token'].startswith('dapd_')\n"

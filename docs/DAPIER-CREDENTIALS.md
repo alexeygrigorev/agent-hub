@@ -35,7 +35,8 @@ XDG_CONFIG_HOME="$HOME/.config/agent-hub/shared" "$HOME/.local/bin/dapier" auth 
 ## Renewal and failure delivery
 
 The Hub2 host heartbeat starts a bounded background maintenance worker. A
-process lock serializes checks across host instances; a persisted hourly
+process lock serializes checks across host instances and Dapier commands,
+including the CLI's own refresh-on-401 path; a persisted hourly
 checkpoint prevents repeated requests. With seven days remaining, the worker
 calls Dapier's fixed HTTPS `/api/agent/device/refresh` endpoint and atomically
 replaces the shared credential. Redirects are rejected. Already-running
