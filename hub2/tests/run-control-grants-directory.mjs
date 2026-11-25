@@ -12,3 +12,5 @@ await import('./engine-compat.test.ts');
 await import('./deployment-credentials.test.ts');
 
 await import('./cli-inventory-contract.test.ts');
+
+await import('./webhooks.test.ts');
