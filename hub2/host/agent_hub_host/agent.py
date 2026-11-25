@@ -233,6 +233,7 @@ HOST_FAILURE_DETAILS = {'access_lifetime_insufficient': 'Provider credential pre
  'host_command_queue_full': 'Launch preparation was refused.',
  'host_identity_required': 'Host identity is required.',
  'host_launch_queue_full': 'Launch preparation was refused.',
+ 'disk_below_floor': 'Disk free space is below the configured admission floor.',
  'host_not_approved': 'Provider credential preparation was refused.',
  'host_operation_failed': 'Host operation failed.',
  'implement_worktree_branch_ambiguous': 'Launch preparation was refused.',

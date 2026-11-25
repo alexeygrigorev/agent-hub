@@ -1,0 +1,6 @@
+[Unit]
+Description=Hub host automatic disk hygiene for finished-session build artifacts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/share/agent-hub-ops/disk_hygiene.py --apply
