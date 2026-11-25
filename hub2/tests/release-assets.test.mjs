@@ -12,7 +12,8 @@ const env = {
   CONTROL: { idFromName: () => 'global', get: () => ({ fetch: async () => Response.json({ error: 'unauthorized' }, { status: 401 }) }) },
 };
 // These immutable matched-release payloads are fetched before a host has credentials.
-const naturalNames = ['agent-hub-quota-dispatcher.pyz', 'hub-quota-publish.py', 'natural-quota-prelude.py'];
+const naturalNames = ['agent-hub-quota-dispatcher.pyz', 'hub-quota-publish.py', 'natural-quota-prelude.py',
+  'hub-alert-natural-donor.py', 'hub-natural-stage.py'];
 const names = [...naturalNames, 'host-release.json', 'hub.pyz', 'hub.pyz.sha256', 'manifest.json',
   'install.sh', 'install.ps1', 'host-install.sh', 'host-install.ps1', 'hub2-self-update.py', 'hub2-enroll.py', 'hub_alert_client.py',
   'agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer',
@@ -48,7 +49,7 @@ for (const name of names) {
     assert.equal(seen.length, before, path);
   }
 }
-for (const path of ['/cli/agent-hub-quota-dispatcher-private.pyz', '/cli/agent-hub-quota-dispatcher.pyz.bak', '/cli/hub-quota-publish.py.bak', '/cli/natural-quota-prelude.py/extra', '/cli/hub_alert_client.py.bak', '/cli/hub_alert_client_private.py', '/cli/hub_alert_client.py/extra', '/cli/private.env', '/cli/%2e%2e/private.env', '/cli/other-1.0.whl', '/cli/agent_hub_host_v2-malformed.whl', '/api/sessions']) {
+for (const path of ['/cli/agent-hub-quota-dispatcher-private.pyz', '/cli/agent-hub-quota-dispatcher.pyz.bak', '/cli/hub-quota-publish.py.bak', '/cli/hub-natural-stage.py.bak', '/cli/hub-natural-stage.py/extra', '/cli/hub-alert-natural-donor.py.bak', '/cli/hub-alert-natural-donor-private.py', '/cli/Hub-Natural-Stage.py', '/cli/natural-quota-prelude.py/extra', '/cli/hub_alert_client.py.bak', '/cli/hub_alert_client_private.py', '/cli/hub_alert_client.py/extra', '/cli/private.env', '/cli/%2e%2e/private.env', '/cli/other-1.0.whl', '/cli/agent_hub_host_v2-malformed.whl', '/api/sessions']) {
   const before = assets;
   assert.notEqual((await worker.fetch(new Request('https://hub.example' + path), env)).status, 200);
   assert.equal(assets, before, path);

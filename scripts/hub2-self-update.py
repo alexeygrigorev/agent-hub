@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1804,6 +1805,51 @@ def validate_expected_manifest(manifest, expected_tuple):
         raise ValueError('published host release does not match expected candidate tuple')
 
 
+NATURAL_STAGE_ENTRY = '/usr/local/lib/agent-hub/natural/hub-natural-stage.py'
+NATURAL_STAGE_ARGV = ('/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-S', '-B', NATURAL_STAGE_ENTRY, '--stage-current')
+NATURAL_STAGE_TIMEOUT = 300
+
+
+def verified_natural_stage_entry(entry=NATURAL_STAGE_ENTRY):
+    """True only for the fixed entry in a Root-owned, non-symlink, non-writable graph."""
+    try:
+        path = Path(entry)
+        if not path.is_absolute() or '..' in path.parts:
+            return False
+        directory = Path('/')
+        for part in path.parent.parts[1:]:
+            directory = directory / part
+            info = os.lstat(directory)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                return False
+        info = os.lstat(path)
+        return (stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
+                and not info.st_mode & 0o022 and 0 < info.st_size <= 1024 * 1024)
+    except OSError:
+        return False
+
+
+def run_optional_natural_stage(*, verifier=verified_natural_stage_entry, runner=subprocess.run):
+    """Non-gating observation hook: invoke only the verified fixed Root staging entry.
+
+    It never raises and its outcome never affects readiness, rollback or the exit
+    status. It does not claim a natural MainPID/archive/readiness; staging data is not
+    activation and the Root-owned qualification stays a separate operation.
+    """
+    try:
+        if not verifier():
+            print('Natural staging entry absent or untrusted; skipped (non-gating)')
+            return False
+        result = runner(list(NATURAL_STAGE_ARGV), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=NATURAL_STAGE_TIMEOUT, close_fds=True, check=False,
+                        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        print('Natural staging finished (non-gating) status=' + str(result.returncode))
+        return result.returncode == 0
+    except Exception as exc:  # Optional observation must never fail the update.
+        print('Natural staging unavailable (non-gating): ' + type(exc).__name__)
+        return False
+
+
 def install(base_url, root, *, install_service=False, restart=True, scheduled=False,
             expected_host_version=None, expected_cli_sha256=None, expected_updater_sha256=None):
     expected_tuple = validate_expected_tuple(
@@ -1882,6 +1928,8 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             commit_updater(root, releases)
             update_regular_operator_cli(root, target, installed)
             print('Hub2 release already current: ' + version)
+            if restart:
+                run_optional_natural_stage()
             return
         if scheduled and restart and old and defer_activation(root, current, version):
             return
@@ -1898,6 +1946,8 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             record_activation(root, version)
             update_regular_operator_cli(root, target, read_release_receipt(target))
             print('Reactivated retained Hub2 release: ' + version)
+            if restart:
+                run_optional_natural_stage()
             return
         scratch = root / 'tmp'
         scratch.mkdir(exist_ok=True)
@@ -1990,6 +2040,8 @@ def install(base_url, root, *, install_service=False, restart=True, scheduled=Fa
             record_activation(root, version)
         update_regular_operator_cli(root, target, read_release_receipt(target))
         print('Activated Hub2 release: ' + version)
+        if restart:
+            run_optional_natural_stage()
 
 
 def main(argv=None):

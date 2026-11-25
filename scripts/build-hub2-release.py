@@ -30,6 +30,9 @@ WINDOWS_READER_CLOSURE = ('private_fs.py', 'win32_fs.py')
 WINDOWS_ARTIFACT_ABI = 'hub2-windows-credential-artifacts-v1'
 NATURAL_ARCHIVE = 'agent-hub-quota-dispatcher.pyz'
 NATURAL_PAYLOADS = ('hub-quota-publish.py', 'hub_alert_client.py', 'natural-quota-prelude.py')
+# Root-side helpers are published as inert, hash-bound DATA beside the natural archive.
+# Both appear together or not at all; they are never executed by this tooling.
+NATURAL_HELPERS = ('hub-alert-natural-donor.py', 'hub-natural-stage.py')
 NATURAL_MAIN_STUB = (
     'from agent_hub_host.quota_dispatch_entry import main\n'
     'raise SystemExit(main())\n'
@@ -89,6 +92,12 @@ def verify_bundle(directory, expected_commit, expected_manifest_sha256):
     for name in ('hub-quota-publish.py', 'natural-quota-prelude.py', NATURAL_ARCHIVE):
         if name in records:
             expected_files.add(name)
+    # Root helper artifacts are all-or-nothing and only accompany a natural archive;
+    # pre-helper releases (neither present) remain valid rollback targets.
+    helpers = [name for name in NATURAL_HELPERS if name in records]
+    if helpers and (len(helpers) != len(NATURAL_HELPERS) or NATURAL_ARCHIVE not in records):
+        raise ValueError('partial natural helper artifact set')
+    expected_files.update(helpers)
     if records.keys() != expected_files or {path.name for path in directory.iterdir()} != expected_files | {'host-release.json'}:
         raise ValueError('release directory has missing or unexpected files')
     for name, record in records.items():
@@ -240,7 +249,7 @@ def export_source(repo, revision, target):
     archive = run(['git', '-C', str(repo), 'archive', sha, '--', 'hub2/host', 'host/agent_hub_host',
                    'config/model-routing.json', 'scripts/build-hub-cli.py',
                    'scripts/session-host-supervisor.py', 'scripts/hub2-self-update.py', 'scripts/hub2-enroll.py',
-                   'scripts/build-quota-dispatcher.py', *(f'scripts/{name}' for name in NATURAL_PAYLOADS),
+                   'scripts/build-quota-dispatcher.py', *(f'scripts/{name}' for name in (*NATURAL_PAYLOADS, *NATURAL_HELPERS)),
                    'deploy/agent-hub2-host.service', 'deploy/agent-hub2-host-update.service',
                    'deploy/agent-hub2-host-update.timer', 'deploy/host-install.sh', 'deploy/' + WINDOWS_HOST_INSTALLER, 'uv.lock',
                    *(f'public/cli/{name}' for name in CLI_INSTALLERS)])
@@ -316,7 +325,7 @@ def build(repo, revision, output):
             shutil.copyfile(source / 'public/cli' / installer, artifacts / installer)
         shutil.copyfile(source / 'scripts/hub2-self-update.py', artifacts / 'hub2-self-update.py')
         shutil.copyfile(source / 'scripts/hub2-enroll.py', artifacts / 'hub2-enroll.py')
-        for name in NATURAL_PAYLOADS:
+        for name in (*NATURAL_PAYLOADS, *NATURAL_HELPERS):
             shutil.copyfile(source / 'scripts' / name, artifacts / name)
         shutil.copyfile(source / 'deploy/host-install.sh', artifacts / 'host-install.sh')
         shutil.copyfile(source / 'deploy' / WINDOWS_HOST_INSTALLER, artifacts / WINDOWS_HOST_INSTALLER)

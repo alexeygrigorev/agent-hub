@@ -3342,6 +3342,7 @@ class AlertClientPackagingTests(unittest.TestCase):
                  'scripts/hub2-enroll.py', 'scripts/build-quota-dispatcher.py',
                  'scripts/hub-quota-publish.py', 'scripts/hub_alert_client.py',
                  'scripts/natural-quota-prelude.py', 'deploy/host-install.sh',
+                 *(f'scripts/{name}' for name in builder.NATURAL_HELPERS),
                  'deploy/' + builder.WINDOWS_HOST_INSTALLER, 'uv.lock',
                  *(f'deploy/{name}' for name in builder.UNITS),
                  *(f'public/cli/{name}' for name in builder.CLI_INSTALLERS)]
@@ -3395,6 +3396,7 @@ class AlertClientPackagingTests(unittest.TestCase):
                 'scripts/build-quota-dispatcher.py': (REPO / 'scripts/build-quota-dispatcher.py').read_bytes(),
                 'scripts/hub-quota-publish.py': (REPO / 'scripts/hub-quota-publish.py').read_bytes(),
                 'scripts/natural-quota-prelude.py': (REPO / 'scripts/natural-quota-prelude.py').read_bytes(),
+                **{f'scripts/{name}': (REPO / 'scripts' / name).read_bytes() for name in builder.NATURAL_HELPERS},
             }
             # Match the real exported release closure; these source bytes are not executed.
             for name in ('private_fs.py', 'win32_fs.py'):
@@ -3446,8 +3448,43 @@ def build(out, version):
         installer = (output / builder.WINDOWS_HOST_INSTALLER).read_bytes()
         self.assertEqual(manifest['artifacts'][builder.WINDOWS_HOST_INSTALLER],
                          {'sha256': hashlib.sha256(installer).hexdigest(), 'size': len(installer)})
+        # Both Root helper artifacts are bound by exact hash and the 20-file cap is not raised.
+        for name in builder.NATURAL_HELPERS:
+            data = (REPO / 'scripts' / name).read_bytes()
+            self.assertEqual((output / name).read_bytes(), data)
+            self.assertEqual(manifest['artifacts'][name], {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)})
+        self.assertLessEqual(len(manifest['artifacts']), 20)
         digest = hashlib.sha256((output / 'host-release.json').read_bytes()).hexdigest()
         self.assertEqual(builder.verify_bundle(output, SHA, digest), manifest)
+        # Substituting or dropping one helper in the published set never passes.
+        stage = output / 'hub-natural-stage.py'
+        original = stage.read_bytes()
+        stage.write_bytes(b'substituted' + original[11:])
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch: hub-natural-stage.py'):
+            builder.verify_bundle(output, SHA, digest)
+        stage.write_bytes(original)
+        self.assertEqual(builder.verify_bundle(output, SHA, digest), manifest)
+
+    def helper_bundle(self, names):
+        bundle, _digest = publication_bundle(self.directory / ('helpers-' + '-'.join(n[:8] for n in names) or 'none'), SHA)
+        manifest = json.loads((bundle / 'host-release.json').read_bytes())
+        for name in names:
+            data = b'inert helper data ' + name.encode()
+            (bundle / name).write_bytes(data)
+            manifest['artifacts'][name] = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+        raw = json.dumps(manifest, sort_keys=True).encode()
+        (bundle / 'host-release.json').write_bytes(raw)
+        return bundle, hashlib.sha256(raw).hexdigest()
+
+    def test_legacy_bundle_without_helpers_verifies_but_partial_or_orphan_helpers_do_not(self):
+        legacy, digest = publication_bundle(self.directory / 'legacy', SHA)
+        self.assertNotIn('hub-natural-stage.py', builder.verify_bundle(legacy, SHA, digest)['artifacts'])
+        for names in (builder.NATURAL_HELPERS[:1], builder.NATURAL_HELPERS[1:], builder.NATURAL_HELPERS):
+            with self.subTest(names=names):
+                bundle, digest = self.helper_bundle(names)
+                # Helpers alone, or one without the other, are a partial natural set.
+                with self.assertRaisesRegex(ValueError, 'partial natural helper artifact set'):
+                    builder.verify_bundle(bundle, SHA, digest)
 
     def test_missing_and_tampered_client_never_pass_verified_bundle(self):
         bundle, digest = publication_bundle(self.directory / 'bundle', SHA)
