@@ -111,8 +111,12 @@ def test_bad_context_never_falls_back_or_sends(scoped, monkeypatch, fault):
         write(data)
     for call in (config.load_config, lambda: intake.request('GET', '/api/intakes/' + INTAKE),
                  lambda: session_control.request('GET', '/api/fleet')):
-        with pytest.raises(worker_auth.WorkerContextError, match='^' + DIAGNOSTIC.replace('.', r'\.') + '$'):
+        reason = {'missing': 'context_missing', 'expired': 'context_expired'}.get(fault, 'context_invalid')
+        with pytest.raises(worker_auth.WorkerContextError) as caught:
             call()
+        assert caught.value.reason == reason
+        assert str(caught.value).startswith('[' + reason + '] ')
+        assert TOKEN not in str(caught.value) and str(path) not in str(caught.value)
 
 
 @pytest.mark.parametrize('key,value', [('HUB_CONFIG_FILE', 'host_profile'),
@@ -227,7 +231,7 @@ runpy.run_module('agent_hub_host',run_name='__main__')
     result = subprocess.run([sys.executable, '-c', code, *command], env=env, text=True,
                             capture_output=True, timeout=10, cwd=tmp_path)
     assert result.returncode != 0
-    assert DIAGNOSTIC in result.stderr
+    assert '[context_missing] ' in result.stderr and 're-issuance required' in result.stderr
     assert TOKEN not in result.stderr and str(path) not in result.stderr
     assert 'Traceback' not in result.stderr and 'network forbidden' not in result.stderr
     assert snapshot(tmp_path) == before
@@ -304,7 +308,7 @@ runpy.run_module('agent_hub_host',run_name='__main__')
     result = subprocess.run([sys.executable, '-c', code, 'intake', 'summary'], env=env,
                             capture_output=True, text=True, cwd=tmp_path, timeout=10)
     assert result.returncode != 0
-    assert DIAGNOSTIC in result.stderr
+    assert '[context_missing] ' in result.stderr
     for secret in (TOKEN, 'FAKE_PRIVILEGED_ONLY', str(scoped[0]), 'network forbidden', 'Traceback'):
         assert secret not in result.stderr
     assert snapshot(tmp_path) == before
@@ -314,3 +318,50 @@ def test_deeply_nested_json_is_typed_and_does_not_fall_back(scoped):
     path, _, _ = scoped
     path.write_text('[' * 2000 + ']' * 2000)
     with pytest.raises(worker_auth.WorkerContextError): config.load_config()
+
+
+@pytest.mark.parametrize('key', ['HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE'])
+def test_profile_env_override_names_the_variable_and_does_not_ask_for_reissue(scoped, monkeypatch, key):
+    monkeypatch.setenv(key, '/home/someone/.config/agent-hub/cli.json')
+    with pytest.raises(worker_auth.WorkerContextError) as caught:
+        config.load_config()
+    text = str(caught.value)
+    assert caught.value.reason == 'worker_env_override_forbidden' and caught.value.var == key
+    assert text.startswith('[worker_env_override_forbidden] ') and key in text
+    assert 're-issuance required' not in text and 'someone' not in text and TOKEN not in text
+    assert session_control.diagnostic(caught.value) == text and intake.diagnostic(caught.value) == text
+
+
+@pytest.mark.parametrize('key,value', [('HUB_TOKEN', 'FAKE_PRIVILEGED_ONLY'),
+                                      ('HUB_URL', 'https://elsewhere.example.invalid')])
+def test_transport_override_is_typed_and_names_the_variable(scoped, monkeypatch, key, value):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(worker_auth.WorkerContextError) as caught:
+        config.load_config()
+    assert caught.value.reason == 'worker_transport_override_forbidden' and key in str(caught.value)
+    assert 're-issuance required' not in str(caught.value) and value not in str(caught.value)
+
+
+def test_reissuance_is_only_advised_where_it_helps():
+    for reason, text in worker_auth.REASONS.items():
+        assert ('re-issuance required' in text) == (reason in ('context_missing', 'context_expired', 'context_invalid'))
+    assert worker_auth.WorkerContextError('bogus').reason == 'context_invalid'
+    assert worker_auth.WorkerContextError('worker_env_override_forbidden', '/etc/x').var == 'an override variable'
+
+
+def test_worker_403_gets_typed_evidence_refusal_without_secrets(scoped):
+    import io, urllib.error
+    body = io.BytesIO(json.dumps({'error': 'forbidden', 'missing_scope': 'intake:read',
+                                  'detail': 'missing scope intake:read'}).encode())
+    err = urllib.error.HTTPError('https://worker.example.invalid/x', 403, 'Forbidden', {}, body)
+    text = str(session_control.http_error(err))
+    assert 'evidence_read_not_granted' in text
+    assert 'hub intake append ' + scoped[1]['worker']['intake_id'] + ' --note' in text
+    assert TOKEN not in text and str(scoped[0]) not in text
+
+
+def test_non_worker_403_has_no_evidence_refusal(monkeypatch):
+    import io, urllib.error
+    for k in ('APLEXER_TAG', 'HUB2_CONFIG'): monkeypatch.delenv(k, raising=False)
+    err = urllib.error.HTTPError('https://x.example.invalid/', 403, 'F', {}, io.BytesIO(b'{"error":"forbidden"}'))
+    assert 'evidence_read_not_granted' not in str(session_control.http_error(err))

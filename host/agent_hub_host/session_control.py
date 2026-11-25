@@ -197,6 +197,25 @@ def replay_notice(exc, delay):
     sys.stderr.write(f'Hub unavailable ({diagnostic(exc).split(";")[0]}); replaying the same key in {delay}s\n')
 
 
+def evidence_refusal():
+    """Typed refusal for a managed worker denied a read outside its own intake tree.
+
+    A worker has no read grant for other intakes/sessions, even ones its brief cites
+    as evidence, and never falls back to a host/human profile. Say so, and name the
+    exact request the operator can act on. Only the worker's own intake id is used."""
+    from . import worker_auth
+    try:
+        ctx = worker_auth.load_v2_context()
+    except worker_auth.WorkerContextError:
+        return ''
+    if not ctx:
+        return ''
+    intake_id = ctx['_hub2_worker']['intake_id']
+    return ('; refusal: evidence_read_not_granted (this worker may read only its own and parent intake; '
+            'no host or human profile is used). Request the read from the operator with: '
+            f'hub intake append {intake_id} --note "evidence read requested: <session-or-intake id>"')
+
+
 def http_error(exc, key=None):
     # Surface the server error code and useful bounded details.
     # Best-effort: an unreadable body keeps the status-only form.
@@ -290,6 +309,8 @@ def http_error(exc, key=None):
         parts.append(f'; field: {field}')
     if detail:
         parts.append(f'; detail: {detail}')
+    if exc.code == 403 and code == 'forbidden':
+        parts.append(evidence_refusal())
     full_message = ''.join(parts)
     if key and f'reconcile with --key {key}' not in full_message:
         full_message += f' (reconcile with --key {key} via show/commands)'

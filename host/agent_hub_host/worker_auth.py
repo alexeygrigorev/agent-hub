@@ -20,10 +20,36 @@ from . import private_fs
 LAUNCH = re.compile(r'(?:task-)?hub-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
 
 
+# Typed reasons. Messages are fixed text: never paths, tokens or untrusted input.
+# Only reasons where host re-issuance really fixes the problem say so.
+REASONS = {
+    'worker_env_override_forbidden': 'Worker context refused: {var} is set in this managed worker environment; '
+                                     'unset it and rerun (a worker never uses a host or human profile; '
+                                     'no re-issuance is needed).',
+    'worker_transport_override_forbidden': 'Worker context refused: {var} conflicts with the worker context; '
+                                           'unset it and rerun (no re-issuance is needed).',
+    'context_missing': 'Worker context missing: the per-launch context file is absent or unreadable; '
+                       'host re-issuance required.',
+    'context_expired': 'Worker context expired; host re-issuance required.',
+    'context_invalid': 'Worker context invalid: the context file or its launch identity is malformed or '
+                       'inconsistent; host re-issuance required.',
+    'worker_profile_write_forbidden': 'Worker context refused: a managed worker cannot read or write a '
+                                      'profile through this command (no re-issuance is needed).',
+}
+GENERIC = 'Worker context unavailable or unsafe; host re-issuance required.'
+
+
 class WorkerContextError(ValueError):
-    """A fixed diagnostic; never include paths, tokens or untrusted input."""
-    def __init__(self):
-        super().__init__('Worker context unavailable or unsafe; host re-issuance required.')
+    """Typed diagnostic; never include paths, tokens or untrusted input."""
+    def __init__(self, reason='context_invalid', var=None):
+        if reason not in REASONS:
+            reason = 'context_invalid'
+        if var not in ('HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE', 'HUB_TOKEN', 'HUB_JOB_TOKEN',
+                       'HUB_URL', 'HUB_BASE_URL'):
+            var = 'an override variable'
+        self.reason = reason
+        self.var = var if reason.endswith('override_forbidden') else None
+        super().__init__('[%s] %s' % (reason, REASONS[reason].format(var=var)))
 
 
 V2_LAUNCH = re.compile(r'task-hub2-([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\Z')
@@ -38,7 +64,7 @@ def is_v2_worker():
 
 def refuse_v2_profile_io():
     if is_v2_worker():
-        raise WorkerContextError()
+        raise WorkerContextError('worker_profile_write_forbidden')
 
 
 def _unique_object(pairs):
@@ -64,9 +90,13 @@ def _v2_context():
     match = V2_LAUNCH.fullmatch(os.environ.get('APLEXER_TAG', ''))
     workspace = os.environ.get('APLEXER_WORKSPACE', '')
     selector = os.environ.get('HUB2_CONFIG', '')
-    if (not match or not workspace or not selector or os.environ.get('HUB_CONFIG_FILE')
-            or os.environ.get('HUB_WORKER_CONFIG_FILE')):
-        raise WorkerContextError()
+    for var in ('HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE'):
+        if os.environ.get(var):
+            raise WorkerContextError('worker_env_override_forbidden', var)
+    if not workspace or not selector:
+        raise WorkerContextError('context_missing')
+    if not match:
+        raise WorkerContextError('context_invalid')
     root, path = Path(workspace), Path(selector)
     if (not root.is_absolute() or not path.is_absolute()
             or workspace != str(root) or selector != str(path)
@@ -80,7 +110,11 @@ def _v2_context():
     name = re.fullmatch(re.escape(match[1]) + r'-([1-9][0-9]{0,15})\.json', path.name)
     if not name:
         raise WorkerContextError()
-    data = json.loads(private_fs.read_bytes(path, 16384).decode('utf-8'), object_pairs_hook=_unique_object)
+    try:
+        raw = private_fs.read_bytes(path, 16384)
+    except OSError:
+        raise WorkerContextError('context_missing') from None
+    data = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object)
     if not isinstance(data, dict) or set(data) != {'server', 'token', 'expires_at', 'worker'}:
         raise WorkerContextError()
     worker = data['worker']
@@ -103,16 +137,19 @@ def _v2_context():
             raise WorkerContextError()
     token, expiry = data['token'], data['expires_at']
     if (not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9._~-]{32,256}', token)
-            or type(expiry) not in (int, float) or not math.isfinite(expiry)
-            or not time.time() < expiry <= time.time() + 86405):
-        raise WorkerContextError()
+            or type(expiry) not in (int, float) or not math.isfinite(expiry)):
+        raise WorkerContextError('context_invalid')
+    if not time.time() < expiry:
+        raise WorkerContextError('context_expired')
+    if expiry > time.time() + 86405:
+        raise WorkerContextError('context_invalid')
     origin = _origin(data['server'])
     for key in ('HUB_URL', 'HUB_BASE_URL'):
         if os.environ.get(key) and _origin(os.environ[key]) != origin:
-            raise WorkerContextError()
+            raise WorkerContextError('worker_transport_override_forbidden', key)
     for key in ('HUB_TOKEN', 'HUB_JOB_TOKEN'):
         if os.environ.get(key) and os.environ[key] != token:
-            raise WorkerContextError()
+            raise WorkerContextError('worker_transport_override_forbidden', key)
     return {'base_url': data['server'].rstrip('/'), 'access_token': token,
             'client_kind': 'agent', '_hub2_worker': worker, '_hub2_expires_at': expiry}
 
@@ -122,8 +159,10 @@ def load_v2_context():
         return None
     try:
         return _v2_context()
+    except WorkerContextError:
+        raise
     except (OSError, ValueError, TypeError, OverflowError, KeyError, UnicodeError, RecursionError):
-        raise WorkerContextError() from None
+        raise WorkerContextError('context_invalid') from None
 
 
 def validate_v2_request(profile):
@@ -209,7 +248,7 @@ def provision(workspace, launch_id, request):
 def refresh_guard():
     """Serialize CLI processes sharing one rotating worker refresh token."""
     if is_v2_worker():
-        raise WorkerContextError()
+        raise WorkerContextError('worker_profile_write_forbidden')
     path = None if os.environ.get('HUB_CONFIG_FILE') else config_path()
     if path is None:
         yield
