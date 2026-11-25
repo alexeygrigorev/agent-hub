@@ -1049,7 +1049,7 @@ export class MachineDO {
       this.db.transaction(this.ctx, () => {
         if(newlyBound)this.db.run('UPDATE sessions SET launch_json=? WHERE id=?',JSON.stringify({...launch,[WORKSPACE_BINDING_FIELD]:binding}),row.id);
         this.db.run("UPDATE sessions SET state='claimed', offer_expires_at=NULL, updated_at=? WHERE id=? AND state='offered' AND epoch=?", now, row.id, row.epoch);
-        // A start that waited in the host queue gets the full launch grace from its claim.
+        // A start that waited in the host queue renews its lease from the claim time.
         this.db.run('UPDATE attention SET observed_at=? WHERE session_id=? AND reason=? AND operation_id=?',now,row.id,HOST_LAUNCH_QUEUED_REASON,row.operation_id);
         this.db.run('INSERT OR IGNORE INTO launch_admissions VALUES(?,?,?,?)', row.operation_id,row.id,row.epoch,now);
         this.insertOutbox(`claim:${row.operation_id}`, 'claim', row.operation_id, row.project_id,
