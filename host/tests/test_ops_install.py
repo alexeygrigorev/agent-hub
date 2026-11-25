@@ -71,7 +71,8 @@ class OpsInstallTests(unittest.TestCase):
             p.write_text(FAKE)
             p.chmod(0o700)
         self.env = {'PATH': str(self.adapters) + ':/usr/bin:/bin', 'HOME': str(self.home),
-                    'TMPDIR': str(self.home), 'OPS_HUB_MACHINE': 'fixture-machine',
+                    'TMPDIR': str(self.home), 'OPS_LOCK_DIR': str(self.home),
+                    'OPS_HUB_MACHINE': 'fixture-machine',
                     'OPS_INTAKE': '12345678-1234-4123-a123-123456789012',
                     'PYTHONDONTWRITEBYTECODE': '1', 'GIT_CONFIG_NOSYSTEM': '1',
                     'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_ALLOW_PROTOCOL': 'file',
