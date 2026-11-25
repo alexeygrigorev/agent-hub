@@ -655,14 +655,37 @@ def goal_prompt(prompt, workspace, task_id, first_action_path):
     return result
 
 
-def validate_first_action(fa_path, start_json, min_mtime):
-    """Artifact identity check against the launch start record; clone-proof.
+def first_action_data_valid(data, start_json):
+    """Identity/liveness check of one parsed whoami artifact against the start record.
 
     A genuine rich native whoami taken after start must show live mutation:
     active phase and live fields (updated_at_ms/last_activity_ms) after the
-    record's created_at_ms. The wrapper start JSON itself — byte-identical,
-    reformatted, or augmented — is rejected as a laundered clone.
+    record's created_at_ms. The wrapper start JSON itself - byte-identical,
+    reformatted, or augmented - is rejected as a laundered clone.
     """
+    if not isinstance(data, dict) or not REQUIRED_WHOAMI_FIELDS.issubset(data):
+        return False
+    if not isinstance(data.get("worker_pid"), int) or isinstance(data.get("worker_pid"), bool) or data["worker_pid"] <= 0:
+        return False
+    if data.get("phase") not in ("running", "working", "launching"):
+        return False
+    if data.get("id") != start_json.get("id") or data.get("tag") != start_json.get("tag"):
+        return False
+    if not same_workspace(data.get("workspace"), start_json.get("workspace")):
+        return False
+    if "parent_session" in start_json and data.get("parent_session") != start_json.get("parent_session"):
+        return False
+    created = start_json.get("created_at_ms")
+    stamp = data.get("updated_at_ms", data.get("last_activity_ms"))
+    if type(created) is not int or type(stamp) is not int or stamp <= created:
+        return False
+    if set(start_json).issubset(set(data)) and all(data.get(key) == value for key, value in start_json.items()):
+        return False
+    return True
+
+
+def validate_first_action(fa_path, start_json, min_mtime):
+    """Artifact identity check against the launch start record; clone-proof."""
     try:
         if not os.path.exists(fa_path):
             return False
@@ -672,26 +695,7 @@ def validate_first_action(fa_path, start_json, min_mtime):
             raw = stream.read(262145)
         if len(raw) > 262144:
             return False
-        data = json.loads(raw)
-        if not isinstance(data, dict) or not REQUIRED_WHOAMI_FIELDS.issubset(data):
-            return False
-        if not isinstance(data.get("worker_pid"), int) or isinstance(data.get("worker_pid"), bool) or data["worker_pid"] <= 0:
-            return False
-        if data.get("phase") not in ("running", "working", "launching"):
-            return False
-        if data.get("id") != start_json.get("id") or data.get("tag") != start_json.get("tag"):
-            return False
-        if not same_workspace(data.get("workspace"), start_json.get("workspace")):
-            return False
-        if "parent_session" in start_json and data.get("parent_session") != start_json.get("parent_session"):
-            return False
-        created = start_json.get("created_at_ms")
-        stamp = data.get("updated_at_ms", data.get("last_activity_ms"))
-        if type(created) is not int or type(stamp) is not int or stamp <= created:
-            return False
-        if set(start_json).issubset(set(data)) and all(data.get(key) == value for key, value in start_json.items()):
-            return False
-        return True
+        return first_action_data_valid(json.loads(raw), start_json)
     except (OSError, ValueError, TypeError):
         return False
 
@@ -1589,8 +1593,12 @@ class NativeLauncher:
                                                    claude_config_dir=claude_config_dir)
         # Pane creation is the start receipt. First-action proof is observed later;
         # a slow model must not hold the native id behind the server deadline.
-        receipt = {"session_id": start_json["id"],
-                   "first_action_verified": validate_first_action(str(fa_path), start_json, started)}
+        # An immediate proof is the same artifact check the later observer makes,
+        # and its timestamps are the artifact's, not the time this code ran.
+        from . import first_action_observation
+        proof = (first_action_observation.observe_proof(fa_path, start_json, started)
+                 if validate_first_action(str(fa_path), start_json, started) else None)
+        receipt = {"session_id": start_json["id"], "first_action_verified": proof is not None}
         receipt.update({"model": specification["model"], "model_verified": True,
                         "mode": "interactive" if specification.get("interactive") else "headless"})
         if specification.get("interactive"):
@@ -1600,6 +1608,7 @@ class NativeLauncher:
             receipt["effort_verified"] = True
         if goal_registration:
             receipt["goal_registration"] = goal_registration
+        specification['_first_action_launch'] = {'dispatched_at': started, 'proof': proof}
         self.record_evidence(task_id, specification, receipt, start_json)
         return receipt
 
@@ -1725,24 +1734,29 @@ class NativeLauncher:
 
     def record_evidence(self, task_id, specification, receipt, start_json):
         try:
-            path = Path(specification["workspace"]) / ".local" / f"launch-{task_id}.json"
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            private_file(path.parent)
+            late = specification.get('_first_action_launch') or {}
+            dispatched_at, first_action_proof = late.get('dispatched_at'), late.get('proof')
+            from . import first_action_observation
+            path = first_action_observation.record_path(specification["workspace"], task_id)
             evidence = {"task_id": task_id, "session_id": receipt["session_id"], "tag": "task-" + task_id,
                         "workspace": specification["workspace"], "created_at_ms": start_json.get("created_at_ms"),
                         "engine": start_json.get("engine"), "native_started_at": time.time(),
-                        "first_action_validated_at": time.time() if receipt.get("first_action_verified") else None,
+                        # Proof time and activity are the artifact's own; later proof
+                        # arrives through first_action_observation, never a clock refresh.
+                        "first_action_validated_at": first_action_proof["validated_at"] if first_action_proof else None,
+                        "first_action_activity_ms": first_action_proof["activity_ms"] if first_action_proof else None,
                         "interactive": bool(specification.get("interactive")),
                         "effort": specification.get("effort"), "with_goal": bool(specification.get("with_goal")),
                         "goal_registration": receipt.get("goal_registration"),
                         "task_output": specification.get("_task_output"),
                         "managed_exec_context": specification.get("_managed_exec_context")}
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-            with os.fdopen(fd, 'w', encoding='utf8') as stream:
-                stream.write(json.dumps(evidence))
-                stream.flush()
-                os.fsync(stream.fileno())
-            private_file(path)
+            if dispatched_at is not None:
+                evidence["native_dispatch_at"] = dispatched_at
+                evidence["native_start"] = first_action_observation.start_evidence(start_json)
+            if isinstance(specification.get("operation_id"), str) and type(specification.get("epoch")) is int:
+                evidence["operation_id"] = specification["operation_id"]
+                evidence["epoch"] = specification["epoch"]
+            first_action_observation.write_record(path, evidence)
         except OSError:
             import logging
             logging.getLogger(__name__).exception('Native launch evidence write failed task=%s', task_id)
