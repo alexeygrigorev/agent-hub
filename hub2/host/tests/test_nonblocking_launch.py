@@ -4,6 +4,7 @@ import queue
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -217,6 +218,63 @@ class NonblockingLaunchTests(unittest.TestCase):
                 bridge._launch_pool.shutdown(wait=True)
                 bridge._command_pool.shutdown(wait=True)
                 self.assertFalse(thread.is_alive())
+                self.assertFalse(failures)
+                journal.close_thread()
+
+    def test_burst_beyond_the_launch_queue_cap_waits_then_launches_without_disconnect(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal = Journal(Path(temp) / 'journal.sqlite')
+            incoming = queue.Queue()
+            release, lock = threading.Event(), threading.Lock()
+            started, entered, failures = [], [], []
+            class Socket:
+                def __enter__(self):
+                    entered.append(1)
+                    return self
+                def __exit__(self, *_): pass
+                def recv(self, timeout=None):
+                    try: value = incoming.get(timeout=min(timeout or 1, 1))
+                    except queue.Empty: raise TimeoutError()
+                    if isinstance(value, BaseException): raise value
+                    return json.dumps(value)
+                def send(self, raw):
+                    frame = json.loads(raw)
+                    if frame['type'] == 'offer_ack':
+                        incoming.put({'type': 'ack', 'session_id': frame['session_id'], 'epoch': frame['epoch']})
+            bridge = Bridge.__new__(Bridge)
+            bridge.client = SimpleNamespace(socket=lambda _: Socket(), request=lambda *a: {})
+            bridge.journal = journal
+            bridge.budget_paused_until = bridge.budget_safety_paused_until = 0
+            bridge.heartbeat, bridge.reconcile = Mock(), Mock()
+            def offer(value, acknowledge):
+                acknowledge(value['session_id'], 1)  # raises claim_ack_unverified on timeout
+                with lock: started.append(value['session_id'])
+                release.wait(5)
+            bridge.offer = offer
+            def serve():
+                try: bridge.serve('machine', [])
+                except StopServe: pass
+                except BaseException as error: failures.append(error)
+                finally: journal.close_thread()
+            total = 40  # larger than the 32-slot host launch queue
+            for n in range(total):
+                incoming.put({'type': 'session.offer', 'offer': {'session_id': f's{n}'}})
+            thread = threading.Thread(target=serve)
+            thread.start()
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and len(started) < 8: time.sleep(0.01)
+                self.assertEqual(len(started), 8)  # launch pool width; the rest wait, none failed
+                release.set()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline and len(started) < total: time.sleep(0.02)
+                self.assertEqual(sorted(started), sorted(f's{n}' for n in range(total)))
+                self.assertEqual(len(entered), 1, 'queue pressure dropped the host connection')
+            finally:
+                release.set()
+                incoming.put(StopServe())
+                thread.join(5)
+                bridge._launch_pool.shutdown(wait=True)
                 self.assertFalse(failures)
                 journal.close_thread()
 

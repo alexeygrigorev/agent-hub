@@ -1,4 +1,5 @@
 """Native process receipts are journaled before delivery and replayed on reconnect."""
+import collections
 import hashlib
 import json
 import logging
@@ -26,6 +27,7 @@ from .git_salvage import salvage_branch
 
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
+LAUNCH_BACKLOG_MAX = 512
 _NATIVE_INVENTORY_START_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LIMIT = 128
@@ -2143,6 +2145,10 @@ class Bridge:
         if not hasattr(self, '_inflight'):
             self._inflight, self._inflight_lock = set(), threading.Lock()
         self._session_locks = getattr(self, '_session_locks', {})
+        # Offers that arrive while every worker slot is busy wait here, unacked,
+        # and launch as slots free; a full queue is backpressure, never a
+        # disconnect (which would fail every in-flight claim ack).
+        pending = collections.deque()
         delay = 1
         while True:
             safety=time.time()*1000 < self.budget_paused_until
@@ -2195,7 +2201,10 @@ class Bridge:
                             self.heartbeat(labels)
                             next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                         active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1").fetchone()
-                        recv_timeout = 5 if active else min(
+                        while pending and slots.acquire(blocking=False):
+                            queued_event, queued_session = pending.popleft()
+                            pool.submit(execute, queued_event, queued_session)
+                        recv_timeout = 0.25 if pending else 5 if active else min(
                             LIVE_SESSION_HEARTBEAT_SECONDS,
                             max(0.01, next_live_session_heartbeat - now),
                         )
@@ -2225,8 +2234,16 @@ class Bridge:
                                 with self._inflight_lock:
                                     if session in self._inflight:
                                         continue
-                                    if not slots.acquire(blocking=False):
-                                        raise RuntimeError('host_launch_queue_full')
+                                    if pending or not slots.acquire(blocking=False):
+                                        if len(pending) >= LAUNCH_BACKLOG_MAX:
+                                            # Hub re-offers an unclaimed attempt; never drop the connection.
+                                            logging.getLogger(__name__).warning('Launch backlog full; deferring offer session=%s', session)
+                                            continue
+                                        self._inflight.add(session)
+                                        self._session_locks.setdefault(session, threading.RLock())
+                                        pending.append((event, session))
+                                        logging.getLogger(__name__).info('Launch queued on host session=%s depth=%d', session, len(pending))
+                                        continue
                                     self._inflight.add(session)
                                     self._session_locks.setdefault(session, threading.RLock())
                                 pool.submit(execute, event, session)
@@ -2254,6 +2271,9 @@ class Bridge:
                         self.journal.flush(self.client)
             except Exception as error:
                 self._managed_socket = None
+                with self._inflight_lock:
+                    while pending:
+                        self._inflight.discard(pending.popleft()[1])
                 logging.getLogger(__name__).exception('Host disconnected machine=%s', machine_id)
                 if isinstance(error,ApiError) and error.retry_at:
                     self.budget_paused_until=max(self.budget_paused_until,error.retry_at)
