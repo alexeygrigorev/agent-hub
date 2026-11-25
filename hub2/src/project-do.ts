@@ -18,7 +18,7 @@ import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, isFastStartRefusal, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, isFastStartRefusal, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, DEADLINE_REASON, OOM_REASON, MAX_DEADLINE_CONTINUATIONS, continuationLimit, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
   LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
   type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
@@ -1584,6 +1584,10 @@ export class ProjectDO {
     const now = Date.now();
     const nativeDeadline = evidence.native_deadline as JsonRecord | undefined;
     const deadlineExceeded = nativeDeadline?.exceeded === true;
+    // Typed native cause first: a deadline or memcg-OOM exit is never relabelled
+    // as a launch/host failure, whatever else the host's journal recorded.
+    const oomKilled=(evidence.native_exit as JsonRecord|undefined)?.oom_killed===true;
+    const typedExit:string|undefined=stopRequested?undefined:deadlineExceeded?DEADLINE_REASON:oomKilled?OOM_REASON:undefined;
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
     // The host names an engine that refused to start on its auth/preflight
     // check; recovery must repick instead of retrying that engine (intake 62ccfa1e).
@@ -1623,16 +1627,16 @@ export class ProjectDO {
         const route=(this.parse(currentSaga.routing_json) as JsonRecord|null)??{};
         if(route.acceptance_verification===true){
           const verdict=launchFailed?undefined:this.findVerificationVerdict(current,saga);
-          completion=this.verificationOutcome(current,currentSaga,verdict,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-            :'verifier_exit_'+String(body.exit_code),now);
+          completion=this.verificationOutcome(current,currentSaga,verdict,typedExit??(launchFailed?'launch_failed':stopRequested?'stop_requested'
+            :'verifier_exit_'+String(body.exit_code)),now);
           // Hub's own gate decided: independent verification passed and, for
           // code work, the merge gate holds. The intake is accepted.
           status=completion.outcome==='claimed'?'accepted':'failed';
         }else{
           const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
           status=claim?'completed-awaiting-review':'failed';
-          completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-            :preflight??(body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code)),!launchFailed&&!stopRequested,true,now);
+          completion=this.completionOutcome(current,saga,claim,typedExit??(launchFailed?'launch_failed':stopRequested?'stop_requested'
+            :preflight??(body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code))),(!launchFailed||typedExit!==undefined)&&!stopRequested,true,now);
         }
       }
       // An uncontrolled failed exit is Hub's own retry candidate: schedule its
@@ -1796,7 +1800,7 @@ export class ProjectDO {
   /** Consecutive Hub-started continuations since the last requester start. */
   private continuationDepth(intakeId:string):number{
     let depth=0;
-    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_AUTO_CONTINUATIONS+1)){
+    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_DEADLINE_CONTINUATIONS+1)){
       if(row.actor_id!==COMPLETION_ACTOR)break;
       depth++;
     }
@@ -1819,7 +1823,7 @@ export class ProjectDO {
       ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
     // A fresh session cannot clear a permission, credential or external blocker:
     // never spend the bounded continuations on one. A running job gets time first.
-    if(!claim&&continuable&&!contractOmitted&&!hard&&depth<MAX_AUTO_CONTINUATIONS)
+    if(!claim&&continuable&&!contractOmitted&&!hard&&depth<continuationLimit(reason))
       record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
     // Fail loudly (intake 42b42c9b): a session that ended on its own with no completion
@@ -2005,7 +2009,14 @@ export class ProjectDO {
         session_id:b.session_id,wake_id:b.wake_id,wake_state:b.state,wake_at_ms:b.wake_at_ms,
         reason:missed?'missed_wake':null,authority:'untrusted_task_data',
         ...(missed?{note:'Scheduled wake was not verified within its deadline. Handed to idle-with-open-AC recovery.'}:{})},now);
-      if(missed)this.raiseDeveloperAlert(intake.id,b.session_id as string,'missed_wake','missed_wake',0,now,undefined,b.wake_id as string);
+      if(missed){
+        // A wake that was pending when the session died at its hard deadline (or OOM) is a
+        // consequence of that exit, not a delivery fault: name the real cause.
+        const ended=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+        const cause=(ended.native_deadline as JsonRecord|undefined)?.exceeded===true?DEADLINE_REASON
+          :((ended.native_exit as JsonRecord|undefined)?.oom_killed===true?OOM_REASON:undefined);
+        this.raiseDeveloperAlert(intake.id,b.session_id as string,cause??'missed_wake',cause??'missed_wake',0,now,cause?{cause:exitCause(cause)}:undefined,b.wake_id as string);
+      }
     });return json({recorded:true});
   }
 
@@ -2030,13 +2041,13 @@ export class ProjectDO {
 
   private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}},receiptKey?:string):void{
     const blockerEvent=why?.blocker&&why?.blockerEvent?{seq:why.blockerEvent.seq,at:why.blockerEvent.at,age_ms:Math.max(0,now-why.blockerEvent.at)}:undefined;
-    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS,
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:continuationLimit(reason),
       ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{}),...(blockerEvent?{blocker_event:blockerEvent}:{})};
     this.appendEvent(intakeId,'developer-alert:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'developer_alert_raised',alert,now);
     const blockerRef=blockerEvent?` Blocker event: seq ${blockerEvent.seq}, age ${this.formatBlockerAge(blockerEvent.age_ms)}.`:'';
     this.appendEvent(intakeId,'developer-owner:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
-      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).${why?` Cause: ${why.cause}`:''}${blockerRef}`,
+      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${continuationLimit(reason)} recovery sessions used).${why?` Cause: ${why.cause}`:''}${blockerRef}`,
       next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
     console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
@@ -2122,7 +2133,7 @@ export class ProjectDO {
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
-        timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout};
+        timeout_seconds:record.reason===DEADLINE_REASON?Math.min(7200,timeout*2):timeout};
       // Budget the whole continuation launch (same fields the start builds) in
       // escaped-JSON bytes so the complete contract still fits the Machine limit.
       const criteria=this.parse(intake.acceptance_criteria_json),next={...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''};
@@ -2238,7 +2249,8 @@ export class ProjectDO {
         const evidence=(this.parse(intake.final_evidence_json) as JsonRecord|null)??{};
         const deadlineExceeded=(evidence.native_deadline as JsonRecord|undefined)?.exceeded===true;
         const exitCode=typeof evidence.exit_code==='number'?evidence.exit_code:null;
-        const reason=deadlineExceeded?'deadline_exceeded':exitCode===0?'exit_without_completion_claim':'native_exit_'+String(exitCode??'unknown');
+        const oomKilled=((evidence.native_exit as JsonRecord|undefined)?.oom_killed)===true;
+        const reason=deadlineExceeded?DEADLINE_REASON:oomKilled?OOM_REASON:exitCode===0?'exit_without_completion_claim':'native_exit_'+String(exitCode??'unknown');
         const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
         if(route.completion_contract!==true){
           this.db.run('UPDATE dispatch_sagas SET routing_json=?,updated_at=? WHERE operation_id=?',
@@ -2251,7 +2263,7 @@ export class ProjectDO {
         const why=this.unfinishedCause(intake,saga,reason),hard=!!why.blocker&&HARD_BLOCKERS.includes(why.blocker.cause);
         const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:hard?'blocked_'+why.blocker!.cause:reason,depth,cause:why.cause,
           ...(why.blocker?{blocker:why.blocker}:{}),
-          ...(depth<MAX_AUTO_CONTINUATIONS&&!hard?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:why.blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now}}:{})};
+          ...(depth<continuationLimit(reason)&&!hard?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:why.blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now}}:{})};
         this.db.run("UPDATE intakes SET status='open',final_evidence_json=?,updated_at=? WHERE id=?",
           JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
         this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
@@ -2349,7 +2361,7 @@ export class ProjectDO {
     const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
     const preflight=ENGINE_PREFLIGHT_FAILURES.has(String(evidence.failure_reason));
     // Only engine start faults: a workspace/request refusal keeps the pinned route.
-    const fastFailure=reason!=='deadline_exceeded'&&(evidence.launch_failed===true&&evidence.failure_reason==='host_operation_failed'
+    const fastFailure=reason!==DEADLINE_REASON&&(evidence.launch_failed===true&&evidence.failure_reason==='host_operation_failed'
       ||isFastStartRefusal(evidence.exit_code,row.saga_created_at,row.saga_updated_at));
     const routeFallback=(depth>0||preflight||fastFailure)&&typeof route.policy_id==='string';
     const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
@@ -2360,7 +2372,7 @@ export class ProjectDO {
       ...(routeFallback?{exclude_policy_ids:[String(route.policy_id)]}:{}),
       ...(shell?{exclude_machine_ids:[row.saga_machine_id]}:{}),
       // A session killed at its deadline gets more time, within the start limit.
-      timeout_seconds:reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout};
+      timeout_seconds:reason===DEADLINE_REASON?Math.min(7200,timeout*2):timeout};
     const criteria=this.parse(intake.acceptance_criteria_json);
     const budget=continuationBudget({...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''} as JsonRecord,row.id,Array.isArray(criteria)?criteria.map(String):[]);
     body.prompt=retryPrompt(row.id,attempt,MAX_AUTO_RETRIES,sagaSession,reason,basePrompt(String(launch.prompt??''))||intake.text,

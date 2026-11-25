@@ -17,6 +17,14 @@ export const CONTINUATION_END = '\n=== Original task (historical objective; the 
 const PREVIOUS_CONTINUATIONS = [[CONTINUATION_MARKER, '\n=== Original task ===\n'], ['--- Hub continuation ---\n', '\n--- Original task ---\n']] as const;
 /** Consecutive Hub-started continuations after one requester start. */
 export const MAX_AUTO_CONTINUATIONS = 2;
+/** Typed exit reasons from native evidence (never folded into launch/wake failures). */
+export const DEADLINE_REASON = 'native_deadline_exceeded';
+export const OOM_REASON = 'oom';
+/** A session killed at its hard runtime deadline was working, not failing: the
+ * 2 h cap is bounded by the provider credential lifetime and cannot be raised, so
+ * Hub renews it with two extra continuations beyond the ordinary budget. */
+export const MAX_DEADLINE_CONTINUATIONS = MAX_AUTO_CONTINUATIONS + 2;
+export const continuationLimit = (reason: string): number => reason === DEADLINE_REASON ? MAX_DEADLINE_CONTINUATIONS : MAX_AUTO_CONTINUATIONS;
 /** Consecutive Hub retries of a failed intake whose sessions carry no
  * completion contract (operator shells and legacy attempts). Controlled
  * sessions are bounded by MAX_AUTO_CONTINUATIONS instead. */
@@ -231,7 +239,7 @@ export function continuationBudget(launchWithoutPrompt: unknown, intakeId: strin
  * bounds its UTF-8 size), the unit the Machine launch limit counts. */
 export function continuationPrompt(intakeId: string, depth: number, previousSession: string, reason: string, original: string, snapshot?: ContinuationSnapshot, budget = PROMPT_LIMIT): string {
   const intro = CONTINUATION_MARKER
-    + `Hub started this session automatically (continuation ${depth} of at most ${MAX_AUTO_CONTINUATIONS}) because session ${previousSession} ended without completing intake ${intakeId} (${reason}). `
+    + `Hub started this session automatically (continuation ${depth} of at most ${continuationLimit(reason)}) because session ${previousSession} ended without completing intake ${intakeId} (${reason}). `
     + `Before acting, read the current state: hub intake context ${intakeId} (status, current context and the newest events) and hub intake show ${intakeId} (status and acceptance criteria). `
     + `hub intake history ${intakeId} pages from the oldest event, so its first page is not the current state. `
     + 'Then check the workspace and continue the remaining work; do not redo or repeat steps the current state records as finished or accepted.';
@@ -390,7 +398,9 @@ export function isFastStartRefusal(exitCode: unknown, startedAt: number, endedAt
 
 const REASON_TEXT: Record<string, string> = {
   exit_without_completion_claim: 'the session exited on its own without a completion record',
-  deadline_exceeded: 'the session was killed at its deadline',
+  [DEADLINE_REASON]: 'the session was killed at its hard runtime deadline (launch timeout_seconds, at most 2 h from admission, enforced by SIGHUP)',
+  deadline_exceeded: 'the session was killed at its hard runtime deadline (launch timeout_seconds, at most 2 h from admission, enforced by SIGHUP)',
+  [OOM_REASON]: 'the session workload hit its memory cap (kernel memcg OOM kill); run tests inside capped-test-run or a bounded sub-scope',
   launch_failed: 'the session failed to launch',
   engine_auth_check_unavailable: 'the engine failed its authentication check before starting; Hub repicks another engine',
   engine_auth_expired: 'the engine login expired before starting; Hub repicks another engine',
@@ -432,7 +442,7 @@ export function deliveryBody(input: {
         ? `Hub does not restart a session into a ${input.blocker.cause} blocker; the Hub developer was alerted.`
         : input.continuation?.state === 'refused'
         ? `Hub could not start a continuation (${input.continuation.last_reason ?? 'refused'}).`
-        : input.depth >= MAX_AUTO_CONTINUATIONS
+        : input.depth >= continuationLimit(input.reason)
           ? `Hub already continued it ${input.depth} times automatically; it needs a decision.`
           : 'Hub does not continue this exit automatically.',
       `State and notes: hub intake history ${input.intake_id}. Restart with hub sessions start --intake-task-id ${input.intake_id} when ready.`];
