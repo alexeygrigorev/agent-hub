@@ -1644,6 +1644,44 @@ test('review prohibitions consume coordinated delivery verbs and PR references a
   assert.equal(readOnlyBrief('Delivery', 'Read-only follow-up. Merge the PR.', ['Result']),false);
 });
 
+test('the four real review briefs of intakes 757e3124, 169e24be, d1af7e3d and aa36d9d3 are read-only, not code delivery',()=>{
+  const briefs:{id:string;title:string;text:string;ac:string[]}[]=[
+ {
+  "id": "757e3124",
+  "title": "Review PR 742 exact head 675783ee (desktop no-work fixes, 42b42c9b)",
+  "text": "Independent review of exact head 675783ee of PR https://github.com/alexeygrigorev/agent-hub/pull/742 (DESKTOP-FP4OP26 no-work fixes), parent intake 42b42c9b. Check against ACs 1-4 and the binding AC5-9 note on 42b42c9b (Orin a-d): no native_acknowledged while text sits in the agy composer queue (typed native_input_queued), host waits for the running turn / flushes queue before reporting, Windows headless capture shows progress while running, Claude interactive path includes #730, typed launcher_capability_unavailable_<capability>, host_operation_failed error_class without exception text, session_ended_no_output developer alert, shell-interactive refused at start. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (Review: approved sha=... or REQUEST_CHANGES with file:line findings) and a note on intake 42b42c9b.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head 675783ee as a PR 742 comment and a note on parent intake 42b42c9b, covering ACs 1-4 and AC5-9 (note) of 42b42c9b."
+  ]
+ },
+ {
+  "id": "169e24be",
+  "title": "Re-review PR 742 exact head e6499961 (desktop no-work fixes, 42b42c9b)",
+  "text": "Independent review of exact head e6499961 of PR https://github.com/alexeygrigorev/agent-hub/pull/742 (DESKTOP-FP4OP26 no-work fixes), parent intake 42b42c9b. Check against ACs 1-4 and the binding AC5-9 note on 42b42c9b (Orin a-d): no native_acknowledged while text sits in the agy composer queue (typed native_input_queued), host waits for the running turn / flushes queue before reporting, Windows headless capture shows progress while running, Claude interactive path includes #730, typed launcher_capability_unavailable_<capability>, host_operation_failed error_class without exception text, session_ended_no_output developer alert, shell-interactive refused at start. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (Review: approved sha=... or REQUEST_CHANGES with file:line findings) and a note on intake 42b42c9b.\nRe-review: the previous review of 675783ee requested changes (two P1: fail-open send verification in agent.py, and native_input_queued projected as delivered in machine-do.ts). Verify both are fixed with command-level and host-to-server regression tests.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head e6499961 as a PR 742 comment and a note on parent intake 42b42c9b, covering ACs 1-4 and AC5-9 (note) of 42b42c9b."
+  ]
+ },
+ {
+  "id": "d1af7e3d",
+  "title": "Review PR 743 exact head dd5eb2b5 (worker context refusals, 37e34dcd)",
+  "text": "Independent review of exact head dd5eb2b5 of PR https://github.com/alexeygrigorev/agent-hub/pull/743 (fix(worker-auth): typed worker context refusals; read-only evidence read), parent intake 37e34dcd. Security-sensitive: confirm no worker can fall back to a human/host profile, no paths/tokens/untrusted input in messages, and the evidence-read path is read-only, scoped to sessions cited by the worker own intake, and audited. Read-only: do not push, merge or deploy. GitHub refuses a formal APPROVE from the PR-owning account: post the verdict as a PR comment (APPROVE or REQUEST_CHANGES with file:line findings) and a note on intake 37e34dcd.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head dd5eb2b5 as a PR 743 comment and a note on parent intake 37e34dcd, covering ACs 2-3 of 37e34dcd."
+  ]
+ },
+ {
+  "id": "aa36d9d3",
+  "title": "Review PR 741 exact head 400f9a9a (auto-restart failover, 36ce7c2e)",
+  "text": "Independent review of exact head 400f9a9a of PR https://github.com/alexeygrigorev/agent-hub/pull/741 (fix(hub2): fail over controlled sessions after repeated crashes), parent intake 36ce7c2e (Alexey t2983u, auto-restart of failed sessions). The previous acceptance covered 891fd592; implementer session 95fd5cd9 changed the source to fix 3 red checks, so the new head needs a fresh review. Read-only: do not push, merge or deploy.\n",
+  "ac": [
+   "Reviewer posts APPROVE or REQUEST_CHANGES with file:line findings for exact head 400f9a9a (gh pr review on PR 741 and a note on parent intake 36ce7c2e), checking the CI-fix changes and that ACs 3-5 of 36ce7c2e (auto-restart on another route, loud alert, regression test for 21a07a26) are still met."
+  ]
+ }
+];
+  for(const b of briefs)assert.equal(readOnlyBrief(b.title,b.text,b.ac),true,b.id);
+});
+
 test('absent merge evidence is typed separately from malformed evidence and non-code work',()=>{
   assert.deepEqual(mergeGate(true,undefined).problems,['merge_evidence_missing']);
   assert.deepEqual(mergeGateAll(true,[]).problems,['merge_evidence_missing']);
