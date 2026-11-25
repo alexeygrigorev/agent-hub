@@ -2112,7 +2112,12 @@ class Bridge:
         stop = threading.Event()
         def beats():
             try:
-                run_heartbeat_loop(lambda: self.heartbeat(labels), stop)
+                from .dapier_credentials import request_maintenance
+                request_maintenance()
+                def tick():
+                    self.heartbeat(labels)
+                    request_maintenance()
+                run_heartbeat_loop(tick, stop)
             finally:
                 self.journal.close_thread()
         thread = threading.Thread(target=beats, name='hub2-live-session-heartbeat', daemon=True)

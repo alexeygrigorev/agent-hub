@@ -2726,27 +2726,22 @@ def shared_dataops_dir():
 
 
 def link_operator_dapier_session(home):
-    """Expose the operator's dapier session (XDG_CONFIG_HOME/dapier) in a session HOME.
-
-    dapier reads $XDG_CONFIG_HOME/dapier/session.json and managed sessions get a
-    private XDG_CONFIG_HOME, so they reported "Not signed in" while the host
-    user was signed in (intake fc36c32b). A symlink keeps a single session file.
-    """
-    source = operator_config_dir('dapier')
-    if not (source / 'session.json').is_file():
+    """Compatibility entry point: managed Dapier always uses Hub's store."""
+    if os.name == 'nt' or sys.platform == 'win32':
         return
+    from .dapier_credentials import shared_root
+    source = shared_root() / 'dapier'
     target = Path(home) / '.config' / 'dapier'
-    try:
-        if target.is_symlink():
-            if Path(os.readlink(target)) == source:
-                return
-            target.unlink()
-        elif target.exists():
+    if not (source / 'session.json').is_file() and not target.is_symlink():
+        return
+    if target.is_symlink():
+        if Path(os.readlink(target)) == source:
             return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(source, target_is_directory=True)
-    except OSError:
-        pass
+        target.unlink()
+    elif target.exists():
+        raise ValueError('dapier_private_home_conflict')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(source, target_is_directory=True)
 
 
 def engine_environment(bundle, home, dest=None):
@@ -2791,6 +2786,8 @@ def engine_environment(bundle, home, dest=None):
     if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
         env['DATAOPS_CONFIG_DIR'] = str(shared)
     link_operator_dapier_session(home)
+    from .dapier_credentials import session_environment, shared_root
+    env.update(session_environment(shared_root(), env.get('PATH')))
     if bundle.get('provider') == 'go':
         from .fleet import load_settings
         from .opencode_auth import environment, prepare
