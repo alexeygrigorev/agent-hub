@@ -71,7 +71,7 @@ export class Hub2Webhooks extends WebhookService {
   }
 
   private jobActor(project: string, route: string): Actor {
-    return { id: 'webhook:' + route, kind: 'agent', scopes: ['session:start', 'intake:write', 'intake:read', 'project:' + project] };
+    return { id: 'webhook:' + route, kind: 'agent', scopes: ['session:start', 'intake:write', 'intake:read', 'project:' + project, 'worker_project:' + project] };
   }
 
   override async pump(): Promise<number | undefined> {

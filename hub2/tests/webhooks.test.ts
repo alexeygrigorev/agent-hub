@@ -95,3 +95,61 @@ test('management refuses nonadmin, invalid target and signing modes that Hub2 ca
   assert.equal(JSON.stringify(listing).includes(route.secret), false);
   assert.equal((await f.call('/webhooks/' + route.id, 'POST', { text: 'x'.repeat(2000) }, { 'X-Webhook-Token': route.secret }))?.status, 413);
 });
+
+test('actual Hub2 session-start bridge preserves a fixed target, durable key and draft-only intake classification', async () => {
+  const { startSession } = await import('../src/worker');
+  const calls: { path: string; body: Record<string, unknown>; actor: unknown }[] = [];
+  const env = {
+    CONTROL: { idFromName: (name: string) => name, get: () => ({ fetch: async () => Response.json({ repo: { canonical_name: launch.project, canonical_url: 'https://github.com/' + launch.project, status: 'active' } }) }) },
+    PROJECTS: { idFromName: (name: string) => name, get: () => ({ fetch: async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      calls.push({ path, body: await request.json() as Record<string, unknown>, actor: JSON.parse(request.headers.get('x-hub2-actor')!) });
+      if (path.endsWith('/start')) return Response.json({ session: { id: 'session-started' } }, { status: 202 });
+      return Response.json({ id: 'intake-created' }, { status: 201 });
+    } }) },
+  } as unknown as Hub2Env;
+  const actor = { id: 'webhook:route', kind: 'agent' as const, scopes: ['session:start', 'intake:write', 'intake:read', 'project:' + launch.project] };
+  const response = await startSession(new Request('https://hub.test/api/sessions', { method: 'POST', headers: { 'Idempotency-Key': 'webhook-fixed-delivery' },
+    body: JSON.stringify({ ...launch, purpose: 'implement', model: 'opus', engine: 'claude', effort: 'high', brief: 'Prepare local drafts only.' }) }), env, actor, true);
+  assert.equal(response.status, 202);
+  assert.equal(calls[0].body.code_task, false);
+  assert.equal(calls[0].body.key, 'webhook-fixed-delivery:intake');
+  assert.equal(calls[1].body.key, 'webhook-fixed-delivery');
+  assert.equal(calls[1].body.machine_id, launch.machine);
+  assert.equal(calls[1].body.model, 'opus');
+  assert.deepEqual(calls[1].actor, actor);
+});
+
+test('webhook dispatch passes actual Control repository authorization with only its configured project scope', async () => {
+  const { ControlDO } = await import('../src/control-do');
+  const { NodeDurableStorage } = await import('../node/sqlite-storage');
+  const sql = new NodeSqlStorage(':memory:');
+  const state = { storage: new NodeDurableStorage(sql), blockConcurrencyWhile: (fn: () => Promise<unknown>) => fn() } as unknown as DurableObjectState;
+  const projectCalls: Record<string, unknown>[] = [];
+  let control: InstanceType<typeof ControlDO>;
+  const env = {
+    CONTROL: { idFromName: (name: string) => name, get: () => ({ fetch: (request: Request) => control.fetch(request) }) },
+    PROJECTS: { idFromName: (name: string) => name, get: () => ({ fetch: async (request: Request) => {
+      projectCalls.push(await request.json() as Record<string, unknown>);
+      if (new URL(request.url).pathname.endsWith('/start')) return Response.json({ session: { id: 'session-real-control' } }, { status: 202 });
+      return Response.json({ id: 'intake-real-control' }, { status: 201 });
+    } }) },
+  } as unknown as Hub2Env;
+  control = new ControlDO(state, env);
+  const adminHeaders = { 'x-hub2-actor': JSON.stringify({ id: 'human:test', kind: 'operator', scopes: ['operator:admin'] }) };
+  const repo = await control.fetch(new Request('https://control.test/api/repos/' + encodeURIComponent(launch.project), { method: 'PATCH', headers: adminHeaders,
+    body: JSON.stringify({ canonical_url: 'https://github.com/' + launch.project, purpose: 'Draft job source' }) }));
+  assert.equal(repo.status, 200);
+  const created = await control.fetch(new Request('https://control.test/api/webhooks', { method: 'POST', headers: adminHeaders,
+    body: JSON.stringify({ name: 'control-auth-drafts', launch, template: 'Prepare local drafts from {{payload.source_url}}' }) }));
+  assert.equal(created.status, 201);
+  const route = await created.json() as { id: string; secret: string };
+  const accepted = await control.fetch(new Request('https://control.test/webhooks/' + route.id, { method: 'POST',
+    headers: { 'X-Webhook-Token': route.secret, 'X-Delivery-Id': 'actual-control-1' }, body: JSON.stringify({ source_url: 'https://aishippinglabs.com/api/events/example/preparation-source' }) }));
+  assert.equal(accepted.status, 202);
+  const receipt = await accepted.json() as { status: string };
+  assert.equal(receipt.status, 'queued');
+  assert.equal(projectCalls.length, 2);
+  assert.equal(projectCalls[0].code_task, false);
+  sql.close();
+});

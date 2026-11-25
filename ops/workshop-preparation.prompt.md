@@ -15,11 +15,15 @@ Source endpoint: {{payload.source_url}}
 Event ID: {{payload.event_id}}
 
 Fetch this source through the existing authenticated website API using the
-privately provisioned asl runtime credential. Require an HTTPS source on
+privately provisioned asl runtime credential. On this host, the supported
+CLI resolves it with `uv run --directory /home/alexey/git/ai-shipping-labs
+--env-file /home/alexey/git/ai-shipping-labs/.env asl raw GET <source-path>`.
+Do not read or print the env file; pass only the path component of the
+validated source URL as <source-path>. Require an HTTPS source on
 https://aishippinglabs.com/api/events/ ending in /preparation-source; refuse
 another origin. Never print the credential, download URLs or transcript body
-in terminal output. If capture is still running (409), retry with bounded
-backoff. Report a concrete blocker rather than claiming successful drafts if
+in terminal output. If capture is still running (409), retry after 15, 30 and then 60 seconds,
+for at most 10 minutes. Never reset the original transcript-ready deadline. Report a concrete blocker rather than claiming successful drafts if
 the transcript or required source files cannot be obtained.
 
 Create a fresh directory under .local/recording-preparation/. Preserve raw VTT
