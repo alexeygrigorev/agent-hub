@@ -11,3 +11,4 @@ await import('./task-completion-cli.test.ts');
 await import('./intake-relations.test.ts');
 await import('./worker-parent-intake.test.ts');
 await import('./worker-evidence-read.test.ts');
+await import('./intake-stats-promote.test.ts');

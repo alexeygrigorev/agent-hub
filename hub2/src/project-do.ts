@@ -3,6 +3,7 @@ import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
 import { IntakeRelations } from './intake-relations';
 import {listProjectIntakes} from './intake-list';
+import {buildIntakeStats} from './intake-stats';
 import {boundWorkspace,checkoutWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
@@ -204,7 +205,7 @@ export class ProjectDO {
         ?? error('method_not_allowed', 405, `${request.method} is not supported on /${relation[2]}`);
       const prerequisites = url.pathname.match(/^\/_internal\/prerequisites\/([^/]+)$/);
       if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate))?$/);
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate|stats|promote))?$/);
       if (!match) return error('not_found', 404);
       const intakeId = this.resolveIntakeRef(actorFrom(request), decodeURIComponent(match[1]));
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
@@ -215,6 +216,8 @@ export class ProjectDO {
       if(match[2]==='merge-evidence'&&request.method==='POST')return await this.mergeEvidence(request,intakeId);
       if(match[2]==='merge-state'&&request.method==='GET')return this.mergeState(request,intakeId);
       if(match[2]==='reevaluate'&&request.method==='POST')return await this.reevaluate(request,intakeId);
+      if(match[2]==='stats')return request.method==='GET'?this.statsIntake(request,intakeId):error('method_not_allowed',405);
+      if(match[2]==='promote')return request.method==='POST'?await this.promoteIntake(request,intakeId):error('method_not_allowed',405);
       if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
       if(match[2]==='context'&&request.method==='GET')return this.contextView(request,intakeId);
       if(match[2]==='audit'&&request.method==='GET')return this.history(request,intakeId);
@@ -325,9 +328,80 @@ export class ProjectDO {
       task: this.taskCompat(row) }, status);
   }
 
-  /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */
+  /** Version handle for compare-and-set callers (CLI `intake close/update/promote`): the row's updated_at. */
   private taskCompat(row: IntakeRow): JsonRecord {
-    return { id: row.id, updated_at: row.updated_at, ...this.intakeContext(row.id), control: { version: row.updated_at } };
+    return { id: row.id, updated_at: row.updated_at, promoted_at: this.promotedAt(row), ...this.intakeContext(row.id), control: { version: row.updated_at } };
+  }
+
+  private promotedAt(row: IntakeRow): number | null {
+    const source = this.parse(row.source_json) as JsonRecord | null;
+    return typeof source?.promoted_at === 'number' && Number.isSafeInteger(source.promoted_at) && source.promoted_at > 0 ? source.promoted_at : null;
+  }
+
+  /** `hub intake stats <id>`: read-only timing, attempts, engines/accounts and blockers for one intake. */
+  private statsIntake(request: Request, intakeId: string): Response {
+    const actor = actorFrom(request);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+    if (!row) return error('intake_not_found', 404);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
+    const sagas = this.db.all<SagaRow & { updated_at: number }>(
+      'SELECT operation_id, session_id, machine_id, account_id, launch_spec_json, routing_json, retry_count, native_id, state, attempt, last_reason, created_at, updated_at FROM dispatch_sagas WHERE intake_id = ? ORDER BY created_at ASC, operation_id ASC LIMIT 200',
+      row.id,
+    );
+    const events = this.db.all<IntakeEventRow>(
+      "SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? AND kind IN ('native_session_started','finish_evidence_received','session_stopped','session_reaped','session_lost','session_launch_failed','task_retry_started','task_continuation_started','worker_append','task_acceptance_verified','intake_updated') ORDER BY seq ASC LIMIT 500",
+      row.id,
+    );
+    const dependencies = this.relations.prerequisites(row.id);
+    return json({ stats: buildIntakeStats(row, sagas, events, dependencies.length, Date.now()) });
+  }
+
+  /** `hub intake promote <id>`: stamp promoted_at on a queueable intake with CAS and idempotency. */
+  private async promoteIntake(request: Request, intakeId: string): Promise<Response> {
+    const actor = actorFrom(request);
+    const body = await bodyObject(request, 4096);
+    const key = this.idempotencyKey(request, body);
+    if (!key) return error('idempotency_key_required', 400);
+    const allowed = ['key', 'expected_version', 'expected_updated_at'];
+    if (Object.keys(body).some(field => !allowed.includes(field))) return error('unknown_intake_field', 400);
+    const expected = body.expected_version !== undefined ? body.expected_version : body.expected_updated_at;
+    if (body.expected_version !== undefined && body.expected_updated_at !== undefined && body.expected_version !== body.expected_updated_at) {
+      return error('invalid_expected_version', 400);
+    }
+    if (expected !== undefined && (typeof expected !== 'number' || !Number.isSafeInteger(expected) || expected < 0)) {
+      return error('invalid_expected_version', 400);
+    }
+    const digest = await sha256Hex(JSON.stringify(body));
+    const scope = 'intake:promote:' + intakeId;
+    const replay = this.idempotent(scope, key, digest);
+    if (replay instanceof Response) return replay;
+    return this.transaction(() => {
+      const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+      if (!row) return error('intake_not_found', 404);
+      if (!this.canProject(actor, row.project, 'intake:write')) {
+        return forbiddenScope('intake:write', `promoting intake ${row.id} needs intake:write with project:${row.project} or operator:admin`);
+      }
+      if (replay) return json({ intake: this.viewIntake(row), task: this.taskCompat(row), duplicate: true });
+      if (expected !== undefined && expected !== row.updated_at) return error('version_conflict', 409);
+      if (!['open', 'failed', 'needs_attention'].includes(row.status)) {
+        return error(
+          'intake_not_promotable',
+          409,
+          `intake ${row.id} has status ${row.status} and cannot be promoted; reopen with \`hub intake update ${row.id} --status open\` and start with \`hub sessions start --intake-task-id ${row.id}\``,
+        );
+      }
+      const at = Math.max(Date.now(), row.updated_at + 1);
+      const source = { ...((this.parse(row.source_json) as JsonRecord | null) ?? {}), promoted_at: at };
+      const sourceJson = JSON.stringify(source);
+      this.db.run('UPDATE intakes SET source_json = ?, updated_at = ? WHERE id = ?', sourceJson, at, row.id);
+      this.appendEvent(row.id, 'promote:' + row.id + ':' + key, actor!.id, 'intake_promoted', { promoted_at: at }, at);
+      this.db.run(
+        'INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',
+        scope, key, digest, JSON.stringify({ id: row.id, promoted_at: at }), at, at + 180 * 86400000,
+      );
+      const updated = { ...row, source_json: sourceJson, updated_at: at } as IntakeRow;
+      return json({ intake: this.viewIntake(updated), task: this.taskCompat(updated) });
+    });
   }
 
   /** `hub intake context`: the intake plus its most recent events, bounded. */
@@ -2519,7 +2593,7 @@ export class ProjectDO {
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
       linked_sessions: this.sessionLinks.links(row.id),
       dispatch: saga ? this.sagaView(saga, row.status) : undefined,
-      priority:row.priority??2,original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
+      priority:row.priority??2,promoted_at:this.promotedAt(row),original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
     };
   }
 
