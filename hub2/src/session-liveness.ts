@@ -4,6 +4,25 @@ export const HOST_INVENTORY_LOST_MS = 5 * 60_000;
 export const SESSION_IDLE_MS = 6 * 60 * 60_000;
 export const SESSION_REAP_INTERVAL_MS = 3 * 60_000;
 export const CLAIMED_WITHOUT_NATIVE_GRACE_MS = 2 * 60_000;
+// A start the host reports as queued behind its launch cap (slots or RAM
+// headroom) is backpressure, not a dead host: each report leases the start for
+// HOST_LAUNCH_QUEUE_LEASE_MS (the host re-reports every 30s), bounded overall
+// by HOST_LAUNCH_QUEUE_MAX_MS from creation. Without reports the ordinary
+// 2 minute grace applies.
+export const HOST_LAUNCH_QUEUED_REASON = 'host_launch_queued';
+export const HOST_LAUNCH_QUEUE_LEASE_MS = 90_000;
+export const HOST_LAUNCH_QUEUE_MAX_MS = 30 * 60_000;
+
+/** Launch deadline for a start without a native id, extended by a live host-queue lease. */
+export function launchDeadline(session:{created_at:number;operation_id:string},
+  attention?:{reason:string;operation_id:string|null;observed_at:number}|null):number{
+  const grace=session.created_at+CLAIMED_WITHOUT_NATIVE_GRACE_MS;
+  if(!attention||attention.reason!==HOST_LAUNCH_QUEUED_REASON||attention.operation_id!==session.operation_id)return grace;
+  return Math.max(grace,Math.min(attention.observed_at+HOST_LAUNCH_QUEUE_LEASE_MS,session.created_at+HOST_LAUNCH_QUEUE_MAX_MS));
+}
+
+/** The same deadline as SQL over `sessions s` and the `attention` table. */
+export const LAUNCH_DEADLINE_SQL=`MAX(s.created_at+${CLAIMED_WITHOUT_NATIVE_GRACE_MS},COALESCE((SELECT MIN(a.observed_at+${HOST_LAUNCH_QUEUE_LEASE_MS},s.created_at+${HOST_LAUNCH_QUEUE_MAX_MS}) FROM attention a WHERE a.session_id=s.id AND a.reason='${HOST_LAUNCH_QUEUED_REASON}' AND a.operation_id=s.operation_id),0))`;
 
 export type LiveSession = {
   session_id: string;

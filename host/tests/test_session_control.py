@@ -333,6 +333,22 @@ class TestSessionControlCli(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'workspace_label_unavailable'):
                 session_control.execute(args)
 
+    def test_start_wait_reports_host_queued_start_as_queued_not_failed(self):
+        # t4016u: a burst start held behind the host launch cap is backpressure.
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-queued', '--wait', '--timeout', '30', '--interval', '1')
+        queued = {'session': {'id': 's-q', 'state': 'offered', 'machine_id': 'h1', 'start_state': 'queued_on_host',
+                              'host_queue': {'state': 'queued'}, 'attention': {'reason': 'host_launch_queued'}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-q', 'state': 'offered'}, queued]), \
+                patch.object(session_control, 'wait_for_session', side_effect=ValueError('Session wait timed out; re-check status')):
+            result = session_control.execute(args)
+        self.assertEqual(result['start_state'], 'queued_on_host')
+        self.assertEqual(result['state'], 'offered')
+        # Without the queued marker a timeout still surfaces as a timeout.
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-x', 'state': 'offered'}, {'session': {'id': 's-x', 'state': 'offered'}}]), \
+                patch.object(session_control, 'wait_for_session', side_effect=ValueError('Session wait timed out; re-check status')):
+            with self.assertRaisesRegex(ValueError, 'timed out'):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--key', 'k-x', '--wait', '--timeout', '30', '--interval', '1'))
+
     def test_send_wait_ignores_transport_until_correlated_ack(self):
         args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k2', '--wait', '--timeout', '30', '--interval', '1')
         listing = lambda state: {'commands': [{'id': 'c1', 'state': state}]}

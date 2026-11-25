@@ -661,6 +661,47 @@ test('an unclaimed offer has one terminal acceptance deadline and never requeues
  assert.ok(!f.events.some(event=>event.path==='/_internal/requeue'));
 });
 
+test('t4016u: a burst start the host reports as queued waits under its lease, reads queued on host, then launches',async()=>{
+ const f=fixture(),frames:any[]=[],admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const queued='burst-queued',epoch=await startOffered(f,queued);
+ // Old enough that the ordinary 2 minute grace has lapsed.
+ const created=Date.now()-150_000;
+ f.database.prepare('UPDATE sessions SET created_at=?,offer_expires_at=? WHERE id=?').run(created,created+120_000,queued);f.clearCache();
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:queued,epoch,operation_id:'op-'+queued,depth:3,cause:'launch_slots'}));
+ const reply=frames.find(frame=>frame.type==='offer_queued');
+ assert.equal(reply.session_id,queued);assert.ok(reply.expires_at>Date.now()+60_000,'the queued offer lease is extended');
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'offered','queued start must not fail');
+ assert.ok(!f.events.some(event=>event.path==='/_internal/reaped'),'no launch failure reported for a queued start');
+ const view=(await (await f.call('/api/sessions/'+queued,'GET',undefined,admin)).json() as any).session;
+ assert.equal(view.start_state,'queued_on_host');assert.equal(view.host_queue.state,'queued');assert.equal(view.attention.reason,'host_launch_queued');
+ // The slot frees: the host claims it and gets the full launch grace from the claim.
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:queued,epoch}));
+ assert.ok(frames.some(frame=>frame.type==='ack'&&frame.session_id===queued),'a lease-extended offer is still claimable');
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'claimed');
+ const started=await f.call('/api/sessions/'+queued+'/started','POST',{operation_id:'op-'+queued,epoch,native_id:'00000000-0000-4000-8000-000000004016'});
+ assert.equal(started.status,201);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'running');
+ assert.equal(f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(queued),undefined,'queued attention clears on start');
+
+ // Without fresh reports the lease lapses and the ordinary timeout applies.
+ const silent='burst-silent',silentEpoch=await startOffered(f,silent);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:silent,epoch:silentEpoch,depth:1,cause:'launch_slots'}));
+ f.database.prepare('UPDATE sessions SET created_at=?,offer_expires_at=? WHERE id=?').run(Date.now()-300_000,Date.now()-1,silent);
+ f.database.prepare('UPDATE attention SET observed_at=? WHERE session_id=?').run(Date.now()-91_000,silent);f.clearCache();
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(silent) as any).state,'failed');
+ // And the overall queue wait is bounded even while the host keeps reporting.
+ const capped='burst-capped',cappedEpoch=await startOffered(f,capped);
+ f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-31*60_000,capped);f.clearCache();
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:capped,epoch:cappedEpoch,depth:1,cause:'launch_slots'}));
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(capped) as any).state,'failed');
+});
+
 test('claim timestamps cannot extend the original start deadline',async()=>{
  const f=fixture(),session='late-claim';await startClaimed(f,session,null);
  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(Date.now()-120_001,Date.now(),session);

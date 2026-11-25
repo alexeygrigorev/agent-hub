@@ -28,6 +28,21 @@ from .git_salvage import salvage_branch
 # Keep the live native-session census fresh for the global Hub session limit.
 LIVE_SESSION_HEARTBEAT_SECONDS = 30
 LAUNCH_BACKLOG_MAX = 512
+# A queued start is re-reported to the Hub this often; the Hub leases it for 90s
+# per report, so a live host never has its queued starts reaped as dead.
+LAUNCH_QUEUE_REPORT_SECONDS = 30
+# The claim ACK is re-sent (idempotent on the Hub) before it counts as
+# unverified: a burst serializes claims in the machine Durable Object.
+CLAIM_ACK_WAIT_SECONDS = 15
+CLAIM_ACK_ATTEMPTS = 4
+# RAM-headroom refusals during a burst wait for reservations to settle.
+ADMISSION_BACKPRESSURE_SECONDS = 600
+ADMISSION_RETRY_SECONDS = 5
+
+
+def offer_queued_frame(session, epoch, operation, depth, cause):
+    return json.dumps({'type': 'offer_queued', 'session_id': session, 'epoch': epoch, 'operation_id': operation,
+                       'depth': depth, 'cause': cause}, sort_keys=True, separators=(',', ':'))
 _NATIVE_INVENTORY_START_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LOCK = threading.Lock()
 _NATIVE_OBSERVATION_REPORT_LIMIT = 128
@@ -430,6 +445,8 @@ def native_control_step(diagnostic, stage, operation, *args, **kwargs):
 
 
 class Bridge:
+    admission_backpressure_seconds = ADMISSION_BACKPRESSURE_SECONDS
+
     def __init__(self, client, journal, roots, engines, executable="a", runner=subprocess.run, launcher_config=None,machine_id=None,capabilities=None,workspaces=None,alert_observer=None):
         self.client, self.journal, self.runner = client, journal, runner
         self._alert_observer_spec = alert_observer
@@ -897,7 +914,36 @@ class Bridge:
     def attempt_label(self, session, operation, epoch):
         return hashlib.sha256(canonical([self.machine_id, session, operation, epoch]).encode()).hexdigest()
 
+    def report_launch_queued(self, socket, offer, depth, cause):
+        """Tell the Hub this start is queued here (backpressure), so it leases it instead of failing it."""
+        if socket is None or not isinstance(offer.get('session_id'), str) or type(offer.get('epoch')) is not int:
+            return
+        try:
+            socket.send(offer_queued_frame(offer['session_id'], offer['epoch'], offer.get('operation_id'), depth, cause))
+        except Exception:
+            logging.getLogger(__name__).warning('Launch queue report not sent session=%s', offer.get('session_id'))
+
     def mark_native_dispatch(self, operation, session, epoch, specification=None):
+        """RAM-headroom refusal during a burst is backpressure: wait, report queued, retry.
+
+        Each retry is a complete fresh admission (a refusal commits nothing),
+        bounded by ADMISSION_BACKPRESSURE_SECONDS; then the refusal stands."""
+        deadline = time.monotonic() + self.admission_backpressure_seconds
+        next_report = 0.0
+        while True:
+            try:
+                return self._admit_native_dispatch(operation, session, epoch, specification)
+            except RuntimeError as error:
+                if str(error) != 'host_launch_queue_full' or time.monotonic() >= deadline:
+                    raise
+            if time.monotonic() >= next_report:
+                logging.getLogger(__name__).info('Launch waiting for RAM headroom session=%s', session)
+                self.report_launch_queued(getattr(self, '_managed_socket', None),
+                                          {'session_id': session, 'epoch': epoch, 'operation_id': operation}, 0, 'ram_headroom')
+                next_report = time.monotonic() + LAUNCH_QUEUE_REPORT_SECONDS
+            time.sleep(min(ADMISSION_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
+
+    def _admit_native_dispatch(self, operation, session, epoch, specification=None):
         """Admission and the durable 0->1 dispatch marker commit atomically.
 
         The physical available-RAM sample, the conservative uncovered inflight
@@ -2169,8 +2215,15 @@ class Bridge:
                         with _lock:
                             _waiters[(session, epoch)] = ready
                         try:
-                            _socket.send(offer_ack_frame(session, epoch, workspace_binding))
-                            return ready.wait(15)
+                            frame = offer_ack_frame(session, epoch, workspace_binding)
+                            for attempt in range(CLAIM_ACK_ATTEMPTS):
+                                _socket.send(frame)
+                                if ready.ready.wait(CLAIM_ACK_WAIT_SECONDS):
+                                    break
+                                # Unanswered is not refused: the Hub answers a
+                                # repeated ACK for an already-claimed offer as a duplicate.
+                                logging.getLogger(__name__).warning('Claim ack unanswered; resending session=%s attempt=%d', session, attempt + 1)
+                            return ready.wait(0)
                         finally:
                             with _lock:
                                 _waiters.pop((session, epoch), None)
@@ -2190,6 +2243,7 @@ class Bridge:
                             _slots.release()
                             self.journal.close_thread()
                     next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
+                    next_queue_report = time.monotonic() + LAUNCH_QUEUE_REPORT_SECONDS
                     self.journal.flush(self.client)
                     self.reconcile()
                     delay = 1
@@ -2202,15 +2256,38 @@ class Bridge:
                             next_live_session_heartbeat = time.monotonic() + LIVE_SESSION_HEARTBEAT_SECONDS
                         active = self.journal.db.execute("SELECT 1 FROM launches WHERE state IN ('running','aborting','deadline_stopping','launching') LIMIT 1").fetchone()
                         while pending and slots.acquire(blocking=False):
-                            queued_event, queued_session = pending.popleft()
-                            pool.submit(execute, queued_event, queued_session)
+                            entry = pending.popleft()
+                            offer = entry['event'].get('offer') if entry['kind'] == 'offer' else None
+                            if (offer is not None and offer.get('claimed') is not True
+                                    and isinstance(offer.get('expires_at'), (int, float))
+                                    and offer['expires_at'] <= time.time() * 1000):
+                                # The Hub stopped leasing it; it re-offers or reaps, never this host.
+                                slots.release()
+                                with self._inflight_lock:
+                                    self._inflight.discard(entry['session'])
+                                logging.getLogger(__name__).warning('Queued offer expired before a launch slot freed session=%s', entry['session'])
+                                continue
+                            entry['pool'].submit(execute, entry['event'], entry['session'])
+                        if pending and time.monotonic() >= next_queue_report:
+                            for depth, entry in enumerate(pending, 1):
+                                if entry['kind'] == 'offer':
+                                    self.report_launch_queued(socket, entry['event'].get('offer') or {}, depth, 'launch_slots')
+                            next_queue_report = time.monotonic() + LAUNCH_QUEUE_REPORT_SECONDS
                         recv_timeout = 0.25 if pending else 5 if active else min(
                             LIVE_SESSION_HEARTBEAT_SECONDS,
                             max(0.01, next_live_session_heartbeat - now),
                         )
                         try:
                             event = json.loads(socket.recv(timeout=recv_timeout))
-                            if event.get('type') == 'ack':
+                            if event.get('type') == 'offer_queued':
+                                # The Hub extended a queued offer's lease; launch it under that expiry.
+                                for entry in pending:
+                                    offer = entry['event'].get('offer') if entry['kind'] == 'offer' else None
+                                    if (offer is not None and offer.get('session_id') == event.get('session_id')
+                                            and offer.get('epoch') == event.get('epoch')
+                                            and isinstance(event.get('expires_at'), int)):
+                                        offer['expires_at'] = max(offer.get('expires_at') or 0, event['expires_at'])
+                            elif event.get('type') == 'ack':
                                 with waiter_lock:
                                     ready = waiters.get((event.get('session_id'), event.get('epoch')))
                                     if ready:
@@ -2241,8 +2318,9 @@ class Bridge:
                                             continue
                                         self._inflight.add(session)
                                         self._session_locks.setdefault(session, threading.RLock())
-                                        pending.append((event, session))
+                                        pending.append({'kind': 'offer', 'event': event, 'session': session, 'pool': pool})
                                         logging.getLogger(__name__).info('Launch queued on host session=%s depth=%d', session, len(pending))
+                                        self.report_launch_queued(socket, event.get('offer') or {}, len(pending), 'launch_slots')
                                         continue
                                     self._inflight.add(session)
                                     self._session_locks.setdefault(session, threading.RLock())
@@ -2251,13 +2329,16 @@ class Bridge:
                                 session = 'native:' + str(event['command'].get('native_id'))
                                 with self._inflight_lock:
                                     self._session_locks.setdefault(session, threading.RLock())
-                                if not slots.acquire(blocking=False):
-                                    raise RuntimeError('host_command_queue_full')
+                                if pending or not slots.acquire(blocking=False):
+                                    # Backpressure, never a disconnect that fails every pending claim ACK.
+                                    pending.append({'kind': 'command', 'event': event, 'session': session, 'pool': commands})
+                                    continue
                                 commands.submit(execute, event, session)
                             elif event.get('type') == 'session.command' and event.get('command', {}).get('session_id') in self._inflight:
                                 session = event['command']['session_id']
-                                if not slots.acquire(blocking=False):
-                                    raise RuntimeError('host_command_queue_full')
+                                if pending or not slots.acquire(blocking=False):
+                                    pending.append({'kind': 'command', 'event': event, 'session': session, 'pool': commands})
+                                    continue
                                 commands.submit(execute, event, session)
                             else:
                                 self.dispatch(event, socket, acknowledge)
@@ -2273,7 +2354,9 @@ class Bridge:
                 self._managed_socket = None
                 with self._inflight_lock:
                     while pending:
-                        self._inflight.discard(pending.popleft()[1])
+                        entry = pending.popleft()
+                        if entry['kind'] == 'offer':
+                            self._inflight.discard(entry['session'])
                 logging.getLogger(__name__).exception('Host disconnected machine=%s', machine_id)
                 if isinstance(error,ApiError) and error.retry_at:
                     self.budget_paused_until=max(self.budget_paused_until,error.retry_at)

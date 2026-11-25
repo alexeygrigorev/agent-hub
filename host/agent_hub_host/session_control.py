@@ -930,6 +930,8 @@ def match_session_state(entry: dict, wanted: str) -> bool:
 
 
 TRANSIENT_BIND_STATES = ('queued', 'offered', 'claimed', 'starting', 'uncertain')
+# Hub2 session views name a start held behind the host launch cap (t4016u).
+HOST_QUEUED_START_STATES = ('queued_on_host', 'launching_after_host_queue')
 
 
 def _session_row(view):
@@ -1391,7 +1393,19 @@ def _execute(args):
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
-            binding = wait_for_session(created['id'], timeout, interval)
+            try:
+                binding = wait_for_session(created['id'], timeout, interval)
+            except ValueError:
+                # t4016u: a start held behind the host launch cap is queued
+                # (backpressure), not failed; report that instead of a timeout.
+                from urllib.parse import quote
+                queued = _session_row(request('GET', '/api/sessions/' + quote(created['id'], safe='')))
+                if not isinstance(queued, dict) or queued.get('start_state') not in HOST_QUEUED_START_STATES:
+                    raise
+                sys.stderr.write(f"Start queued on host {queued.get('machine_id') or ''}: waiting for a launch slot "
+                                 f"(state={queued.get('state')}); it launches when a slot frees\n")
+                created.update(queued)
+                return created
             created['binding_wait'] = binding
             bound = binding.get('session') if isinstance(binding, dict) else None
             bound = bound if isinstance(bound, dict) else binding

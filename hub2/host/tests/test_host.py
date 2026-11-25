@@ -1859,6 +1859,7 @@ class HostTests(unittest.TestCase):
     def test_admission_refuses_one_byte_short_and_settles_no_dispatch(self):
         self.exact_headroom(-1)  # one byte below the floor+allowance headroom
         self.quiet_census()
+        self.bridge.admission_backpressure_seconds = 0  # the refusal itself, without the burst wait
         self.assertIsNone(self.bridge.offer(self.offer()))
         self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
         row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
@@ -1868,6 +1869,31 @@ class HostTests(unittest.TestCase):
         self.assertTrue(receipt['no_dispatch'])
         self.assertEqual(receipt['failure_reason'], 'host_launch_queue_full')
         self.assertEqual(receipt['detail'], 'Launch preparation was refused.')
+
+    def test_ram_headroom_refusal_waits_reports_queued_and_launches_when_headroom_frees(self):
+        # t4016u: a burst exhausts RAM headroom; the start waits (reported as
+        # queued on the host) and launches once reservations settle, instead of
+        # failing the intake as host_launch_queue_full.
+        self.exact_headroom(-1)
+        self.quiet_census()
+        frames, samples = [], []
+        self.bridge._managed_socket = SimpleNamespace(send=lambda raw: frames.append(json.loads(raw)))
+        def sample(deadline):
+            samples.append(1)
+            if len(samples) >= 3:
+                self.exact_headroom(4096)
+            return self.sample_available[0]
+        self.bridge.resource_sample = sample
+        with patch('agent_hub_host.agent.ADMISSION_RETRY_SECONDS', 0.01):
+            native = self.bridge.offer(self.offer())
+        self.assertIsNotNone(native)
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        self.assertEqual(tuple(self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()), ('running', 1))
+        queued = [frame for frame in frames if frame['type'] == 'offer_queued']
+        self.assertEqual(queued[0]['session_id'], 'session-1')
+        self.assertEqual(queued[0]['cause'], 'ram_headroom')
+        self.assertFalse(any('host_launch_queue_full' in row[0] for row in
+                             self.journal.db.execute('SELECT payload FROM outbox').fetchall()))
 
     def test_malformed_worker_caps_refuse_launch_without_clamping(self):
         for memory_mb, pids in ((1501, 256), (1500, 257), (True, 256), ('1500', 256), (0, 256)):
