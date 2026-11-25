@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Hub host disk hygiene every 6 hours
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hub-disk-hygiene.service
+
+[Install]
+WantedBy=timers.target
