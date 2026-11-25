@@ -710,7 +710,7 @@ def _current_charges(db, residents, exclude_operation, now_ms, attempt_label=Non
 
 
 def disk_floor_gb(launcher_config):
-    """Configured root/workspace disk floor in GiB (optional; defaults to 15 GiB)."""
+    """Configured root/workspace disk floor in GiB (None when unconfigured)."""
     raw = (launcher_config or {}).get('disk_floor_gb')
     if raw is None:
         env_raw = os.environ.get('HUB2_DISK_FLOOR_GB')
@@ -720,7 +720,7 @@ def disk_floor_gb(launcher_config):
             except ValueError as exc:
                 raise ValueError('launcher_capability_unavailable') from exc
         else:
-            return DEFAULT_DISK_FLOOR_GB
+            return None
     if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
         raise ValueError('launcher_capability_unavailable')
     return float(raw)
@@ -749,6 +749,8 @@ def _trigger_hygiene_once(now_mono=None, trigger_fn=None):
 
 def check_disk_floor(launcher_config, workspace_path=None, *, disk_usage_fn=None, trigger_fn=None, now_mono=None):
     floor = disk_floor_gb(launcher_config)
+    if floor is None:
+        return None
     usage_fn = disk_usage_fn or shutil.disk_usage
     target = Path(workspace_path) if workspace_path else Path('/')
     if not target.exists():
