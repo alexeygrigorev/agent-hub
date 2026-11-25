@@ -4,6 +4,7 @@ import { NodeSqlStorage } from '../node/sqlite-storage';
 import { MeteredDb } from '../src/db';
 import { Hub2Webhooks, HUB2_WEBHOOK_SCHEMA } from '../src/webhooks';
 import type { Hub2Env } from '../src/types';
+import { eligibleCandidates, type PickInput } from '../src/routing-pool';
 
 function fixture() {
   const db = new MeteredDb(new NodeSqlStorage(':memory:') as unknown as import('@cloudflare/workers-types').SqlStorage);
@@ -20,7 +21,13 @@ function fixture() {
     return Response.json({ intake });
   } }) } } as unknown as Hub2Env;
   const make = () => new Hub2Webhooks(ctx, db, env, async (request, _env, actor, draft) => {
-    calls.push({ body: await request.json() as Record<string, unknown>, draft, actor });
+    const body = await request.json() as Record<string, unknown>;
+    calls.push({ body, draft, actor });
+    // Exercise the actual selector contract: headless starts cannot request
+    // the interactive-only built-in goal mode. A permissive start mock hid it.
+    const candidates = eligibleCandidates({ version: 1, candidates: [{ id: 'claude-opus-high', engine: 'claude', model: 'opus', effort: 'high', account_id: 'claude', weight: 1, capabilities: ['headless', 'effort'], enabled: true }] },
+      { ...body, interactive: body.mode === 'interactive', with_goal: body.with_goal === true } as PickInput);
+    assert.equal(candidates.length, 1);
     if (!available) return Response.json({ error: 'no_available_host' }, { status: 503 });
     return Response.json({ id: 'session-1', intake_id: 'intake-1' }, { status: 202 });
   });

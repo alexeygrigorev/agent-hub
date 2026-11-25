@@ -93,7 +93,7 @@ export class Hub2Webhooks extends WebhookService {
     const request = new Request('https://hub.internal/api/sessions', { method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
       body: JSON.stringify({ ...launch, brief: draftBrief(row), purpose: 'implement', engine: 'claude', model: 'opus', effort: 'high',
-        engine_override_reason: 'workshop-followup-materials requires Opus for workshop drafts', with_goal: true, name: 'Webhook draft ' + row.id }) });
+        engine_override_reason: 'workshop-followup-materials requires Opus for workshop drafts', with_goal: false, name: 'Webhook draft ' + row.id }) });
     try {
       const response = await this.starter(request, this.env2, this.jobActor(launch.project, row.source_id), true);
       const started = await response.json() as JsonRecord;
