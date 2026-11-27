@@ -955,9 +955,10 @@ export class ProjectDO {
     let route: PickedRoute;
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
+      if (!actor) return error('forbidden', 403);
       const isAdmin = hasScope(actor, 'operator:admin');
       if (interactive) {
-        if (!actor || actor.kind !== 'operator') return error('forbidden', 403);
+        if (actor.kind !== 'operator') return error('forbidden', 403);
         if (!isAdmin && !hasScope(actor, 'shell:start')) return error('forbidden', 403);
       } else if (!isAdmin) {
         return error('forbidden', 403);
