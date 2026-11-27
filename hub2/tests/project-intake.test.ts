@@ -1286,5 +1286,12 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   assert.equal((await cmd('k-other',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['session:send']})).status,403);
   assert.equal((await cmd('k-agent',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
   assert.equal((await cmd('k-ok',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,201);
+  // 6. Wake endpoints also enforce operator-only, exact-session-ID binding on shell sessions.
+  const wake=(m:string,p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(m==='POST'?{body:JSON.stringify({key:'w-'+p,at:'now',prompt:'echo hi'})}:{})}));
+  assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,404);
+  assert.equal((await wake('POST','wake',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,404);
+  assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
  }finally{machineSql.close();f.sql.close();f.collectorSql.close();}
 });

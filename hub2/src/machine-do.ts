@@ -1628,7 +1628,7 @@ export class MachineDO {
       &&nativeReturncode(evidence.native_exit as JsonRecord)===0;
   }
 
-  private canAccessShellSession(actor: Actor | undefined, session: SessionRow, requiredScope: string): boolean {
+  private canAccessShellSession(actor: Actor | undefined, session: { id: string }, requiredScope: string): boolean {
     if (!actor || actor.kind !== 'operator') return false;
     if (hasScope(actor, 'operator:admin')) return true;
     return hasScope(actor, requiredScope) && actor.resource_id === session.id;
@@ -2597,10 +2597,10 @@ export class MachineDO {
     });
   }
 
-  private wakeSession(id:string):WakeSession|undefined{
+  private wakeSession(id:string): (WakeSession & { engine: string }) | undefined {
     const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);if(!row)return;
     const launch=this.parse(row.launch_json) as JsonRecord;
-    return{id:row.id,operation_id:row.operation_id,epoch:row.epoch,native_id:row.native_id,state:row.state,project_id:row.project_id,intake_id:row.intake_id,machine_id:row.machine_id,interactive:launch.interactive===true,workspace:String(boundWorkspace(launch))};
+    return{id:row.id,operation_id:row.operation_id,epoch:row.epoch,native_id:row.native_id,state:row.state,project_id:row.project_id,intake_id:row.intake_id,machine_id:row.machine_id,interactive:launch.interactive===true,workspace:String(boundWorkspace(launch)),engine:String(launch.engine??'').toLowerCase()};
   }
   private enqueueWake(w:WakeRecord):boolean{
     const current=this.wakeSession(w.session_id);
@@ -2645,7 +2645,9 @@ export class MachineDO {
   private async sessionWake(request:Request,id:string,action:string):Promise<Response>{
     const session=this.wakeSession(id),actor=actorFrom(request);
     const read=request.method==='GET';
-    if(!session||!actor||!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))return error('session_not_found',404);
+    if(!session||!actor||(session.engine==='shell'
+      ? !this.canAccessShellSession(actor,session,read?'session:read':'session:send')
+      : (!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))))return error('session_not_found',404);
     if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
     if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
     const b=await bodyObject(request,12288);if(Object.keys(b).some(k=>!['key','at','prompt','body'].includes(k)))return error('invalid_wake',400);
