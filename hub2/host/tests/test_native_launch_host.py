@@ -664,7 +664,8 @@ class CapabilityTest(unittest.TestCase):
         self.assertEqual(caps['codex'], {'headless', 'interactive', 'goal', 'effort'})
         self.assertEqual(caps['opencode'], {'headless', 'interactive'})
         self.assertNotIn('claude', caps)
-        self.assertEqual(caps['shell'], {'headless'})
+        expected_shell = {'headless', 'interactive'} if nl.resolve_interactive_shell_command() else {'headless'}
+        self.assertEqual(caps['shell'], expected_shell)
 
     def test_claude_capability_can_install_without_global_claude(self):
         config = {'private_provider_homes': True, 'routes': {'claude': {'provider': 'claude'}}}
@@ -808,6 +809,27 @@ class LaunchReceiptTest(unittest.TestCase):
             normalize.assert_not_called()
             command = runner.call_args.args[0]
             self.assertEqual(command[command.index('--') + 1:], child)
+
+    def test_interactive_shell_launch_posix_and_windows(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            posix_child = ['/bin/bash', '-l']
+            output = json.dumps({'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
+                                 'workspace': workspace, 'command': posix_child, 'engine': 'shell'})
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=output))
+            adapter = nl.NativeLauncher({'routes': {'shell': {'provider': 'shell'}}}, runner=runner)
+            with mock.patch.object(nl, 'resolve_interactive_shell_command', return_value=posix_child), \
+                 mock.patch.object(adapter, 'record_evidence'):
+                receipt = adapter.launch('t1', {'workspace': workspace, 'engine': 'shell', 'model': 'shell',
+                                                 'prompt': 'await operator input', 'interactive': True, 'timeout_seconds': 60})
+            self.assertTrue(receipt['interactive_verified'])
+            self.assertEqual(receipt['mode'], 'interactive')
+            argv = runner.call_args.args[0]
+            self.assertIn('--engine', argv)
+            self.assertEqual(argv[argv.index('--engine') + 1], 'shell')
+            self.assertEqual(argv[argv.index('--') + 1:], posix_child)
+        with mock.patch.object(nl.os, 'name', 'nt'), \
+             mock.patch.object(nl.shutil, 'which', side_effect=lambda name, path=None: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' if name == 'powershell.exe' else None):
+            self.assertEqual(nl.resolve_interactive_shell_command(), ['C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoLogo'])
 
     def test_launch_attempts_start_without_a_host_capacity_gate(self):
         config = {'private_provider_homes': True, 'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}

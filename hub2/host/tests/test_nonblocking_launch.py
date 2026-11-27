@@ -147,14 +147,16 @@ class NonblockingLaunchTests(unittest.TestCase):
                     'id':'d6cf9872-8597-48a5-be64-990cdef4db31','tag':'task-hub2-shell',
                     'workspace':temp,'command':child}), '')
             launcher=NativeLauncher({'private_provider_homes':True},runner=runner)
-            self.assertEqual(launcher.capabilities()['shell'], {'headless'})
+            self.assertEqual(launcher.capabilities()['shell'], {'headless', 'interactive'})
             receipt=launcher.launch('hub2-shell',{'session_id':'shell','workspace':temp,'engine':'shell',
                 'model':'shell','effort':None,'prompt':"printf CANARY-OK; exit 7",'timeout_seconds':60})
             self.assertEqual(receipt['session_id'],'d6cf9872-8597-48a5-be64-990cdef4db31')
             self.assertIn('hub.managed=true',calls[0])
             self.assertNotIn('task',calls[0][calls[0].index('--')+1:])
+            interactive_cmd = launcher.profile_command('good', {'interactive': True}, {'provider': 'shell'}, '')
+            self.assertEqual(interactive_cmd[0], '/bin/bash' if __import__('os').access('/bin/bash', __import__('os').X_OK) else '/bin/sh')
             with self.assertRaisesRegex(RuntimeError,'capability'):
-                launcher.profile_command('bad',{'interactive':True}, {'provider':'shell'}, 'echo bad')
+                launcher.profile_command('bad',{'interactive':True,'with_goal':True}, {'provider':'shell'}, 'echo bad')
 
     def test_profile_task_effort_uses_the_same_quoted_native_mapping(self):
         with tempfile.TemporaryDirectory() as temp:

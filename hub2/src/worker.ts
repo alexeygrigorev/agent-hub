@@ -105,6 +105,7 @@ const router = {
         path === '/api/deployment-credentials' ||
         /^\/api\/deployment-credentials\/deployment:[0-9a-f-]+\/revoke$/.test(path) ||
         path === '/api/named-agents' ||
+        path === '/api/shell-grants' ||
         /^\/api\/named-agents\/[^/]+\/grants$/.test(path) ||
         /^\/api\/named-agents\/[^/]+\/(?:sticky|claim)$/.test(path) ||
         path === '/api/directory' ||
@@ -756,8 +757,6 @@ async function relationForward(request: Request, env: Hub2Env, control: DurableO
  * Every refusal names a reason; nothing here waits on a machine.
  */
 async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor) && !hasScope(actor, 'session:start'))
-    return forbiddenScope('session:start', 'grant session:start or operator:admin to start sessions');
   let body: JsonRecord;
   try {
     const parsed = JSON.parse(await boundedText(request, 32_768));
@@ -767,6 +766,11 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     if (caught instanceof HttpError) return error(caught.code, caught.status);
     return error('invalid_json', 400);
   }
+  const interactiveShellRequest =
+    typeof body.engine === 'string' && body.engine.toLowerCase() === 'shell' && body.mode === 'interactive';
+  if (!admin(actor) && !hasScope(actor, 'session:start')
+    && !(interactiveShellRequest && actor.kind === 'operator' && hasScope(actor, 'shell:start')))
+    return forbiddenScope('session:start', 'grant session:start or operator:admin to start sessions');
   const key = request.headers.get('idempotency-key') || body.key;
   if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(key)) return error('idempotency_key_required', 400);
   const purpose = sessionPurpose(body.purpose);

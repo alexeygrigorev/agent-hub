@@ -1628,6 +1628,12 @@ export class MachineDO {
       &&nativeReturncode(evidence.native_exit as JsonRecord)===0;
   }
 
+  private canAccessShellSession(actor: Actor | undefined, session: SessionRow, requiredScope: string): boolean {
+    if (!actor || actor.kind !== 'operator') return false;
+    if (hasScope(actor, 'operator:admin')) return true;
+    return hasScope(actor, requiredScope) && actor.resource_id === session.id;
+  }
+
   private async createCommand(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request);
     if (!actor || actor.kind === 'machine') return error('forbidden', 403);
@@ -1638,9 +1644,13 @@ export class MachineDO {
     if(Object.hasOwn(body,'capture_binding'))return error('reserved_command_field',400);
     if (!['send', 'capture', 'stop'].includes(String(kind))) return error('invalid_command_kind', 400);
     const scope = kind === 'send' ? 'session:send' : kind === 'capture' ? 'session:capture' : 'session:stop';
-    if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
+    const sessionLaunch = this.parse(session.launch_json) as JsonRecord;
+    const isShell = String(sessionLaunch.engine ?? '').toLowerCase() === 'shell';
+    if (isShell) {
+      if (!this.canAccessShellSession(actor, session, scope)) return error('forbidden', 403);
+    } else if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
       || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
-    if (kind === 'send' && (this.parse(session.launch_json) as JsonRecord).interactive !== true) return error('headless_send_refused', 409);
+    if (kind === 'send' && sessionLaunch.interactive !== true) return error('headless_send_refused', 409);
     const captureMode = kind === 'capture' ? body.mode : undefined;
     if (captureMode !== undefined && captureMode !== 'screen') return error('invalid_capture_mode', 400);
     if (kind !== 'capture' && body.mode !== undefined) return error('unexpected_capture_mode', 400);
@@ -2520,7 +2530,10 @@ export class MachineDO {
   /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
   private commandListing(request: Request, sessionId: string): Response {
     const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
-    if (!session || (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || '')))) return error('session_not_found', 404);
+    const isShell = !!session && String((this.parse(session.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
+    if (!session || (isShell
+      ? !this.canAccessShellSession(actor, session, 'session:read')
+      : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
     const query = new URL(request.url).searchParams;
     const commandId = query.get('command_id');
     if (commandId !== null && (query.getAll('command_id').length !== 1 || !/^[A-Za-z0-9-]{1,80}$/.test(commandId))) return error('invalid_command_id',400);
@@ -2645,13 +2658,19 @@ export class MachineDO {
 
   private sessionDetail(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
+    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
+    if (!row || (isShell
+      ? !this.canAccessShellSession(actor, row, 'session:read')
+      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
     return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
   }
 
   private sessionEvents(request: Request, id: string): Response {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    if (!row || (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||'')))) return error('session_not_found',404);
+    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
+    if (!row || (isShell
+      ? !this.canAccessShellSession(actor, row, 'session:read')
+      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
     const events: JsonRecord[] = [];
     const attention = this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?', row.id);
     const diagnostic = attention ? this.hostStartDiagnostic(row, attention.reason) : null;

@@ -6,6 +6,7 @@ import {listProjectIntakes} from './intake-list';
 import {buildIntakeStats} from './intake-stats';
 import {boundWorkspace,checkoutWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
+import { hostSupportsEngineMode } from './routing-pool';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
 import { actorFrom, bodyObject, boundedString, error, forbiddenScope, hasScope, HttpError, json } from './http';
@@ -810,7 +811,9 @@ export class ProjectDO {
     if (!key) return error('idempotency_key_required', 400);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
-    if (!this.canStartIntake(actor, intake)) {
+    if (!this.canStartIntake(actor, intake)
+      && !(typeof body.engine === 'string' && body.engine.toLowerCase() === 'shell' && body.interactive === true
+        && actor?.kind === 'operator' && this.canProject(actor, intake.project, 'shell:start'))) {
       if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id === intake.id) {
         return forbiddenScope('operator:admin', 'a worker session cannot start a new session on its own intake; create a child intake first or use operator:admin');
       }
@@ -914,8 +917,6 @@ export class ProjectDO {
         ||interactive||withGoal)return error('invalid_managed_credential_route',400);
     }
     if (withGoal&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('goal_unavailable', 409);
-    // Hosts advertise shell as headless-only (modes:v1:shell:h); refuse before an intake dispatch is consumed.
-    if (interactive&&typeof engineInput==='string'&&engineInput.toLowerCase()==='shell') return error('launcher_capability_unavailable_interactive', 409, 'shell supports headless only; interactive is not advertised on any host');
     const capabilities = body.required_capabilities === undefined ? [] : body.required_capabilities;
     if (!Array.isArray(capabilities) || capabilities.length > 32
       || capabilities.some(value => typeof value !== 'string' || value.length < 1 || value.length > 80)) return error('invalid_required_capabilities', 400);
@@ -954,10 +955,34 @@ export class ProjectDO {
     let route: PickedRoute;
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
-      if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+      const isAdmin = hasScope(actor, 'operator:admin');
+      if (interactive) {
+        if (!actor || actor.kind !== 'operator') return error('forbidden', 403);
+        if (!isAdmin && !hasScope(actor, 'shell:start')) return error('forbidden', 403);
+      } else if (!isAdmin) {
+        return error('forbidden', 403);
+      }
       const hostIds = new Set<string>();
-      if (typeof machineInput === 'string') hostIds.add(machineInput);
-      else {
+      if (typeof machineInput === 'string') {
+        if (!isAdmin) {
+          const check = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
+            'https://control.internal/_internal/shell-grants/check',
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id, machine_id: machineInput }) },
+          );
+          const granted = check.ok && ((await check.json()) as { granted?: boolean }).granted === true;
+          if (!granted) return error('forbidden', 403, 'explicit shell grant required for this user and host');
+        }
+        hostIds.add(machineInput);
+      } else if (!isAdmin) {
+        const granted = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
+          'https://control.internal/_internal/shell-grants/hosts',
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id }) },
+        );
+        if (!granted.ok) return error('model_picker_data_unavailable', 503);
+        const { machine_ids } = (await granted.json()) as { machine_ids?: string[] };
+        for (const id of machine_ids || []) if (typeof id === 'string') hostIds.add(id);
+        if (!hostIds.size) return error('forbidden', 403, 'explicit shell grant required for this user and host');
+      } else {
         let after = '';
         do {
           const response = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
@@ -976,16 +1001,24 @@ export class ProjectDO {
           headers: { 'x-hub2-actor': JSON.stringify(actor) },
         });
         if (!response.ok) throw new HttpError('model_picker_data_unavailable', 503);
-        const host = await response.json() as { connected?: boolean; last_seen?: number };
+        const host = await response.json() as { connected?: boolean; last_seen?: number; capabilities?: string[]; engines?: string[] };
         return { machine_id, connected: host.connected === true, last_seen: host.last_seen ?? null,
+          capabilities: Array.isArray(host.capabilities) ? host.capabilities : [],
+          engines: Array.isArray(host.engines) ? host.engines : [],
           age_ms: typeof host.last_seen === 'number' ? Math.max(0, Date.now() - host.last_seen) : null };
       }));
       const connected = hosts.filter(host => host.connected);
+      const eligible = interactive
+        ? connected.filter(host => hostSupportsEngineMode(host, 'shell', 'interactive'))
+        : connected;
+      if (interactive && connected.length && !eligible.length) {
+        return error('launcher_capability_unavailable_interactive', 409, 'shell supports headless only; interactive is not advertised on any target host');
+      }
       // A retry prefers any other connected host; the failed machine is only
       // reused when no alternative is connected at all.
       const selected = excludedMachineIds?.length
-        ? connected.find(host => !excludedMachineIds!.includes(host.machine_id)) ?? connected[0]
-        : connected[0];
+        ? eligible.find(host => !excludedMachineIds!.includes(host.machine_id)) ?? eligible[0]
+        : eligible[0];
       if (!selected) return error('no_connected_host', 503, JSON.stringify({ machines: hosts }));
       route = {
         machine_id: selected.machine_id, engine: 'shell', model: 'shell', account_id: '', policy_id: 'operator-shell',

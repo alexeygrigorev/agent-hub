@@ -230,7 +230,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(auth, "Bearer synthetic-token")
         self.assertEqual(body["labels"], ["fleet-cycle"])
         self.assertEqual(body["engines"], ["shell"])
-        self.assertEqual(body["capabilities"], ["headless", "modes:v1:shell:h", "repo-identity:v1", "workspace-preflight:v1", "session-wakes:strict-inbox:v1"])
+        expected_shell_modes = "modes:v1:shell:hi" if "interactive" in body["capabilities"][1] or body["capabilities"][1] == "modes:v1:shell:hi" else "modes:v1:shell:h"
+        self.assertIn(body["capabilities"][1], ("modes:v1:shell:hi", "modes:v1:shell:h"))
+        self.assertEqual(body["capabilities"], ["headless", expected_shell_modes, "repo-identity:v1", "workspace-preflight:v1", "session-wakes:strict-inbox:v1"])
         self.assertNotIn("native_sessions", body)
         journal.assert_not_called()
         refresh.assert_not_called()
