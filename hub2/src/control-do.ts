@@ -23,6 +23,9 @@ const STICKY_QUOTA_SCHEMA = [
  'CREATE TABLE IF NOT EXISTS named_agent_pins(agent_id TEXT PRIMARY KEY,machine TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
  'CREATE TABLE IF NOT EXISTS agent_forward_grants(agent_id TEXT NOT NULL,family_id TEXT NOT NULL,enabled INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(agent_id,family_id)) WITHOUT ROWID',
 ];
+const SHELL_GRANTS_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS shell_grants(actor_id TEXT NOT NULL,machine_id TEXT NOT NULL,enabled INTEGER NOT NULL,granted_by TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,revoked_at INTEGER,PRIMARY KEY(actor_id,machine_id)) WITHOUT ROWID',
+];
 import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from './claude-oauth';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -81,6 +84,7 @@ const SCHEMA = [
   )`,
   'CREATE INDEX repo_aliases_owner_alias ON repo_aliases(canonical_name, alias)',
   ...STICKY_QUOTA_SCHEMA,
+  ...SHELL_GRANTS_SCHEMA,
 ];
 
 const ONCALL_SCHEMA = [
@@ -139,14 +143,14 @@ export class ControlDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 8, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA],async()=>{
+    this.ready=initializeSchema(ctx, this.db, 9, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA,SHELL_GRANTS_SCHEMA],async()=>{
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
         catch{this.invalidatePickerCoverage();}
       }
       await this.scheduleWake();
-    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,8));
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,9));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
@@ -184,6 +188,9 @@ export class ControlDO {
       if (url.pathname.startsWith('/api/routes/') && request.method === 'GET') return this.lookupRoute(request);
       if (url.pathname === '/api/directory' && request.method === 'GET') return this.directory(request);
       if (url.pathname === '/api/named-agents') return await this.namedAgents(request);
+      if (url.pathname === '/api/shell-grants') return await this.shellGrants(request);
+      if (url.pathname === '/_internal/shell-grants/check' && request.method === 'POST') return await this.checkShellGrant(request);
+      if (url.pathname === '/_internal/shell-grants/hosts' && request.method === 'POST') return await this.listGrantedShellHosts(request);
       const grantMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/grants$/);
       if(grantMatch) return await this.agentGrants(request,decodeURIComponent(grantMatch[1]));
       const stickyMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/sticky$/);
@@ -1313,6 +1320,41 @@ export class ControlDO {
     const prior=this.db.one('SELECT agent_id FROM agent_grants WHERE agent_id=? AND family_id=? AND client_id=?',id,b.family_id,client);
     if(!prior&&this.db.all('SELECT family_id FROM agent_grants WHERE agent_id=? LIMIT 101',id).length>=100)return error('grant_capacity',409);
     this.db.run('INSERT INTO agent_grants(agent_id,family_id,client_id,can_send,can_read,enabled) VALUES(?,?,?,?,?,?) ON CONFLICT(agent_id,family_id,client_id) DO UPDATE SET can_send=excluded.can_send,can_read=excluded.can_read,enabled=excluded.enabled',id,b.family_id,client,Number(b.can_send),Number(b.can_read),Number(b.enabled));return json({recorded:true});
+  }
+  private async shellGrants(request:Request):Promise<Response>{
+    const actor=actorFrom(request);if(!actor||actor.kind!=='operator'||!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(this.db.schemaVersion<9)return error('schema_migration_deferred',503);
+    if(request.method==='GET'){
+      const items=this.db.all<{actor_id:string;machine_id:string;enabled:number;granted_by:string;created_at:number;updated_at:number;revoked_at:number|null}>('SELECT actor_id,machine_id,enabled,granted_by,created_at,updated_at,revoked_at FROM shell_grants ORDER BY actor_id,machine_id LIMIT 201');
+      return json({items:items.map(r=>({...r,enabled:!!r.enabled}))});
+    }
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    const b=await bodyObject(request,4096);
+    const actorId=typeof b.actor_id==='string'?b.actor_id.trim():'';
+    const machineId=typeof b.machine_id==='string'?b.machine_id.trim():'';
+    if(!boundedString(actorId,180)||!/^[A-Za-z0-9_.-]{1,80}$/.test(machineId))return error('invalid_shell_grant',400);
+    const revoke=b.revoke===true||b.enabled===false;
+    const now=Date.now();
+    if(revoke){
+      this.db.run('UPDATE shell_grants SET enabled=0,updated_at=?,revoked_at=? WHERE actor_id=? AND machine_id=?',now,now,actorId,machineId);
+      return json({granted:false,revoked:true,actor_id:actorId,machine_id:machineId});
+    }
+    this.db.run('INSERT INTO shell_grants(actor_id,machine_id,enabled,granted_by,created_at,updated_at,revoked_at) VALUES(?,?,1,?,?,?,NULL) ON CONFLICT(actor_id,machine_id) DO UPDATE SET enabled=1,granted_by=excluded.granted_by,updated_at=excluded.updated_at,revoked_at=NULL',actorId,machineId,actor.id,now,now);
+    return json({granted:true,actor_id:actorId,machine_id:machineId},201);
+  }
+  private async checkShellGrant(request:Request):Promise<Response>{
+    if(this.db.schemaVersion<9)return json({granted:false});
+    const b=await bodyObject(request,4096);
+    if(!boundedString(b.actor_id,180)||typeof b.machine_id!=='string'||!/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine_id))return json({granted:false});
+    const row=this.db.one<{enabled:number;revoked_at:number|null}>('SELECT enabled,revoked_at FROM shell_grants WHERE actor_id=? AND machine_id=?',b.actor_id,b.machine_id);
+    return json({granted:!!row&&row.enabled===1&&row.revoked_at===null});
+  }
+  private async listGrantedShellHosts(request:Request):Promise<Response>{
+    if(this.db.schemaVersion<9)return json({machine_ids:[]});
+    const b=await bodyObject(request,4096);
+    if(!boundedString(b.actor_id,180))return json({machine_ids:[]});
+    const rows=this.db.all<{machine_id:string}>('SELECT machine_id FROM shell_grants WHERE actor_id=? AND enabled=1 AND revoked_at IS NULL ORDER BY machine_id LIMIT 100',b.actor_id);
+    return json({machine_ids:rows.map(r=>r.machine_id)});
   }
   /** Sticky-session administration (intake 408b585e AC2): an operator sets the
    * machine pin and per-family forward grants for a named agent. */

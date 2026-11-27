@@ -61,7 +61,7 @@ TOMBSTONE_ENVELOPE_BYTES = 1048576
 TOMBSTONE_METADATA_BYTES = 65536
 # The only approved OpenCode subscription model; GLM never leaves the zai route.
 OPENCODE_MODEL = "opencode-go/muse-spark-1.3-contributor"
-PROVIDER_CAPABILITIES = {"shell": {"headless"}, "zai": {"headless", "interactive", "goal", "effort"},
+PROVIDER_CAPABILITIES = {"shell": {"headless", "interactive"}, "zai": {"headless", "interactive", "goal", "effort"},
                          "codex": {"headless", "interactive", "goal", "effort"},
                          "go": {"headless", "interactive"},
                          "claude": {"headless", "interactive", "goal", "effort"},
@@ -185,6 +185,26 @@ def _is_executable_file(path):
     if not candidate.is_file():
         return False
     return True if os.name == 'nt' else os.access(candidate, os.X_OK)
+
+
+def resolve_interactive_shell_command(environ=None):
+    """Return the host's native interactive shell argv, or None if unavailable."""
+    env = os.environ if environ is None else environ
+    if os.name == 'nt':
+        for name in ('powershell.exe', 'pwsh.exe'):
+            found = shutil.which(name, path=env.get('PATH'))
+            if found:
+                return [found, '-NoLogo']
+        comspec = env.get('COMSPEC', 'cmd.exe')
+        found = shutil.which(comspec, path=env.get('PATH')) or (
+            comspec if os.path.isabs(comspec) and os.path.isfile(comspec) else None
+        )
+        return [found] if found else None
+    if os.access('/bin/bash', os.X_OK):
+        return ['/bin/bash', '-l']
+    if os.access('/bin/sh', os.X_OK):
+        return ['/bin/sh']
+    return None
 
 
 def resolve_engine_binary(provider, environ=None):
@@ -1133,7 +1153,8 @@ class NativeLauncher:
         return {'output': clean.encode('utf8')[:4096].decode('utf8', errors='ignore')}
 
     def capabilities(self):
-        result = {"shell": {"headless"}}
+        shell_modes = {"headless", "interactive"} if resolve_interactive_shell_command() else {"headless"}
+        result = {"shell": shell_modes}
         for engine, route in self.config.get("routes", {}).items():
             provider = route.get("provider") if isinstance(route, dict) else None
             supported = set(PROVIDER_CAPABILITIES.get(provider, set()))
@@ -1509,6 +1530,8 @@ class NativeLauncher:
             native_engine = {"codex": "codex", "zai": "codex", "claude": "claude",
                              "go": "opencode", "antigravity": "antigravity"}[provider]
             argv += ["--engine", native_engine]
+        elif specification.get("interactive") and provider == "shell":
+            argv += ["--engine", "shell"]
         if specification.get("session_id"):
             argv += ["--label", "hub.managed=true", "--label", "hub.session=" + specification["session_id"]]
         if specification.get('attempt_label'):
@@ -1607,10 +1630,15 @@ class NativeLauncher:
         """Use the same local profile primitive as model-roulette, without shell parsing."""
         provider = route["provider"]
         if provider == 'shell':
-            # Explicit operator-only jobs execute command text without a model.
+            # Explicit operator-only jobs execute without a model.
             # The aplexer containment and accepted runtime deadline still apply.
-            if specification.get('interactive') or specification.get('with_goal') or specification.get('effort') is not None:
+            if specification.get('with_goal') or specification.get('effort') is not None:
                 raise RuntimeError('launcher_capability_unavailable')
+            if specification.get('interactive'):
+                shell_cmd = resolve_interactive_shell_command()
+                if not shell_cmd:
+                    raise RuntimeError('launcher_capability_unavailable')
+                return shell_cmd
             return ([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/s', '/c', prompt] if os.name == 'nt'
                     else ['/bin/sh', '-c', prompt])
         model = specification["model"]

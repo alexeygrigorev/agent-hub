@@ -61,13 +61,21 @@ function requiredCapabilitiesFor(input: PickInput): string[] {
 
 // Additive closed capability string: never reinterpret old interactive:<engine>
 // as absence of headless. Multiple complete declarations intersect conservatively.
-function declaredEngineModes(machine: MachineView | undefined, engine: string): string[] | null {
+export function declaredEngineModes(machine: { capabilities?: string[] } | undefined, engine: string): string[] | null {
   if (!/^[A-Za-z0-9_.-]{1,48}$/.test(engine)) return null;
   const prefix = `modes:v1:${engine}:`;
   const declarations = (machine?.capabilities || []).filter(value => value.startsWith(prefix))
     .map(value => value.slice(prefix.length)).filter(bits => ['h', 'i', 'hi'].includes(bits));
   if (!declarations.length) return null;
   return ['headless', 'interactive'].filter((mode, index) => declarations.every(bits => bits.includes(index === 0 ? 'h' : 'i')));
+}
+
+export function hostSupportsEngineMode(machine: { capabilities?: string[]; engines?: string[] } | undefined, engine: string, mode: 'headless' | 'interactive'): boolean {
+  if (!machine) return false;
+  const modes = declaredEngineModes(machine, engine);
+  if (modes !== null) return modes.includes(mode);
+  const capabilities = machine.capabilities || [];
+  return capabilities.includes(mode) || capabilities.includes(`${mode}:${engine}`);
 }
 
 export type RoutingPolicy = {version: unknown; candidates: Candidate[]};

@@ -41,8 +41,8 @@ test('quota evidence export: admin writes, any actor reads a stable below-thresh
  assert.equal((await call('/api/quota/grokbot','PUT',{remaining:0.7,source:'x',captured_at:now,valid_for_ms:0})).status,400);
  assert.equal((await call('/api/quota/grokbot','PUT',{remaining:0.7,source:'x',captured_at:now},workerSession())).status,403);
  assert.equal((await call('/api/quota/grokbot','DELETE')).status,405);
- // Persistence survives a DO restart; schema is at version 8.
- assert.equal(database.prepare('SELECT version FROM hub2_schema').get()!.version,8);
+ // Persistence survives a DO restart; schema is at version 9.
+ assert.equal(database.prepare('SELECT version FROM hub2_schema').get()!.version,9);
 });
 test('unauthenticated quota reads are refused before any evidence is revealed',async()=>{
  const {control}=fixture();

@@ -75,6 +75,7 @@ class CentralRouteBootstrapTests(unittest.TestCase):
         adapter = nl.NativeLauncher({'private_provider_homes': True})
         with mock.patch.object(nl.shutil, 'which', return_value=None), \
                 mock.patch.object(nl.provider_home, 'claude_install_available', return_value=False), \
+                mock.patch.object(nl, 'resolve_interactive_shell_command', return_value=None), \
                 mock.patch.object(nl, 'codex_launch_wrapper', side_effect=ValueError('unavailable')):
             self.assertEqual(adapter.capabilities(), {'shell': {'headless'}})
 
