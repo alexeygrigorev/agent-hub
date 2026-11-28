@@ -114,9 +114,6 @@ def cmd_start(args):
     workspace = os.path.realpath(take(args, "--workspace", "."))
     cwd = os.path.realpath(take(args, "--cwd", workspace))
     tag = take(args, "--tag", "main")
-    engine = take(args, "--engine")
-    while "--label" in args:
-        take(args, "--label")
     deadline = take(args, "--deadline-ms")
     memory, pids = take(args, "--memory"), take(args, "--pids")
     take(args, "--startup-timeout-ms")
@@ -134,7 +131,6 @@ def cmd_start(args):
     row = {key: value for key, value in FIXTURE["status_running"].items()}
     row.update({
         "id": session, "tag": tag, "workspace": workspace, "cwd": cwd, "command": child,
-        "engine": engine or row.get("engine"),
         "env": dict(item.split("=", 1) for item in envs), "env_unset": [],
         "created_at_ms": created, "updated_at_ms": created, "last_activity_ms": created,
         "deadline_ms": int(deadline) if deadline else None, "phase": "starting", "state": "starting",
@@ -160,31 +156,8 @@ def cmd_supervise(session):
     row = json.loads(path.read_text())
     env = dict(os.environ, **row["env"], APLEXER_SESSION_ID=session)
     log = open(row["history_path"], "ab", buffering=0)
-    r_fd, w_fd = os.pipe()
-    fifo_path = SESSIONS / (session + ".in")
-    row.update(stdin_path=str(fifo_path))
-    workload = subprocess.Popen(row["command"], cwd=row["cwd"], env=env, stdin=r_fd,
+    workload = subprocess.Popen(row["command"], cwd=row["cwd"], env=env, stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    os.close(r_fd)
-    import threading
-    def pump():
-        offset = 0
-        while workload.poll() is None and not (SESSIONS / (session + ".stop")).exists():
-            if fifo_path.exists():
-                data = fifo_path.read_bytes()
-                if len(data) > offset:
-                    chunk = data[offset:]
-                    offset = len(data)
-                    try:
-                        os.write(w_fd, chunk)
-                    except OSError:
-                        break
-            time.sleep(0.05)
-        try:
-            os.close(w_fd)
-        except OSError:
-            pass
-    threading.Thread(target=pump, daemon=True).start()
     row.update(phase="running", state="running", worker_pid=os.getpid(), workload_pid=workload.pid)
     write(path, row)
     code = workload.wait()
@@ -197,20 +170,6 @@ def cmd_supervise(session):
     return 0
 
 
-def cmd_send(args):
-    selector = next((a for a in args if not a.startswith("-")), None)
-    row = resolve(selector) if selector else None
-    if not row or row.get("phase") != "running":
-        return fail("no such running session")
-    text = sys.stdin.read() if "--stdin" in args else ""
-    if "--enter" in args and not text.endswith("\n"):
-        text += "\n"
-    stdin_path = Path(row.get("stdin_path") or (SESSIONS / (row["id"] + ".in")))
-    with open(stdin_path, "ab") as f:
-        f.write(text.encode("utf-8"))
-    return 0
-
-
 def cmd_kill(args):
     if not args:
         return fail("session required", 2)
@@ -219,11 +178,6 @@ def cmd_kill(args):
         return fail("no such session")
     path = SESSIONS / (row["id"] + ".json")
     if row["phase"] == "running":
-        (SESSIONS / (row["id"] + ".stop")).write_text("1")
-        try:
-            os.killpg(row["workload_pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
         try:
             os.killpg(row["workload_pid"], signal.SIGHUP)
         except ProcessLookupError:
@@ -286,8 +240,6 @@ def main(argv):
         return 0
     if command == "kill":
         return cmd_kill(args)
-    if command == "send":
-        return cmd_send(args)
     if command == "capture":
         return cmd_capture(args)
     if command in ("whoami", "current"):
