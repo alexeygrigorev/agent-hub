@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from harness import (MACHINE, MODEL, Cli, Host, Server, build_cli, configure_hub, new_key, scratch_root,
+from harness import (MACHINE, MODEL, PROJECT, Cli, Host, Server, build_cli, configure_hub, new_key, scratch_root,
                      stale_heartbeat_host_copy, wait_for)
 
 BRIEF = "E2E start-path brief: print a marker and keep running"
@@ -342,3 +342,53 @@ def test_server_restart_mid_session_host_reconnects(hub):
     stop = hub.cli.run("sessions", "stop", session_id, "--timeout", str(STOP_DEADLINE_S))
     assert stop.returncode == 0, (stop.stdout[-2000:], stop.stderr[-2000:])
     assert hub.wait_state(session_id, {"stopped", "failed"}, STOP_DEADLINE_S)["state"] == "stopped"
+
+
+def test_interactive_shell_e2e_grant_start_send_capture_retain_var_revoke_stop(hub):
+    # 1. Negative: starting interactive shell without an explicit grant for human:dev on MACHINE is denied (403).
+    no_grant = hub.cli.run("sessions", "start", "--repo", PROJECT, "--machine", MACHINE,
+                           "--engine", "shell", "--interactive", "--key", new_key())
+    assert no_grant.returncode != 0, (no_grant.stdout, no_grant.stderr)
+    assert "403" in (no_grant.stdout + no_grant.stderr) or "forbidden" in (no_grant.stdout + no_grant.stderr), (no_grant.stdout, no_grant.stderr)
+
+    # 2. Grant human:dev on MACHINE; starting on another host is still denied (403).
+    hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE})
+    wrong_host = hub.cli.run("sessions", "start", "--repo", PROJECT, "--machine", "ungranted-host",
+                             "--engine", "shell", "--interactive", "--key", new_key())
+    assert wrong_host.returncode != 0, (wrong_host.stdout, wrong_host.stderr)
+
+    # 3. Start detachable interactive shell via real `hub` CLI.
+    started = hub.cli.json("sessions", "start", "--workspace", str(hub.host.workspace), "--machine", MACHINE,
+                           "--engine", "shell", "--interactive", "--key", new_key())
+    session_id = started["id"]
+    assert started.get("state") == "running", started
+
+    # 4. Send harmless session-local command setting a shell variable, then disconnect/reconnect by session_id and read it back.
+    sent1 = hub.cli.json("sessions", "send", session_id, "--prompt", "E2E_SHELL_VAR=retained_42; echo VAR_SET_OK",
+                         "--wait", "--timeout", "30")
+    assert sent1["command_wait"]["state"] == "acked", sent1
+    sent2 = hub.cli.json("sessions", "send", session_id, "--prompt", "echo RETAINED:$E2E_SHELL_VAR",
+                         "--wait", "--timeout", "30")
+    assert sent2["command_wait"]["state"] == "acked", sent2
+    captured = hub.cli.json("sessions", "capture", session_id, "--timeout", "30")
+    out = captured["command_wait"]["ack"]["capture"]
+    assert "VAR_SET_OK" in out and "RETAINED:retained_42" in out, out
+
+    # 5. Revoke grant: running session is stopped by bounded stop-only cleanup and further CLI access is denied.
+    revoked = hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE, "revoke": True})
+    assert revoked.get("revoked") is True and revoked.get("cleanup", {}).get("stop_requested") == 1, revoked
+    denied_send = hub.cli.run("sessions", "send", session_id, "--prompt", "echo should_fail")
+    assert denied_send.returncode != 0
+    wait_for(lambda: hub.native_row(session_id) is None, STOP_DEADLINE_S, label="revoked shell native process stopped")
+
+    # 6. Normal explicit CLI stop lifecycle on a fresh granted interactive shell session.
+    hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE})
+    started2 = hub.cli.json("sessions", "start", "--workspace", str(hub.host.workspace), "--machine", MACHINE,
+                            "--engine", "shell", "--interactive", "--key", new_key())
+    session_id2 = started2["id"]
+    assert started2.get("state") == "running", started2
+    stopped2 = hub.cli.json("sessions", "stop", session_id2, "--timeout", str(STOP_DEADLINE_S))
+    assert stopped2["stop_wait"].get("state") == "stopped" or stopped2["stop_wait"].get("stop_confirmed") is True, stopped2
+    assert hub.native_row(session_id2) is None, hub.host.native_rows()
+
+

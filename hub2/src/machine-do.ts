@@ -1645,9 +1645,11 @@ export class MachineDO {
   /** Shell session ACL. Returns undefined for non-shell sessions (generic ACL
    * applies). Legacy headless shells keep their original ACL (admin, or an
    * operator holding the scope bound to the exact session ID). Interactive
-   * shells are default-deny with NO operator:admin exception: an operator
-   * with the exact session-bound scope, matching session owner (when recorded),
-   * AND an active explicit grant for that principal on the session's host,
+   * shells are default-deny with NO operator:admin bypass: an authenticated
+   * operator (holding operator:admin from standard Hub login/device approval
+   * with no foreign resource_id, or holding the exact session-bound scope)
+   * must match the recorded session owner (shell_actor_id === actor.id) AND
+   * have an active explicit grant for that principal on the session's host,
    * re-checked on every request so revocation applies to the next call (reads
    * and stop included). Admin rights only administer grants. A CONTROL failure
    * fails closed. */
@@ -1656,8 +1658,10 @@ export class MachineDO {
     if (String(launch.engine ?? '').toLowerCase() !== 'shell') return undefined;
     if (!actor || actor.kind !== 'operator') return false;
     if (launch.interactive !== true) return hasScope(actor, 'operator:admin') || (hasScope(actor, requiredScope) && actor.resource_id === session.id);
-    if (!hasScope(actor, requiredScope) || actor.resource_id !== session.id) return false;
-    if (typeof launch.shell_actor_id === 'string' && launch.shell_actor_id !== actor.id) return false;
+    const exactScope = hasScope(actor, requiredScope) && actor.resource_id === session.id;
+    const commonOperator = hasScope(actor, 'operator:admin') && (actor.resource_id === undefined || actor.resource_id === session.id);
+    if (!exactScope && !commonOperator) return false;
+    if (typeof launch.shell_actor_id !== 'string' || launch.shell_actor_id !== actor.id) return false;
     return (await this.checkShellGrantState(actor.id, session.machine_id)) === 'granted';
   }
 

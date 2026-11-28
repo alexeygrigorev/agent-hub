@@ -1276,24 +1276,38 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   const started=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'granted-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator);
   assert.equal(started.status,201);
   const sid=(await body(started)).session.id;
-  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}));
+  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alexey'}})}));
   assert.equal(reserve.status,201);
   machineSql.prepare("UPDATE sessions SET state='running',native_id='11111111-1111-4111-8111-111111111111' WHERE id=?").run(sid);
   const cmd=(p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},body:JSON.stringify({kind:'send',text:'echo hi',key:p})}));
   assert.equal((await cmd('k-proj',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,403);
   assert.equal((await cmd('k-other',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-other-admin',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['operator:admin']})).status,403);
   assert.equal((await cmd('k-agent',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
   assert.equal((await cmd('k-ok',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,201);
-  // 6. Wake endpoints also enforce operator-only, exact-session-ID binding on shell sessions.
+  // Common authenticated operator credential (ControlAuth.preparedIssue / verifyKnownCredential: scopes=['operator:admin'], resource_id=undefined) works for the owning granted principal.
+  const commonAlexey={id:'human:alexey',kind:'operator',scopes:['operator:admin'],family_id:'fam-alexey',generation:'gen-alexey',client_id:'hub-cli'};
+  assert.equal((await cmd('k-common-ok',commonAlexey)).status,201);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify(commonAlexey)}}))).status,200);
+  // Missing shell_actor_id on an interactive shell session fails closed even for a granted operator.
+  const sidNoOwner='99999999-9999-4999-8999-999999999999';
+  assert.equal((await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-no-owner',dispatch_id:'d-no-owner',session_id:sidNoOwner,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'f'.repeat(64),attempt:0,title:'shell-no-owner',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}))).status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='88888888-8888-4888-8888-888888888888' WHERE id=?").run(sidNoOwner);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sidNoOwner+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(commonAlexey)},body:JSON.stringify({kind:'send',text:'echo no-owner',key:'k-no-owner'})}))).status,403);
+  // 6. Wake endpoints also enforce operator-only, exact-session-ID / owner binding on shell sessions.
   const wake=(m:string,p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(m==='POST'?{body:JSON.stringify({key:'w-'+p,at:'now',prompt:'echo hi'})}:{})}));
   assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,404);
   assert.equal((await wake('POST','wake',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,404);
   assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
-  // Grant lookup failure fails closed (never allows) for a principal that otherwise holds the exact scope.
+  // Common authenticated operator credential (scopes=['operator:admin'], resource_id=undefined) also starts interactive shell when granted.
+  const ownCommon=await intake(f,'shell-common-op');
+  assert.equal((await f.call('/api/intakes/'+ownCommon.id+'/start','POST',{key:'common-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},commonAlexey)).status,201);
+  // Grant lookup failure fails closed (never allows) for a principal that otherwise holds the exact scope or common operator credential.
   controlDown=true;
   assert.equal((await cmd('k-ctl-down',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-ctl-down-common',commonAlexey)).status,403);
   controlDown=false;
   // Admin has no interactive shell exception: no grant -> start and session access denied.
   const adminNoGrant={id:'human:root',kind:'operator',scopes:['operator:admin','shell:start','project:org/a']};
@@ -1401,12 +1415,17 @@ test('interactive shell revocation runs bounded stop-only cleanup and queued com
   assert.equal(reserve.status,201);
   machineSql.prepare("UPDATE sessions SET state='running',native_id='22222222-2222-4222-8222-222222222222' WHERE id=?").run(sid);
 
-  // Owner binding: bob has a grant on h1 but cannot access alice's shell session even with exact resource_id.
+  // Owner binding: bob has a grant on h1 but cannot access alice's shell session even with exact resource_id or common operator:admin credential.
   const bobCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
    method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',resource_id:sid,scopes:['session:send']})},
    body:JSON.stringify({kind:'send',text:'echo stolen',key:'bob-1'}),
   }));
   assert.equal(bobCmd.status,403);
+  const bobAdminCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',scopes:['operator:admin']})},
+   body:JSON.stringify({kind:'send',text:'echo stolen-admin',key:'bob-2'}),
+  }));
+  assert.equal(bobAdminCmd.status,403);
 
   // 3. Queue send + capture commands while grant is active, then revoke via ControlDO.
   pushed.length=0;

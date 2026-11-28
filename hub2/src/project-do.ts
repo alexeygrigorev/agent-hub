@@ -956,13 +956,16 @@ export class ProjectDO {
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
       if (!actor) return error('forbidden', 403);
-      // Interactive shells are default-deny with no admin exception: the
-      // principal needs shell:start AND an explicit per-host grant. Admin only
-      // administers grants. Legacy headless shells stay admin-only, unchanged.
+      // Interactive shells are default-deny with no admin exception: an
+      // authenticated operator (holding operator:admin from standard Hub
+      // login/device approval, or shell:start) needs an explicit per-host
+      // grant in shell_grants. Admin rights administer grants (/api/shell-grants)
+      // and do not bypass the grant check. Legacy headless shells stay
+      // admin-only, unchanged.
       const isAdmin = !interactive && hasScope(actor, 'operator:admin');
       if (interactive) {
         if (actor.kind !== 'operator') return error('forbidden', 403);
-        if (!hasScope(actor, 'shell:start')) return error('forbidden', 403);
+        if (!hasScope(actor, 'operator:admin') && !hasScope(actor, 'shell:start')) return error('forbidden', 403);
       } else if (!isAdmin) {
         return error('forbidden', 403);
       }
