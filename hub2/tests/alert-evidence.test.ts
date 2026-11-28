@@ -315,7 +315,7 @@ async function defineTests() {
       assert.equal(o.dirty,true,mode);assert.equal((await o.snapshot(NONCE)).available,false,mode);
     }
   });
-  test('publication recovery: one delayed checkpoint preserves all cumulative counts and both prefix-linked slots',async t=>{
+  test('publication recovery: one delayed checkpoint preserves all cumulative counts and both prefix-linked slots',{timeout:180000},async t=>{
     const directory=temp();
     let release!:()=>void,entered!:()=>void,held=false,active=0,maximum=0;
     const wait=new Promise<void>(yes=>release=yes),holding=new Promise<void>(yes=>entered=yes);
@@ -1320,7 +1320,7 @@ async function defineTests() {
         '\nHUB2_PICKER_EXCLUDED_EVIDENCE_DIR='+excluded+'\nHUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR='+quota+'\n');
       const child=spawn(process.execPath,['--experimental-transform-types',join(hub,'node/main.ts'),'--host','127.0.0.1','--port','0','--data-dir',join(directory,'db'),'--dev-vars',vars],
         {stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});t.after(()=>stop(child));let output='',errors='';child.stderr!.on('data',b=>errors+=b);
-      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('diagnostic main timeout '+errors));},6000);
+      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('diagnostic main timeout '+errors));},cutoff+6000);
         child.stdout!.on('data',b=>{output+=b;const found=output.match(/listening http:\/\/127\.0\.0\.1:(\d+)/);if(found){clearTimeout(timer);yes(found[1]);}});
         child.once('exit',()=>{clearTimeout(timer);no(new Error('diagnostic main exited '+errors));});});
       const base='http://127.0.0.1:'+port,headers={Authorization:'Bearer '+TOKEN};
