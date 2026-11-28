@@ -272,11 +272,13 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   // An engine that failed its auth/preflight check on a machine is unhealthy
   // there (intake 62ccfa1e): route around it, but never refuse when it is all that is left.
   const unhealthyOn = (id: string, engine: string) => (machines.get(id)?.unhealthy_engines || [])
-    .some(entry => entry?.engine === engine && Number(entry.until) > snapshot.observed_at);
-  const authExpiredOn = (id: string, engine: string): boolean =>
+    .some(entry => entry?.engine === engine && Number(entry.until) > snapshot.observed_at
+      && !(managedCentral && entry?.reason === 'engine_auth_expired'));
+  const authExpiredOn = (id: string, engine: string): boolean => !managedCentral && (
     (machines.get(id)?.unhealthy_engines || []).some(entry =>
       entry?.engine === engine && entry?.reason === 'engine_auth_expired' && Number(entry.until) > snapshot.observed_at)
-    || (engine === 'claude' && (machines.get(id)?.capabilities || []).includes('auth:expired:l:claude'));
+    || (engine === 'claude' && (machines.get(id)?.capabilities || []).includes('auth:expired:l:claude'))
+  );
   const healthy = pool.map(row => ({...row, hosts: row.hosts.filter(id => !unhealthyOn(id, row.candidate.engine) && !authExpiredOn(id, row.candidate.engine))}));
   const lost = (index: number) => pool[index].hosts.length > 0 && healthy[index].hosts.length === 0;
   if (healthy.some(row => row.hosts.length > 0)) {
