@@ -10,7 +10,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-from agent_hub_host.local_auth_readiness import _default_claude_auth_state, local_claude_missing_contexts, FILE_LIMIT, MISSING, UNKNOWN
+from agent_hub_host.local_auth_readiness import (
+    _default_claude_auth_state, local_claude_missing_contexts, probe_local_claude_auth_status,
+    EXPIRED, FILE_LIMIT, MISSING, OK, UNKNOWN,
+)
 
 
 @unittest.skipUnless(sys.platform == 'linux', 'known-negative backend is deliberately Linux-only')
@@ -236,6 +239,18 @@ class OtherPlatformTests(unittest.TestCase):
         for platform in ('darwin', 'win32', 'other'):
             with patch('agent_hub_host.local_auth_readiness._read', side_effect=AssertionError('must not read')):
                 self.assertEqual(_default_claude_auth_state({}, platform=platform), UNKNOWN)
+
+    def test_probe_local_claude_auth_status_classifies_logged_in_and_expired(self):
+        with patch('agent_hub_host.local_auth_readiness.shutil.which', return_value='/usr/bin/claude'):
+            with patch('agent_hub_host.local_auth_readiness.subprocess.run') as run:
+                run.return_value = unittest.mock.Mock(returncode=1, stdout=b'{"loggedIn":false,"authMethod":"none"}')
+                self.assertEqual(probe_local_claude_auth_status({'PATH': '/usr/bin'}), EXPIRED)
+                run.return_value = unittest.mock.Mock(returncode=0, stdout=b'{"loggedIn":true,"authMethod":"claudeai"}')
+                self.assertEqual(probe_local_claude_auth_status({'PATH': '/usr/bin'}), OK)
+                run.return_value = unittest.mock.Mock(returncode=1, stdout=b'not-json')
+                self.assertEqual(probe_local_claude_auth_status({'PATH': '/usr/bin'}), UNKNOWN)
+        with patch('agent_hub_host.local_auth_readiness.shutil.which', return_value=None):
+            self.assertEqual(probe_local_claude_auth_status({'PATH': ''}), UNKNOWN)
 
 
 if __name__ == '__main__':

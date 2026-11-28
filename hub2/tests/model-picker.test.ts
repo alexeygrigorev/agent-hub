@@ -1225,3 +1225,22 @@ test('intake 62ccfa1e: an engine that failed its preflight check on a machine is
  const lapsed=await pickModelRouteDetailed(env,{interactive:false},()=>0);
  assert.equal(lapsed.diagnostics.excluded.some(row=>row.reason==='engine_unhealthy'),false,'an expired hold restores the engine');
 });
+
+test('intake d3258fcc: claude engine_auth_expired routes around claude and refuses explicit opus/sonnet starts',async()=>{
+ const policy=pool.filter(row=>['go-muse','claude-sonnet-medium','claude-opus-medium'].includes(row.id));
+ const view=(unhealthy:unknown[],caps:string[]=['headless','effort'])=>({idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({
+  machine_id:'h1',connected:true,engines:['claude','go'],capabilities:caps,unhealthy_engines:unhealthy})})});
+ const env=poolEnv({'shared-go':true,claude:true},{'shared-go':90,claude:72},['claude','go'],policy);
+ const expired={engine:'claude',reason:'engine_auth_expired',session_id:'heartbeat',failed_at:Date.now(),until:Date.now()+60_000};
+ env.MACHINES=view([expired]);
+ const picked=await pickModelRouteDetailed(env,{interactive:false,machine_id:'h1'},()=>0);
+ assert.equal(picked.route.engine,'go');
+ assert(picked.diagnostics.excluded.some(row=>row.reason==='engine_unhealthy'&&row.account_id==='claude'));
+ for(const input of [{interactive:false,engine:'claude'},{interactive:false,model:'opus'},{interactive:false,model:'sonnet'}]){
+  await assert.rejects(()=>pickModelRouteDetailed(env,input,()=>0),
+   (err:any)=>err?.code==='engine_auth_expired'&&err?.status===503);
+ }
+ env.MACHINES=view([],['headless','effort','auth:expired:l:claude']);
+ await assert.rejects(()=>pickModelRouteDetailed(env,{interactive:false,model:'opus'},()=>0),
+  (err:any)=>err?.code==='engine_auth_expired'&&err?.status===503);
+});

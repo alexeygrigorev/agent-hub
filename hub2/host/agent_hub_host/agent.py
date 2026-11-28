@@ -22,7 +22,7 @@ from .repository_identity import QUALIFIED_WORKSPACE, REPOSITORY_IDENTITY_CAPABI
 from .native_launch import (NativeLauncher, LOCAL_ROUTES, UUID_RE, canonical,
                             detect_antigravity_first_run_block, native_returncode,
                             same_workspace, spawn_environment)
-from .local_auth_readiness import local_claude_missing_contexts
+from .local_auth_readiness import EXPIRED, local_claude_missing_contexts, probe_local_claude_auth_status
 from .git_salvage import salvage_branch
 
 # Keep the live native-session census fresh for the global Hub session limit.
@@ -367,15 +367,26 @@ HOST_FAILURE_FACTS = {
 # start an engine (agent_hub_host.opencode_auth). Their reason codes only.
 ENGINE_PREFLIGHT_EVENTS = {'opencode_auth_check_unavailable': 'engine_auth_check_unavailable',
                            'opencode_auth_expired': 'engine_auth_expired'}
+_CLAUDE_AUTH_FAILURE_PATTERNS = (
+    'oauth session expired',
+    'not logged in',
+    'login expired',
+    'please run /login',
+    'run /login',
+)
 
 
 def engine_preflight_failure(output):
     """Typed engine auth/preflight refusal from a task's stdout, else None.
 
-    Only a whole line that is exactly one bootstrap event object counts; the
-    line's other fields are never forwarded."""
+    Only a whole line that is exactly one bootstrap event object counts for
+    structured events; Claude auth-expired/logged-out banners also map to
+    engine_auth_expired. The line's other fields are never forwarded."""
     for line in reversed((output or '').splitlines()[-64:]):
         line = line.strip()
+        lower = line.lower()
+        if any(pattern in lower for pattern in _CLAUDE_AUTH_FAILURE_PATTERNS):
+            return 'engine_auth_expired'
         if not line.startswith('{"event"'):
             continue
         try:
@@ -1270,6 +1281,8 @@ class Bridge:
             return None
         if reason is None:
             return None
+        if reason == 'engine_auth_expired':
+            self._claude_auth_cache = ('expired', time.monotonic())
         detail = HOST_FAILURE_DETAILS[reason]
         logging.getLogger(__name__).error(
             'ENGINE PREFLIGHT FAILED session=%s operation=%s stage=host_runtime reason=%s detail=%s',
@@ -2007,6 +2020,23 @@ class Bridge:
         except (OSError,ValueError,RuntimeError,subprocess.SubprocessError):
             return False
 
+    def _claude_auth_status_cached(self):
+        """Return cached local Claude auth status ('ok'|'expired'|'unknown') without blocking."""
+        now = time.monotonic()
+        cached = getattr(self, '_claude_auth_cache', None)
+        if cached is not None and now - cached[1] < 60.0:
+            return cached[0]
+        if not getattr(self, '_claude_auth_probing', False):
+            self._claude_auth_probing = True
+            def _refresh():
+                try:
+                    status = probe_local_claude_auth_status(spawn_environment(False))
+                    self._claude_auth_cache = (status, time.monotonic())
+                finally:
+                    self._claude_auth_probing = False
+            threading.Thread(target=_refresh, name='hub2-claude-auth-probe', daemon=True).start()
+        return cached[0] if cached is not None else 'unknown'
+
     def heartbeat(self,labels,include_native_sessions=True):
         available=self.launcher.capabilities()
         engines=sorted(engine for engine in self.engines.intersection(available) if available[engine])
@@ -2033,6 +2063,12 @@ class Bridge:
         # socket/heartbeat connection.
         capabilities = list(dict.fromkeys(resource_tags + capabilities))
         configuration = getattr(self.launcher, 'config', {})
+        claude_local_expired = (
+            not configuration.get('private_provider_homes', False)
+            and 'claude' in engines
+            and configuration.get('routes', {}).get('claude') == LOCAL_ROUTES['claude']
+            and self._claude_auth_status_cached() == EXPIRED
+        )
         if not configuration.get('private_provider_homes', False):
             # Execution-source hints only, never login/account health proof.
             # Custom routes cannot inherit a canonical account association.
@@ -2041,9 +2077,13 @@ class Bridge:
             for engine in engines:
                 if engine not in accounts or configuration.get('routes', {}).get(engine) != LOCAL_ROUTES[engine]:
                     continue
+                if engine == 'claude' and claude_local_expired:
+                    continue
                 for mode in ('headless', 'interactive'):
                     if mode in available[engine]:
                         capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
+        if claude_local_expired:
+            capabilities.append('auth:expired:l:claude')
         capabilities = capabilities[:32]
         if (len(capabilities) < 32 and 'claude' in engines and not configuration.get('private_provider_homes', False)
                 and configuration.get('routes', {}).get('claude') == LOCAL_ROUTES['claude']):

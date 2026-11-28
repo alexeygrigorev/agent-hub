@@ -25,6 +25,14 @@ class EnginePreflightOutputTest(unittest.TestCase):
         for reason in ('engine_auth_check_unavailable', 'engine_auth_expired'):
             self.assertIn(reason, agent.HOST_FAILURE_DETAILS)
 
+    def test_claude_auth_expired_banners_map_to_engine_auth_expired(self):
+        for line in (
+            'Failed to authenticate: OAuth session expired and could not be refreshed\n',
+            'Not logged in · Please run /login\n',
+            'Login expired · Please run /login\n',
+        ):
+            self.assertEqual(agent.engine_preflight_failure(line), 'engine_auth_expired', line)
+
     def test_other_output_is_not_a_preflight_failure(self):
         for output in ('', None, 'Traceback: AuthCheckUnavailable\n', '{"event": "fleet_device_auth"}\n',
                        'agent said {"event": "opencode_auth_expired"}\n', '{"event": broken\n',

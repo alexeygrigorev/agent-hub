@@ -612,6 +612,25 @@ export class MachineDO {
     // A heartbeat with no socket (daemon cannot connect, or the DO restarted)
     // starts a disconnect episode; the next socket ends it.
     if(!this.hostSocketOpen(machineId))await this.hostDisconnected(machineId,now,'heartbeat_without_socket');
+    const authExpiredClaude = capabilities.includes('auth:expired:l:claude');
+    if (authExpiredClaude) {
+      const health = await this.engineHealth(now);
+      if (health.claude?.reason !== 'engine_auth_expired') {
+        await this.markEngineUnhealthy('claude', 'engine_auth_expired', 'heartbeat', now);
+        console.error('[hub2] ENGINE_AUTH_FAILED alert=dev@dtcdev.click', JSON.stringify({
+          machine_id: machineId, engine: 'claude', reason: 'engine_auth_expired',
+        }));
+      } else {
+        health.claude.until = now + ENGINE_UNHEALTHY_MS;
+        if (typeof this.ctx.storage.put === 'function') await this.ctx.storage.put('engine_health', health);
+      }
+    } else if ((capabilities as string[]).some(cap => cap.startsWith('credentials:local:') && cap.includes(':claude:'))) {
+      const health = await this.engineHealth(now);
+      if (health.claude?.reason === 'engine_auth_expired') {
+        delete health.claude;
+        if (typeof this.ctx.storage.put === 'function') await this.ctx.storage.put('engine_health', health);
+      }
+    }
     await this.scheduleNext();
     return json({ ok: true, machine_id: machineId, last_seen: now });
   }

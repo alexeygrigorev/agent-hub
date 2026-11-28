@@ -11,12 +11,15 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 import tomllib
 import time
 
 UNKNOWN = 'unknown'
 MISSING = 'missing'
+EXPIRED = 'expired'
+OK = 'ok'
 FILE_LIMIT = 262144
 ALTERNATE_ENV = ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_FILE',
                  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
@@ -257,3 +260,33 @@ def local_claude_missing_contexts(workspaces, modes, environment=None, *, platfo
         return result
     except Exception:
         return []
+
+
+def probe_local_claude_auth_status(environment=None, *, timeout=5):
+    """Run `claude auth status` in the sanitized local env; return ok/expired/unknown.
+
+    Never logs stdout/stderr/tokens and never blocks past `timeout` seconds.
+    """
+    try:
+        env = os.environ if environment is None else environment
+        binary = shutil.which('claude', path=env.get('PATH', ''))
+        if not binary:
+            return UNKNOWN
+        proc = subprocess.run(
+            [binary, 'auth', 'status'],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        raw = (proc.stdout or b'')[:65536]
+        data = _decode_json(raw)
+        if data.get('loggedIn') is False:
+            return EXPIRED
+        if data.get('loggedIn') is True:
+            return OK
+        return UNKNOWN
+    except Exception:
+        return UNKNOWN

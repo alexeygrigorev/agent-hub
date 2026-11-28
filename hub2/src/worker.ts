@@ -1231,6 +1231,23 @@ async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Pr
   else if (response.status !== 404) return response;
   if (candidates.length > 32) return error('quota_projection_bound_exceeded', 503);
   const ids = [...new Set([...candidates.map(c => c.account_id), ...Object.keys(QUOTA_ACCOUNT_ENGINES), ...(env.HUB2_DEFAULT_ACCOUNT_ID ? [env.HUB2_DEFAULT_ACCOUNT_ID] : [])])];
+  const machineViews: Array<{ connected?: boolean; engines?: string[]; capabilities?: string[]; unhealthy_engines?: Array<{ engine?: string; reason?: string; until?: number }> }> = [];
+  try {
+    const dir = await control.fetch(new Request(CONTROL + '/api/directory?kind=machines&limit=50', {
+      headers: { 'x-hub2-actor': JSON.stringify(actor) },
+    }));
+    if (dir.ok) {
+      const page = await dir.json() as { items?: Array<{ id: string }> };
+      const fetched = await Promise.all((page.items || []).map(async m => {
+        const reply = await env.MACHINES.get(env.MACHINES.idFromName(m.id)).fetch('https://routing.internal/_internal/routing-snapshot', {
+          headers: { 'x-hub2-actor': JSON.stringify(actor) },
+        });
+        return reply.ok ? await reply.json() as typeof machineViews[number] : null;
+      }));
+      for (const view of fetched) if (view) machineViews.push(view);
+    }
+  } catch { /* Machine routing snapshots are advisory for quota auth state. */ }
+  const now = Date.now();
   const pools: JsonRecord[] = [];
   for (const id of ids) {
     if (!/^[A-Za-z0-9_.-]{1,80}$/.test(id) || ['shared-zai', 'zcodex'].includes(id))
@@ -1245,14 +1262,27 @@ async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Pr
       account: { provider: string; enabled: number; min_remaining: number } | null;
       quota: { remaining: number; captured_at: number; reset_at: number | null } | null;
       fresh: boolean;
+      credential_usable?: boolean;
+      credential_status?: string;
     };
     if (q.has('provider') && q.get('provider') !== data.account?.provider) continue;
     if (!data.account && !data.quota) continue; // well-known account label never configured
+    const centralAuthFailed = data.credential_usable === false && (data.credential_status === 'expired' || data.credential_status === 'refresh_failed');
+    const connectedHosts = machineViews.filter(m => m.connected === true && Array.isArray(m.engines) && engines.some(e => m.engines!.includes(e)));
+    const hostAuthExpired = connectedHosts.length > 0 && connectedHosts.every(m => engines.some(e =>
+      m.engines!.includes(e) && (
+        (Array.isArray(m.unhealthy_engines) && m.unhealthy_engines.some(u => u?.engine === e && u?.reason === 'engine_auth_expired' && Number(u.until) > now))
+        || (e === 'claude' && Array.isArray(m.capabilities) && m.capabilities.includes('auth:expired:l:claude'))
+      )
+    ));
+    const authFailed = centralAuthFailed || hostAuthExpired;
+    const authReason = centralAuthFailed ? 'credential_' + data.credential_status : hostAuthExpired ? 'engine_auth_expired' : undefined;
     pools.push({
       provider: data.account?.provider || 'unknown', account: id, engines,
       routing: data.account?.enabled ? 'enabled' : 'disabled',
-      state: !data.quota ? 'unknown' : !data.fresh ? 'stale' : data.quota.remaining <= (data.account?.min_remaining ?? 0) ? 'exhausted' : 'fresh',
-      remaining_percent: data.fresh ? data.quota?.remaining ?? null : null,
+      state: authFailed ? 'auth_expired' : !data.quota ? 'unknown' : !data.fresh ? 'stale' : data.quota.remaining <= (data.account?.min_remaining ?? 0) ? 'exhausted' : 'fresh',
+      remaining_percent: authFailed ? null : data.fresh ? data.quota?.remaining ?? null : null,
+      ...(authFailed ? { credential_usable: false, decision_reason: authReason } : {}),
       observed_at: data.quota ? new Date(data.quota.captured_at).toISOString() : null,
       reset_at: data.quota?.reset_at ? new Date(data.quota.reset_at).toISOString() : null,
     });

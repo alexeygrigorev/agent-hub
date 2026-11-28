@@ -98,7 +98,7 @@ function pickerFailureReason(stage: PickerStage, caught: unknown): EvidenceInval
       if (stage === 'snapshot' && caught.code === 'model_picker_data_unavailable') return 'picker_snapshot_data_unavailable';
       if (stage !== 'decision' && caught.code === 'no_connected_host')
         return stage === 'snapshot' ? 'picker_snapshot_no_host' : 'picker_pool_no_host';
-      if (stage !== 'decision' && (caught.code === 'model_policy_unavailable' || caught.code === 'model_policy_unconfigured'))
+      if (stage !== 'decision' && (caught.code === 'model_policy_unavailable' || caught.code === 'model_policy_unconfigured' || caught.code === 'engine_auth_expired'))
         return stage === 'snapshot' ? 'picker_snapshot_policy_unavailable' : 'picker_pool_policy_unavailable';
     }
   } catch { /* Diagnostics cannot change or expose an unknown exception. */ }
