@@ -1093,7 +1093,7 @@ export class ProjectDO {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
-      ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
+      ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason, ...(interactive && actor ? { shell_actor_id: actor.id } : {}) } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     let contractOmitted = false;
