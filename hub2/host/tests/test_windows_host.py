@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -237,6 +238,41 @@ class WindowsSelfUpdateTests(unittest.TestCase):
         code, report, _, log = self.run_update(InstallerProcess(b'', 0), 'c' * 40)
         self.assertEqual((code, report['updated'], report['reason']), (1, False, 'installed_version_mismatch'))
         self.assertIn('self-update exit code=1 reason=installed_version_mismatch', log)
+
+    def test_self_update_records_installer_timeout_when_the_killer_outlives_the_killed_tree(self):
+        # A real child and the real launcher. Timer.finished is set only once
+        # _terminate returns, and on Windows that is when taskkill.exe exits:
+        # after the killed tree has ended the launcher's wait. Reading the
+        # label from that flag made a hang `installer_failed` or
+        # `installer_timeout` by thread scheduling. The killer here returns
+        # only once this test says so, after the launcher has already reported.
+        version, files = release_files()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        reported, children = threading.Event(), []
+
+        def spawn(argv, **kwargs):
+            children.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs))
+            return children[-1]
+
+        def taskkill(argv, **kwargs):
+            children[0].kill()
+            reported.wait(10)
+            return subprocess.CompletedProcess(argv, 0)
+        self.addCleanup(reported.set)
+        out = io.StringIO()
+        with patch.object(windows_host, 'state_root', return_value=Path(directory.name)), \
+                patch.object(windows_host, 'host_release', return_value=('c' * 40, 1)), \
+                patch.object(windows_host, 'installed_host_version', return_value='c' * 40), \
+                patch.object(windows_host, 'INSTALL_TIMEOUT_S', 0.1), \
+                patch.object(windows_host.subprocess, 'run', taskkill):
+            code = windows_host.windows_self_update('https://hub.example/', opener=opener_for(files), spawn=spawn,
+                                                    out=out)
+        report = json.loads(out.getvalue())
+        self.assertNotEqual(code, 0)
+        self.assertEqual((report['updated'], report['reason'], report['exit_code']), (False, 'installer_timeout', code))
+        self.assertIn(f'self-update exit code={code} reason=installer_timeout',
+                      (Path(directory.name) / 'self-update.log').read_text())
 
     def test_self_update_is_a_no_op_when_current(self):
         version, files = release_files()

@@ -231,12 +231,17 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
 
     def test_why_the_detached_installer_never_runs_inside_the_task(self):
         # Same task and installer each time; one variable per run.
-        findings = {mode: self.run_task(mode) for mode in ('legacy_wait', 'no_window', 'breakaway')}
+        findings = {mode: self.run_task(mode) for mode in ('legacy_wait', 'legacy_files', 'no_window', 'breakaway')}
         self.assertTrue(all(finding['task_started'] for finding in findings.values()), 'a scheduled task never ran')
         # Not the launcher's exit: PowerShell exits 0 at once while it is still alive.
         self.assertIsNone(findings['legacy_wait']['install_log'])
         self.assertEqual(json.loads(findings['legacy_wait']['child_exit'])['outcome'][0]['exit_code'], 0)
-        # Not the discarded output either: given a console, the script runs.
+        # Not the discarded output either: kept in a file, it stays empty.
+        kept = findings['legacy_files']
+        self.assertEqual(json.loads(kept['child_exit'])['outcome'][0]['exit_code'], 0)
+        self.assertIsNone(kept['install_log'])
+        self.assertEqual(kept['installer_output'], '')
+        # Given a console instead of none, the same script runs.
         self.assertIn('Hub2 host install from https://hub.example (mode=update)', findings['no_window']['install_log'])
         # A task's job cannot be left, so waiting in the foreground is the only way.
         self.assertIn('Access is denied', findings['breakaway']['spawn_error'])

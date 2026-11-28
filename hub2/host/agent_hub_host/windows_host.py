@@ -159,7 +159,10 @@ def _relay_installer_output(process, stream, out):
             out.flush()
 
 
-def _terminate(process):
+def _terminate(process, expired):
+    # Mark the deadline before anything is killed: this wait can end as soon as
+    # the installer's tree is gone, which is before taskkill.exe returns.
+    expired.set()
     try:
         subprocess.run(['taskkill.exe', '/PID', str(process.pid), '/T', '/F'], stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
@@ -201,16 +204,20 @@ def windows_self_update(base_url, force=False, opener=urlopen, spawn=subprocess.
         process = spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', temporary],
                         env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        deadline = threading.Timer(INSTALL_TIMEOUT_S, _terminate, (process,))
+        # The label follows the timer having fired. Timer.finished would not do:
+        # it is set only after _terminate returns, and that is later than the
+        # moment the killed tree ends this wait.
+        expired = threading.Event()
+        deadline = threading.Timer(INSTALL_TIMEOUT_S, _terminate, (process, expired))
         deadline.start()
         try:
             _relay_installer_output(process, stream, out)
             code = process.wait()
         finally:
-            expired = deadline.finished.is_set()
+            timed_out = expired.is_set()
             deadline.cancel()
         installed = installed_host_version()
-        if expired:
+        if timed_out:
             code, reason = code or 1, 'installer_timeout'
         elif code != 0:
             reason = 'installer_failed'
