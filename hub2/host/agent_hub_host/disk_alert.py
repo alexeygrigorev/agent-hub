@@ -1,9 +1,10 @@
-"""Early disk alerting for Hub hosts (85% warn, 92% crit, 24h projected fill).
+"""Early disk alerting for Hub hosts (85% warn, 90% crit, 24h projected fill).
 
 Stores samples/state on tmpfs (XDG_RUNTIME_DIR or /dev/shm) so alerting still
 works when the root filesystem is 100% full, and routes alerts through
 oncall-send (which itself falls back to tmpfs on ENOSPC) with optional HTTP
-webhook fallback.
+webhook fallback. Alerts are deduped per episode (fire once on transition or
+escalation until usage recovers).
 """
 from __future__ import annotations
 
@@ -19,9 +20,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_WARN_USED_PCT = 85.0
-DEFAULT_CRIT_USED_PCT = 92.0
+DEFAULT_CRIT_USED_PCT = 90.0
 DEFAULT_FILL_CRIT_HOURS = 24.0
-DEFAULT_REPEAT_SEC = 4 * 3600
 
 
 def default_state_dir() -> Path:
@@ -200,9 +200,8 @@ def run_check(
 
     delivery: dict[str, Any] | None = None
     if report['level'] in ('WARN', 'CRIT'):
-        last_sent = float(prev.get('last_sent_ts', 0))
         escalated = prev.get('level') == 'WARN' and report['level'] == 'CRIT'
-        if report['forced'] or escalated or prev.get('level') == 'OK' or not prev or (now_s - last_sent >= DEFAULT_REPEAT_SEC):
+        if report['forced'] or escalated or prev.get('level') == 'OK' or not prev:
             delivery = dispatch_alert(report, oncall_bin=oncall_bin, http_url=http_url)
             if delivery.get('ok') and not report['forced']:
                 state_file.write_text(json.dumps({'level': report['level'], 'last_sent_ts': now_s}), encoding='utf-8')

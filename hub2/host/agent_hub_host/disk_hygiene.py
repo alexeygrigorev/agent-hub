@@ -41,14 +41,16 @@ ACTIVE_SESSION_STATES = frozenset({
     'pending_admission', 'claimed', 'admitted', 'aborting', 'deadline_stopping',
 })
 
-PROTECTED_FILE_SUFFIXES = ('.db', '.sqlite', '.sqlite3', '-wal', '-shm')
-PROTECTED_DIR_NAMES = frozenset({'.git', '.codex', '.claude', '.gemini', '.zcodex', '.opencode'})
+PROTECTED_FILE_SUFFIXES = ('.db', '.sqlite', '.sqlite3', '-wal', '-shm', '.pem', '.key', '.p12', '.pfx', '.mp4', '.mkv', '.webm', '.wav')
+PROTECTED_DIR_NAMES = frozenset({'.git', '.codex', '.claude', '.gemini', '.zcodex', '.opencode', 'recordings'})
 
 
 def default_denylist(home: Path) -> tuple[Path, ...]:
     return (
         home / 'tmp' / 'agent-reports',
         home / 'git' / 'relay',
+        home / 'git' / 'academy',
+        home / 'recordings',
         home / '.config' / 'agent-hub' / 'providers',
         home / '.config' / 'agent-hub' / 'v2-journal.sqlite',
     )
@@ -243,6 +245,222 @@ def _session_finished_idle_ok(
     return True, f'finished_idle_{idle_hours:.1f}h'
 
 
+def measure_mount_used_pct(mount: Path) -> float:
+    if hasattr(os, 'statvfs'):
+        st = os.statvfs(mount)
+        frsize = st.f_frsize or st.f_bsize
+        used = (st.f_blocks - st.f_bfree) * frsize
+        avail = st.f_bavail * frsize
+        denom = used + avail
+        return (used * 100.0 / denom) if denom > 0 else 0.0
+    usage = shutil.disk_usage(mount)
+    return (usage.used * 100.0 / usage.total) if usage.total > 0 else 0.0
+
+
+def _dir_newest_mtime(path: Path, *, max_entries: int = 5000) -> float:
+    try:
+        latest = path.lstat().st_mtime
+    except OSError:
+        return time.time()
+    seen = 0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    seen += 1
+                    if seen > max_entries:
+                        return latest
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if st.st_mtime > latest:
+                            latest = st.st_mtime
+                        if entry.is_dir(follow_symlinks=False) and not entry.is_symlink():
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return latest
+
+
+def discover_project_dirs(home: Path) -> list[Path]:
+    found: dict[Path, Path] = {}
+    for base in (home / 'work', home / 'git'):
+        if not base.is_dir():
+            continue
+        try:
+            for entry in base.iterdir():
+                if entry.is_dir() and not entry.is_symlink():
+                    found[entry.resolve(strict=False)] = entry
+        except OSError:
+            continue
+    return sorted(found.values())
+
+
+def is_worktree_safe_to_prune(wt: Path) -> tuple[bool, str]:
+    """Return (True, reason) only for clean, linked git worktrees with no unpushed/unmerged work."""
+    try:
+        inside = subprocess.run(
+            ['git', '-C', str(wt), 'rev-parse', '--is-inside-work-tree'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if inside.returncode != 0 or inside.stdout.strip() != 'true':
+            return False, 'not_git_worktree'
+        git_dir = subprocess.run(
+            ['git', '-C', str(wt), 'rev-parse', '--path-format=absolute', '--git-dir'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        common_dir = subprocess.run(
+            ['git', '-C', str(wt), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if git_dir.returncode != 0 or common_dir.returncode != 0:
+            return False, 'git_dir_unknown'
+        if Path(git_dir.stdout.strip()).resolve(strict=False) == Path(common_dir.stdout.strip()).resolve(strict=False):
+            return False, 'main_checkout_not_linked_worktree'
+
+        status = subprocess.run(
+            ['git', '-C', str(wt), 'status', '--porcelain'],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            return False, 'dirty_worktree'
+
+        # Check if HEAD is merged into origin/main or origin/master
+        merged = False
+        for ref in ('refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master'):
+            chk = subprocess.run(
+                ['git', '-C', str(wt), 'merge-base', '--is-ancestor', 'HEAD', ref],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if chk.returncode == 0:
+                merged = True
+                break
+        if not merged:
+            # Also check if upstream exists and has 0 unpushed commits
+            up = subprocess.run(
+                ['git', '-C', str(wt), 'rev-list', '--count', '@{u}..HEAD'],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if up.returncode != 0 or (up.stdout.strip().isdigit() and int(up.stdout.strip()) > 0):
+                return False, 'unpushed_or_unmerged_work'
+            return False, 'not_merged_to_default_branch'
+
+        return True, 'merged_clean_worktree'
+    except (OSError, subprocess.SubprocessError):
+        return False, 'git_check_failed'
+
+
+def _prune_worktree(wt: Path) -> bool:
+    try:
+        common_res = subprocess.run(
+            ['git', '-C', str(wt), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        common_parent = Path(common_res.stdout.strip()).parent if common_res.returncode == 0 else None
+        if common_parent and common_parent.is_dir():
+            rm = subprocess.run(
+                ['git', '-C', str(common_parent), 'worktree', 'remove', '--force', str(wt)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if rm.returncode == 0 and not wt.exists():
+                return True
+        if _safe_remove_dir(wt):
+            if common_parent and common_parent.is_dir():
+                subprocess.run(
+                    ['git', '-C', str(common_parent), 'worktree', 'prune'],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+            return True
+        return False
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _parse_docker_size(raw: str) -> int:
+    import re
+    m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)', raw, re.I)
+    if not m:
+        return 0
+    unit = m.group(2).upper()
+    base = 1024 if unit.endswith('IB') else 1000
+    power = {'B': 0, 'KB': 1, 'KIB': 1, 'MB': 2, 'MIB': 2, 'GB': 3, 'GIB': 3, 'TB': 4, 'TIB': 4}[unit]
+    return int(float(m.group(1)) * (base ** power))
+
+
+def plan_and_clean_docker(*, apply: bool, min_age_hours: float = 24.0) -> list[dict[str, Any]]:
+    if not shutil.which('docker'):
+        return []
+    try:
+        info = subprocess.run(['docker', 'info'], capture_output=True, text=True, timeout=10, check=False)
+        if info.returncode != 0:
+            return []
+        df = subprocess.run(
+            ['docker', 'system', 'df', '--format', '{{.Type}}|{{.Reclaimable}}'],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if df.returncode != 0:
+            return []
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    reclaimable_images = 0
+    reclaimable_build = 0
+    for line in df.stdout.splitlines():
+        parts = line.split('|', 1)
+        if len(parts) != 2:
+            continue
+        kind, val = parts[0].strip(), parts[1].strip()
+        if kind == 'Images':
+            reclaimable_images = _parse_docker_size(val)
+        elif kind == 'Build Cache':
+            reclaimable_build = _parse_docker_size(val)
+
+    results: list[dict[str, Any]] = []
+    until = f'{int(max(1, min_age_hours))}h'
+    if reclaimable_images > 0:
+        status = 'WOULD_REMOVE'
+        if apply:
+            pr = subprocess.run(
+                ['docker', 'image', 'prune', '-a', '-f', '--filter', f'until={until}'],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            status = 'REMOVED' if pr.returncode == 0 else 'REMOVE_FAILED'
+        results.append({
+            'path': 'docker:unused-images',
+            'category': 'docker_images',
+            'bytes': reclaimable_images,
+            'status': status,
+            'reason': f'unused_docker_images_until_{until}',
+        })
+    if reclaimable_build > 0:
+        status = 'WOULD_REMOVE'
+        if apply:
+            pr = subprocess.run(
+                ['docker', 'builder', 'prune', '-f', '--filter', f'until={until}'],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            status = 'REMOVED' if pr.returncode == 0 else 'REMOVE_FAILED'
+        results.append({
+            'path': 'docker:build-cache',
+            'category': 'docker_images',
+            'bytes': reclaimable_build,
+            'status': status,
+            'reason': f'docker_build_cache_until_{until}',
+        })
+    return results
+
+
+def _dir_newest_mtime_idle_ok(path: Path, *, now_s: float, min_idle_hours: float) -> tuple[bool, str]:
+    latest = _dir_newest_mtime(path)
+    idle_hours = (now_s - latest) / 3600.0
+    if idle_hours <= min_idle_hours:
+        return False, f'mtime_idle_{idle_hours:.1f}h_le_{min_idle_hours:.0f}h'
+    return True, f'mtime_idle_{idle_hours:.1f}h'
+
+
 def discover_worktrees(home: Path, extra_roots: Iterable[Path] = ()) -> list[Path]:
     patterns = [
         str(home / 'git' / '*-wt-*'),
@@ -388,6 +606,8 @@ def run_hygiene(
     sessions_json: Path | None = None,
     extra_worktrees: Iterable[Path] = (),
     min_idle_hours: float = 24.0,
+    min_used_pct: float | None = None,
+    include_docker: bool = True,
     now_s: float | None = None,
     denylist: Iterable[Path] | None = None,
     managed_root: Path | None = None,
@@ -408,13 +628,7 @@ def run_hygiene(
     managed_root = managed_root or (home / '.config' / 'agent-hub' / 'managed-engines')
 
     df_before = shutil.disk_usage(mount_path)
-    sessions = load_hub_sessions(sessions_json)
-    worktrees = discover_worktrees(home, extra_worktrees)
-
-    engine_candidates = plan_managed_engines_retention(managed_root, sessions, deny)
-    scan_targets = list(worktrees) + [p for p, _, _ in engine_candidates]
-    opened, scan_ok = scan_open_paths(scan_targets)
-
+    used_pct = measure_mount_used_pct(mount_path)
     categories: dict[str, int] = {
         'venv': 0,
         'node_modules': 0,
@@ -422,13 +636,27 @@ def run_hygiene(
         'build_dist': 0,
         'python_cache': 0,
         'managed_engines': 0,
+        'docker_images': 0,
+        'stale_worktrees': 0,
     }
     actions: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    if sessions is None:
-        skipped.append({'path': 'ALL_WORKTREES', 'reason': 'hub_sessions_unavailable'})
-    elif not scan_ok:
+    artifacts_allowed = min_used_pct is None or used_pct >= min_used_pct
+    if not artifacts_allowed:
+        skipped.append({'path': str(mount_path), 'reason': f'used_{used_pct:.1f}_lt_{min_used_pct:.0f}'})
+
+    sessions = load_hub_sessions(sessions_json)
+    worktrees = discover_worktrees(home, extra_worktrees)
+    wt_resolved_set = {w.resolve(strict=False) for w in worktrees}
+    project_dirs = [p for p in discover_project_dirs(home) if p.resolve(strict=False) not in wt_resolved_set] if artifacts_allowed else []
+
+    engine_candidates = plan_managed_engines_retention(managed_root, sessions, deny) if artifacts_allowed else []
+    scan_targets = list(worktrees) + list(project_dirs) + [p for p, _, _ in engine_candidates]
+    opened, scan_ok = scan_open_paths(scan_targets)
+    opened_resolved = {o.resolve(strict=False) for o in opened}
+
+    if not scan_ok:
         skipped.append({'path': 'ALL', 'reason': 'proc_open_scan_incomplete'})
     else:
         for wt in worktrees:
@@ -436,13 +664,52 @@ def run_hygiene(
             if is_denylisted(wt, deny):
                 skipped.append({'path': str(wt), 'reason': 'denylisted'})
                 continue
-            if wt in opened or any(o.resolve(strict=False) == wt_resolved for o in opened):
+            if wt in opened or wt_resolved in opened_resolved:
                 skipped.append({'path': str(wt), 'reason': 'live_process_open'})
                 continue
-            ok, reason = _session_finished_idle_ok(wt, sessions, now_s=now_s, min_idle_hours=min_idle_hours)
+
+            # AC3: Prune closed/merged Hub worktrees with no unpushed work and no active session
+            has_active = False
+            if sessions is not None:
+                for s in sessions:
+                    ws = _session_workspace(s)
+                    if not ws:
+                        continue
+                    ws_res = Path(ws).resolve(strict=False)
+                    if ws_res == wt_resolved or _is_under(ws_res, wt_resolved) or _is_under(wt_resolved, ws_res):
+                        if _session_state(s) in ACTIVE_SESSION_STATES:
+                            has_active = True
+                            break
+            if not has_active:
+                prune_ok, prune_reason = is_worktree_safe_to_prune(wt)
+                if prune_ok:
+                    size = dir_size_bytes(wt)
+                    status = 'WOULD_REMOVE'
+                    if apply:
+                        status = 'REMOVED' if _prune_worktree(wt) else 'REMOVE_FAILED'
+                    if status in ('WOULD_REMOVE', 'REMOVED'):
+                        categories['stale_worktrees'] += size
+                    actions.append({
+                        'path': str(wt),
+                        'worktree': str(wt),
+                        'category': 'stale_worktrees',
+                        'bytes': size,
+                        'status': status,
+                        'reason': prune_reason,
+                    })
+                    continue
+
+            if not artifacts_allowed:
+                continue
+
+            if sessions is not None:
+                ok, reason = _session_finished_idle_ok(wt, sessions, now_s=now_s, min_idle_hours=min_idle_hours)
+            else:
+                ok, reason = _dir_newest_mtime_idle_ok(wt, now_s=now_s, min_idle_hours=min_idle_hours)
             if not ok:
                 skipped.append({'path': str(wt), 'reason': reason})
                 continue
+
             for art_path, cat in find_rebuildable_artifacts(wt, deny):
                 size = dir_size_bytes(art_path)
                 status = 'WOULD_REMOVE'
@@ -459,8 +726,36 @@ def run_hygiene(
                     'reason': reason,
                 })
 
+        for proj in project_dirs:
+            proj_resolved = proj.resolve(strict=False)
+            if is_denylisted(proj, deny):
+                skipped.append({'path': str(proj), 'reason': 'denylisted'})
+                continue
+            if proj in opened or proj_resolved in opened_resolved:
+                skipped.append({'path': str(proj), 'reason': 'live_process_open'})
+                continue
+            for art_path, cat in find_rebuildable_artifacts(proj, deny):
+                art_ok, art_reason = _dir_newest_mtime_idle_ok(art_path, now_s=now_s, min_idle_hours=min_idle_hours)
+                if not art_ok:
+                    skipped.append({'path': str(art_path), 'reason': art_reason})
+                    continue
+                size = dir_size_bytes(art_path)
+                status = 'WOULD_REMOVE'
+                if apply:
+                    status = 'REMOVED' if _safe_remove_dir(art_path) else 'REMOVE_FAILED'
+                if status in ('WOULD_REMOVE', 'REMOVED'):
+                    categories[cat] = categories.get(cat, 0) + size
+                actions.append({
+                    'path': str(art_path),
+                    'worktree': str(proj),
+                    'category': cat,
+                    'bytes': size,
+                    'status': status,
+                    'reason': art_reason,
+                })
+
         for eng_path, cat, reason in engine_candidates:
-            if eng_path in opened:
+            if eng_path in opened or eng_path.resolve(strict=False) in opened_resolved:
                 skipped.append({'path': str(eng_path), 'reason': 'live_process_open'})
                 continue
             size = dir_size_bytes(eng_path)
@@ -478,6 +773,12 @@ def run_hygiene(
                 'status': status,
                 'reason': reason,
             })
+
+        if include_docker and artifacts_allowed:
+            for d_act in plan_and_clean_docker(apply=apply, min_age_hours=min_idle_hours):
+                if d_act['status'] in ('WOULD_REMOVE', 'REMOVED'):
+                    categories['docker_images'] += d_act['bytes']
+                actions.append(d_act)
 
     total_bytes = sum(categories.values())
     df_after = shutil.disk_usage(mount_path)
@@ -533,12 +834,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--dry-run', action='store_true', help='Report only (default)')
     parser.add_argument('--sessions-json', type=Path, default=None, help='Path to hub sessions JSON snapshot')
     parser.add_argument('--min-idle-hours', type=float, default=24.0)
+    parser.add_argument('--min-used-pct', type=float, default=None, help='Only run cleanup when root usage >= pct')
+    parser.add_argument('--no-docker', action='store_true', help='Skip docker image/build-cache pruning')
     parser.add_argument('--json', action='store_true', help='Print JSON result')
     args = parser.parse_args(argv)
     result = run_hygiene(
         apply=bool(args.apply and not args.dry_run),
         sessions_json=args.sessions_json,
         min_idle_hours=args.min_idle_hours,
+        min_used_pct=args.min_used_pct,
+        include_docker=not args.no_docker,
     )
     if args.json:
         print(json.dumps(result, indent=2))

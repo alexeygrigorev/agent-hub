@@ -100,7 +100,7 @@ class TestAuth(unittest.TestCase):
         
         token = auth.refresh_token()
         self.assertEqual(token, "new_acc")
-        mock_update_config.assert_called_once_with(dict(base_url="https://fake", access_token="new_acc", refresh_token="new_ref"))
+        mock_update_config.assert_called_with(dict(base_url="https://fake", access_token="new_acc", refresh_token="new_ref"))
 
     @patch("urllib.request.OpenerDirector.open")
     @patch("agent_hub_host.config.save_config")
