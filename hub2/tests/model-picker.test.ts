@@ -1243,4 +1243,6 @@ test('intake d3258fcc: claude engine_auth_expired routes around claude and refus
  env.MACHINES=view([],['headless','effort','auth:expired:l:claude']);
  await assert.rejects(()=>pickModelRouteDetailed(env,{interactive:false,model:'opus'},()=>0),
   (err:any)=>err?.code==='engine_auth_expired'&&err?.status===503);
+ const managed=await pickModelRouteDetailed(env,{interactive:false,engine:'claude',model:'opus',effort:'medium',managed_credential_label:'hub-claude'},()=>0);
+ assert.equal(managed.route.policy_id,'claude-opus-medium');
 });

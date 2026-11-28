@@ -1281,7 +1281,7 @@ class Bridge:
             return None
         if reason is None:
             return None
-        if reason == 'engine_auth_expired':
+        if reason == 'engine_auth_expired' and isinstance(row, dict) and row.get('engine') == 'claude':
             self._claude_auth_cache = ('expired', time.monotonic())
         detail = HOST_FAILURE_DETAILS[reason]
         logging.getLogger(__name__).error(
@@ -2069,6 +2069,8 @@ class Bridge:
             and configuration.get('routes', {}).get('claude') == LOCAL_ROUTES['claude']
             and self._claude_auth_status_cached() == EXPIRED
         )
+        if claude_local_expired:
+            capabilities.append('auth:expired:l:claude')
         if not configuration.get('private_provider_homes', False):
             # Execution-source hints only, never login/account health proof.
             # Custom routes cannot inherit a canonical account association.
@@ -2082,8 +2084,6 @@ class Bridge:
                 for mode in ('headless', 'interactive'):
                     if mode in available[engine]:
                         capabilities.append('credentials:local:' + mode + ':' + engine + ':' + accounts[engine])
-        if claude_local_expired:
-            capabilities.append('auth:expired:l:claude')
         capabilities = capabilities[:32]
         if (len(capabilities) < 32 and 'claude' in engines and not configuration.get('private_provider_homes', False)
                 and configuration.get('routes', {}).get('claude') == LOCAL_ROUTES['claude']):
