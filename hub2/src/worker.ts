@@ -268,30 +268,34 @@ const router = {
           const response = await control.fetch(await forwardRequest(new Request(request.url, {headers:request.headers}), CONTROL+'/api/routes/intake/'+encodeURIComponent(actor.resource_id), actor));
           if (!response.ok) return response;
           const {route} = await response.json() as {route:{owner:string}};
-          if (requested && requested !== route.owner)
-            return json({ error: 'project_forbidden', missing_scope: `project:${requested}`, detail: `session is scoped to project ${route.owner}; missing scope project:${requested} or operator:admin` }, 403);
-          url.searchParams.set('project',route.owner);
-          const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
-          const relation = await relationForward(request, env, control, actor, internalPath);
-          if (relation instanceof Response) return relation;
-          const forwarded = await env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
-          // Not the worker's own or parent intake: a GET of an intake its own intake text cites as
-          // evidence is read-only granted; otherwise report Control's named refusal, not the project miss.
-          if (routeDenied && intakeId && (forwarded.status === 404 || forwarded.status === 403)) {
-            const sub = internalPath.match(/^\/api\/intakes\/[^/]+(?:\/(history))?$/);
-            if (request.method === 'GET' && sub) {
-              const grant = await evidenceGrant(env, control, actor, 'intake', decodeURIComponent(intakeId), routeDenied);
-              if (grant instanceof Response) return grant;
-              const evidencePath = '/api/intakes/' + encodeURIComponent(grant.route.id) + (sub[1] ? '/' + sub[1] : '');
-              // Keep the read's own paging (history after/limit); the project is always the worker's own.
-              const query = new URLSearchParams();
-              for (const key of ['after', 'limit']) { const v = url.searchParams.get(key); if (v !== null) query.set(key, v); }
-              query.set('project', route.owner);
-              return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,
-                'https://project.internal' + evidencePath + '?' + query.toString(), grant.actor));
+          const crossProjectOrchestrator = !!requested && requested !== route.owner
+            && hasScope(actor, 'session:list') && hasScope(actor, 'repos:write');
+          if (!crossProjectOrchestrator) {
+            if (requested && requested !== route.owner)
+              return json({ error: 'project_forbidden', missing_scope: `project:${requested}`, detail: `session is scoped to project ${route.owner}; missing scope project:${requested} or operator:admin` }, 403);
+            url.searchParams.set('project',route.owner);
+            const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
+            const relation = await relationForward(request, env, control, actor, internalPath);
+            if (relation instanceof Response) return relation;
+            const forwarded = await env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
+            // Not the worker's own or parent intake: a GET of an intake its own intake text cites as
+            // evidence is read-only granted; otherwise report Control's named refusal, not the project miss.
+            if (routeDenied && intakeId && (forwarded.status === 404 || forwarded.status === 403)) {
+              const sub = internalPath.match(/^\/api\/intakes\/[^/]+(?:\/(history))?$/);
+              if (request.method === 'GET' && sub) {
+                const grant = await evidenceGrant(env, control, actor, 'intake', decodeURIComponent(intakeId), routeDenied);
+                if (grant instanceof Response) return grant;
+                const evidencePath = '/api/intakes/' + encodeURIComponent(grant.route.id) + (sub[1] ? '/' + sub[1] : '');
+                // Keep the read's own paging (history after/limit); the project is always the worker's own.
+                const query = new URLSearchParams();
+                for (const key of ['after', 'limit']) { const v = url.searchParams.get(key); if (v !== null) query.set(key, v); }
+                query.set('project', route.owner);
+                return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,
+                  'https://project.internal' + evidencePath + '?' + query.toString(), grant.actor));
+              }
             }
+            return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
           }
-          return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
         }
         if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
           return control.fetch(await forwardRequest(request, CONTROL + '/api/intakes' + url.search, actor));
@@ -796,12 +800,22 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   if (taskRef !== undefined) {
     const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(taskRef)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
     if (!routed.ok) {
-      const code = ((await routed.json().catch(() => ({}))) as JsonRecord).error;
-      return error(typeof code === 'string' ? code : 'intake_not_found', routed.status === 403 ? 403 : routed.status === 400 ? 400 : 404, 'intake_task_id did not resolve to a Hub2 intake');
+      const boundOrchestrator = actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id && hasScope(actor, 'session:list');
+      if (boundOrchestrator && (routed.status === 403 || routed.status === 404)) {
+        const own = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(actor.resource_id!)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+        if (!own.ok) return own;
+        const { route: ownRoute } = (await own.json()) as { route: { id: string; owner: string } };
+        existingIntake = taskRef;
+        project = ownRoute.owner;
+      } else {
+        const code = ((await routed.json().catch(() => ({}))) as JsonRecord).error;
+        return error(typeof code === 'string' ? code : 'intake_not_found', routed.status === 403 ? 403 : routed.status === 400 ? 400 : 404, 'intake_task_id did not resolve to a Hub2 intake');
+      }
+    } else {
+      const { route } = (await routed.json()) as { route: { id: string; owner: string } };
+      existingIntake = route.id;
+      project = route.owner;
     }
-    const { route } = (await routed.json()) as { route: { id: string; owner: string } };
-    existingIntake = route.id;
-    project = route.owner;
   }
   const labelIsPath = !label || label.startsWith('/') || /^[A-Za-z]:\\/.test(label);
   if (!project && label && !labelIsPath) {
@@ -820,7 +834,8 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     project = items[0].canonical_name;
   }
   if (actor.kind === 'agent' && actor.id.startsWith('session:') && !admin(actor)
-    && !hasScope(actor, `project:${project}`) && !hasScope(actor, `worker_project:${project}`)) {
+    && !hasScope(actor, `project:${project}`) && !hasScope(actor, `worker_project:${project}`)
+    && !(hasScope(actor, 'session:list') && hasScope(actor, 'repos:write'))) {
     return forbiddenScope(`project:${project}`, `session is scoped to its own project; grant project:${project} or operator:admin`);
   }
   const repoResponse = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
@@ -904,7 +919,7 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
       ...(discarded ? { intake_archived: true } : {}) }, started.response.ok ? 502 : started.response.status);
   }
   // 201 = offered to the host; 202 = accepted and dispatching.
-  return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
+  return json({ ...session, project: canonical, intake_id: typeof session.intake_id === 'string' ? session.intake_id : intakeId }, started.response.status);
 }
 
 class ObserverDeadline extends Error {}
@@ -1094,7 +1109,7 @@ async function machineProjection(
   actor: Actor,
   sessions: boolean,
 ): Promise<Response> {
-  if (!admin(actor)) return error('forbidden', 403);
+  if (!admin(actor) && !(sessions && hasScope(actor, 'session:list'))) return error('forbidden', 403);
   const q = new URL(request.url).searchParams,
     limit = Number(q.get('limit') || 25);
   if (!Number.isInteger(limit) || limit < 1 || limit > (sessions ? 100 : 50)) return error('invalid_page', 400);
@@ -1215,7 +1230,7 @@ const QUOTA_ACCOUNT_ENGINES: Record<string, string[]> = {
 
 /** Bounded, usage-only view of the accounts referenced by the routing policy. */
 async function quotaProjection(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor)) return error('forbidden', 403);
+  if (!admin(actor) && !hasScope(actor, 'quota:read')) return error('forbidden', 403);
   const q = new URL(request.url).searchParams;
   if (q.get('view') && q.get('view') !== 'fleet') return error('invalid_view', 400);
   // Account evidence is fleet-wide, with no host attribution in Hub2. Do not

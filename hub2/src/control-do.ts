@@ -1205,7 +1205,7 @@ export class ControlDO {
 
   private async editRepo(request: Request, name: string): Promise<Response> {
     const actor = actorFrom(request);
-    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (!hasScope(actor, 'operator:admin') && !hasScope(actor, 'repos:write')) return error('forbidden', 403);
     if (!/^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(name)) return error('invalid_repo_name', 400);
     const body = await bodyObject(request, 8192);
     const existing = this.db.one<Record<string, unknown>>(
@@ -1568,7 +1568,7 @@ export class ControlDO {
     const match=new URL(request.url).pathname.match(/^\/api\/routes\/(intake|session|message|schedule)\/([^/]+)$/);if(!match)return error('not_found',404);
     const kind=match[1],value=decodeURIComponent(match[2]);if(!boundedString(value,180))return error('invalid_route_id',400);
     type Route={id:string;owner:string;resource_id:string;bound_intake_id:string|null};
-    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||(actor.kind!=='agent'&&hasScope(actor,'routing:read'));
+    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||(actor.kind!=='agent'&&hasScope(actor,'routing:read'))||(kind==='session'&&hasScope(actor,'session:read')&&actor.client_id!=='evidence-read');
     const bound=(r:Route)=>kind!=='message'&&hasScope(actor,'intake:read')&&((kind==='intake'&&actor.resource_id===r.id)||(kind==='session'&&!!r.bound_intake_id&&actor.resource_id===r.bound_intake_id)||hasScope(actor,'project:'+r.resource_id));
     const exact=this.db.one<Route>('SELECT '+columns+' FROM object_routes WHERE kind=? AND id=?',kind,value);
     const denied=(id:string)=>forbiddenScope(kind==='message'?'message:read':kind==='schedule'?'schedule:read':'intake:read',`${kind} ${id} exists but is not visible to ${actor.id}; grant intake:read with project:<owner>, a route ACL, the bound or child-intake worker session, or operator:admin`);
