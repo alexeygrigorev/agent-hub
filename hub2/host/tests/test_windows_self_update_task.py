@@ -83,11 +83,11 @@ Set-StrictMode -Version 2
 function Write-Step([string]$Message) {
   $line = (Get-Date).ToString('o') + ' ' + $Message
   Write-Host $line
-  Add-Content -LiteralPath '{log}' -Value $line
+  Add-Content -LiteralPath '@LOG@' -Value $line
 }
 Write-Step 'Hub2 host install from https://hub.example (mode=update)'
-Start-Sleep -Seconds {seconds}
-{tail}
+Start-Sleep -Seconds @SECONDS@
+@TAIL@
 """
 
 
@@ -121,7 +121,7 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         self.state.mkdir()
         self.files.mkdir()
         (self.state / 'tmp').mkdir()
-        self.publish(INSTALLER.format(log=self.state / 'install.log', seconds=2, tail=''))
+        self.publish(INSTALLER)
         self.task = 'AgentHub2HostUpdateTest-' + uuid.uuid4().hex[:10]
         self.addCleanup(lambda: powershell(
             f"Unregister-ScheduledTask -TaskName '{self.task}' -Confirm:$false -ErrorAction SilentlyContinue", False))
@@ -129,7 +129,7 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
 
     def publish(self, installer):
         """Serve the installer locally with the manifest that makes it the verified release."""
-        data = installer.encode('utf-8')
+        data = installer.replace('@LOG@', str(self.state / 'install.log')).encode('utf-8')
         manifest = {'host_version': PUBLISHED, 'artifacts': {
             'host-install.ps1': {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}}}
         (self.files / 'host-release.json').write_text(json.dumps(manifest), encoding='utf-8')
@@ -186,8 +186,8 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         self.assertIn('self-update exit code=0 reason=installed', log)
 
     def test_foreground_handoff_fails_the_task_with_the_installers_exit_code(self):
-        self.publish(INSTALLER.format(log=self.state / 'install.log', seconds=0,
-                                      tail="Write-Step 'install failed: pip install failed; see install.log'\nexit 3"))
+        self.publish(INSTALLER.replace('@SECONDS@', '0').replace(
+            '@TAIL@', "Write-Step 'install failed: pip install failed; see install.log'\nexit 3"))
         evidence = self.run_task('foreground')
         self.assertTrue(evidence['task_started'], 'the scheduled task never ran')
         self.assertEqual(evidence['last_task_result'], 3)
