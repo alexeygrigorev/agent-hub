@@ -18,12 +18,19 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from .native_inventory import MAX_CENSUS_AGE_SECONDS
+
+DEFAULT_DISK_FLOOR_GB = 15.0
+HYGIENE_TRIGGER_COOLDOWN_SECONDS = 600.0
+_HYGIENE_LOCK = threading.Lock()
+_LAST_HYGIENE_TRIGGER_MONO = 0.0
 
 # Fixed user policy floor for native dispatch, deliberately not the weaker
 # configurable resource-management default and not operator-tunable here.
@@ -702,7 +709,61 @@ def _current_charges(db, residents, exclude_operation, now_ms, attempt_label=Non
     return total
 
 
-def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=None, now_ms=None):
+def disk_floor_gb(launcher_config):
+    """Configured root/workspace disk floor in GiB (None when unconfigured)."""
+    raw = (launcher_config or {}).get('disk_floor_gb')
+    if raw is None:
+        env_raw = os.environ.get('HUB2_DISK_FLOOR_GB')
+        if env_raw is not None and env_raw.strip():
+            try:
+                raw = float(env_raw)
+            except ValueError as exc:
+                raise ValueError('launcher_capability_unavailable') from exc
+        else:
+            return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        raise ValueError('launcher_capability_unavailable')
+    return float(raw)
+
+
+def _trigger_hygiene_once(now_mono=None, trigger_fn=None):
+    """Run disk hygiene at most once per cooldown window when disk is below floor."""
+    global _LAST_HYGIENE_TRIGGER_MONO
+    now_mono = time.monotonic() if now_mono is None else now_mono
+    with _HYGIENE_LOCK:
+        if _LAST_HYGIENE_TRIGGER_MONO > 0 and (now_mono - _LAST_HYGIENE_TRIGGER_MONO) < HYGIENE_TRIGGER_COOLDOWN_SECONDS:
+            return False
+        _LAST_HYGIENE_TRIGGER_MONO = now_mono
+    if trigger_fn is not None:
+        trigger_fn()
+        return True
+    from . import disk_hygiene
+    t = threading.Thread(
+        target=lambda: disk_hygiene.run_hygiene(apply=True),
+        name='hub2-disk-hygiene-trigger',
+        daemon=True,
+    )
+    t.start()
+    return True
+
+
+def check_disk_floor(launcher_config, workspace_path=None, *, disk_usage_fn=None, trigger_fn=None, now_mono=None):
+    floor = disk_floor_gb(launcher_config)
+    if floor is None:
+        return None
+    usage_fn = disk_usage_fn or shutil.disk_usage
+    target = Path(workspace_path) if workspace_path else Path('/')
+    if not target.exists():
+        target = Path('/')
+    free_gb = usage_fn(target).free / (1024 ** 3)
+    if free_gb < floor:
+        _trigger_hygiene_once(now_mono=now_mono, trigger_fn=trigger_fn)
+        raise RuntimeError('disk_below_floor')
+    return free_gb
+
+
+def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=None, now_ms=None,
+                   disk_usage_fn=None, hygiene_trigger_fn=None):
     """Admit one prepared dispatch against physical RAM, journal-atomic.
 
     ONE original monotonic deadline is established before any evidence
@@ -762,6 +823,12 @@ def admit_dispatch(bridge, operation, session, epoch, caps, census=None, sample=
         available = sampler(deadline)  # the physical sample is always taken last
         if available - (charged + allowance) < floor:
             raise RuntimeError('host_launch_queue_full')
+        check_disk_floor(
+            getattr(getattr(bridge, 'launcher', None), 'config', None),
+            row['workspace'],
+            disk_usage_fn=disk_usage_fn,
+            trigger_fn=hygiene_trigger_fn,
+        )
         db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
                    'allowance_bytes,updated_at_ms) VALUES(?,?,?,?,?,?,?)',
                    (operation, session, epoch, digest, attempt, allowance, now_ms))
