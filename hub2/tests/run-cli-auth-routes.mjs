@@ -101,7 +101,7 @@ try {
   assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'go-orin-route', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin', weight: 1, capabilities: [], enabled: true }] })).status, 400);
 
   // Connected host reporting auth:expired:l:claude prevents /api/quota from reporting claude as fresh.
-  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'claude-opus-medium', engine: 'claude', model: 'opus', account_id: 'claude', weight: 1, capabilities: [], enabled: true }] })).status, 200);
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'claude-opus-medium', engine: 'claude', model: 'opus', effort: 'medium', account_id: 'claude', weight: 1, capabilities: [], enabled: true }] })).status, 200);
   assert.equal((await call('/api/accounts/claude/api/account', 'PATCH', { provider: 'claude', enabled: true })).status, 200);
   assert.equal((await call('/api/accounts/claude/api/account/quota', 'PUT', { remaining: 72, captured_at: now, valid_until: now + 60000, source: 'synthetic' })).status, 200);
   const origMachines = fixture.env.MACHINES;
