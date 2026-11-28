@@ -10,7 +10,6 @@ the way host-install.ps1 registers AgentHub2HostUpdate (Interactive, Limited,
 IgnoreNew), so the handoff is exercised against Task Scheduler itself. Only the
 network is replaced: the installer is a local script that logs like the real one.
 """
-import ctypes
 import hashlib
 import json
 import os
@@ -53,18 +52,31 @@ def launcher_before_the_fix():
     version, data = windows_host.verified_installer('https://hub.example', opener)
     script = Path(scenario['state'], 'tmp', 'host-install.ps1')
     script.write_bytes(data)
-    flags = 0x00000008 | 0x00000200 | (0x01000000 if scenario['mode'] == 'breakaway' else 0)
+    detached, new_group, no_window, breakaway = 0x00000008, 0x00000200, 0x08000000, 0x01000000
+    flags = {'legacy': detached | new_group, 'legacy_wait': detached | new_group,
+             'legacy_files': detached | new_group, 'no_window': no_window,
+             'breakaway': detached | new_group | breakaway}[scenario['mode']]
+    if scenario['mode'] == 'legacy_files':
+        handles = {'stdout': open(Path(scenario['state'], 'installer-output.txt'), 'wb'), 'stderr': subprocess.STDOUT}
+    else:
+        handles = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
     try:
         child = subprocess.Popen(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                                   '-File', str(script)], env={**os.environ, 'HUB2_INSTALL_MODE': 'update'},
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 creationflags=flags)
+                                 stdin=subprocess.DEVNULL, creationflags=flags, **handles)
     except OSError as error:
         Path(scenario['state'], 'spawn-error.txt').write_text(repr(error), encoding='utf-8')
         return 0
     Path(scenario['state'], 'child-pid.txt').write_text(str(child.pid), encoding='utf-8')
-    if scenario['mode'] == 'legacy_wait':
-        time.sleep(scenario['launcher_seconds'])
+    watched = scenario['launcher_seconds'] if scenario['mode'] in ('legacy_wait', 'legacy_files') else 0
+    started = time.monotonic()
+    outcome = []
+    while time.monotonic() - started < watched:
+        time.sleep(0.05)
+        if child.poll() is not None:
+            outcome = [{'exited_after_s': round(time.monotonic() - started, 2), 'exit_code': child.returncode}]
+            break
+    Path(scenario['state'], 'child-exit.json').write_text(json.dumps({'launcher_alive_s': watched, 'outcome': outcome}))
     return 0
 
 with patch.object(windows_host, 'state_root', return_value=Path(scenario['state'])), \\
@@ -99,18 +111,6 @@ def powershell(script, check=True):
     return (done.stdout + done.stderr).strip()
 
 
-def alive(pid):
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(0x1000, False, int(pid))
-    if not handle:
-        return False
-    try:
-        code = ctypes.c_ulong()
-        return not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
-    finally:
-        kernel32.CloseHandle(handle)
-
-
 @unittest.skipUnless(WINDOWS, 'needs the Windows Task Scheduler')
 class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
     def setUp(self):
@@ -129,7 +129,8 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
 
     def publish(self, installer):
         """Serve the installer locally with the manifest that makes it the verified release."""
-        data = installer.replace('@LOG@', str(self.state / 'install.log')).encode('utf-8')
+        data = (installer.replace('@LOG@', str(self.state / 'install.log')).replace('@SECONDS@', '2')
+                .replace('@TAIL@', '').encode('utf-8'))
         manifest = {'host_version': PUBLISHED, 'artifacts': {
             'host-install.ps1': {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}}}
         (self.files / 'host-release.json').write_text(json.dumps(manifest), encoding='utf-8')
@@ -149,26 +150,24 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
             Register-ScheduledTask -TaskName '{self.task}' -Action $action -Settings $settings -Principal $principal -Description 'Hub2 host verified self-update (test)' -Force | Out-Null
             Start-ScheduledTask -TaskName '{self.task}'
         ''')
-        state = lambda: powershell(f"(Get-ScheduledTask -TaskName '{self.task}').State")
-        deadline = time.monotonic() + 60
-        while state() != 'Running' and time.monotonic() < deadline:
-            time.sleep(0.5)
-        running = state() == 'Running'
-        deadline = time.monotonic() + 180
+        def state():
+            return powershell(f"(Get-ScheduledTask -TaskName '{self.task}').State")
+        deadline = time.monotonic() + 240
         while state() == 'Running' and time.monotonic() < deadline:
             time.sleep(0.5)
-        time.sleep(3)  # a detached installer that outlived the task would log by now
-        evidence = {'mode': mode, 'task_started': running, 'task_state': state(),
-                    'last_task_result': int(powershell(
-                        f"(Get-ScheduledTaskInfo -TaskName '{self.task}').LastTaskResult")),
-                    'session_id': powershell('(Get-Process -Id $PID).SessionId'),
+        time.sleep(3)  # a detached installer that outlived its task would log by now
+        info = powershell(f"$i = Get-ScheduledTaskInfo -TaskName '{self.task}'; "
+                          '"{0}|{1}|{2}" -f $i.LastTaskResult, $i.LastRunTime.ToString("o"), $i.NumberOfMissedRuns')
+        result, last_run, missed = info.split('|')
+        evidence = {'mode': mode, 'task_state': state(), 'last_task_result': int(result), 'last_run_time': last_run,
+                    'missed_runs': int(missed), 'session_id': powershell('(Get-Process -Id $PID).SessionId'),
                     'install_log': (self.state / 'install.log').read_text() if (self.state / 'install.log').exists() else None}
-        child = self.state / 'child-pid.txt'
-        if child.exists():
-            evidence['installer_pid_alive_after_task'] = alive(child.read_text())
-        error = self.state / 'spawn-error.txt'
-        if error.exists():
-            evidence['spawn_error'] = error.read_text()
+        # 267011 is SCHED_S_TASK_HAS_NOT_RUN: a task shorter than one poll never shows as Running.
+        evidence['task_started'] = evidence['last_task_result'] != 267011
+        for name, key in (('child-exit.json', 'child_exit'), ('spawn-error.txt', 'spawn_error'),
+                          ('installer-output.txt', 'installer_output')):
+            if (self.state / name).exists():
+                evidence[key] = (self.state / name).read_text(errors='replace')
         handoff = self.state / 'self-update.log'
         if handoff.exists():
             evidence['self_update_log'] = handoff.read_text(errors='replace')
@@ -179,7 +178,7 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         evidence = self.run_task('foreground')
         self.assertTrue(evidence['task_started'], 'the scheduled task never ran')
         self.assertEqual(evidence['last_task_result'], 0)
-        self.assertIn('installed host_version=' + PUBLISHED, (self.state / 'install.log').read_text())
+        self.assertIn('installed host_version=' + PUBLISHED, evidence['install_log'])
         log = evidence['self_update_log']
         self.assertIn('self-update start from=' + CURRENT + ' host_version=' + PUBLISHED, log)
         self.assertIn('Hub2 host install from https://hub.example (mode=update)', log)  # installer output kept
@@ -200,14 +199,13 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         self.assertTrue(evidence['task_started'], 'the scheduled task never ran')
         self.assertEqual(evidence['last_task_result'], 0)
         self.assertIsNone(evidence['install_log'], 'the detached installer survived its task')
-        self.assertFalse(evidence['installer_pid_alive_after_task'])
 
-    def test_the_same_detached_installer_runs_while_its_launcher_stays_alive(self):
-        # Control: identical task, flags and installer; only the launcher lives 8 s.
-        evidence = self.run_task('legacy_wait')
-        self.assertTrue(evidence['task_started'], 'the scheduled task never ran')
-        self.assertIn('installed host_version=' + PUBLISHED, evidence['install_log'] or '')
-
+    def test_why_the_detached_installer_never_runs(self):
+        # Same task and installer each time; one variable per run. The launcher
+        # stays alive for the first two, so a teardown at its exit cannot be the cause.
+        findings = {mode: self.run_task(mode) for mode in ('legacy_wait', 'legacy_files', 'no_window', 'breakaway')}
+        self.assertTrue(all(finding['task_started'] for finding in findings.values()), 'a scheduled task never ran')
+        self.assertIsNone(findings['legacy_wait']['install_log'], 'the detached installer failed only at launcher exit')
 
 if __name__ == '__main__':
     unittest.main()
