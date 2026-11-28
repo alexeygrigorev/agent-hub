@@ -379,6 +379,48 @@ try{
   expect(await api('/api/intakes/'+id+'/merge-state'+q,'GET',undefined,null),401,'anonymous merge-state refused');
   expect(await api('/api/intake/tasks/'+id+'/reevaluate','POST',{key:'reeval-open'}),409,'re-evaluation needs a finished session');
  });
+ await test('interactive shell through real edge enforces common operator flow, per-host grant, owner binding, and revocation stop-only cleanup',async()=>{
+  // 1. Default deny without grant: even dev operator (operator:admin / *) cannot start an interactive shell without an explicit grant on the host.
+  const deniedStart=await api('/api/sessions','POST',{key:'shell-no-grant',workspace,repo:project,machine,engine:'shell',mode:'interactive'});
+  assert.equal(deniedStart.status,403,'interactive shell must be refused without an explicit per-host grant');
+  // 2. Grant human:dev on synthetic-machine; wrong host is still refused, granted host starts and binds shell_actor_id=human:dev.
+  expect(await api('/api/shell-grants','POST',{actor_id:'human:dev',machine_id:machine}),201,'grant human:dev on machine');
+  assert.equal((await api('/api/sessions','POST',{key:'shell-wrong-host',workspace,repo:project,machine:'other-host',engine:'shell',mode:'interactive'})).status,403,'ungranted host refused');
+  if(liveSocket){liveSocket.socket.close();liveSocket=null;}
+  liveSocket=await socket(hostToken);
+  const started=expect(await api('/api/sessions','POST',{key:'shell-granted-1',workspace,repo:project,machine,engine:'shell',mode:'interactive',engine_override_reason:'common operator interactive shell test'}),201,'start interactive shell');
+  const sid=started.id;assert.equal(typeof sid,'string');
+  const offered=await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===sid);
+  assert.equal(offered.offer.launch.engine,'shell');assert.equal(offered.offer.launch.interactive,true);assert.equal(offered.offer.launch.shell_actor_id,'human:dev');
+  liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:sid,epoch:offered.offer.epoch}));
+  await liveSocket.wait(v=>v.type==='ack'&&v.session_id===sid);
+  expect(await api(`/api/sessions/${sid}/admission`,'POST',{operation_id:offered.offer.operation_id,epoch:offered.offer.epoch},hostToken),200,'admit shell');
+  const nativeId='77777777-7777-4777-8777-777777777777';
+  expect(await api(`/api/sessions/${sid}/started`,'POST',{operation_id:offered.offer.operation_id,epoch:offered.offer.epoch,native_id:nativeId},hostToken),201,'shell started');
+  // 3. Common operator can send, capture, show, list commands; machine/worker tokens are denied.
+  assert.equal((await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-host',body:'echo no'},hostToken)).status,403,'machine token denied send');
+  const sent=expect(await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-1',body:'X_VAR=42; echo $X_VAR'}),201,'operator send');
+  const sendCmd=await liveSocket.wait(v=>v.type==='session.command'&&v.command.id===sent.command_id);
+  assert.equal(sendCmd.command.kind,'send');assert.equal(sendCmd.command.text,'X_VAR=42; echo $X_VAR');
+  expect(await api(`/api/sessions/${sid}/commands/${sent.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{delivery:'native_acknowledged'}},hostToken),200,'ack send');
+  const cap=expect(await api(`/api/sessions/${sid}/capture`,'POST',{key:'sh-cap-1'}),201,'operator capture');
+  await liveSocket.wait(v=>v.type==='session.command'&&v.command.id===cap.command_id);
+  expect(await api(`/api/sessions/${sid}/commands/${cap.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{output:'42\n'}},hostToken),200,'ack capture');
+  const cmds=expect(await api(`/api/sessions/${sid}/commands`),200,'list commands');
+  assert.equal(cmds.commands.find(c=>c.id===cap.command_id)?.ack?.capture,'42\n');
+  expect(await api(`/api/sessions/${sid}`),200,'show shell session');
+  // 4. Revoke grant: queued command is cancelled, stop is dispatched, and subsequent send/capture/stop/show/commands are denied.
+  const queuedSend=expect(await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-queued',body:'echo after'}),201,'queue send before revoke');
+  const revoked=expect(await api('/api/shell-grants','POST',{actor_id:'human:dev',machine_id:machine,revoke:true}),200,'revoke grant');
+  assert.equal(revoked.revoked,true);assert.equal(revoked.cleanup.status,'dispatched');assert.equal(revoked.cleanup.stop_requested,1);
+  await liveSocket.wait(v=>v.type==='session.command'&&v.command.session_id===sid&&v.command.kind==='stop');
+  assert.equal((await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-revoked',body:'echo denied'})).status,403,'send after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/capture`,'POST',{key:'sh-cap-revoked'})).status,403,'capture after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/stop`,'POST',{key:'sh-stop-revoked'})).status,403,'stop after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}`)).status,404,'show after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/commands`)).status,404,'commands after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/commands/${queuedSend.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{delivery:'native_acknowledged'}},hostToken)).status,409,'late ack of cancelled send rejected');
+ });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();
  const sourceAfter=await hashes();const sourceStable=JSON.stringify(sourceBefore)===JSON.stringify(sourceAfter);

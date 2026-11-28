@@ -416,6 +416,7 @@ export class MachineDO {
       if (url.pathname === '/_internal/workspace-preflight' && request.method === 'POST') return await this.workspacePreflight(request);
       if (url.pathname === '/_internal/live-sessions' && request.method === 'GET') return this.liveSessionView();
       if (url.pathname === '/_internal/reap' && request.method === 'POST') return await this.reap(request);
+      if (url.pathname === '/_internal/shell-grants/revoke' && request.method === 'POST') return await this.revokeShellGrantInternal(request);
       if (url.pathname === '/_metrics' && request.method === 'GET') return json({ counts: this.db.snapshot(), constructor_ms: this.constructorMs });
       if (url.pathname === '/api/connect' && request.method === 'GET') return await this.connect(request);
       if (url.pathname === '/api/heartbeat' && request.method === 'POST') return await this.heartbeat(request);
@@ -439,11 +440,11 @@ export class MachineDO {
       if (url.pathname === '/api/offers' && request.method === 'GET') return this.offers(request);
       if (url.pathname === '/api/sessions' && request.method === 'GET') return this.sessionList(request);
       const sessionView = url.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-      if (sessionView && request.method === 'GET') return this.sessionDetail(request, decodeURIComponent(sessionView[1]));
+      if (sessionView && request.method === 'GET') return await this.sessionDetail(request, decodeURIComponent(sessionView[1]));
       const wake=url.pathname.match(/^\/api\/sessions\/([^/]+)\/(wake|wakes)$/);
       if(wake)return await this.sessionWake(request,decodeURIComponent(wake[1]),wake[2]);
       const sessionEvents = url.pathname.match(/^\/api\/sessions\/([^/]+)\/events$/);
-      if (sessionEvents && request.method === 'GET') return this.sessionEvents(request, decodeURIComponent(sessionEvents[1]));
+      if (sessionEvents && request.method === 'GET') return await this.sessionEvents(request, decodeURIComponent(sessionEvents[1]));
       const commandAck = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands\/([^/]+)\/ack$/);
       if (commandAck && request.method === 'POST') return await this.ackCommand(request, decodeURIComponent(commandAck[1]), decodeURIComponent(commandAck[2]));
       const link = url.pathname.match(/^\/api\/sessions\/([^/]+)\/link$/);
@@ -451,7 +452,7 @@ export class MachineDO {
       const legacy = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(stop|send|capture)$/);
       if (legacy && request.method === 'POST') return await this.legacyCommand(request, decodeURIComponent(legacy[1]), legacy[2]);
       const commandList = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands$/);
-      if (commandList && request.method === 'GET') return this.commandListing(request, decodeURIComponent(commandList[1]));
+      if (commandList && request.method === 'GET') return await this.commandListing(request, decodeURIComponent(commandList[1]));
       const commandSend = url.pathname.match(/^\/api\/sessions\/([^/]+)\/commands$/);
       if (commandSend && request.method === 'POST') return await this.createCommand(request, decodeURIComponent(commandSend[1]));
       const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(started|finish|admission|credentials)$/);
@@ -1628,10 +1629,125 @@ export class MachineDO {
       &&nativeReturncode(evidence.native_exit as JsonRecord)===0;
   }
 
-  private canAccessShellSession(actor: Actor | undefined, session: { id: string }, requiredScope: string): boolean {
+  private async checkShellGrantState(actorId: string, machineId: string, env: Hub2Env = this.env): Promise<'granted' | 'denied' | 'unavailable'> {
+    try {
+      const check = await env.CONTROL.get(env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/shell-grants/check', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actorId, machine_id: machineId }),
+      });
+      if (!check.ok) return 'unavailable';
+      return ((await check.json()) as { granted?: boolean }).granted === true ? 'granted' : 'denied';
+    } catch (caught) {
+      console.error('shell_grant_check_unavailable', caught instanceof Error ? caught.message : 'unknown');
+      return 'unavailable';
+    }
+  }
+
+  /** Shell session ACL. Returns undefined for non-shell sessions (generic ACL
+   * applies). Legacy headless shells keep their original ACL (admin, or an
+   * operator holding the scope bound to the exact session ID). Interactive
+   * shells are default-deny with NO operator:admin bypass: an authenticated
+   * operator (holding operator:admin from standard Hub login/device approval
+   * with no foreign resource_id, or holding the exact session-bound scope)
+   * must match the recorded session owner (shell_actor_id === actor.id) AND
+   * have an active explicit grant for that principal on the session's host,
+   * re-checked on every request so revocation applies to the next call (reads
+   * and stop included). Admin rights only administer grants. A CONTROL failure
+   * fails closed. */
+  private async shellSessionAllowed(actor: Actor | undefined, session: { id: string; machine_id: string; launch_json: string }, requiredScope: string): Promise<boolean | undefined> {
+    const launch = this.parse(session.launch_json) as JsonRecord;
+    if (String(launch.engine ?? '').toLowerCase() !== 'shell') return undefined;
     if (!actor || actor.kind !== 'operator') return false;
-    if (hasScope(actor, 'operator:admin')) return true;
-    return hasScope(actor, requiredScope) && actor.resource_id === session.id;
+    if (launch.interactive !== true) return hasScope(actor, 'operator:admin') || (hasScope(actor, requiredScope) && actor.resource_id === session.id);
+    const exactScope = hasScope(actor, requiredScope) && actor.resource_id === session.id;
+    const commonOperator = hasScope(actor, 'operator:admin') && (actor.resource_id === undefined || actor.resource_id === session.id);
+    if (!exactScope && !commonOperator) return false;
+    if (typeof launch.shell_actor_id !== 'string' || launch.shell_actor_id !== actor.id) return false;
+    return (await this.checkShellGrantState(actor.id, session.machine_id)) === 'granted';
+  }
+
+  private cancelRevokedShellCommands(session: SessionRow, now: number): number {
+    const pending = this.db.all<{ id: string }>(
+      "SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind IN ('send','capture','wake_send') AND state IN ('pending','wake_pending') LIMIT 200",
+      session.id, session.machine_id, session.epoch,
+    );
+    if (!pending.length) return 0;
+    const resultJson = JSON.stringify({ error: 'shell_grant_revoked', reason: 'shell_grant_revoked' });
+    this.db.run(
+      "UPDATE session_commands SET state='failed',result_json=?,updated_at=? WHERE session_id=? AND machine_id=? AND epoch=? AND kind IN ('send','capture','wake_send') AND state IN ('pending','wake_pending')",
+      resultJson, now, session.id, session.machine_id, session.epoch,
+    );
+    return pending.length;
+  }
+
+  /** Internal stop-only control path (reaper and grant-revocation cleanup).
+   * Never creates send/capture/wake commands and never returns session output. */
+  private async enqueueInternalStop(session: SessionRow, key: string, reason: string, now: number): Promise<'stopped' | 'stop_requested' | 'already_pending' | 'skipped'> {
+    const digest = await sha256Hex(JSON.stringify({ kind: 'stop', text: null, epoch: session.epoch }));
+    const id = crypto.randomUUID();
+    if (this.unclaimedWithoutNative(session)) {
+      const applied = await this.recordStopped(session, reason, now, { id, request_key: key, request_digest: digest });
+      return applied ? 'stopped' : 'skipped';
+    }
+    if (!this.canDispatchStop(session)) return 'skipped';
+    let outcome: 'stop_requested' | 'already_pending' | 'skipped' = 'skipped';
+    this.db.transaction(this.ctx, () => {
+      const current = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', session.id);
+      if (!current || current.epoch !== session.epoch || !this.canDispatchStop(current)) return;
+      const existing = this.db.one<{ id: string }>(
+        "SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending' LIMIT 1",
+        current.id, current.machine_id, current.epoch,
+      );
+      if (existing) { outcome = 'already_pending'; return; }
+      const priorKey = this.db.one<{ id: string }>('SELECT id FROM session_commands WHERE session_id=? AND request_key=?', current.id, key);
+      if (priorKey) { outcome = 'already_pending'; return; }
+      const pendingResult = JSON.stringify({ ...(current.native_id ? { dispatch_native_id: current.native_id } : {}), reason });
+      if (this.db.schemaVersion >= 7) {
+        this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,capture_mode,state,result_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,'stop',NULL,NULL,'pending',?,?,?)`, id, current.id, current.machine_id, current.epoch, key, digest, pendingResult, now, now);
+      } else {
+        this.db.run(`INSERT INTO session_commands(id,session_id,machine_id,epoch,request_key,request_digest,kind,text,state,result_json,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,'stop',NULL,'pending',?,?,?)`, id, current.id, current.machine_id, current.epoch, key, digest, pendingResult, now, now);
+      }
+      outcome = 'stop_requested';
+    });
+    return outcome;
+  }
+
+  /** Bounded stop-only cleanup invoked internally by ControlDO when a shell grant
+   * is revoked. Cancels queued send/capture/wake commands and requests stop for
+   * active interactive shell sessions owned by actor_id; never sends input or
+   * reads output. */
+  private async revokeShellGrantInternal(request: Request): Promise<Response> {
+    const body = await bodyObject(request, 4096);
+    if (!boundedString(body.actor_id, 180)) return error('invalid_shell_revoke', 400);
+    const actorId = body.actor_id.trim();
+    const revokedAt = Number.isSafeInteger(body.revoked_at) && Number(body.revoked_at) > 0 ? Number(body.revoked_at) : Date.now();
+    const now = Date.now();
+    const rows = this.db.all<SessionRow>("SELECT * FROM sessions WHERE state IN ('staged','offered','claimed','running') ORDER BY created_at, id LIMIT 200");
+    const matching = rows.filter(session => {
+      const launch = this.parse(session.launch_json) as JsonRecord;
+      return String(launch.engine ?? '').toLowerCase() === 'shell' && launch.interactive === true && launch.shell_actor_id === actorId;
+    });
+    const truncated = matching.length > 64;
+    const bounded = matching.slice(0, 64);
+    let sessionsStopped = 0, stopRequested = 0, commandsCancelled = 0;
+    let notifyMachineId: string | null = null;
+    for (const session of bounded) {
+      commandsCancelled += this.cancelRevokedShellCommands(session, now);
+      const outcome = await this.enqueueInternalStop(session, `shell-revoke:${session.id}:${session.epoch}:${revokedAt}`, 'shell_grant_revoked', now);
+      if (outcome === 'stopped') sessionsStopped++;
+      if (outcome === 'stop_requested') { stopRequested++; notifyMachineId = session.machine_id; }
+    }
+    if (sessionsStopped > 0 || stopRequested > 0) await this.scheduleNext();
+    if (notifyMachineId) await this.notifyPendingCommands(notifyMachineId);
+    return json({
+      revoked: true,
+      actor_id: actorId,
+      sessions_stopped: sessionsStopped,
+      stop_requested: stopRequested,
+      commands_cancelled: commandsCancelled,
+      truncated,
+    });
   }
 
   private async createCommand(request: Request, sessionId: string): Promise<Response> {
@@ -1645,9 +1761,9 @@ export class MachineDO {
     if (!['send', 'capture', 'stop'].includes(String(kind))) return error('invalid_command_kind', 400);
     const scope = kind === 'send' ? 'session:send' : kind === 'capture' ? 'session:capture' : 'session:stop';
     const sessionLaunch = this.parse(session.launch_json) as JsonRecord;
-    const isShell = String(sessionLaunch.engine ?? '').toLowerCase() === 'shell';
-    if (isShell) {
-      if (!this.canAccessShellSession(actor, session, scope)) return error('forbidden', 403);
+    const shellAllowed = await this.shellSessionAllowed(actor, session, scope);
+    if (shellAllowed !== undefined) {
+      if (!shellAllowed) return error('forbidden', 403);
     } else if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
       || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
     if (kind === 'send' && sessionLaunch.interactive !== true) return error('headless_send_refused', 409);
@@ -1870,7 +1986,7 @@ export class MachineDO {
     return json({ acknowledged: true });
   }
 
-  private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env):Promise<void>{
+  private async sendPendingCommands(socket:WebSocket,machineId:string,env:Hub2Env=this.env,depth=0):Promise<void>{
     const stop=this.stopOnly(socket);
     const wakeCap=this.db.one<{capabilities_json:string}>('SELECT capabilities_json FROM machine_capabilities WHERE machine_id=?',machineId);
     const wakeCaps=wakeCap?JSON.parse(wakeCap.capabilities_json) as string[]:[];
@@ -1903,6 +2019,23 @@ export class MachineDO {
     try{
       const view=this.commandView(command);
       const session=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',command.session_id,machineId);
+      if(session&&command.kind!=='stop'){
+        const launch=this.parse(session.launch_json) as JsonRecord;
+        if(String(launch.engine??'').toLowerCase()==='shell'&&launch.interactive===true){
+          const grantState=typeof launch.shell_actor_id==='string'
+            ? await this.checkShellGrantState(launch.shell_actor_id,machineId,env)
+            : 'denied';
+          if(grantState==='unavailable')return;
+          if(grantState==='denied'){
+            const now=Date.now();
+            this.cancelRevokedShellCommands(session,now);
+            await this.enqueueInternalStop(session,`shell-revoke:${session.id}:${session.epoch}:dispatch`,'shell_grant_revoked',now);
+            await this.scheduleNext();
+            if(depth<1)await this.sendPendingCommands(socket,machineId,env,depth+1);
+            return;
+          }
+        }
+      }
       if(command.kind==='capture'&&session&&session.state!=='running'&&session.state!=='claimed'&&!this.retainedCaptureReady(session))return;
       if (session && !session.native_id && (session.state === 'claimed' || session.state === 'expired' || session.state === 'failed')) {
         const launch=this.parse(session.launch_json) as JsonRecord;
@@ -2236,16 +2369,13 @@ export class MachineDO {
         const pending=this.db.one<{id:string}>("SELECT id FROM session_commands WHERE session_id=? AND machine_id=? AND epoch=? AND kind='stop' AND state='pending' ORDER BY created_at DESC LIMIT 1",
           session.id,session.machine_id,session.epoch);
         if(pending)continue;
-        const actor={id:'hub2-session-reaper',kind:'operator',scopes:['operator:admin']};
-        const command=await this.createCommand(new Request(`https://machine.internal/api/sessions/${session.id}/commands`,{
-          method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},
-          body:JSON.stringify({kind:'stop',key:`reap:${session.id}:${session.epoch}:${Math.floor(now/SESSION_REAP_INTERVAL_MS)}`}),
-        }),session.id);
-        if(command.status===201){
+        const outcome=await this.enqueueInternalStop(session,`reap:${session.id}:${session.epoch}:${Math.floor(now/SESSION_REAP_INTERVAL_MS)}`,reason,now);
+        if(outcome==='stop_requested'){
+          await this.notifyPendingCommands(session.machine_id);
           stopRequested++;actions.push({session_id:session.id,action:'stop_requested',reason});
           console.info('[hub2] SESSION_REAP_STOP_REQUESTED',JSON.stringify({session_id:session.id,machine_id:machine.machine_id,reason}));
-        }else if(!command.ok){
-          console.error('[hub2] SESSION_REAP_STOP_FAILED',JSON.stringify({session_id:session.id,machine_id:machine.machine_id,reason,status:command.status}));
+        }else if(outcome==='skipped'){
+          console.error('[hub2] SESSION_REAP_STOP_FAILED',JSON.stringify({session_id:session.id,machine_id:machine.machine_id,reason,status:409}));
         }
         continue;
       }
@@ -2528,12 +2658,10 @@ export class MachineDO {
   }
 
   /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
-  private commandListing(request: Request, sessionId: string): Response {
+  private async commandListing(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
-    const isShell = !!session && String((this.parse(session.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
-    if (!session || (isShell
-      ? !this.canAccessShellSession(actor, session, 'session:read')
-      : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
+    const shellAllowed = session ? await this.shellSessionAllowed(actor, session, 'session:read') : undefined;
+    if (!session || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
     const query = new URL(request.url).searchParams;
     const commandId = query.get('command_id');
     if (commandId !== null && (query.getAll('command_id').length !== 1 || !/^[A-Za-z0-9-]{1,80}$/.test(commandId))) return error('invalid_command_id',400);
@@ -2645,8 +2773,9 @@ export class MachineDO {
   private async sessionWake(request:Request,id:string,action:string):Promise<Response>{
     const session=this.wakeSession(id),actor=actorFrom(request);
     const read=request.method==='GET';
-    if(!session||!actor||(session.engine==='shell'
-      ? !this.canAccessShellSession(actor,session,read?'session:read':'session:send')
+    const shellAllowed=session&&actor?await this.shellSessionAllowed(actor,this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id)!,read?'session:read':'session:send'):undefined;
+    if(!session||!actor||(shellAllowed!==undefined
+      ? !shellAllowed
       : (!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))))return error('session_not_found',404);
     if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
     if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
@@ -2658,21 +2787,17 @@ export class MachineDO {
     return json({...this.wakes.view(current),...this.wakes.waiting(id),replay},replay?200:201);
   }
 
-  private sessionDetail(request: Request, id: string): Response {
+  private async sessionDetail(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
-    if (!row || (isShell
-      ? !this.canAccessShellSession(actor, row, 'session:read')
-      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
+    const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
     return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
   }
 
-  private sessionEvents(request: Request, id: string): Response {
+  private async sessionEvents(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell';
-    if (!row || (isShell
-      ? !this.canAccessShellSession(actor, row, 'session:read')
-      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
+    const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
     const events: JsonRecord[] = [];
     const attention = this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?', row.id);
     const diagnostic = attention ? this.hostStartDiagnostic(row, attention.reason) : null;

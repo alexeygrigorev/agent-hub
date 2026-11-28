@@ -1247,10 +1247,11 @@ test('scoped worker session creates child intakes and starts child sessions whil
 });
 
 test('shell interactive start is refused with a typed capability reason before any dispatch is consumed',async()=>{
- const f=fixture({machineCapabilities:['headless','modes:v1:shell:h']});
+ const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:h']});
  try{
   const own=await intake(f,'shell-interactive');
-  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true});
+  await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1'})}));
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},{id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']});
   assert.equal(refused.status,409);
   assert.equal((await body(refused)).error,'launcher_capability_unavailable_interactive');
   assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,0);
@@ -1259,9 +1260,10 @@ test('shell interactive start is refused with a typed capability reason before a
 
 test('interactive shell enforces capability, per-user/host grants, revocation, and scoped session ID binding',async()=>{
  const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:hi']});
+ let controlDown=false;
  const machineSql=new DatabaseSync(':memory:');
  const machineCtx:any={id:{toString:()=>'m/h1'},getWebSockets:()=>[],storage:{sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){}},blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn())};
- const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async()=>Response.json({ok:true})})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
+ const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{if(controlDown)throw new Error('control_down');const r=i instanceof Request?i:new Request(i,init);return new URL(r.url).pathname.startsWith('/_internal/shell-grants/')?f.control.fetch(r):Response.json({ok:true});}})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
  try{
   const operator={id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']};
   const agent={id:'session:other',kind:'agent',resource_id:'org/a',scopes:['operator:admin','session:start','shell:start','project:org/a']};
@@ -1274,24 +1276,247 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   const started=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'granted-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator);
   assert.equal(started.status,201);
   const sid=(await body(started)).session.id;
-  const revoked=await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1',revoke:true})}));
-  assert.equal(revoked.status,200);
-  const own2=await intake(f,'shell-revoked');
-  assert.equal((await f.call('/api/intakes/'+own2.id+'/start','POST',{key:'after-revoke',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
-  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}));
+  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alexey'}})}));
   assert.equal(reserve.status,201);
   machineSql.prepare("UPDATE sessions SET state='running',native_id='11111111-1111-4111-8111-111111111111' WHERE id=?").run(sid);
   const cmd=(p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},body:JSON.stringify({kind:'send',text:'echo hi',key:p})}));
   assert.equal((await cmd('k-proj',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,403);
   assert.equal((await cmd('k-other',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-other-admin',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['operator:admin']})).status,403);
   assert.equal((await cmd('k-agent',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
   assert.equal((await cmd('k-ok',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,201);
-  // 6. Wake endpoints also enforce operator-only, exact-session-ID binding on shell sessions.
+  // Common authenticated operator credential (ControlAuth.preparedIssue / verifyKnownCredential: scopes=['operator:admin'], resource_id=undefined) works for the owning granted principal.
+  const commonAlexey={id:'human:alexey',kind:'operator',scopes:['operator:admin'],family_id:'fam-alexey',generation:'gen-alexey',client_id:'hub-cli'};
+  assert.equal((await cmd('k-common-ok',commonAlexey)).status,201);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify(commonAlexey)}}))).status,200);
+  // Missing shell_actor_id on an interactive shell session fails closed even for a granted operator.
+  const sidNoOwner='99999999-9999-4999-8999-999999999999';
+  assert.equal((await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-no-owner',dispatch_id:'d-no-owner',session_id:sidNoOwner,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'f'.repeat(64),attempt:0,title:'shell-no-owner',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}))).status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='88888888-8888-4888-8888-888888888888' WHERE id=?").run(sidNoOwner);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sidNoOwner+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(commonAlexey)},body:JSON.stringify({kind:'send',text:'echo no-owner',key:'k-no-owner'})}))).status,403);
+  // 6. Wake endpoints also enforce operator-only, exact-session-ID / owner binding on shell sessions.
   const wake=(m:string,p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(m==='POST'?{body:JSON.stringify({key:'w-'+p,at:'now',prompt:'echo hi'})}:{})}));
   assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,404);
   assert.equal((await wake('POST','wake',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,404);
   assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
+  // Common authenticated operator credential (scopes=['operator:admin'], resource_id=undefined) also starts interactive shell when granted.
+  const ownCommon=await intake(f,'shell-common-op');
+  assert.equal((await f.call('/api/intakes/'+ownCommon.id+'/start','POST',{key:'common-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},commonAlexey)).status,201);
+  // Grant lookup failure fails closed (never allows) for a principal that otherwise holds the exact scope or common operator credential.
+  controlDown=true;
+  assert.equal((await cmd('k-ctl-down',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-ctl-down-common',commonAlexey)).status,403);
+  controlDown=false;
+  // Admin has no interactive shell exception: no grant -> start and session access denied.
+  const adminNoGrant={id:'human:root',kind:'operator',scopes:['operator:admin','shell:start','project:org/a']};
+  const own3=await intake(f,'shell-admin-nogrant');
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant-auto',workspace:'relay',engine:'shell',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await cmd('k-admin',{id:'human:root',kind:'operator',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
+  assert.equal((await cmd('k-admin-bare',{id:'human:root',kind:'operator',scopes:['operator:admin']})).status,403);
+  assert.equal((await cmd('k-nogrant-other',{id:'human:other',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  // Revocation applies to the running session on the very next request.
+  assert.equal((await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1',revoke:true})}))).status,200);
+  for(const [k,kind] of [['r-send','send'],['r-cap','capture'],['r-stop','stop']] as const){
+    const r=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})},body:JSON.stringify({kind,...(kind==='send'?{text:'echo hi'}:{}),key:k})}));
+    assert.equal(r.status,403,kind);
+  }
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})).status,404);
+  const own2=await intake(f,'shell-revoked');
+  assert.equal((await f.call('/api/intakes/'+own2.id+'/start','POST',{key:'after-revoke',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
+  // Legacy headless shell start stays admin-only and is not affected by shell grants.
+  const own4=await intake(f,'shell-headless');
+  assert.equal((await f.call('/api/intakes/'+own4.id+'/start','POST',{key:'hl-op',workspace:'relay',engine:'shell',machine_id:'h1'},operator)).status,403);
  }finally{machineSql.close();f.sql.close();f.collectorSql.close();}
+});
+
+test('interactive shell revocation runs bounded stop-only cleanup and queued commands cannot outlive the grant',async()=>{
+ let controlDown=false;
+ let skipMachineRevokePush=false;
+ const pushed:any[]=[];
+ let socketAttachment:any={machine_id:'h1',actor_id:'machine:h1',generation:'gen-1',stop_only:false};
+ const fakeSocket:any={
+  readyState:1,
+  deserializeAttachment:()=>socketAttachment,
+  send:(raw:string)=>{pushed.push(JSON.parse(raw));},
+  close:()=>{},
+ };
+ const machineSql=new DatabaseSync(':memory:');
+ const machineCtx:any={
+  id:{toString:()=>'m/h1'},
+  getWebSockets:()=>[fakeSocket],
+  storage:{
+   sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},
+   transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},
+   async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){},
+  },
+  blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn()),
+ };
+ const controlSql=new DatabaseSync(':memory:');
+ const controlCtx:any={
+  id:{toString:()=>'control/global'},
+  storage:{
+   sql:{exec(q:string,...a:any[]){const p=controlSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},
+   transactionSync(fn:any){controlSql.exec('BEGIN');try{const r=fn();controlSql.exec('COMMIT');return r;}catch(e){controlSql.exec('ROLLBACK');throw e;}},
+   async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){},
+  },
+  blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn()),
+ };
+ let machine!:MachineDO;
+ const control=new ControlDO(controlCtx,{
+  HUB2_SCHEMA_MIGRATIONS:'apply',
+  MACHINES:{idFromName:()=>'h1',get:()=>({fetch:async(i:any,init?:any)=>{
+   if(skipMachineRevokePush)throw new Error('machine_push_skipped');
+   const r=i instanceof Request?i:new Request(i,init);
+   return machine.fetch(r);
+  }})},
+ } as any);
+ machine=new MachineDO(machineCtx,{
+  HUB2_SCHEMA_MIGRATIONS:'apply',
+  CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{
+   const r=i instanceof Request?i:new Request(i,init);
+   const p=new URL(r.url).pathname;
+   if(p==='/_authorize')return Response.json({current:true});
+   if(p.startsWith('/_internal/shell-grants/')){
+    if(controlDown)throw new Error('control_down');
+    return control.fetch(r);
+   }
+   return Response.json({ok:true});
+  }})},
+  PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},
+  MACHINES:{idFromName:()=>'h1',get:()=>machine},
+  ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},
+  MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})},
+ } as any);
+ try{
+  const grant=(actorId:string,revoke=false)=>control.fetch(new Request('https://c.test/api/shell-grants',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},
+   body:JSON.stringify({actor_id:actorId,machine_id:'h1',...(revoke?{revoke:true}:{})}),
+  }));
+  // 1. Grant two principals on h1 and verify checkSessionCap allows shell:start without session:start/admin.
+  assert.equal((await grant('human:alice')).status,201);
+  assert.equal((await grant('human:bob')).status,201);
+  const capRes=await control.fetch(new Request('https://c.test/_internal/session-cap/check',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',scopes:['shell:start']})},
+   body:JSON.stringify({operation_id:'op-cap-1',session_id:'sid-cap-1'}),
+  }));
+  assert.equal(capRes.status,200);
+
+  // 2. Reserve and start an interactive shell owned by human:alice.
+  const sid='11111111-1111-4111-8111-111111111111';
+  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({operation_id:'op-sh1',dispatch_id:'d-sh1',session_id:sid,project_id:'org/a',intake_id:'in-1',machine_id:'h1',request_digest:'b'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alice'}}),
+  }));
+  assert.equal(reserve.status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='22222222-2222-4222-8222-222222222222' WHERE id=?").run(sid);
+
+  // Owner binding: bob has a grant on h1 but cannot access alice's shell session even with exact resource_id or common operator:admin credential.
+  const bobCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',resource_id:sid,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo stolen',key:'bob-1'}),
+  }));
+  assert.equal(bobCmd.status,403);
+  const bobAdminCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',scopes:['operator:admin']})},
+   body:JSON.stringify({kind:'send',text:'echo stolen-admin',key:'bob-2'}),
+  }));
+  assert.equal(bobAdminCmd.status,403);
+
+  // 3. Queue send + capture commands while grant is active, then revoke via ControlDO.
+  pushed.length=0;
+  const sendRes=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo secret-cmd',key:'alice-send-1'}),
+  }));
+  assert.equal(sendRes.status,201);
+  const sendId=(await body(sendRes)).command.id;
+  const capCmdRes=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid,scopes:['session:capture']})},
+   body:JSON.stringify({kind:'capture',key:'alice-cap-1'}),
+  }));
+  assert.equal(capCmdRes.status,201);
+
+  pushed.length=0;
+  const revoked=await grant('human:alice',true);
+  assert.equal(revoked.status,200);
+  const revokeBody=await body(revoked);
+  // Cleanup response is strictly bounded metadata: zero command text or capture output.
+  assert.equal(revokeBody.revoked,true);
+  assert.equal(revokeBody.cleanup.status,'dispatched');
+  assert.equal(revokeBody.cleanup.stop_requested,1);
+  assert.equal(revokeBody.cleanup.commands_cancelled,2);
+  assert.equal(JSON.stringify(revokeBody).includes('secret-cmd'),false);
+
+  // Queued send and capture were immediately failed with shell_grant_revoked; only stop was pushed.
+  const rows=machineSql.prepare('SELECT kind,state,result_json FROM session_commands WHERE session_id=? ORDER BY created_at,id').all(sid) as any[];
+  const byKind=Object.fromEntries(rows.map(r=>[r.kind,r]));
+  assert.equal(byKind.send.state,'failed');
+  assert.equal(JSON.parse(byKind.send.result_json).error,'shell_grant_revoked');
+  assert.equal(byKind.capture.state,'failed');
+  assert.equal(JSON.parse(byKind.capture.result_json).error,'shell_grant_revoked');
+  assert.equal(byKind.stop.state,'pending');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].type,'session.command');
+  assert.equal(pushed[0].command.kind,'stop');
+
+  // Late host ack for the cancelled send command is rejected (409 command_not_pending).
+  const lateAck=await machine.fetch(new Request(`https://m.test/api/sessions/${sid}/commands/${sendId}/ack`,{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']})},
+   body:JSON.stringify({epoch:1,result:{delivered:true}}),
+  }));
+  assert.equal(lateAck.status,409);
+
+  // 4. Defense-in-depth: queued command cannot outlive revocation even if the revocation push to MachineDO was missed.
+  assert.equal((await grant('human:alice',false)).status,201);
+  const sid2='33333333-3333-4333-8333-333333333333';
+  assert.equal((await machine.fetch(new Request('https://m.test/_internal/reserve',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({operation_id:'op-sh2',dispatch_id:'d-sh2',session_id:sid2,project_id:'org/a',intake_id:'in-2',machine_id:'h1',request_digest:'c'.repeat(64),attempt:0,title:'shell2',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alice'}}),
+  }))).status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='44444444-4444-4444-8444-444444444444' WHERE id=?").run(sid2);
+  // Mark sid1 stopped so only sid2 has pending commands.
+  machineSql.prepare("UPDATE sessions SET state='stopped' WHERE id=?").run(sid);
+  machineSql.prepare("UPDATE session_commands SET state='acked' WHERE session_id=? AND kind='stop'").run(sid);
+  // Queue a send while host socket is detached (no sockets), then revoke with missed MachineDO push.
+  const savedGetWs=machineCtx.getWebSockets;
+  machineCtx.getWebSockets=()=>[];
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid2+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid2,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo must-not-dispatch',key:'alice-queued-2'}),
+  }))).status,201);
+  skipMachineRevokePush=true;
+  const rev2=await grant('human:alice',true);
+  assert.equal(rev2.status,200);
+  assert.equal((await body(rev2)).cleanup.status,'unavailable');
+  skipMachineRevokePush=false;
+  machineCtx.getWebSockets=savedGetWs;
+
+  // Fail closed when CONTROL is down at dispatch time: queued send must NOT be pushed.
+  controlDown=true;
+  pushed.length=0;
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,0);
+  controlDown=false;
+
+  // When CONTROL is reachable, dispatch re-checks grant, cancels the queued send, and pushes ONLY stop.
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].command.kind,'stop');
+  assert.equal(pushed[0].command.session_id,sid2);
+  const send2=machineSql.prepare("SELECT state,result_json FROM session_commands WHERE session_id=? AND kind='send'").get(sid2) as any;
+  assert.equal(send2.state,'failed');
+  assert.equal(JSON.parse(send2.result_json).error,'shell_grant_revoked');
+
+  // Stop-only safety socket delivers ONLY stop, never send/capture.
+  socketAttachment={machine_id:'h1',actor_id:'machine:h1',generation:'gen-1',stop_only:true};
+  pushed.length=0;
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].command.kind,'stop');
+ }finally{machineSql.close();controlSql.close();}
 });

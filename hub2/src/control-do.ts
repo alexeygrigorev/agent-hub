@@ -1337,7 +1337,23 @@ export class ControlDO {
     const now=Date.now();
     if(revoke){
       this.db.run('UPDATE shell_grants SET enabled=0,updated_at=?,revoked_at=? WHERE actor_id=? AND machine_id=?',now,now,actorId,machineId);
-      return json({granted:false,revoked:true,actor_id:actorId,machine_id:machineId});
+      let cleanup:JsonRecord={status:'unavailable'};
+      try{
+        const response=await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch('https://machine.internal/_internal/shell-grants/revoke',{
+          method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor_id:actorId,revoked_at:now}),
+        });
+        if(response.ok){
+          const body=await response.json() as JsonRecord;
+          cleanup={
+            status:'dispatched',
+            sessions_stopped:Number(body.sessions_stopped||0),
+            stop_requested:Number(body.stop_requested||0),
+            commands_cancelled:Number(body.commands_cancelled||0),
+            truncated:body.truncated===true,
+          };
+        }
+      }catch{}
+      return json({granted:false,revoked:true,actor_id:actorId,machine_id:machineId,cleanup});
     }
     this.db.run('INSERT INTO shell_grants(actor_id,machine_id,enabled,granted_by,created_at,updated_at,revoked_at) VALUES(?,?,1,?,?,?,NULL) ON CONFLICT(actor_id,machine_id) DO UPDATE SET enabled=1,granted_by=excluded.granted_by,updated_at=excluded.updated_at,revoked_at=NULL',actorId,machineId,actor.id,now,now);
     return json({granted:true,actor_id:actorId,machine_id:machineId},201);
@@ -1587,7 +1603,7 @@ export class ControlDO {
 
   private async checkSessionCap(request:Request):Promise<Response>{
     const actor=actorFrom(request);
-    if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'session:start'))return error('forbidden',403);
+    if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'session:start')&&!(actor?.kind==='operator'&&hasScope(actor,'shell:start')))return error('forbidden',403);
     const body=await bodyObject(request,4096);
     if(!boundedString(body.operation_id,180)||!boundedString(body.session_id,180))return error('invalid_session_start',400);
     const operationId=body.operation_id,sessionId=body.session_id;
