@@ -9,6 +9,9 @@ export const WORKER_CREDENTIAL_SCHEMA = [
   'CREATE UNIQUE INDEX worker_credentials_token ON worker_credentials(token_hash) WHERE token_hash IS NOT NULL',
   'CREATE INDEX worker_credentials_machine ON worker_credentials(machine_id,revoked_at,deadline,session_id,epoch)',
 ];
+export type WorkerRole = 'worker' | 'orchestrator';
+const WORKER_ROLE_TABLE =
+  "CREATE TABLE IF NOT EXISTS worker_credential_roles(session_id TEXT NOT NULL,epoch INTEGER NOT NULL,role TEXT NOT NULL CHECK(role IN ('worker','orchestrator')),PRIMARY KEY(session_id,epoch)) WITHOUT ROWID";
 type Binding = {
   session_id: string;
   epoch: number;
@@ -18,36 +21,66 @@ type Binding = {
   project_id: string;
   deadline: number;
   machine_generation: string;
+  role?: WorkerRole;
 };
 type Grant = Binding & { sealed_token: string; token_hash: string | null; revoked_at: number | null };
 const fields = ['session_id', 'operation_id', 'machine_id', 'intake_id', 'project_id'] as const;
 export class WorkerCredentials {
   private key?: Promise<CryptoKey>;
+  private roleTableReady = false;
   constructor(
     private ctx: DurableObjectState,
     private db: MeteredDb,
     private env: Hub2Env,
   ) {}
+  private ensureRoleTable(): void {
+    if (this.roleTableReady) return;
+    this.db.run(WORKER_ROLE_TABLE);
+    this.roleTableReady = true;
+  }
+  private roleFor(sessionId: string, epoch: number): WorkerRole {
+    try {
+      const row = this.db.one<{ role: string }>(
+        'SELECT role FROM worker_credential_roles WHERE session_id=? AND epoch=?',
+        sessionId,
+        epoch,
+      );
+      return row?.role === 'orchestrator' ? 'orchestrator' : 'worker';
+    } catch {
+      return 'worker';
+    }
+  }
   private actor(b: Binding) {
     return 'session:' + b.session_id;
   }
   private generation(b: Binding) {
     return 'worker:' + b.epoch + ':' + b.operation_id;
   }
+  private scopesFor(actor: string, projectId: string, role: WorkerRole): string[] {
+    const base = [
+      'intake:read', 'intake:append', 'intake:create',
+      'routing:read',
+      'claim:read', 'claim:write',
+      'message:read', 'message:send', 'mailbox:' + actor,
+      'worker_project:' + projectId,
+    ];
+    if (role !== 'orchestrator') return base;
+    return [
+      ...base,
+      'quota:read',
+      'repos:read', 'repos:write',
+      'session:list', 'session:start', 'session:read', 'session:send', 'session:stop',
+    ];
+  }
   private verified(row: Grant | undefined): Actor | undefined {
     if (!row || !row.token_hash) return;
     const actor = this.actor(row);
+    const role = this.roleFor(row.session_id, row.epoch);
     return verifyKnownCredential({
       actor_id: actor, kind: 'agent', resource_id: row.intake_id,
       generation: this.generation(row), expires_at: row.deadline,
       revoked_at: row.revoked_at, family_id: 'worker:' + row.session_id + ':' + row.epoch,
-      client_id: 'native-worker', scopes_json: JSON.stringify([
-        'intake:read', 'intake:append', 'intake:create',
-        'session:start', 'routing:read',
-        'claim:read', 'claim:write',
-        'message:read', 'message:send', 'mailbox:' + actor,
-        'worker_project:' + row.project_id,
-      ]),
+      client_id: 'native-worker', scopes_json: JSON.stringify(this.scopesFor(actor, row.project_id, role)),
     }, this.env);
   }
   verifyHash(hash: string): Actor | undefined {
@@ -104,10 +137,12 @@ export class WorkerCredentials {
     if (
       !Number.isSafeInteger(b.epoch) ||
       b.epoch < 1 ||
-      fields.some((k) => typeof b[k] !== 'string' || !b[k] || b[k].length > 180)
+      fields.some((k) => typeof b[k] !== 'string' || !b[k] || b[k].length > 180) ||
+      (b.role !== undefined && b.role !== 'worker' && b.role !== 'orchestrator')
     )
       return error('invalid_worker_binding', 400);
     if (path === '/_worker/revoke') return this.revoke(b);
+    const requestedRole: WorkerRole = b.role === 'orchestrator' ? 'orchestrator' : 'worker';
     if (
       !Number.isSafeInteger(b.deadline) ||
       b.deadline <= Date.now() ||
@@ -140,6 +175,7 @@ export class WorkerCredentials {
       ),
       token: string | undefined;
     if (!selected) {
+      if (requestedRole === 'orchestrator') this.ensureRoleTable();
       token = randomToken();
       const sealed = await this.crypt(token, b),
         hash = await sha256Hex(token);
@@ -173,11 +209,20 @@ export class WorkerCredentials {
           sealed,
           hash,
         );
+        if (requestedRole === 'orchestrator') {
+          this.db.run(
+            'INSERT OR REPLACE INTO worker_credential_roles(session_id,epoch,role) VALUES(?,?,?)',
+            b.session_id,
+            b.epoch,
+            requestedRole,
+          );
+        }
         return { ...b, sealed_token: sealed, token_hash: hash, revoked_at: null };
       });
       if (selected.sealed_token !== sealed) token = undefined;
     }
-    if (!this.same(selected, b) || selected.revoked_at !== null || selected.deadline <= Date.now())
+    const grantedRole = this.roleFor(selected.session_id, selected.epoch);
+    if (!this.same(selected, b) || grantedRole !== requestedRole || selected.revoked_at !== null || selected.deadline <= Date.now())
       return error('worker_grant_unavailable', 409);
     token ??= await this.crypt(selected.sealed_token, selected, true);
     if (
@@ -192,6 +237,7 @@ export class WorkerCredentials {
     return json({
       token,
       actor: this.actor(b),
+      role: grantedRole,
       expires_at: selected.deadline,
       ...Object.fromEntries(fields.map((k) => [k, b[k]])),
       epoch: b.epoch,

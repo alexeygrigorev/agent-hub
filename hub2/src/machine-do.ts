@@ -1163,13 +1163,15 @@ export class MachineDO {
     const row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=? AND machine_id=?',sessionId,machine);
     if(!row||row.state!=='claimed'||row.operation_id!==body.operation_id||row.epoch!==body.epoch)return error('child_credential_fence',409);
     const admission=this.db.one<{observed_at:number}>('SELECT observed_at FROM launch_admissions WHERE operation_id=? AND session_id=? AND epoch=?',row.operation_id,row.id,row.epoch);
-    const timeout=(this.parse(row.launch_json) as JsonRecord).timeout_seconds;
+    const launch=this.parse(row.launch_json) as JsonRecord;
+    const timeout=launch.timeout_seconds;
     if(!admission||!Number.isSafeInteger(timeout)||Number(timeout)<1||Number(timeout)>86400)return error('launch_admission_required',409);
     const deadline=admission.observed_at+Number(timeout)*1000;
     if(deadline<=Date.now())return error('child_credential_deadline_passed',409);
+    const role=launch.orchestrator===true?'orchestrator':'worker';
     const response=await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_worker/issue',{
       method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:row.id,operation_id:row.operation_id,
-        epoch:row.epoch,machine_id:row.machine_id,machine_generation:actor.generation,intake_id:row.intake_id,project_id:row.project_id,deadline})});
+        epoch:row.epoch,machine_id:row.machine_id,machine_generation:actor.generation,intake_id:row.intake_id,project_id:row.project_id,deadline,role})});
     if(!response.ok)return error('child_credential_unavailable',response.status===409?409:503);
     const result=await response.json() as JsonRecord;
     if(result.session_id!==row.id||result.operation_id!==row.operation_id||result.epoch!==row.epoch||result.machine_id!==row.machine_id||result.intake_id!==row.intake_id||result.project_id!==row.project_id||result.actor!=='session:'+row.id||typeof result.token!=='string'||!Number.isSafeInteger(result.expires_at)||Number(result.expires_at)>deadline||Number(result.expires_at)<=Date.now())return error('child_credential_unverified',503);
@@ -1784,8 +1786,7 @@ export class MachineDO {
     const shellAllowed = await this.shellSessionAllowed(actor, session, scope);
     if (shellAllowed !== undefined) {
       if (!shellAllowed) return error('forbidden', 403);
-    } else if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
-      || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
+    } else if (!this.canSessionScope(actor, session, scope)) return error('forbidden', 403);
     if (kind === 'send' && sessionLaunch.interactive !== true) return error('headless_send_refused', 409);
     const captureMode = kind === 'capture' ? body.mode : undefined;
     if (captureMode !== undefined && captureMode !== 'screen') return error('invalid_capture_mode', 400);
@@ -2610,9 +2611,16 @@ export class MachineDO {
       stopEvidence?1:0,stopEvidence?1:0,stopResult,unconfirmedStopResult,failedResult,now,session.id,session.machine_id,session.epoch);
   }
 
+  private canSessionScope(actor: Actor | undefined, session: { id: string; project_id: string }, scope: string): boolean {
+    if (hasScope(actor, 'operator:admin')) return true;
+    if (!hasScope(actor, scope)) return false;
+    if ([session.id, session.project_id].includes(actor?.resource_id || '')) return true;
+    return actor?.kind === 'agent' && hasScope(actor, 'session:list') && actor.client_id === 'native-worker';
+  }
+
   private sessionList(request: Request): Response {
     const actor=actorFrom(request);
-    if (!hasScope(actor,'operator:admin')) return error('forbidden',403);
+    if (!hasScope(actor,'operator:admin') && !hasScope(actor,'session:list')) return error('forbidden',403);
     const query=new URL(request.url).searchParams,rawAfter=query.get('after')||'',limit=Number(query.get('limit')||25);
     let after=rawAfter;
     if (!Number.isInteger(limit)||limit<1||limit>100||rawAfter.length>1024) return error('invalid_page',400);
@@ -2682,7 +2690,7 @@ export class MachineDO {
   private async commandListing(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
     const shellAllowed = session ? await this.shellSessionAllowed(actor, session, 'session:read') : undefined;
-    if (!session || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
+    if (!session || (shellAllowed !== undefined ? !shellAllowed : !this.canSessionScope(actor, session, 'session:read'))) return error('session_not_found', 404);
     const query = new URL(request.url).searchParams;
     const commandId = query.get('command_id');
     if (commandId !== null && (query.getAll('command_id').length !== 1 || !/^[A-Za-z0-9-]{1,80}$/.test(commandId))) return error('invalid_command_id',400);
@@ -2797,7 +2805,7 @@ export class MachineDO {
     const shellAllowed=session&&actor?await this.shellSessionAllowed(actor,this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id)!,read?'session:read':'session:send'):undefined;
     if(!session||!actor||(shellAllowed!==undefined
       ? !shellAllowed
-      : (!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))))return error('session_not_found',404);
+      : (!this.canSessionScope(actor,session,read?'session:read':'session:send')&&!this.workerSelfWake(actor,session,read))))return error('session_not_found',404);
     if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
     if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
     const b=await bodyObject(request,12288);if(Object.keys(b).some(k=>!['key','at','prompt','body'].includes(k)))return error('invalid_wake',400);
@@ -2811,14 +2819,14 @@ export class MachineDO {
   private async sessionDetail(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
-    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : !this.canSessionScope(actor, row, 'session:read'))) return error('session_not_found', 404);
     return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
   }
 
   private async sessionEvents(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
     const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
-    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : !this.canSessionScope(actor, row, 'session:read'))) return error('session_not_found', 404);
     const events: JsonRecord[] = [];
     const attention = this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?', row.id);
     const diagnostic = attention ? this.hostStartDiagnostic(row, attention.reason) : null;

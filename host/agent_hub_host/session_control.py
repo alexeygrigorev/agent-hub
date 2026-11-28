@@ -28,7 +28,7 @@ MAX_BRIEF_CHARS = 8000
 MAX_BODY = 16384
 SESSION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 TIERS = ('quick', 'daily', 'deep')
-PURPOSES = ('fix', 'implement', 'review', 'think')
+PURPOSES = ('fix', 'implement', 'review', 'think', 'orchestrate')
 WAIT_DEFAULT_TIMEOUT = 300.0
 WAIT_MAX_TIMEOUT = 600.0
 WAIT_MIN_INTERVAL = 1.0
@@ -711,7 +711,7 @@ def add_commands(sub):
     start.add_argument('--engine', help='Engine override (operators only)')
     start.add_argument('--model', help='Explicit model label, e.g. fable or gpt-6.1-sol (operators only)')
     start.add_argument('--purpose', choices=PURPOSES, default='implement',
-                       help='Start purpose for model policy: fix|implement|review|think (default implement; astra is drawn only for review/think)')
+                       help='Start purpose for model policy and token role: fix|implement|review|think|orchestrate (default implement; orchestrate issues an orchestrator-scoped token; astra is drawn only for review/think)')
     start.add_argument('--reason', default=None,
                        help='Optional explanation for an explicit deep-tier, model or engine choice')
     start.add_argument('--machine')

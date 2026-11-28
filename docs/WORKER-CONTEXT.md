@@ -43,3 +43,27 @@ Anything else returns `403 evidence_not_referenced` with a `reason` (`not_refere
 `intake_authored_by_worker`, `own_intake_not_in_project`) and an `operator_command`, for example
 `hub sessions show <full id>`. The worker records that as a `permission` blocker for an operator to
 run. Cross-project targets keep Control's original `missing scope intake:read` refusal.
+
+## Orchestrator-scoped tokens
+
+Normal headless workers (`--purpose implement|fix|review|think`, non-interactive) receive a
+least-privilege single-intake token (`intake:read`, `intake:append`, `intake:create`,
+`routing:read`, `claim:read`, `claim:write`, `message:read`, `message:send`, own mailbox, and
+`worker_project:<project>`). They cannot list or start other sessions, read fleet quota or repos,
+or read unrelated intakes (HTTP 403).
+
+When an operator starts a managed orchestrator session — signalled by `--interactive`,
+`--with-goal`, or `--purpose orchestrate` (excluding `shell` sessions) — Hub issues an
+orchestrator-scoped worker token (`role: "orchestrator"`) with these additional scopes:
+
+- `quota:read` (`hub quota`)
+- `repos:read`, `repos:write` (`hub repos list`, `hub repos show`, `hub repos add --file`)
+- `session:list`, `session:start`, `session:read`, `session:send`, `session:stop`
+  (`hub sessions list / start / show / send / stop`)
+- `hub intake show` and `hub intake append` (by full UUID or 6+ char prefix) on the linked parent
+  intake, its child intakes, and intakes created by the orchestrator session. Unrelated intakes
+  still return HTTP 403.
+
+Only an `operator:admin` start (and Hub's own continuation/retry of an existing orchestrator) can
+mark a session as `orchestrator: true`; child sessions started by an orchestrator always receive
+least-privilege worker tokens. Interactive `shell` sessions remain operator-only.

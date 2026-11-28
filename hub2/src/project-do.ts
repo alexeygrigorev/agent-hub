@@ -13,7 +13,7 @@ import { actorFrom, bodyObject, boundedString, error, forbiddenScope, hasScope, 
 import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
-import { sessionPurpose } from './session-purpose';
+import { isOrchestratorLaunch, sessionPurpose } from './session-purpose';
 import {inheritedModelConstraints,normalizeModelConstraint,type InheritedModelConstraint} from './intake-model-constraints';
 import { codeTask, mergeEvidenceShapeError, mergeGateAll, mergeGaps, readOnlyBrief } from './merge-gate';
 import { nativeReturncode } from './native-exit';
@@ -515,8 +515,8 @@ export class ProjectDO {
     const digest=await sha256Hex(JSON.stringify([body.note??null,body.evidence??null])),eventKey='append:'+intakeId+':'+key;
     return this.transaction(()=>{
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!intake)return error('intake_not_found',404);
-      if(!actor||!hasScope(actor,'operator:admin')&&!((actor.resource_id===intake.id||this.isWorkerParent(actor,intake))&&hasScope(actor,'intake:append')))
-        return forbiddenScope('intake:append',`append to intake ${intake.id} needs intake:append on that intake, its child-intake worker session, or operator:admin`);
+      if(!actor||!hasScope(actor,'operator:admin')&&!((actor.resource_id===intake.id||this.isWorkerParent(actor,intake)||this.isOrchestratorChild(actor,intake))&&hasScope(actor,'intake:append')))
+        return forbiddenScope('intake:append',`append to intake ${intake.id} needs intake:append on that intake, its child-intake worker session, its parent orchestrator session, or operator:admin`);
       // A completion claim may come only from that session itself or an operator.
       const claimKind=(body.evidence as JsonRecord|undefined)?.kind;
       // A child's session reports progress to its parent; it never writes records the parent's gates read.
@@ -894,7 +894,7 @@ export class ProjectDO {
     // Implementation/fix sessions do real multi-step work (PR, CI, deploy) and
     // must not be killed at 30 minutes; review/think keep the short default.
     const timeoutSeconds = body.timeout_seconds === undefined
-      ? (purpose === 'implement' || purpose === 'fix' ? 7200 : 1800) : body.timeout_seconds;
+      ? (purpose === 'implement' || purpose === 'fix' || purpose === 'orchestrate' ? 7200 : 1800) : body.timeout_seconds;
     const absoluteWorkspace = typeof workspace === 'string' && (workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace));
     const workspaceLabel = typeof workspace === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspace);
     if (typeof workspace !== 'string' || workspace.length > 1024
@@ -1092,9 +1092,13 @@ export class ProjectDO {
     // Task sessions (not operator shells or scheduled runs) carry Hub's
     // completion contract; their outcome is decided by a completion claim.
     const completionControlled = route.engine.toLowerCase() !== 'shell' && !intake.schedule_id;
+    const orchestrator = isOrchestratorLaunch({ interactive, with_goal: withGoal, purpose, engine: route.engine })
+      && (hasScope(actor, 'operator:admin')
+        || ((actor?.id === COMPLETION_ACTOR || actor?.id === RETRY_ACTOR) && body.orchestrator === true));
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
+      ...(orchestrator ? { orchestrator: true } : {}),
       ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
       ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason, ...(interactive && actor ? { shell_actor_id: actor.id } : {}) } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
@@ -2268,6 +2272,7 @@ export class ProjectDO {
       const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
         ...(repick?{exclude_policy_ids:excluded}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
         interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+        ...(launch.orchestrator===true?{orchestrator:true}:{}),
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
@@ -2506,6 +2511,7 @@ export class ProjectDO {
     const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
       ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
       interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+      ...(launch.orchestrator===true?{orchestrator:true}:{}),
       purpose:launch.purpose??'implement',override_reason:'hub_failed_intake_retry',
       ...(Array.isArray(route.required_capabilities)?{required_capabilities:route.required_capabilities}:{}),
       ...(routeFallback?{exclude_policy_ids:[String(route.policy_id)]}:{}),
@@ -2716,15 +2722,25 @@ export class ProjectDO {
 
   private canCreateIntake(actor: ReturnType<typeof actorFrom>, project: string): boolean {
     if (this.canProject(actor, project, 'intake:write')) return true;
-    return !!actor && actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id
-      && hasScope(actor, 'intake:create') && hasScope(actor, `worker_project:${project}`);
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !actor.resource_id || !hasScope(actor, 'intake:create')) return false;
+    return hasScope(actor, `worker_project:${project}`) || (hasScope(actor, 'session:list') && hasScope(actor, 'repos:write'));
   }
 
   private canStartIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
     if (this.canProject(actor, intake.project, 'session:start')) return true;
     if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !hasScope(actor, 'session:start')) return false;
-    if (!hasScope(actor, `worker_project:${intake.project}`)) return false;
+    const projectAllowed = hasScope(actor, `worker_project:${intake.project}`) || (hasScope(actor, 'session:list') && hasScope(actor, 'repos:write'));
+    if (!projectAllowed) return false;
     if (actor.resource_id === intake.id) return false;
+    return intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id);
+  }
+
+  /**
+   * An orchestrator session may append notes/evidence to its linked intake's child intakes
+   * and to intakes it created.
+   */
+  private isOrchestratorChild(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !hasScope(actor, 'session:list')) return false;
     return intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id);
   }
 
@@ -2739,12 +2755,18 @@ export class ProjectDO {
     return !!own?.parent_intake_id && own.parent_intake_id === intake.id;
   }
 
-  /** Resolve short intake refs: bound worker sessions only see their own parent; operators/project callers resolve any unique prefix in this project. */
+  /** Resolve short intake refs: bound worker sessions see their own parent, children, and owned intakes; operators/project callers resolve any unique prefix in this project. */
   private resolveIntakeRef(actor: ReturnType<typeof actorFrom>, ref: string): string {
     if (ref.length < 6 || this.db.one('SELECT id FROM intakes WHERE id=?', ref)) return ref;
     if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id) {
       const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
-      return own?.parent_intake_id?.startsWith(ref) ? own.parent_intake_id : ref;
+      if (own?.parent_intake_id?.startsWith(ref)) return own.parent_intake_id;
+      const children = this.db.all<{ id: string }>(
+        'SELECT id FROM intakes WHERE (parent_intake_id=? OR owner_actor_id=?) AND id>=? AND id<? ORDER BY id LIMIT 2',
+        actor.resource_id, actor.id, ref, ref + '\uffff',
+      );
+      if (children.length > 1) throw new HttpError('ambiguous_prefix', 409, `intake id prefix ${ref} matches several intakes; pass the full id`);
+      return children.length === 1 ? children[0].id : ref;
     }
     const rows = this.db.all<{ id: string }>('SELECT id FROM intakes WHERE id>=? AND id<? ORDER BY id LIMIT 2', ref, ref + '\uffff');
     if (rows.length > 1) throw new HttpError('ambiguous_prefix', 409, `intake id prefix ${ref} matches several intakes; pass the full id`);

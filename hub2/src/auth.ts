@@ -232,7 +232,7 @@ export function verifyKnownCredential(row: any, env: AuthEnv): Actor | undefined
   } catch {
     return;
   }
-  if (!Array.isArray(scopes) || scopes.length > 16 || !scopes.every((s) => typeof s === 'string'))
+  if (!Array.isArray(scopes) || scopes.length > 24 || !scopes.every((s) => typeof s === 'string'))
     return;
   const worker = row.kind === 'agent';
   if (worker) {
@@ -247,7 +247,14 @@ export function verifyKnownCredential(row: any, env: AuthEnv): Actor | undefined
       'intake:read',
       'intake:append',
       'intake:create',
+      'quota:read',
+      'repos:read',
+      'repos:write',
+      'session:list',
       'session:start',
+      'session:read',
+      'session:send',
+      'session:stop',
       'routing:read',
       'claim:read',
       'claim:write',
