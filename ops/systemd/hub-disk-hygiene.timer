@@ -1,11 +1,11 @@
 [Unit]
-Description=Run Hub host disk hygiene every 6 hours
+Description=Run Hub host disk hygiene every 30 minutes
 
 [Timer]
 OnBootSec=10m
-OnUnitActiveSec=6h
+OnUnitActiveSec=30m
 Persistent=true
-RandomizedDelaySec=5m
+RandomizedDelaySec=2m
 Unit=hub-disk-hygiene.service
 
 [Install]

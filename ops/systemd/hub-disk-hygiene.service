@@ -1,6 +1,6 @@
 [Unit]
-Description=Hub host automatic disk hygiene for finished-session build artifacts
+Description=Hub host automatic disk hygiene for rebuildable artifacts (>=85% root usage)
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.local/share/agent-hub-ops/disk_hygiene.py --apply
+ExecStart=/usr/bin/python3 %h/.local/share/agent-hub-ops/disk_hygiene.py --apply --min-used-pct 85

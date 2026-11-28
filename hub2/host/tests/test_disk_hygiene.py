@@ -55,7 +55,7 @@ class DiskHygieneTests(unittest.TestCase):
             }), encoding='utf-8')
 
             dry = disk_hygiene.run_hygiene(
-                apply=False, home=home, sessions_json=sessions_file, now_s=now, mount_path=home,
+                apply=False, home=home, sessions_json=sessions_file, now_s=now, mount_path=home, include_docker=False,
             )
             self.assertEqual(dry['mode'], 'dry-run')
             self.assertGreater(dry['total_bytes'], 0)
@@ -64,7 +64,7 @@ class DiskHygieneTests(unittest.TestCase):
             self.assertIn('DAILY_HYGIENE_SUMMARY', dry['daily_line'])
 
             applied = disk_hygiene.run_hygiene(
-                apply=True, home=home, sessions_json=sessions_file, now_s=now, mount_path=home,
+                apply=True, home=home, sessions_json=sessions_file, now_s=now, mount_path=home, include_docker=False,
             )
             self.assertEqual(applied['mode'], 'apply')
             self.assertFalse((wt / '.venv').exists())
@@ -103,7 +103,7 @@ class DiskHygieneTests(unittest.TestCase):
             with mock.patch.object(disk_hygiene, 'scan_open_paths', return_value=({wt_open}, True)):
                 res = disk_hygiene.run_hygiene(
                     apply=True, home=home, sessions_json=sessions_file,
-                    extra_worktrees=[relay_wt], now_s=now, mount_path=home,
+                    extra_worktrees=[relay_wt], now_s=now, mount_path=home, include_docker=False,
                 )
             self.assertEqual(res['total_bytes'], 0)
             self.assertTrue((wt_recent / '.venv').exists())
@@ -133,11 +133,95 @@ class DiskHygieneTests(unittest.TestCase):
 
             res = disk_hygiene.run_hygiene(
                 apply=True, home=home, sessions_json=sessions_file, managed_root=managed, mount_path=home,
+                include_docker=False,
             )
             self.assertTrue(cur.exists())
             self.assertFalse(old.exists())
             self.assertFalse(cur_cache.exists())
             self.assertGreater(res['categories_bytes']['managed_engines'], 0)
+
+    def test_min_used_pct_gate_and_denylist_and_project_dirs(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            academy = home / 'git' / 'academy'
+            relay = home / 'git' / 'relay'
+            reports = home / 'tmp' / 'agent-reports'
+            recs = home / 'recordings'
+            work_proj = home / 'work' / 'proj-a'
+            for d in (academy, relay, reports, recs, work_proj):
+                (d / 'node_modules' / 'pkg').mkdir(parents=True)
+                (d / 'node_modules' / 'pkg' / 'a.js').write_bytes(b'x' * 1024)
+            (work_proj / 'data.sqlite').write_bytes(b'db' * 512)
+            (work_proj / '.env').write_text('SECRET=1\n', encoding='utf-8')
+
+            now = 1_800_000_000.0
+            old_ts = now - 48 * 3600
+            for root_dir, _, files in os.walk(work_proj):
+                os.utime(root_dir, (old_ts, old_ts))
+                for f in files:
+                    os.utime(Path(root_dir) / f, (old_ts, old_ts))
+
+            # Below 85% threshold -> skipped
+            with mock.patch.object(disk_hygiene, 'measure_mount_used_pct', return_value=80.0), \
+                 mock.patch.object(disk_hygiene, 'load_hub_sessions', return_value=None):
+                skipped_res = disk_hygiene.run_hygiene(
+                    apply=True, home=home, min_used_pct=85.0, include_docker=False, now_s=now, mount_path=home,
+                )
+            self.assertEqual(skipped_res['total_bytes'], 0)
+            self.assertTrue((work_proj / 'node_modules').exists())
+
+            # At >= 85% threshold -> cleans work_proj/node_modules, never touches denylist or DB/.env
+            with mock.patch.object(disk_hygiene, 'measure_mount_used_pct', return_value=86.0), \
+                 mock.patch.object(disk_hygiene, 'load_hub_sessions', return_value=None):
+                res = disk_hygiene.run_hygiene(
+                    apply=True, home=home, min_used_pct=85.0, include_docker=False, now_s=now, mount_path=home,
+                )
+            self.assertFalse((work_proj / 'node_modules').exists())
+            self.assertTrue((work_proj / 'data.sqlite').exists())
+            self.assertTrue((work_proj / '.env').exists())
+            self.assertTrue((academy / 'node_modules').exists())
+            self.assertTrue((relay / 'node_modules').exists())
+            self.assertTrue((reports / 'node_modules').exists())
+            self.assertTrue((recs / 'node_modules').exists())
+            self.assertGreater(res['categories_bytes']['node_modules'], 0)
+
+    def test_prunes_merged_clean_worktree_but_preserves_unpushed_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            origin = home / 'origin.git'
+            subprocess.run(['git', 'init', '--bare', '-q', str(origin)], check=True)
+            main_repo = home / 'git' / 'demo-repo'
+            _init_git_worktree(main_repo)
+            subprocess.run(['git', 'branch', '-M', 'main'], cwd=main_repo, check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', str(origin)], cwd=main_repo, check=True)
+            subprocess.run(['git', 'push', '-q', '-u', 'origin', 'main'], cwd=main_repo, check=True)
+
+            wt_merged = main_repo / '.local' / 'hub-worktrees' / ('a' * 64)
+            wt_unpushed = main_repo / '.local' / 'hub-worktrees' / ('b' * 64)
+            wt_merged.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(['git', 'worktree', 'add', '-q', '-b', 'merged-br', str(wt_merged), 'origin/main'], cwd=main_repo, check=True)
+            subprocess.run(['git', 'worktree', 'add', '-q', '-b', 'unpushed-br', str(wt_unpushed), 'origin/main'], cwd=main_repo, check=True)
+            (wt_unpushed / 'new.py').write_text('print(2)\n', encoding='utf-8')
+            subprocess.run(['git', 'add', 'new.py'], cwd=wt_unpushed, check=True)
+            subprocess.run(['git', 'commit', '-q', '-m', 'unpushed'], cwd=wt_unpushed, check=True)
+
+            now = 1_800_000_000.0
+            sessions_file = home / 'sessions.json'
+            sessions_file.write_text(json.dumps({
+                'items': [
+                    {'id': 's1', 'state': 'completed', 'workspace': str(wt_merged), 'updated_at': now - 48 * 3600},
+                    {'id': 's2', 'state': 'completed', 'workspace': str(wt_unpushed), 'updated_at': now - 48 * 3600},
+                ],
+                'next_cursor': None,
+            }), encoding='utf-8')
+
+            res = disk_hygiene.run_hygiene(
+                apply=True, home=home, sessions_json=sessions_file, include_docker=False, now_s=now, mount_path=home,
+            )
+            self.assertFalse(wt_merged.exists())
+            self.assertTrue(wt_unpushed.exists())
+            self.assertGreater(res['categories_bytes']['stale_worktrees'], 0)
 
 
 if __name__ == '__main__':

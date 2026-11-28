@@ -226,6 +226,12 @@ def refresh_token(expected_token=None):
             # server revokes the whole family (2026-11-03 RMTHZ/desktop loss).
             if cfg.get('access_token'):
                 return cfg['access_token']
+        if cfg.get("refresh_pending"):
+            if worker:
+                raise RuntimeError('Worker credential refresh uncertain; host re-issuance required.')
+            if kind == 'human':
+                raise RuntimeError("Human session refresh uncertain. Run `hub auth login` again.")
+            raise RuntimeError("Token refresh outcome uncertain. Please login again.")
         refresh = cfg.get("refresh_token")
         base_url = cfg.get("base_url")
         if not refresh or not base_url:
@@ -235,7 +241,12 @@ def refresh_token(expected_token=None):
                 raise RuntimeError("Human session expired. Run `hub auth login` again.")
             raise RuntimeError("No refresh token or base URL available. Please login.")
 
-        exchange = config._TokenExchange(base_url, "/api/token/refresh", cfg,
+        # Persist refresh_pending before hitting /api/token/refresh so ENOSPC fails
+        # before consuming the rotating refresh token (and prevents replay if commit fails).
+        pending_cfg = dict(cfg)
+        pending_cfg["refresh_pending"] = True
+        save_fn(pending_cfg)
+        exchange = config._TokenExchange(base_url, "/api/token/refresh", pending_cfg,
                                           _load_fn=load_fn, _save_fn=save_fn)
         token_url = exchange.url
         token_payload = json.dumps({

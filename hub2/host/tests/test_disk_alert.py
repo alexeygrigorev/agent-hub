@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_hub_host import disk_alert
 
@@ -30,9 +31,9 @@ class DiskAlertAndSendTests(unittest.TestCase):
             self.assertEqual(res_warn['report']['level'], 'WARN')
             self.assertTrue(res_warn['delivery']['ok'])
 
-            # 92% -> CRIT
+            # 90% -> CRIT
             res_crit = disk_alert.run_check(
-                mount=Path('/'), state_dir=state, force_used_pct=93.0, oncall_bin=str(fake_oncall),
+                mount=Path('/'), state_dir=state, force_used_pct=90.0, oncall_bin=str(fake_oncall),
             )
             self.assertEqual(res_crit['report']['level'], 'CRIT')
             self.assertTrue(res_crit['delivery']['ok'])
@@ -87,6 +88,33 @@ class DiskAlertAndSendTests(unittest.TestCase):
             self.assertIn('STATUS=ok', p2.stdout)
             self.assertEqual(len(list(tmpfs.glob('*.md'))), 0)
             self.assertEqual(len(list(primary.glob('*.md'))), 2)
+
+    def test_dedupes_alert_at_90_pct_until_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'state'
+            fake_oncall = Path(tmp) / 'oncall-send'
+            captured = Path(tmp) / 'captured.txt'
+            fake_oncall.write_text(
+                f'#!/usr/bin/env bash\necho "$@" >> "{captured}"\necho "STATUS=ok"\nexit 0\n',
+                encoding='utf-8',
+            )
+            fake_oncall.chmod(0o755)
+
+            with mock.patch.object(disk_alert, 'measure_mount_used_pct', return_value=(90.5, 10 * 1024**3, 100 * 1024**3)):
+                r1 = disk_alert.run_check(mount=Path('/'), state_dir=state, oncall_bin=str(fake_oncall), now_s=1000.0)
+                r2 = disk_alert.run_check(mount=Path('/'), state_dir=state, oncall_bin=str(fake_oncall), now_s=1000.0 + 6 * 3600)
+            self.assertTrue(r1['delivery']['ok'])
+            self.assertIsNone(r2['delivery'])
+            self.assertEqual(len(captured.read_text(encoding='utf-8').splitlines()), 1)
+
+            with mock.patch.object(disk_alert, 'measure_mount_used_pct', return_value=(70.0, 30 * 1024**3, 100 * 1024**3)):
+                r_ok = disk_alert.run_check(mount=Path('/'), state_dir=state, oncall_bin=str(fake_oncall), now_s=1000.0 + 7 * 3600)
+            self.assertEqual(r_ok['report']['level'], 'OK')
+
+            with mock.patch.object(disk_alert, 'measure_mount_used_pct', return_value=(91.0, 9 * 1024**3, 100 * 1024**3)):
+                r3 = disk_alert.run_check(mount=Path('/'), state_dir=state, oncall_bin=str(fake_oncall), now_s=1000.0 + 8 * 3600)
+            self.assertTrue(r3['delivery']['ok'])
+            self.assertEqual(len(captured.read_text(encoding='utf-8').splitlines()), 2)
 
 
 if __name__ == '__main__':

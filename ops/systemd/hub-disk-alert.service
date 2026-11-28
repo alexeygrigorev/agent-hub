@@ -1,5 +1,5 @@
 [Unit]
-Description=Hub host early disk alert (85% warn / 92% crit / 24h fill)
+Description=Hub host early disk alert (85% warn / 90% crit / 24h fill)
 
 [Service]
 Type=oneshot

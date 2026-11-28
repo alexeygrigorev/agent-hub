@@ -153,12 +153,19 @@ def _human_refresh_locked() -> str:
     cfg = config.load_human_config()
     if not config.is_human_config(cfg) and not cfg.get("refresh_token"):
         raise RuntimeError("Not logged in as human. Run `hub auth login`.")
+    if cfg.get("refresh_pending"):
+        raise HumanSessionExpired("Human refresh outcome uncertain; run `hub auth login`.")
     refresh = cfg.get("refresh_token")
     base_url = cfg.get("base_url")
     if not refresh or not base_url:
         raise HumanSessionExpired("Human session is missing its refresh credential or Hub URL.")
+    # Persist refresh_pending before hitting /api/token/refresh so ENOSPC fails
+    # before consuming the rotating refresh token (and prevents replay if commit fails).
+    pending_cfg = dict(cfg)
+    pending_cfg["refresh_pending"] = True
+    config.save_human_config(pending_cfg)
     exchange = config._TokenExchange(
-        base_url, "/api/token/refresh", cfg,
+        base_url, "/api/token/refresh", pending_cfg,
         _load_fn=config.load_human_config, _save_fn=config.save_human_config,
     )
     try:
