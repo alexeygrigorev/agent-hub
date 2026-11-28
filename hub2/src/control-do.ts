@@ -143,7 +143,9 @@ export class ControlDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
+    this.workers=new WorkerCredentials(ctx,this.db,this.env);
     this.ready=initializeSchema(ctx, this.db, 9, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA,SHELL_GRANTS_SCHEMA],async()=>{
+      this.workers.initialize();
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
@@ -153,7 +155,7 @@ export class ControlDO {
     },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,9));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
-    this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
+    this.auth=new ControlAuth(ctx,this.db,this.env);
   }
 
   async fetch(request: Request): Promise<Response> {
