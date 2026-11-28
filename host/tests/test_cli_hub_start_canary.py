@@ -1683,6 +1683,46 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(st["failures"], 0)
         self.assertEqual(st["last_lock_busy"]["reason"], "deploy_gate_lock_busy")
 
+    def test_stale_prior_pending_gone_is_cleaned_not_blocking(self):
+        import datetime
+        pending_dir = self.state / "pending"
+        self.state.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        pending_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(pending_dir, 0o700)
+        for p in pending_dir.glob("*.json"):
+            p.unlink()
+        ws = str((self.tmp / "ws").resolve())
+        old_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale = pending_dir / "prior-stale-gone.json"
+        stale.write_text(
+            json.dumps(
+                {
+                    "run_id": "prior-stale-gone",
+                    "mode": "shell",
+                    "name": "hub-canary-shell-prior-stale-gone",
+                    "key": "canary-prior-stale-gone",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": ws,
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": "22222222-3333-4444-8555-666666666666",
+                    "native_id": "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+                    "updated_at": old_ts,
+                }
+            )
+        )
+        os.chmod(stale, 0o600)
+        # Fake Hub has never seen the dead SID: list omits it, `a list` omits its
+        # native, and `sessions show <dead-sid>` returns the live SID payload
+        # (id mismatch => definitively gone). The stale record must be unlinked
+        # and the fresh canary must pass instead of prior_pending_reconciliation_failed.
+        r, v = self.run_canary("ok", "--mode", "shell", HUB_CANARY_PENDING_STALE_AFTER_S="60")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"], v)
+        self.assertFalse(stale.exists())
+
     def test_periodic_alert_state_failures_emit_structured_json_without_traceback(self):
         self.state.mkdir(mode=0o700, exist_ok=True)
         os.chmod(self.state, 0o700)
