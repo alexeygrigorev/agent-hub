@@ -74,6 +74,14 @@ if args[:1] == ["routing-machines"]:
     sys.exit(0)
 if args[:2] == ["sessions", "show"]:
     if sc == "archive_show_fail": sys.exit(1)
+    if sc == "show_not_found":
+        if args[2] == SID:
+            print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
+        sys.stderr.write("hub error: HTTP 404 at http://127.0.0.1:8787/api/sessions/" + args[2] + "/show: status 404 (session_not_found): session not found\n"); sys.exit(1)
+    if sc == "show_transient":
+        if args[2] == SID:
+            print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
+        sys.stderr.write("Session HTTP request failed with status 503 (no_connected_host)\n"); sys.exit(1)
     if (d / "show_payload.json").exists():
         print((d / "show_payload.json").read_text()); sys.exit(0)
     print(json.dumps({"session": {"id": SID, "intake_id": "intake-canary-1"}})); sys.exit(0)
@@ -2542,6 +2550,61 @@ class CanaryTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(v["ok"], v)
         self.assertFalse(stale.exists())
+
+    def _write_stale_pending(self, run_id, sid, native_id):
+        import datetime
+        pending_dir = self.state / "pending"
+        self.state.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(self.state, 0o700)
+        pending_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(pending_dir, 0o700)
+        for p in pending_dir.glob("*.json"):
+            p.unlink()
+        ws = str((self.tmp / "ws").resolve())
+        old_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        stale = pending_dir / f"{run_id}.json"
+        stale.write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "mode": "shell",
+                    "name": f"hub-canary-shell-{run_id}",
+                    "key": f"canary-{run_id}",
+                    "repo": "owner/repo",
+                    "machine": "HOST-1",
+                    "workspace": ws,
+                    "prompt": "printf CANARY-OK; sleep 30",
+                    "candidate_sha": None,
+                    "session_id": sid,
+                    "native_id": native_id,
+                    "updated_at": old_ts,
+                }
+            )
+        )
+        os.chmod(stale, 0o600)
+        return stale
+
+    def test_stale_prior_pending_show_not_found_is_cleaned_not_blocking(self):
+        stale = self._write_stale_pending(
+            "prior-stale-404",
+            "22222222-3333-4444-8555-666666666666",
+            "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+        )
+        r, v = self.run_canary("show_not_found", "--mode", "shell", HUB_CANARY_PENDING_STALE_AFTER_S="60")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(v["ok"], v)
+        self.assertFalse(stale.exists())
+
+    def test_stale_prior_pending_show_transient_blocks(self):
+        stale = self._write_stale_pending(
+            "prior-stale-transient",
+            "33333333-4444-4555-8666-777777777777",
+            "cccccccc-dddd-4eee-8fff-000000000000",
+        )
+        r, v = self.run_canary("show_transient", "--mode", "shell", HUB_CANARY_PENDING_STALE_AFTER_S="60")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual((v["ok"], v["stage"], v["reason"]), (False, "cleanup", "prior_pending_reconciliation_failed"))
+        self.assertTrue(stale.exists())
 
     def test_periodic_alert_state_failures_emit_structured_json_without_traceback(self):
         self.state.mkdir(mode=0o700, exist_ok=True)

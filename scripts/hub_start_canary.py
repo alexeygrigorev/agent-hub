@@ -3264,7 +3264,7 @@ class Canary(PhysicalAdmission):
         except (TypeError, ValueError):
             threshold = float(PENDING_STALE_AFTER_S_DEFAULT)
         if not threshold or threshold <= 0:
-            return True
+            return False
         return self.pending_record_age_s(rec, pfile) >= threshold
 
     def prior_session_definitively_gone(self, sid, native_id, key, repo, machine, workspace, deadline):
@@ -3297,17 +3297,19 @@ class Canary(PhysicalAdmission):
             if native_id in running:
                 return False
         if sid is not None:
-            rc, out, _ = self.run([*self.hub, "sessions", "show", sid, "--json"], deadline=deadline)
+            rc, out, err = self.run([*self.hub, "sessions", "show", sid, "--json"], deadline=deadline)
             if rc == 0:
                 try:
                     payload = json.loads(out)
                 except ValueError:
-                    return True
+                    return False
                 node = payload.get("session", payload) if isinstance(payload, dict) else None
                 if isinstance(node, dict) and node.get("id") == sid:
                     return False
                 return True
-            return True
+            if self.failure_reason(rc, err or "") == "session_not_found":
+                return True
+            return False
         return True
 
     def dispose_stale_prior_pending(self, pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
