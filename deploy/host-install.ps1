@@ -98,10 +98,13 @@ function Get-ServeProcesses {
 }
 
 function Stop-Hub2Host {
-  # `hub host self-update` starts this script and exits; pip cannot replace a
-  # running venv interpreter, so wait for that launcher first.
+  # pip cannot replace a running venv interpreter. A launcher that started this
+  # script detached (an older `hub host self-update`) has to exit first; a
+  # foreground launcher (HUB2_UPDATE_FOREGROUND=1) is this script's own parent
+  # and waits for it instead.
+  $foregroundLauncher = $env:HUB2_UPDATE_FOREGROUND -eq '1'
   $deadline = (Get-Date).AddSeconds(30)
-  while ((Get-Date) -lt $deadline -and @(Get-CimInstance Win32_Process | Where-Object {
+  while (-not $foregroundLauncher -and (Get-Date) -lt $deadline -and @(Get-CimInstance Win32_Process | Where-Object {
       $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.IndexOf($Venv, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
       $_.CommandLine -match '(^|\s)self-update(\s|$)' }).Count -gt 0) { Start-Sleep -Milliseconds 500 }
   $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
