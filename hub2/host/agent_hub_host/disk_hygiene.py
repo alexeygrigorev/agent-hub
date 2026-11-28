@@ -79,10 +79,25 @@ def is_denylisted(path: Path, denylist: Iterable[Path]) -> bool:
 
 
 def dir_size_bytes(path: Path) -> int:
-    total = 0
     try:
         if path.is_symlink() or path.is_file():
             return path.lstat().st_size
+    except OSError:
+        return 0
+    if shutil.which('du'):
+        try:
+            proc = subprocess.run(
+                ['du', '-sb', '--', str(path)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                first = proc.stdout.split(None, 1)[0]
+                if first.isdigit():
+                    return int(first)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    total = 0
+    try:
         stack = [path]
         while stack:
             cur = stack.pop()
@@ -257,7 +272,7 @@ def measure_mount_used_pct(mount: Path) -> float:
     return (usage.used * 100.0 / usage.total) if usage.total > 0 else 0.0
 
 
-def _dir_newest_mtime(path: Path, *, max_entries: int = 5000) -> float:
+def _dir_newest_mtime(path: Path, *, max_entries: int = 200) -> float:
     try:
         latest = path.lstat().st_mtime
     except OSError:
@@ -272,6 +287,8 @@ def _dir_newest_mtime(path: Path, *, max_entries: int = 5000) -> float:
                     seen += 1
                     if seen > max_entries:
                         return latest
+                    if entry.name in PROTECTED_DIR_NAMES:
+                        continue
                     try:
                         st = entry.stat(follow_symlinks=False)
                         if st.st_mtime > latest:
@@ -480,6 +497,17 @@ def discover_worktrees(home: Path, extra_roots: Iterable[Path] = ()) -> list[Pat
     return sorted(found.values())
 
 
+def _is_git_repo(path: Path) -> bool:
+    try:
+        proc = subprocess.run(
+            ['git', '-C', str(path), 'rev-parse', '--is-inside-work-tree'],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() == 'true'
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _is_git_tracked(worktree: Path, relpath: Path) -> bool:
     """Return True (fail closed) if git tracks anything at relpath or if git fails."""
     try:
@@ -500,12 +528,13 @@ def _is_git_tracked(worktree: Path, relpath: Path) -> bool:
         return True
 
 
-def find_rebuildable_artifacts(worktree: Path, denylist: Iterable[Path]) -> list[tuple[Path, str]]:
+def find_rebuildable_artifacts(worktree: Path, denylist: Iterable[Path], *, max_depth: int = 4) -> list[tuple[Path, str]]:
     """Find allowlisted untracked/ignored artifact dirs inside worktree."""
+    in_git = _is_git_repo(worktree)
     results: list[tuple[Path, str]] = []
-    stack = [worktree]
+    stack: list[tuple[Path, int]] = [(worktree, 0)]
     while stack:
-        cur = stack.pop()
+        cur, depth = stack.pop()
         try:
             with os.scandir(cur) as it:
                 entries = list(it)
@@ -525,10 +554,11 @@ def find_rebuildable_artifacts(worktree: Path, denylist: Iterable[Path]) -> list
                     rel = p.relative_to(worktree)
                 except ValueError:
                     continue
-                if not _is_git_tracked(worktree, rel):
+                if not in_git or not _is_git_tracked(worktree, rel):
                     results.append((p, ARTIFACT_CATEGORIES[name]))
                 continue
-            stack.append(p)
+            if depth + 1 < max_depth:
+                stack.append((p, depth + 1))
     return sorted(results, key=lambda x: str(x[0]))
 
 
