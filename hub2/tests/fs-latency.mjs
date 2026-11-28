@@ -1,8 +1,9 @@
 // Test-only preload: node --import ./hub2/tests/fs-latency.mjs with
 // TEST_FS_LATENCY_MS=<ms> delays every node:fs/promises path call and
 // every FileHandle operation by that many milliseconds before it starts. It
-// models slow runner storage deterministically; no result is altered. Child
-// processes inherit it through NODE_OPTIONS. Unset or 0 leaves fs untouched.
+// models slow runner storage deterministically; no result is altered. Spawned
+// node children see it only when NODE_OPTIONS carries the --import (node --test
+// forwards a command-line --import to its file runners). Unset or 0: no effect.
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 
