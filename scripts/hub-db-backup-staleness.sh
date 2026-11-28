@@ -81,10 +81,10 @@ backup_alert_close() {
 backup_alert_reply() {
   # One bounded local FD+JSON parser; it imports no Client and opens no socket.
   # The persistent source-session helper remains the sole broker peer.
-  timeout --signal=KILL 0.15s python3 -I -S -c '# JSON-only local-FD reader. No client imports, sockets, peer identity or counts.
+  timeout --signal=KILL 0.75s python3 -I -S -c '# JSON-only local-FD reader. No client imports, sockets, peer identity or counts.
 import json,os,re,select,sys,time,uuid
 fd,kind,role,parent,expected=int(sys.argv[1]),*sys.argv[2:]
-end=time.monotonic()+.145
+end=time.monotonic()+.7
 os.set_blocking(fd,False)
 raw=bytearray()
 while True:
