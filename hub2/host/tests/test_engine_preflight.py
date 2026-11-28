@@ -82,7 +82,7 @@ class EnginePreflightRefusalTest(unittest.TestCase):
         self.bridge._claude_auth_cache = ('ok', 123.0)
         reason, _ = self.refusal('{"event": "opencode_auth_expired", "reason": "engine_auth_expired"}\n')
         self.assertEqual(reason, 'engine_auth_expired')
-        self.assertEqual(self.bridge._claude_auth_cache, ('ok', 123.0))
+        self.assertIsNone(self.bridge._claude_auth_cache)
 
 
 if __name__ == '__main__':
