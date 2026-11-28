@@ -1281,8 +1281,8 @@ class Bridge:
             return None
         if reason is None:
             return None
-        if reason == 'engine_auth_expired' and isinstance(row, dict) and row.get('engine') == 'claude':
-            self._claude_auth_cache = ('expired', time.monotonic())
+        if reason == 'engine_auth_expired':
+            self._claude_auth_cache = None
         detail = HOST_FAILURE_DETAILS[reason]
         logging.getLogger(__name__).error(
             'ENGINE PREFLIGHT FAILED session=%s operation=%s stage=host_runtime reason=%s detail=%s',
