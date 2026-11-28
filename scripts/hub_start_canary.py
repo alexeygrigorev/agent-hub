@@ -27,6 +27,7 @@ TRUSTED_ACTIVE_BUDGET_S = 360.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
 TRUSTED_LOCK_WAIT_S = 60.0
 PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
+PENDING_STALE_AFTER_S_DEFAULT = 3600.0
 # Public, unauthenticated Hub health body checked before each periodic start.
 # HUB_CANARY_HEALTH_URL exists for offline tests: https anywhere, plain http
 # only on a loopback literal; path must be /health; no userinfo/query/fragment.
@@ -2487,6 +2488,7 @@ class Canary(PhysicalAdmission):
             self.active_budget = env_num("HUB_CANARY_ACTIVE_BUDGET_S", 300)
             self.cleanup_budget = env_num("HUB_CANARY_CLEANUP_BUDGET_S", self.stop_timeout)
             self.lock_wait = max(0.0, env_num("HUB_CANARY_LOCK_WAIT_S", PERIODIC_DEFAULT_LOCK_WAIT_S))
+        self.pending_stale_after_s = env_num("HUB_CANARY_PENDING_STALE_AFTER_S", PENDING_STALE_AFTER_S_DEFAULT)
         self.active_deadline = None
         self.workspace = os.environ.get("HUB_CANARY_WORKSPACE") or str(pathlib.Path.home() / "work" / "hub-canary")
         self.host_release_root = pathlib.Path(
@@ -3243,6 +3245,109 @@ class Canary(PhysicalAdmission):
             failure_reason = f"{failure_reason}:{self.host_updater_trigger_error}"
         raise StageFailure("host_release", failure_reason)
 
+    def pending_record_age_s(self, rec, pfile):
+        try:
+            updated_ms = self.parse_timestamp_ms(rec.get("updated_at"))
+        except Exception:
+            updated_ms = None
+        if isinstance(updated_ms, int):
+            return max(0.0, (time.time() * 1000 - updated_ms) / 1000.0)
+        try:
+            mtime = pathlib.Path(pfile).stat().st_mtime
+            return max(0.0, time.time() - mtime)
+        except OSError:
+            return 0.0
+
+    def is_prior_pending_stale(self, rec, pfile):
+        try:
+            threshold = float(self.pending_stale_after_s)
+        except (TypeError, ValueError):
+            threshold = float(PENDING_STALE_AFTER_S_DEFAULT)
+        if not threshold or threshold <= 0:
+            return False
+        return self.pending_record_age_s(rec, pfile) >= threshold
+
+    def prior_session_definitively_gone(self, sid, native_id, key, repo, machine, workspace, deadline):
+        try:
+            items = self.list_items("cleanup", deadline)
+        except StageFailure:
+            return False
+        if not isinstance(items, list):
+            return False
+        if sid is not None:
+            for item in items:
+                if isinstance(item, dict) and item.get("id") == sid:
+                    return False
+        else:
+            resolved_sid, _, conflict = self.resolve_owned_session(
+                items,
+                expected_sid=None,
+                expected_key=key,
+                expected_repo=repo,
+                expected_machine=machine,
+                expected_workspace=workspace,
+            )
+            if conflict or resolved_sid:
+                return False
+        if native_id is not None:
+            try:
+                running = self.a_running_ids(deadline)
+            except StageFailure:
+                return False
+            if native_id in running:
+                return False
+        if sid is not None:
+            rc, out, err = self.run([*self.hub, "sessions", "show", sid, "--json"], deadline=deadline)
+            if rc == 0:
+                try:
+                    payload = json.loads(out)
+                except ValueError:
+                    return False
+                node = payload.get("session", payload) if isinstance(payload, dict) else None
+                if isinstance(node, dict) and node.get("id") == sid:
+                    return False
+                return True
+            if self.failure_reason(rc, err or "") == "session_not_found":
+                return True
+            return False
+        return True
+
+    def dispose_stale_prior_pending(self, pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+        try:
+            if not self.is_prior_pending_stale(rec, pfile):
+                return False
+            if not self.prior_session_definitively_gone(sid, native_id, key, repo, machine, workspace, deadline):
+                return False
+            if sid is not None:
+                try:
+                    self.archive_intake_for(
+                        sid,
+                        deadline,
+                        candidate_sha=rec.get("candidate_sha"),
+                        mode=rec.get("mode"),
+                        expected_repo=repo,
+                        expected_machine=machine,
+                        expected_workspace=workspace,
+                    )
+                except StageFailure:
+                    pass
+            try:
+                durable_unlink(pfile)
+            except OSError:
+                return False
+            return True
+        except BaseException:
+            return False
+
+    def _fail_prior_pending(self, pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+        if key and repo and machine and workspace:
+            try:
+                if self.dispose_stale_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                    return True
+            except BaseException:
+                pass
+        raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+
     def _reconcile_one_pending_file(self, pfile, deadline):
         try:
             rec = json.loads(read_regular_nofollow(pfile, max_bytes=65536).decode("utf-8"))
@@ -3255,13 +3360,14 @@ class Canary(PhysicalAdmission):
             raise StageFailure("cleanup", "prior_pending_corrupt")
         sid = raw_sid if self.valid_session_id(raw_sid) else None
         raw_native = rec.get("native_id")
-        if raw_native is not None and not self.valid_native_id(raw_native):
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
-        native_id = raw_native if self.valid_native_id(raw_native) else None
         key = rec.get("key") if isinstance(rec.get("key"), str) and rec.get("key") else None
         repo = rec.get("repo") if isinstance(rec.get("repo"), str) and rec.get("repo") else None
         machine = rec.get("machine") if isinstance(rec.get("machine"), str) and rec.get("machine") else None
         workspace = rec.get("workspace") if isinstance(rec.get("workspace"), str) and rec.get("workspace") else None
+        if raw_native is not None and not self.valid_native_id(raw_native):
+            if self._fail_prior_pending(pfile, rec, sid, None, key, repo, machine, workspace, deadline):
+                return
+        native_id = raw_native if self.valid_native_id(raw_native) else None
         if not key or not repo or not machine or not workspace:
             raise StageFailure("cleanup", "prior_pending_corrupt")
         if (not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode"))
@@ -3296,13 +3402,16 @@ class Canary(PhysicalAdmission):
                     expected_workspace=workspace,
                 )
                 if conflict:
-                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                    if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                        return
                 sid = sid or resolved_sid
                 if native_id and resolved_native and native_id != resolved_native:
-                    raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                    if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                        return
                 native_id = native_id or resolved_native
         if not sid:
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+            if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                return
         confirmed, resolved_native = self.stop_or_confirm_retired(
             sid,
             f"{key}-reconcile",
@@ -3314,15 +3423,18 @@ class Canary(PhysicalAdmission):
             expected_workspace=workspace,
         )
         if not confirmed:
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+            if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                return
         native_id = native_id or resolved_native
         if native_id is not None and not self.valid_native_id(native_id):
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+            if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                return
         if native_id:
             try:
                 self.wait_gone_for(native_id, deadline)
             except StageFailure:
-                raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+                if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                    return
         if not self.archive_intake_for(
             sid,
             deadline,
@@ -3332,11 +3444,13 @@ class Canary(PhysicalAdmission):
             expected_machine=machine,
             expected_workspace=workspace,
         ):
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+            if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                return
         try:
             durable_unlink(pfile)
         except OSError:
-            raise StageFailure("cleanup", "prior_pending_reconciliation_failed")
+            if self._fail_prior_pending(pfile, rec, sid, native_id, key, repo, machine, workspace, deadline):
+                return
 
     def reconcile_prior_pending(self):
         if self.pending_dir is None:
