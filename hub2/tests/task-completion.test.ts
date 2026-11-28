@@ -1590,6 +1590,24 @@ test('intake 62ccfa1e: an engine auth/preflight failure alerts and the continuat
   }finally{f.close();}
 });
 
+test('intake d3258fcc: engine_auth_expired raises a deduplicated developer_alert_raised linking session and intake',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'claude-auth-expired-alert');
+    assert.equal((await start(f,id,'first',{engine:'claude',override_reason:'pinned claude'})).status,201);
+    const first=await run(f,id),firstSaga=activeSaga(f,id);
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:1,native_exit_confirmed:true,failure_reason:'engine_auth_expired',
+      detail:'Engine login expired before the session started.',evidence:{result:'exit',native_deadline:{exceeded:false}}});
+    assert.equal(r.status,200);
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='engine_auth_expired');
+    assert.equal(alerts.length,1);
+    assert.deepEqual({recipient:alerts[0].body.recipient,intake_id:alerts[0].body.intake_id,session_id:alerts[0].body.session_id,
+      machine_id:alerts[0].body.machine_id,engine:alerts[0].body.engine},
+      {recipient:'dev@dtcdev.click',intake_id:id,session_id:firstSaga.session_id,machine_id:firstSaga.machine_id,engine:'claude'});
+    assert(f.mail.every(m=>m.recipient!=='dev@dtcdev.click'),'alert does not go through requester mailbox');
+  }finally{f.close();}
+});
+
 test('Muse exit 127 restarts on a healthy route; further crashes exhaust the budget with a visible developer alert',async()=>{
   const muse={id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',effort:null,account_id:'shared-go',weight:1,capabilities:[],enabled:true};
   const f=fixture([muse,candidates[0],candidates[3]]);

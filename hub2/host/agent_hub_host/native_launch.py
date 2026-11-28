@@ -1646,6 +1646,11 @@ class NativeLauncher:
             raise ValueError('glm_model_route_refused')
         if provider == 'go' and model != OPENCODE_MODEL:
             raise ValueError('unsupported_opencode_model')
+        if (provider == 'claude' and not specification.get('managed_credential_label')
+                and not specification.get('provider_home')):
+            from .local_auth_readiness import EXPIRED, probe_local_claude_auth_status
+            if probe_local_claude_auth_status(spawn_environment(False)) == EXPIRED:
+                raise RuntimeError('engine_auth_expired')
         directory = Path(specification["workspace"]) / '.local' / 'hub2-prompts'
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not directory.resolve().is_relative_to(Path(specification['workspace']).resolve()):

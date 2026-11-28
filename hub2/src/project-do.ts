@@ -1557,7 +1557,7 @@ export class ProjectDO {
         {project_id:intake.project,operation_id:saga.operation_id,attempt:1,previous_picker:route.picker});
       next=picked.route;diagnostics=picked.diagnostics;
     }catch(caught){
-      if(caught instanceof HttpError&&caught.code==='model_policy_unavailable')return await fail('all_model_routes_auth_failed');
+      if(caught instanceof HttpError&&(caught.code==='model_policy_unavailable'||caught.code==='engine_auth_expired'))return await fail('all_model_routes_auth_failed');
       if(caught instanceof HttpError)return error(caught.code,caught.status);
       return error('model_picker_data_unavailable',503);
     }
@@ -2161,6 +2161,11 @@ export class ProjectDO {
     const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'engine_unhealthy',reason,session_id:saga.session_id,machine_id:saga.machine_id,
       engine:launch.engine??null,model:launch.model??null,policy_id:route.policy_id??null};
     this.appendEvent(intakeId,'engine-unhealthy:'+saga.operation_id,COMPLETION_ACTOR,'engine_preflight_failed',alert,now);
+    if(reason==='engine_auth_expired'){
+      this.appendEvent(intakeId,'developer-alert:engine_auth_expired:'+saga.session_id,COMPLETION_ACTOR,'developer_alert_raised',{
+        ...alert,kind:'engine_auth_expired',intake_id:intakeId,
+      },now);
+    }
     console.error('[hub2] ENGINE_PREFLIGHT_FAILED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
 

@@ -77,7 +77,7 @@ export class AccountDO {
    if(p==='/api/account'&&method==='PATCH')return await this.configure(request,a);
    if(p==='/api/account/quota'&&method==='PUT')return await this.quota(request,a);
    if(p==='/api/account/resets')return await this.resets(request,a);
-   if((p==='/api/account'||p==='/api/account/quota')&&method==='GET'){if(this.canReadQuota(a))await this.lazyQuota();return this.view(a);}
+   if((p==='/api/account'||p==='/api/account/quota')&&method==='GET'){if(this.canReadQuota(a))await this.lazyQuota();return await this.view(a);}
    return error('not_found',404);
   }catch(e){
     if(e instanceof HttpError)return error(e.code,e.status);
@@ -177,12 +177,14 @@ export class AccountDO {
   this.db.run('UPDATE probes SET token=? WHERE id=1',crypto.randomUUID());return json({recorded:true});
  }
  private canReadQuota(a:Actor|undefined):boolean{return hasScope(a,'quota:read')||hasScope(a,'operator:admin')||!!(a?.kind==='machine'&&a.resource_id&&this.db.one('SELECT id FROM approved_hosts WHERE id=?',a.resource_id));}
- private view(a:Actor|undefined):Response{
+ private async view(a:Actor|undefined):Promise<Response>{
   // A host enrolled for central provider homes but missing from this account's
   // approved_hosts gets a typed refusal (intake 41ef7048), not a bare forbidden.
   if(!this.canReadQuota(a))return a?.kind==='machine'?error('host_not_approved',403):error('forbidden',403);
   const account=this.db.one<Account>('SELECT * FROM account WHERE id=1'),quota=this.db.one<Quota>('SELECT * FROM quota WHERE id=1');
-  return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now()});
+  const hasCredential=!!this.db.one('SELECT generation FROM credentials WHERE id=1');
+  const credential=hasCredential?await this.routingCredentialStatus(true):null;
+  return json({account:account||null,quota:quota||null,fresh:!!quota&&quota.valid_until>Date.now(),...(credential?credential:{})});
  }
  private async schedule():Promise<void>{
   this.db.alarmOperation();

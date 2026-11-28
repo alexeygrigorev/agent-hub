@@ -100,6 +100,34 @@ try {
     { provider: 'go', account: 'go-orin', engines: ['opencode'], routing: 'disabled', state: 'fresh', remaining_percent: 64 });
   assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'go-orin-route', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin', weight: 1, capabilities: [], enabled: true }] })).status, 400);
 
+  // Connected host reporting auth:expired:l:claude prevents /api/quota from reporting claude as fresh.
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'claude-opus-medium', engine: 'claude', model: 'opus', account_id: 'claude', weight: 1, capabilities: [], enabled: true }] })).status, 200);
+  assert.equal((await call('/api/accounts/claude/api/account', 'PATCH', { provider: 'claude', enabled: true })).status, 200);
+  assert.equal((await call('/api/accounts/claude/api/account/quota', 'PUT', { remaining: 72, captured_at: now, valid_until: now + 60000, source: 'synthetic' })).status, 200);
+  const origMachines = fixture.env.MACHINES;
+  fixture.env.MACHINES = {
+    idFromName: (id) => origMachines.idFromName(id),
+    get: () => ({
+      fetch: async () => Response.json({
+        machine_id: 'a-empty',
+        connected: true,
+        engines: ['claude'],
+        capabilities: ['headless', 'auth:expired:l:claude'],
+        unhealthy_engines: [{ engine: 'claude', reason: 'engine_auth_expired', until: now + 60000 }],
+      }),
+    }),
+  };
+  try {
+    pools = (await (await call('/api/quota?view=fleet&provider=claude&engine=claude&account=claude')).json()).pools;
+    assert.equal(pools.length, 1);
+    assert.equal(pools[0].state, 'auth_expired');
+    assert.equal(pools[0].remaining_percent, null);
+    assert.equal(pools[0].credential_usable, false);
+    assert.equal(pools[0].decision_reason, 'engine_auth_expired');
+  } finally {
+    fixture.env.MACHINES = origMachines;
+  }
+
   // Empty first host must still return a cursor to the populated second host.
   const first = await (await call('/api/sessions?limit=1')).json();
   assert.deepEqual(first.sessions, []); assert(first.next_cursor);
