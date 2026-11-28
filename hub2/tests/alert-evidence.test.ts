@@ -315,20 +315,23 @@ async function defineTests() {
       assert.equal(o.dirty,true,mode);assert.equal((await o.snapshot(NONCE)).available,false,mode);
     }
   });
-  test('publication recovery: one delayed checkpoint preserves all cumulative counts and both prefix-linked slots',async t=>{
+  test('publication recovery: one delayed checkpoint preserves all cumulative counts and both prefix-linked slots',{timeout:180000},async t=>{
     const directory=temp();
-    let release!:()=>void,held=false,active=0,maximum=0;
-    const wait=new Promise<void>(yes=>release=yes);
-    const f=await fixture(directory,{timeoutMs:2000,writer:async(value:any,handle:any)=>{
+    let release!:()=>void,entered!:()=>void,held=false,active=0,maximum=0;
+    const wait=new Promise<void>(yes=>release=yes),holding=new Promise<void>(yes=>entered=yes);
+    // The held checkpoint is observed through its writer, not by waiting out a
+    // wall-clock expiry, so the budget can cover the final verification of all
+    // 256 prefix snapshots plus both slots on slow storage (fs-latency.mjs).
+    const f=await fixture(directory,{timeoutMs:30000,writer:async(value:any,handle:any)=>{
       active++;maximum=Math.max(maximum,active);
-      try{if(value.kind.endsWith('checkpoint_v1')&&!held){held=true;await wait;}await semanticWriter(value,handle);}finally{active--;}
+      try{if(value.kind.endsWith('checkpoint_v1')&&!held){held=true;entered();await wait;}await semanticWriter(value,handle);}finally{active--;}
     }});t.after(async()=>{release();await (f.observer as any).queue;await f.observer.close();rmSync(directory,{recursive:true,force:true});});
     for(let i=0;i<128;i++){const id=f.observer.begin();await f.observer.finish(id,'observation');}
-    const id=f.observer.begin();await f.observer.finish(id,'alert');assert.equal(held,true);
-    const next=f.observer.begin();await f.observer.finish(next,'observation');
+    const id=f.observer.begin();const alerted=f.observer.finish(id,'alert');await holding;assert.equal(held,true);
+    const next=f.observer.begin();const observed=f.observer.finish(next,'observation');
     assert.equal((await f.observer.snapshot(NONCE)).available,false);
     assert.equal(snapshotFiles(f.state).length,256);
-    release();await (f.observer as any).queue;
+    release();await (f.observer as any).queue;await Promise.all([alerted,observed]);
     const proof=await f.observer.snapshot('6'.repeat(32));assert.equal(proof.complete,true);
     assert.equal(proof.started_total,130);assert.equal(proof.finished_total,130);assert.equal(proof.occurrence_count,1);
     assert.equal(maximum,1);assert.equal(readdirSync(f.state).filter(name=>name.startsWith('checkpoint-')).length,2);
@@ -1113,7 +1116,10 @@ async function defineTests() {
     const directory=temp();
     let release!:()=>void;
     const held=new Promise<void>(r=>release=r);let writes=0,maximum=0,active=0;
-    const f=await fixture(directory,{timeoutMs:25,writer:async(value:any,handle:any)=>{
+    // The held first write must really expire, so the budget stays finite, but
+    // it must still cover the final fresh proof (identity, enrollment, three
+    // artifacts, journal and two snapshots) on slow storage (fs-latency.mjs).
+    const f=await fixture(directory,{timeoutMs:1000,writer:async(value:any,handle:any)=>{
       writes++;active++;maximum=Math.max(maximum,active);
       try{if(writes===1)await held;await semanticWriter(value,handle);}finally{active--;}
     }});t.after(async()=>{release();await (f.observer as any).queue;await f.observer.close();rmSync(directory,{recursive:true,force:true});});
@@ -1132,6 +1138,19 @@ async function defineTests() {
     const fresh=await f.observer.snapshot('3'.repeat(32));
     assert.equal(fresh.complete,true);assert.equal(fresh.started_total,2);assert.equal(fresh.finished_total,2);assert.equal(fresh.occurrence_count,1);
     assert.equal(Object.keys(fresh).length,17);
+  });
+  test('slow storage regression: both publication recovery proofs complete with 3 ms per file operation',async()=>{
+    // Slow CI runners missed these fixed observer budgets. Re-run both cases
+    // unchanged in a child whose every fs/promises and FileHandle call waits 3 ms.
+    const child=spawn(process.execPath,['--experimental-transform-types','--import',pathToFileURL(join(ROOT,'hub2/tests/fs-latency.mjs')).href,
+      '--test','--test-name-pattern=^publication recovery: (expired writer waits stay unknown|one delayed checkpoint preserves)',SELF],
+      {cwd:ROOT,env:{...Object.fromEntries(Object.entries(process.env).filter(([key])=>key!=='NODE_TEST_CONTEXT')),TEST_FS_LATENCY_MS:'3'},stdio:['ignore','pipe','pipe']});
+    let output='';child.stdout!.on('data',b=>output+=b);child.stderr!.on('data',b=>output+=b);
+    const code=await new Promise<number|null>((yes,no)=>{
+      const timer=setTimeout(()=>{child.kill('SIGTERM');no(new Error('slow storage regression timed out '+output));},240000);
+      child.once('error',error=>{clearTimeout(timer);no(error);});child.once('exit',code=>{clearTimeout(timer);yes(code);});});
+    assert.equal(code,0,output);
+    assert.match(output,/^ℹ pass 2$/m,output);assert.match(output,/^ℹ fail 0$/m,output);
   });
   test('inflight and concurrent requests cannot yield a complete nonce barrier',async t=>{
     const directory=temp();t.after(()=>rmSync(directory,{recursive:true,force:true}));
@@ -1266,11 +1285,22 @@ async function defineTests() {
       const hub=join(directory,'hub2');mkdirSync(hub);
       cpSync(join(ROOT,'hub2/node'),join(hub,'node'),{recursive:true});cpSync(join(ROOT,'hub2/src'),join(hub,'src'),{recursive:true});
       copyFileSync(join(ROOT,'hub2/production-worker.ts'),join(hub,'production-worker.ts'));
+      // This copy tests load independence and cutoff classification, not the
+      // production 250 ms ingress cutoff or 150 ms proof budget: a cold child on
+      // slow runner storage can miss those for a timely load (fs-latency.mjs at
+      // 6 ms). Only this copied fixture gets wider bounds; the late load still
+      // starts 400 ms after its cutoff.
+      const cutoff=2000;
+      for(const [name,before,after] of [['node/main.ts','    }, 250);','    }, '+cutoff+');'],
+        ['node/alert-evidence.ts','const TIMEOUT_MS = 150;','const TIMEOUT_MS = 2000;']]){
+        const module=join(hub,name),original=readFileSync(module,'utf8');
+        assert.equal(original.split(before).length,2,name);writeFileSync(module,original.replace(before,after));
+      }
       if(fault==='diagnostic-late'){
         const module=join(hub,'node/alert-evidence.ts'),original=readFileSync(module,'utf8');
         const before="    const producer = options.producer ?? 'credential_monitor';";
         assert.ok(original.includes(before));
-        writeFileSync(module,original.replace(before,"    if (options.producer === 'picker_excluded') await new Promise(resolve => setTimeout(resolve, 350));\n"+before));
+        writeFileSync(module,original.replace(before,"    if (options.producer === 'picker_excluded') await new Promise(resolve => setTimeout(resolve, "+(cutoff+400)+"));\n"+before));
       }
       const create=(producer:string)=>{
         const diagnostic=producer!=='credential_monitor',state=join(directory,producer);mkdirSync(state,{mode:0o700});
@@ -1290,25 +1320,25 @@ async function defineTests() {
         '\nHUB2_PICKER_EXCLUDED_EVIDENCE_DIR='+excluded+'\nHUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR='+quota+'\n');
       const child=spawn(process.execPath,['--experimental-transform-types',join(hub,'node/main.ts'),'--host','127.0.0.1','--port','0','--data-dir',join(directory,'db'),'--dev-vars',vars],
         {stdio:['ignore','pipe','pipe'],env:syntheticEnvironment(directory)});t.after(()=>stop(child));let output='',errors='';child.stderr!.on('data',b=>errors+=b);
-      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('diagnostic main timeout '+errors));},6000);
+      const port=await new Promise<string>((yes,no)=>{const timer=setTimeout(()=>{child.kill('SIGKILL');no(new Error('diagnostic main timeout '+errors));},cutoff+6000);
         child.stdout!.on('data',b=>{output+=b;const found=output.match(/listening http:\/\/127\.0\.0\.1:(\d+)/);if(found){clearTimeout(timer);yes(found[1]);}});
         child.once('exit',()=>{clearTimeout(timer);no(new Error('diagnostic main exited '+errors));});});
       const base='http://127.0.0.1:'+port,headers={Authorization:'Bearer '+TOKEN};
       assert.equal((await fetch(base+'/health')).status,200);assert.equal((await fetch(base+'/api/repos',{headers})).status,200);
       const credentialProof=await (await fetch(base+'/api/model-picker/credential-monitor-evidence?nonce='+NONCE,{headers})).json() as any;
-      assert.equal(credentialProof.complete===true,fault!=='credential-missing');
+      assert.equal(credentialProof.complete===true,fault!=='credential-missing',fault+' credential '+JSON.stringify(credentialProof));
       if(fault==='credential-missing'){
         assert.equal(credentialProof.unavailable_phase,'bootstrap');assert.equal(credentialProof.unavailable_reason,'load_failed');
       }
       for(const producer of ['picker_excluded','picker_quota_stale']){
         const response=await fetch(base+'/api/model-picker/diagnostic-evidence?producer='+producer+'&nonce='+NONCE,{headers});
         assert.equal(response.headers.get('cache-control'),'no-store');const proof=await response.json() as any;
-        assert.equal(proof.complete===true,!(fault!=='credential-missing'&&producer==='picker_excluded'));
+        assert.equal(proof.complete===true,!(fault!=='credential-missing'&&producer==='picker_excluded'),fault+' '+producer+' '+JSON.stringify(proof));
         if(producer==='picker_excluded'&&fault!=='credential-missing'){
           assert.equal(proof.unavailable_phase,'bootstrap');
           assert.equal(proof.unavailable_reason,fault==='diagnostic-late'?'load_after_ingress_cutoff':'load_failed');
           if(fault==='diagnostic-late'){
-            await new Promise(resolve=>setTimeout(resolve,400));
+            await new Promise(resolve=>setTimeout(resolve,1000));
             const later=await (await fetch(base+'/api/model-picker/diagnostic-evidence?producer='+producer+'&nonce='+NONCE,{headers})).json();
             assert.deepEqual(later,proof,'late completion never attaches or rewrites cutoff diagnosis');
           }
