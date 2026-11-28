@@ -3633,7 +3633,7 @@ class Canary(PhysicalAdmission):
         if created_at_ms is None:
             return False, None
         state = node.get("state")
-        if state == "stopped" and node.get("stop_confirmed") is True and not require_exit_zero:
+        if state in ("stopped", "failed") and node.get("stop_confirmed") is True and not require_exit_zero:
             updated_at = node.get("updated_at")
             if updated_at is not None:
                 updated_at_ms = self.parse_timestamp_ms(updated_at)
@@ -3674,7 +3674,7 @@ class Canary(PhysicalAdmission):
         if (
             not isinstance(inner, dict)
             or inner.get("containment_empty") is not True
-            or inner.get("source") != "aplexer_retirement"
+            or inner.get("source") not in ("aplexer_retirement", "aplexer_status")
         ):
             return False, None
         nid_obj = inner.get("native_identity")
@@ -3825,7 +3825,13 @@ class Canary(PhysicalAdmission):
                 *self.hub, "intake", "update", intake_id,
                 "--status", "archived", "--note", f"periodic_{clean(eff_mode, 16)}_canary",
             ]
-        rc, _, _ = self.run(archive_args, deadline=deadline)
+        rc, _, err = self.run(archive_args, deadline=deadline)
+        if rc != 0 and eff_candidate and self.failure_reason(rc, err) == "review_required":
+            archive_args = [
+                *self.hub, "intake", "update", intake_id,
+                "--status", "archived", "--note", f"deploy_gate_{clean(eff_mode, 16)}_canary",
+            ]
+            rc, _, _ = self.run(archive_args, deadline=deadline)
         return rc == 0
 
     def archive_intake(self, deadline=None):
