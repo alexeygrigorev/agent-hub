@@ -1,9 +1,10 @@
 """`hub host self-update` inside its real scheduled task (intake 56a34448).
 
 DESKTOP-FP4OP26 stayed on fdcd5505 while the daily AgentHub2HostUpdate task
-reported result 0 every morning and install.log had no entry: the installer
-was started detached, its output went to DEVNULL and the launcher returned
-success without waiting for it.
+reported result 0 every morning and install.log had no entry. `hub host
+self-update` started the installer with DETACHED_PROCESS, and Windows PowerShell
+started that way exits 0 within a tenth of a second without running the script;
+its output went to DEVNULL and the launcher returned success at once.
 
 The launcher runs here as the action of a per-user scheduled task registered
 the way host-install.ps1 registers AgentHub2HostUpdate (Interactive, Limited,
@@ -101,6 +102,9 @@ Write-Step 'Hub2 host install from https://hub.example (mode=update)'
 Start-Sleep -Seconds @SECONDS@
 @TAIL@
 """
+SUCCESS_TAIL = "Write-Step 'installed host_version=" + PUBLISHED + "'"
+DETACHED, NEW_PROCESS_GROUP, NO_WINDOW, BREAKAWAY = 0x00000008, 0x00000200, 0x08000000, 0x01000000
+POWERSHELL = ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File']
 
 
 def powershell(script, check=True):
@@ -121,7 +125,7 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         self.state.mkdir()
         self.files.mkdir()
         (self.state / 'tmp').mkdir()
-        self.publish(INSTALLER)
+        self.publish(INSTALLER.replace('@TAIL@', SUCCESS_TAIL))
         self.task = 'AgentHub2HostUpdateTest-' + uuid.uuid4().hex[:10]
         self.addCleanup(lambda: powershell(
             f"Unregister-ScheduledTask -TaskName '{self.task}' -Confirm:$false -ErrorAction SilentlyContinue", False))
@@ -141,6 +145,9 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
                     'current': CURRENT, 'installed': PUBLISHED, 'launcher_seconds': 8, **extra}
         path = self.directory / 'scenario.json'
         path.write_text(json.dumps(scenario), encoding='utf-8')
+        for leftover in self.state.rglob('*'):
+            if leftover.is_file():
+                leftover.unlink()
         powershell(f'''
             $ErrorActionPreference = 'Stop'
             $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -200,12 +207,39 @@ class SelfUpdateInsideScheduledTaskTests(unittest.TestCase):
         self.assertEqual(evidence['last_task_result'], 0)
         self.assertIsNone(evidence['install_log'], 'the detached installer survived its task')
 
-    def test_why_the_detached_installer_never_runs(self):
-        # Same task and installer each time; one variable per run. The launcher
-        # stays alive for the first two, so a teardown at its exit cannot be the cause.
-        findings = {mode: self.run_task(mode) for mode in ('legacy_wait', 'legacy_files', 'no_window', 'breakaway')}
+    def spawn_detached_here(self):
+        """The launcher's old spawn, outside any scheduled task."""
+        script = self.state / 'tmp' / 'host-install.ps1'
+        script.write_bytes((self.files / 'host-install.ps1').read_bytes())
+        started = time.monotonic()
+        child = subprocess.Popen(POWERSHELL + [str(script)], env={**os.environ, 'HUB2_INSTALL_MODE': 'update'},
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=DETACHED | NEW_PROCESS_GROUP)
+        code = child.wait(timeout=60)
+        log = self.state / 'install.log'
+        return {'exited_after_s': round(time.monotonic() - started, 2), 'exit_code': code,
+                'install_log': log.read_text() if log.exists() else None}
+
+    def test_detached_powershell_reports_success_without_running_the_script(self):
+        # Cause of the Desktop failure, outside Task Scheduler: no job, no task,
+        # no launcher exit, and PowerShell still exits 0 without a log line.
+        finding = self.spawn_detached_here()
+        print(json.dumps({'mode': 'detached_direct', **finding}, indent=2))
+        self.assertEqual(finding['exit_code'], 0)
+        self.assertLess(finding['exited_after_s'], 3)
+        self.assertIsNone(finding['install_log'])
+
+    def test_why_the_detached_installer_never_runs_inside_the_task(self):
+        # Same task and installer each time; one variable per run.
+        findings = {mode: self.run_task(mode) for mode in ('legacy_wait', 'no_window', 'breakaway')}
         self.assertTrue(all(finding['task_started'] for finding in findings.values()), 'a scheduled task never ran')
-        self.assertIsNone(findings['legacy_wait']['install_log'], 'the detached installer failed only at launcher exit')
+        # Not the launcher's exit: PowerShell exits 0 at once while it is still alive.
+        self.assertIsNone(findings['legacy_wait']['install_log'])
+        self.assertEqual(json.loads(findings['legacy_wait']['child_exit'])['outcome'][0]['exit_code'], 0)
+        # Not the discarded output either: given a console, the script runs.
+        self.assertIn('Hub2 host install from https://hub.example (mode=update)', findings['no_window']['install_log'])
+        # A task's job cannot be left, so waiting in the foreground is the only way.
+        self.assertIn('Access is denied', findings['breakaway']['spawn_error'])
 
 if __name__ == '__main__':
     unittest.main()

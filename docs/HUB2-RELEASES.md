@@ -53,8 +53,10 @@ routes now serve these installers, so an old Windows host that still runs
 - keeps the evidence of each self-update: the installer's output and its exit
   code go to `%LOCALAPPDATA%\agent-hub2\self-update.log`, the installer appends
   its steps to `install.log`, and the task's last run result is the installer's
-  exit code. The launcher must stay alive until the installer exits: a detached
-  installer does not survive the end of its scheduled task;
+  exit code. The launcher starts the installer with `CREATE_NO_WINDOW` and waits
+  for it: started with `DETACHED_PROCESS`, Windows PowerShell exits 0 without
+  running the script, which is how the daily task once reported success
+  without installing anything;
 - retires the legacy supervisor: it writes `replace-pending` and the permanent
   `retired-by-hub2` marker in `%LOCALAPPDATA%\Programs\agent-hub\controller`,
   disables (never deletes) `AgentHubController-*`/`AgentHubSessionHost*`, and stops

@@ -172,12 +172,14 @@ def windows_self_update(base_url, force=False, opener=urlopen, spawn=subprocess.
     """Run the verified installer in update mode, wait for it and return its exit code.
 
     Intake 56a34448: the daily AgentHub2HostUpdate task reported result 0 while
-    nothing was installed. The installer was started detached, its output went
-    to DEVNULL and this launcher exited at once; a detached child does not
-    survive the end of its scheduled task's action, so the installer never
-    reached its first log line. The launcher now stays in the foreground as the
-    ordinary user until the installer exits, keeps its output in self-update.log
-    and fails the task with the installer's exit code.
+    nothing was installed. The installer was started with DETACHED_PROCESS;
+    Windows PowerShell then exits 0 within a tenth of a second without running
+    the script, whether or not its launcher is still alive. Nothing recorded
+    that, because its output went to DEVNULL and the launcher returned success
+    at once. The launcher now starts the installer with CREATE_NO_WINDOW, keeps
+    its output in self-update.log and returns the installer's exit code, so the
+    task fails when the install fails. Task Scheduler refuses breakaway from a
+    task's job, so the launcher waits in the foreground as the ordinary user.
     """
     version, data = verified_installer(base_url, opener)
     current, _ = host_release()
