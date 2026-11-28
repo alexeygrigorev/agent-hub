@@ -1247,10 +1247,11 @@ test('scoped worker session creates child intakes and starts child sessions whil
 });
 
 test('shell interactive start is refused with a typed capability reason before any dispatch is consumed',async()=>{
- const f=fixture({machineCapabilities:['headless','modes:v1:shell:h']});
+ const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:h']});
  try{
   const own=await intake(f,'shell-interactive');
-  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true});
+  await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1'})}));
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},{id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']});
   assert.equal(refused.status,409);
   assert.equal((await body(refused)).error,'launcher_capability_unavailable_interactive');
   assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,0);
@@ -1261,7 +1262,7 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
  const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:hi']});
  const machineSql=new DatabaseSync(':memory:');
  const machineCtx:any={id:{toString:()=>'m/h1'},getWebSockets:()=>[],storage:{sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){}},blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn())};
- const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async()=>Response.json({ok:true})})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
+ const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{const r=i instanceof Request?i:new Request(i,init);return new URL(r.url).pathname.startsWith('/_internal/shell-grants/')?f.control.fetch(r):Response.json({ok:true});}})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
  try{
   const operator={id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']};
   const agent={id:'session:other',kind:'agent',resource_id:'org/a',scopes:['operator:admin','session:start','shell:start','project:org/a']};
@@ -1274,10 +1275,6 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   const started=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'granted-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator);
   assert.equal(started.status,201);
   const sid=(await body(started)).session.id;
-  const revoked=await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1',revoke:true})}));
-  assert.equal(revoked.status,200);
-  const own2=await intake(f,'shell-revoked');
-  assert.equal((await f.call('/api/intakes/'+own2.id+'/start','POST',{key:'after-revoke',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
   const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}));
   assert.equal(reserve.status,201);
   machineSql.prepare("UPDATE sessions SET state='running',native_id='11111111-1111-4111-8111-111111111111' WHERE id=?").run(sid);
@@ -1293,5 +1290,27 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
+  // Admin has no interactive shell exception: no grant -> start and session access denied.
+  const adminNoGrant={id:'human:root',kind:'operator',scopes:['operator:admin','shell:start','project:org/a']};
+  const own3=await intake(f,'shell-admin-nogrant');
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant-auto',workspace:'relay',engine:'shell',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await cmd('k-admin',{id:'human:root',kind:'operator',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
+  assert.equal((await cmd('k-admin-bare',{id:'human:root',kind:'operator',scopes:['operator:admin']})).status,403);
+  assert.equal((await cmd('k-nogrant-other',{id:'human:other',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  // Revocation applies to the running session on the very next request.
+  assert.equal((await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1',revoke:true})}))).status,200);
+  for(const [k,kind] of [['r-send','send'],['r-cap','capture'],['r-stop','stop']] as const){
+    const r=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})},body:JSON.stringify({kind,...(kind==='send'?{text:'echo hi'}:{}),key:k})}));
+    assert.equal(r.status,403,kind);
+  }
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})).status,404);
+  const own2=await intake(f,'shell-revoked');
+  assert.equal((await f.call('/api/intakes/'+own2.id+'/start','POST',{key:'after-revoke',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
+  // Legacy headless shell start stays admin-only and is not affected by shell grants.
+  const own4=await intake(f,'shell-headless');
+  assert.equal((await f.call('/api/intakes/'+own4.id+'/start','POST',{key:'hl-op',workspace:'relay',engine:'shell',machine_id:'h1'},operator)).status,403);
  }finally{machineSql.close();f.sql.close();f.collectorSql.close();}
 });
