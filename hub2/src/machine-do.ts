@@ -1628,23 +1628,29 @@ export class MachineDO {
       &&nativeReturncode(evidence.native_exit as JsonRecord)===0;
   }
 
-  /** Interactive shell sessions (legacy headless shells keep admin access) are default-deny. There is no operator:admin
-   * exception: the caller must be an operator principal holding the exact
-   * scope bound to this session ID AND an active explicit grant for this
-   * principal on the session's host. The grant is re-checked on every
-   * request, so revocation takes effect on the next call (including reads and
-   * stop). Admin rights only administer grants, never use the shell. */
-  private async canAccessShellSession(actor: Actor | undefined, session: { id: string; machine_id?: string }, requiredScope: string): Promise<boolean> {
+  /** Shell session ACL. Returns undefined for non-shell sessions (generic ACL
+   * applies). Legacy headless shells keep their original ACL (admin, or an
+   * operator holding the scope bound to the exact session ID). Interactive
+   * shells are default-deny with NO operator:admin exception: an operator
+   * with the exact session-bound scope AND an active explicit grant for that
+   * principal on the session's host, re-checked on every request so
+   * revocation applies to the next call (reads and stop included). Admin
+   * rights only administer grants. A CONTROL failure fails closed. */
+  private async shellSessionAllowed(actor: Actor | undefined, session: { id: string; machine_id: string; launch_json: string }, requiredScope: string): Promise<boolean | undefined> {
+    const launch = this.parse(session.launch_json) as JsonRecord;
+    if (String(launch.engine ?? '').toLowerCase() !== 'shell') return undefined;
     if (!actor || actor.kind !== 'operator') return false;
+    if (launch.interactive !== true) return hasScope(actor, 'operator:admin') || (hasScope(actor, requiredScope) && actor.resource_id === session.id);
     if (!hasScope(actor, requiredScope) || actor.resource_id !== session.id) return false;
-    const machineId = session.machine_id ?? this.db.one<{ machine_id: string }>('SELECT machine_id FROM sessions WHERE id=?', session.id)?.machine_id;
-    if (!machineId) return false;
     try {
       const check = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch('https://control.internal/_internal/shell-grants/check', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id, machine_id: machineId }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id, machine_id: session.machine_id }),
       });
       return check.ok && ((await check.json()) as { granted?: boolean }).granted === true;
-    } catch { return false; }
+    } catch (caught) {
+      console.error('shell_grant_check_unavailable', caught instanceof Error ? caught.message : 'unknown');
+      return false;
+    }
   }
 
   private async createCommand(request: Request, sessionId: string): Promise<Response> {
@@ -1658,9 +1664,9 @@ export class MachineDO {
     if (!['send', 'capture', 'stop'].includes(String(kind))) return error('invalid_command_kind', 400);
     const scope = kind === 'send' ? 'session:send' : kind === 'capture' ? 'session:capture' : 'session:stop';
     const sessionLaunch = this.parse(session.launch_json) as JsonRecord;
-    const isShell = String(sessionLaunch.engine ?? '').toLowerCase() === 'shell' && sessionLaunch.interactive === true;
-    if (isShell) {
-      if (!(await this.canAccessShellSession(actor, session, scope))) return error('forbidden', 403);
+    const shellAllowed = await this.shellSessionAllowed(actor, session, scope);
+    if (shellAllowed !== undefined) {
+      if (!shellAllowed) return error('forbidden', 403);
     } else if (!hasScope(actor, 'operator:admin') && (!hasScope(actor, scope)
       || (actor.resource_id !== sessionId && actor.resource_id !== session.project_id))) return error('forbidden', 403);
     if (kind === 'send' && sessionLaunch.interactive !== true) return error('headless_send_refused', 409);
@@ -2543,10 +2549,8 @@ export class MachineDO {
   /** Command receipts in the shape `sessions send/capture/stop --wait` polls: ack.capture, ack.outcome, ack.confirmed_exit. */
   private async commandListing(request: Request, sessionId: string): Promise<Response> {
     const actor = actorFrom(request), session = this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?', sessionId);
-    const isShell = !!session && String((this.parse(session.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell' && (this.parse(session.launch_json) as JsonRecord).interactive === true;
-    if (!session || (isShell
-      ? !(await this.canAccessShellSession(actor, session, 'session:read'))
-      : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
+    const shellAllowed = session ? await this.shellSessionAllowed(actor, session, 'session:read') : undefined;
+    if (!session || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor, 'operator:admin') && !(hasScope(actor, 'session:read') && [session.id, session.project_id].includes(actor?.resource_id || ''))))) return error('session_not_found', 404);
     const query = new URL(request.url).searchParams;
     const commandId = query.get('command_id');
     if (commandId !== null && (query.getAll('command_id').length !== 1 || !/^[A-Za-z0-9-]{1,80}$/.test(commandId))) return error('invalid_command_id',400);
@@ -2658,8 +2662,9 @@ export class MachineDO {
   private async sessionWake(request:Request,id:string,action:string):Promise<Response>{
     const session=this.wakeSession(id),actor=actorFrom(request);
     const read=request.method==='GET';
-    if(!session||!actor||(session.engine==='shell'&&session.interactive
-      ? !(await this.canAccessShellSession(actor,session,read?'session:read':'session:send'))
+    const shellAllowed=session&&actor?await this.shellSessionAllowed(actor,this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id)!,read?'session:read':'session:send'):undefined;
+    if(!session||!actor||(shellAllowed!==undefined
+      ? !shellAllowed
       : (!hasScope(actor,'operator:admin')&&!(hasScope(actor,read?'session:read':'session:send')&&[id,session.project_id].includes(actor.resource_id||''))&&!this.workerSelfWake(actor,session,read))))return error('session_not_found',404);
     if(action==='wakes'&&read){await this.wakes.refresh();return json({session_id:id,wakes:await this.wakes.history(id),...this.wakes.waiting(id)});}
     if(action!=='wake'||request.method!=='POST')return error('method_not_allowed',405);
@@ -2673,19 +2678,15 @@ export class MachineDO {
 
   private async sessionDetail(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell' && (this.parse(row.launch_json) as JsonRecord).interactive === true;
-    if (!row || (isShell
-      ? !(await this.canAccessShellSession(actor, row, 'session:read'))
-      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
+    const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
     return json({session:{...this.sessionView(row), ...(this.stopConfirmed(row) ? { stop_confirmed: true } : {})}});
   }
 
   private async sessionEvents(request: Request, id: string): Promise<Response> {
     const actor=actorFrom(request),row=this.db.one<SessionRow>('SELECT * FROM sessions WHERE id=?',id);
-    const isShell = !!row && String((this.parse(row.launch_json) as JsonRecord).engine ?? '').toLowerCase() === 'shell' && (this.parse(row.launch_json) as JsonRecord).interactive === true;
-    if (!row || (isShell
-      ? !(await this.canAccessShellSession(actor, row, 'session:read'))
-      : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found',404);
+    const shellAllowed = row ? await this.shellSessionAllowed(actor, row, 'session:read') : undefined;
+    if (!row || (shellAllowed !== undefined ? !shellAllowed : (!hasScope(actor,'operator:admin') && !(hasScope(actor,'session:read') && [row.id,row.project_id].includes(actor?.resource_id||''))))) return error('session_not_found', 404);
     const events: JsonRecord[] = [];
     const attention = this.db.one<{reason:string;operation_id:string|null;observed_at:number}>('SELECT reason,operation_id,observed_at FROM attention WHERE session_id=?', row.id);
     const diagnostic = attention ? this.hostStartDiagnostic(row, attention.reason) : null;

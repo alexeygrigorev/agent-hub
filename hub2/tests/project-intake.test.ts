@@ -1260,9 +1260,10 @@ test('shell interactive start is refused with a typed capability reason before a
 
 test('interactive shell enforces capability, per-user/host grants, revocation, and scoped session ID binding',async()=>{
  const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:hi']});
+ let controlDown=false;
  const machineSql=new DatabaseSync(':memory:');
  const machineCtx:any={id:{toString:()=>'m/h1'},getWebSockets:()=>[],storage:{sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){}},blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn())};
- const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{const r=i instanceof Request?i:new Request(i,init);return new URL(r.url).pathname.startsWith('/_internal/shell-grants/')?f.control.fetch(r):Response.json({ok:true});}})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
+ const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{if(controlDown)throw new Error('control_down');const r=i instanceof Request?i:new Request(i,init);return new URL(r.url).pathname.startsWith('/_internal/shell-grants/')?f.control.fetch(r):Response.json({ok:true});}})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
  try{
   const operator={id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']};
   const agent={id:'session:other',kind:'agent',resource_id:'org/a',scopes:['operator:admin','session:start','shell:start','project:org/a']};
@@ -1290,6 +1291,10 @@ test('interactive shell enforces capability, per-user/host grants, revocation, a
   assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
   assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
+  // Grant lookup failure fails closed (never allows) for a principal that otherwise holds the exact scope.
+  controlDown=true;
+  assert.equal((await cmd('k-ctl-down',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  controlDown=false;
   // Admin has no interactive shell exception: no grant -> start and session access denied.
   const adminNoGrant={id:'human:root',kind:'operator',scopes:['operator:admin','shell:start','project:org/a']};
   const own3=await intake(f,'shell-admin-nogrant');
