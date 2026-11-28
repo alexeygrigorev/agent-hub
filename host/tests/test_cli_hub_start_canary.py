@@ -2745,6 +2745,37 @@ class CanaryTest(unittest.TestCase):
         self.assertTrue(v_sc["ok"])
         self.assertFalse(prior_stopped.exists())
 
+        # 4b. Prior pending reconciliation accepts aplexer_status finish evidence (e.g. failed native_exit_1)
+        # and state="failed" with stop_confirmed=True + fresh gone check.
+        for label, payload in (
+            ("aplexer-status-failed", make_retired_show(state="failed", source="aplexer_status")),
+            ("failed-stop-confirmed", make_retired_show(state="failed", stop_confirmed=True, include_evidence=False)),
+        ):
+            prior_file = (self.state / "pending") / f"prior-{label}.json"
+            prior_file.write_text(
+                json.dumps(
+                    {
+                        "run_id": f"prior-{label}",
+                        "mode": "full",
+                        "name": f"hub-canary-full-prior-{label}",
+                        "key": f"canary-prior-{label}",
+                        "repo": "owner/repo",
+                        "machine": "HOST-1",
+                        "workspace": ws,
+                        "prompt": "Reply CANARY-OK and exit",
+                        "candidate_sha": None,
+                        "session_id": SID,
+                        "native_id": NATIVE,
+                    }
+                )
+            )
+            os.chmod(prior_file, 0o600)
+            (self.tmp / "show_payload.json").write_text(json.dumps(payload))
+            r_ok, v_ok = self.run_canary("reconcile_stop_409", "--mode", "shell")
+            self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+            self.assertTrue(v_ok["ok"])
+            self.assertFalse(prior_file.exists())
+
         # 5. Terminal states without positive confirmation (or with tampered bindings/timestamps)
         # MUST fail closed on 409 even when `a list --json --running` is empty.
         invalid_payloads = [
