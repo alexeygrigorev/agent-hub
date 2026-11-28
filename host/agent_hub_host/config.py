@@ -171,12 +171,15 @@ class _TokenExchange:
             raise ValueError("Token exchange response mismatch")
         if set(metadata) - {"client_kind", "client_name", "requested_scopes"}:
             raise ValueError("Invalid authentication metadata")
-        if self._load_fn() != self.starting_config:
+        loaded_cmp = {k: v for k, v in self._load_fn().items() if k != "refresh_pending"}
+        start_cmp = {k: v for k, v in self.starting_config.items() if k != "refresh_pending"}
+        if loaded_cmp != start_cmp:
             raise ValueError("Config changed during authentication; retry login")
         # A device login on a different origin is an explicit credential
         # migration. Never carry access/refresh tokens or other server-bound
         # metadata from the old origin into the new profile.
         cfg = {} if self._replace_profile_on_commit else copy.deepcopy(self.starting_config)
+        cfg.pop("refresh_pending", None)
         cfg.update(metadata)
         cfg["access_token"] = data["access_token"]
         # Requested scopes describe login intent, not the approver's consent.
