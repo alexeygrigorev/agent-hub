@@ -38,17 +38,17 @@ export class WorkerCredentials {
     this.db.run(WORKER_ROLE_TABLE);
     this.roleTableReady = true;
   }
+  initialize(): void {
+    this.ensureRoleTable();
+  }
   private roleFor(sessionId: string, epoch: number): WorkerRole {
-    try {
-      const row = this.db.one<{ role: string }>(
-        'SELECT role FROM worker_credential_roles WHERE session_id=? AND epoch=?',
-        sessionId,
-        epoch,
-      );
-      return row?.role === 'orchestrator' ? 'orchestrator' : 'worker';
-    } catch {
-      return 'worker';
-    }
+    this.ensureRoleTable();
+    const row = this.db.one<{ role: string }>(
+      'SELECT role FROM worker_credential_roles WHERE session_id=? AND epoch=?',
+      sessionId,
+      epoch,
+    );
+    return row?.role === 'orchestrator' ? 'orchestrator' : 'worker';
   }
   private actor(b: Binding) {
     return 'session:' + b.session_id;
