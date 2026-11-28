@@ -50,10 +50,11 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
 
     def test_unavailable_native_census_does_not_block_heartbeat_or_websocket(self):
         inventory = Mock(side_effect=RuntimeError('native_census_unavailable'))
-        self.assert_unbound_workspace_stays_connected(inventory)
-        inventory.assert_called_once_with()
+        self.assert_unbound_workspace_stays_connected(inventory, census_thread=True)
+        # Collection is never run inline by the control loop.
+        inventory.assert_not_called()
 
-    def assert_unbound_workspace_stays_connected(self, inventory=None):
+    def assert_unbound_workspace_stays_connected(self, inventory=None, census_thread=False):
         with tempfile.TemporaryDirectory() as temp:
             journal = Journal(Path(temp) / "journal.sqlite")
             self.addCleanup(journal.db.close)
@@ -95,7 +96,8 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
                     with self.assertRaises(_StopServe):
                         bridge.serve("machine-1", ["headless"])
 
-            thread.return_value.start.assert_called_once_with()
+            # Heartbeat thread, plus (only with a census) the single background observer.
+            self.assertEqual(thread.return_value.start.call_count, 2 if census_thread else 1)
             self.assertGreaterEqual(len(client.heartbeats), 2)
             self.assertEqual(client.heartbeats[0][3], [{
                 "session_id": "stale-session",
@@ -107,9 +109,10 @@ class StaleWorkspaceReconcileTests(unittest.TestCase):
             }])
             self.assertEqual(client.socket_calls, ["machine-1"])
             self.assertTrue(socket.entered)
-            self.assertEqual(len(captured.records), 2)
+            self.assertEqual(len(captured.records), 1 if census_thread else 2)
             self.assertIn("unavailable workspace", captured.output[0])
-            self.assertIn("Native census unavailable", captured.output[1])
+            if not census_thread:
+                self.assertIn("Native census unavailable", captured.output[1])
             bridge.launcher.aborted_identity.assert_not_called()
             bridge.launcher.status.assert_not_called()
             bridge.lookup.assert_not_called()

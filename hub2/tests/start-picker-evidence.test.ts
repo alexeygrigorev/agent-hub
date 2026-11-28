@@ -53,7 +53,7 @@ function fixture(){
       return Response.json({state:'offered'});
     }),
     ACCOUNTS:namespace(async(id)=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,
-      credential_status:'ready',quota:{remaining:80},hosts:[id==='codex-private'?'h1':'h2']})),
+      credential_status:'ready',quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:[id==='codex-private'?'h1':'h2']})),
   };
   control=new ControlDO({storage:new NodeDurableStorage(controlSql),
     blockConcurrencyWhile:(callback:any)=>Promise.resolve().then(callback)} as any,env);

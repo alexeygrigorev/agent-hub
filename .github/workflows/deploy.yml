@@ -43,7 +43,8 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +54,7 @@ jobs:
       - name: Validate Hub2 VM installer inputs
         run: |
           bash -n deploy/vm/install-hub2-node.sh
+          bash -n deploy/vm/provision-node24.sh
           test -s deploy/agent-hub-hub2.service
           test -s deploy/hub.caddy
           test -s deploy/vm/hub2-dns-update.sh
@@ -65,6 +67,7 @@ jobs:
           bash -n deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-only-installer.sh
           bash deploy/vm/test-hub-site-ownership.sh
+          python3 test/test_node24_runtime.py
       - name: Session controller shell regression tests
         run: |
           mkdir -p "${RUNNER_TEMP}/ops-watchdog-home"
@@ -77,14 +80,19 @@ jobs:
   hub2:
     uses: ./.github/workflows/hub2.yml
   distribution:
+    # Kept on GitHub-hosted: the schema-installer tests need passwordless root (sudo -n).
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
+      - run: |
+          node --version | grep -Eq '^v24\.' \
+            || { echo "::error::distribution validation must run on Node24; setup-node drifted" >&2; exit 1; }
+          npm --version
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -99,24 +107,115 @@ jobs:
       - run: python3 scripts/ci/test_root_distribution.py
       - run: npm run build
   deploy:
-    needs: [hub2, distribution]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending
+    needs: [test, hub2, distribution]
+    # Intake bf07f437: a green push to main deploys automatically (release_mode
+    # active, full Caddy), so a merged Hub host/server fix never sits
+    # unpublished waiting for someone to dispatch. Pull requests never deploy;
+    # workflow_dispatch stays the manual and bootstrap path.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && (github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.rollback_pending))
     permissions:
       contents: read
       actions: read
+      issues: write
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
+    # Intake e19faefa: this job waits for the Python host tests, which run on the
+    # contabo-hub runner. That runner executes one job at a time, so a waiter on
+    # it blocks the very job it waits for (run 45247689745: legacy-cli-shard-3
+    # started two seconds after the waiting deploy job gave up its slot). The
+    # wait therefore stays on GitHub-hosted, like the root-requiring jobs above.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 4-hour Python wait + its 1-minute step margin + the existing 20-minute
+    # non-wait deploy budget.
+    timeout-minutes: 261
     environment: production
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The rollback-compatibility control checks out the exact deployed
+          # previous release, which a shallow clone of the candidate cannot
+          # reach.
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install VM deploy key
+        env:
+          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
+          umask 077
+          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
+          unset VM_DEPLOY_KEY
+          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
+            echo "VM deploy key is not a valid unencrypted private key" >&2
+            exit 1
+          fi
+      # Forward Node24 compatibility control for the application rollback path:
+      # rollback keeps the OS runtime and restores the previous release source,
+      # so the exact release the VM reports as deployed must rebuild its native
+      # dependencies and start under Node24 before a new deploy rolls out. A
+      # source/runtime compatibility proof only — never an OS rollback.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: |
+          node --version | grep -Eq '^v24\.' \
+            || { echo "::error::rollback compatibility must run on Node24; setup-node drifted" >&2; exit 1; }
+          npm --version
+      - name: Read the deployed previous release identity from the VM
+        id: previous_release
+        env:
+          SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          deployed="$(ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" bash -s -- current-sha < deploy/vm/deploy-release-transaction.sh)"
+          [[ "$deployed" =~ ^(none|[0-9a-f]{40})$ ]] \
+            || { echo "VM reported an invalid deployed release identity: $deployed" >&2; exit 2; }
+          echo "sha=$deployed" >> "$GITHUB_OUTPUT"
+      - name: Rebuild and start the exact deployed previous release on Node24
+        env:
+          PREVIOUS_SHA: ${{ steps.previous_release.outputs.sha }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PREVIOUS_SHA" == "none" ]]; then
+            echo "No deployed release on the VM yet; nothing to prove rollback compatibility against."
+            exit 0
+          fi
+          [[ "$PREVIOUS_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid previous release identity" >&2; exit 2; }
+          git checkout --detach --force "$PREVIOUS_SHA"
+          node --version | grep -Eq '^v24\.'
+          npm ci
+          # Typecheck plus the Node clean-start boot of the checked-out source.
+          npm run build
+          # Return to the candidate so later stages transport its exact bytes.
+          git checkout --detach --force "$DEPLOY_SHA"
+      - name: Require green Python host tests for this main commit
+        if: github.event_name == 'push'
+        # Fixed 4-hour observation deadline: on the single-slot contabo-hub runner
+        # every job of the push runs one at a time, and the declared timeouts of
+        # the Python suite alone sum to 165 minutes (20 + 15 + 4x30 + 10).
+        # The outer minute is process-start/termination margin, not extra eligibility.
+        timeout-minutes: 241
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/wait-python-host-tests.py --repo "$REPO" --sha "$DEPLOY_SHA"
       - name: Prepare and verify matched CLI release bundle
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         id: prepare_cli_bundle
         env:
           GH_TOKEN: ${{ github.token }}
@@ -252,22 +351,8 @@ jobs:
             --verify-dir "$bundle_dir" \
             --manifest-sha256 "$manifest_sha256"
           printf 'bundle_dir=%s\nmanifest_sha256=%s\n' "$bundle_dir" "$manifest_sha256" >> "$GITHUB_OUTPUT"
-      - name: Install VM deploy key
-        env:
-          VM_DEPLOY_KEY: ${{ secrets.AGENT_HUB_VM_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          install -m 700 -d "$RUNNER_TEMP/agent-hub-ssh"
-          umask 077
-          key_file="$RUNNER_TEMP/agent-hub-ssh/hub_vm_key"
-          printf '%s\n' "$VM_DEPLOY_KEY" > "$key_file"
-          unset VM_DEPLOY_KEY
-          if ! ssh-keygen -y -P '' -f "$key_file" >/dev/null 2>&1; then
-            echo "VM deploy key is not a valid unencrypted private key" >&2
-            exit 1
-          fi
       - name: Stage verified matched CLI release bundle on VM
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -285,10 +370,11 @@ jobs:
       - name: Deploy validated revision through the fixed VM transaction script
         id: deploy_vm
         env:
-          RELEASE_MODE: ${{ inputs.release_mode }}
+          RELEASE_MODE: ${{ inputs.release_mode || 'active' }}
           CONFIRM_BOOTSTRAP: ${{ inputs.confirm_bootstrap }}
           HUB_ONLY: ${{ inputs.hub_only }}
           DEPLOY_SHA: ${{ github.sha }}
+          PREVIOUS_SHA: ${{ steps.previous_release.outputs.sha }}
           SSH_TARGET: ${{ secrets.AGENT_HUB_VM_USER }}@${{ secrets.AGENT_HUB_VM_HOST }}
         run: |
           set -euo pipefail
@@ -297,7 +383,9 @@ jobs:
             active) cli_mode_args=(matched-cli) ;;
             bootstrap)
               [[ "$CONFIRM_BOOTSTRAP" == "DISABLE-HUB-DISPATCH" ]] \
-                || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; } ;;
+                || { echo "release_mode=bootstrap disables Hub dispatch; set confirm_bootstrap=DISABLE-HUB-DISPATCH" >&2; exit 2; }
+              # Explicit so the trailing provision-node24 token stays positional.
+              cli_mode_args=(legacy) ;;
             *) echo "invalid release mode" >&2; exit 2 ;;
           esac
           case "$HUB_ONLY" in
@@ -306,15 +394,31 @@ jobs:
             *) echo "invalid hub_only value" >&2; exit 2 ;;
           esac
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
+          [[ "$PREVIOUS_SHA" =~ ^(none|[0-9a-f]{40})$ ]] || { echo "invalid qualified previous release identity" >&2; exit 2; }
           test -n "$SSH_TARGET" || { echo "VM SSH target is not configured" >&2; exit 2; }
+          # Stage the exact candidate provisioner bytes over normal CI SSH to a
+          # SHA-bound path (never a remote curl setup script). The transaction
+          # invoked below then derives that path from the same validated SHA and
+          # verifies its bytes against the immutable candidate Git object.
+          tar -C deploy/vm -cf - provision-node24.sh | ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
+            -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
+            -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "$SSH_TARGET" \
+            "set -euo pipefail; deploy_sha='$DEPLOY_SHA'; [[ \"\$deploy_sha\" =~ ^[0-9a-f]{40}\$ ]]; tmp_root=/opt/agent-hub/.local/tmp; target_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha\"; stage_dir=\"\$tmp_root/ci-node24-provision-\$deploy_sha.stage-\$\$\"; mkdir -p \"\$tmp_root\"; chmod 750 \"\$tmp_root\"; rm -rf -- \"\$stage_dir\"; mkdir -m 700 \"\$stage_dir\"; trap 'rm -rf -- \"\$stage_dir\"' EXIT; tar -C \"\$stage_dir\" --no-same-owner --no-same-permissions -xf -; chmod 750 \"\$stage_dir/provision-node24.sh\"; test \"\$(stat -c %s \"\$stage_dir/provision-node24.sh\")\" -le 262144; rm -rf -- \"\$target_dir\"; mv -T -- \"\$stage_dir\" \"\$target_dir\"; trap - EXIT"
+          # ONE SSH transaction invocation owns the existing deploy lock across
+          # runtime provisioning and all application effects: the transaction
+          # binds the Node24-qualified previous release SHA and runs the
+          # verified staged provisioner inside its own held lock before any
+          # npm/source/config/unit mutation, so a competing transaction cannot
+          # interleave between package verification and the app stage.
           ssh -i "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" \
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" \
+            "$SSH_TARGET" bash -s -- apply "$DEPLOY_SHA" "$RELEASE_MODE" "$caddy_mode" "${cli_mode_args[@]}" provision-node24 "$PREVIOUS_SHA" \
             < deploy/vm/deploy-release-transaction.sh
       - name: Read Hub API health on the configured client URL
         env:
-          RELEASE_MODE: ${{ inputs.release_mode }}
+          RELEASE_MODE: ${{ inputs.release_mode || 'active' }}
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5 6; do
@@ -346,7 +450,7 @@ jobs:
           echo "Hub API health read did not report the requested healthy release mode: $RELEASE_MODE" >&2
           exit 1
       - name: Publish matched CLI and host release assets
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           MANIFEST_SHA256: ${{ steps.prepare_cli_bundle.outputs.manifest_sha256 }}
@@ -361,7 +465,7 @@ jobs:
             "$SSH_TARGET" bash -s -- publish "$DEPLOY_SHA" "$MANIFEST_SHA256" \
             < deploy/vm/deploy-release-transaction.sh
       - name: Verify public CLI and host release assets against CI bundle
-        if: inputs.release_mode == 'active'
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -412,9 +516,9 @@ jobs:
             --rev "$DEPLOY_SHA" \
             --verify-dir "$public_dir" \
             --manifest-sha256 "$MANIFEST_SHA256"
-      - name: Run pre-commit live shell start canary on Hetzner
-        id: precommit_shell_canary
-        if: inputs.release_mode == 'active'
+      - name: Run pre-commit live full start canary on Hetzner
+        id: precommit_full_canary
+        if: (inputs.release_mode || 'active') == 'active'
         env:
           DEPLOY_SHA: ${{ github.sha }}
           BUNDLE_DIR: ${{ steps.prepare_cli_bundle.outputs.bundle_dir }}
@@ -425,6 +529,7 @@ jobs:
           set -euo pipefail
           [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid deploy commit" >&2; exit 2; }
           test -f "$BUNDLE_DIR/hub.pyz" || { echo "verified CLI bundle hub.pyz is missing" >&2; exit 2; }
+          test -f "$BUNDLE_DIR/hub2-self-update.py" || { echo "verified CLI bundle hub2-self-update.py is missing" >&2; exit 2; }
           test -n "${CANARY_SSH_KEY:-}" || { echo "Hetzner canary SSH key is not configured" >&2; exit 2; }
           [[ "${CANARY_SSH_TARGET:-}" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] \
             || { echo "Hetzner canary SSH target is not configured" >&2; exit 2; }
@@ -446,10 +551,16 @@ jobs:
           PY
           )"
           [[ "$cli_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid candidate hub.pyz digest" >&2; exit 2; }
+          updater_sha256="$(python3 -I -S - "$BUNDLE_DIR/hub2-self-update.py" <<'PY'
+          import hashlib, pathlib, sys
+          print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+          PY
+          )"
+          [[ "$updater_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid candidate hub2-self-update.py digest" >&2; exit 2; }
           helper_sha256="$(python3 -I -S scripts/hub_start_canary.py --print-helper-sha256)"
           [[ "$helper_sha256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid canary helper digest" >&2; exit 2; }
           run_token="$(python3 -I -S -c 'import secrets; print(secrets.token_hex(16))')"
-          verdict_file="$RUNNER_TEMP/precommit-shell-canary.json"
+          verdict_file="$RUNNER_TEMP/precommit-full-canary.json"
           ssh -i "$canary_key" \
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="$canary_known_hosts" \
@@ -459,9 +570,9 @@ jobs:
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=3 \
             "$CANARY_SSH_TARGET" \
-            "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --run-token $run_token --helper-sha256 $helper_sha256" \
+            "hub-deploy-gate --candidate-sha $DEPLOY_SHA --candidate-cli-sha256 $cli_sha256 --candidate-updater-sha256 $updater_sha256 --run-token $run_token --helper-sha256 $helper_sha256" \
             > "$verdict_file"
-          python3 -I -S - "$verdict_file" "$DEPLOY_SHA" "$run_token" "$helper_sha256" "$cli_sha256" <<'PY'
+          python3 -I -S - "$verdict_file" "$DEPLOY_SHA" "$run_token" "$helper_sha256" "$cli_sha256" "$updater_sha256" <<'PY'
           import json
           import sys
           from pathlib import Path
@@ -470,10 +581,10 @@ jobs:
           if len(lines) != 1:
               raise SystemExit(f"expected single-line JSON verdict from pre-commit canary, got {len(lines)} lines")
           verdict = json.loads(lines[0])
-          deploy_sha, run_token, helper_sha256, cli_sha256 = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+          deploy_sha, run_token, helper_sha256, cli_sha256, updater_sha256 = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
           if verdict.get("ok") is not True or verdict.get("deploy_gate") is not True:
-              raise SystemExit(f"pre-commit shell canary did not pass: {lines[0]}")
-          if verdict.get("mode") != "shell" or verdict.get("stage") is not None or verdict.get("reason") is not None:
+              raise SystemExit(f"pre-commit full canary did not pass: {lines[0]}")
+          if verdict.get("mode") != "full" or verdict.get("stage") is not None or verdict.get("reason") is not None:
               raise SystemExit(f"unexpected pre-commit canary mode/stage/reason: {lines[0]}")
           if verdict.get("candidate_sha") != deploy_sha or verdict.get("host_version") != deploy_sha:
               raise SystemExit(f"pre-commit canary candidate/host SHA mismatch: {lines[0]}")
@@ -483,9 +594,14 @@ jobs:
               raise SystemExit(f"pre-commit canary helper digest mismatch: {lines[0]}")
           if verdict.get("hub_pyz_sha256") != cli_sha256:
               raise SystemExit(f"pre-commit canary hub.pyz digest mismatch: {lines[0]}")
+          trigger = verdict.get("host_updater_trigger")
+          if trigger not in ("not_needed", "triggered", "bootstrapped"):
+              raise SystemExit(f"pre-commit canary unexpected host_updater_trigger: {lines[0]}")
+          if trigger in ("triggered", "bootstrapped") and verdict.get("host_updater_sha256") != updater_sha256:
+              raise SystemExit(f"pre-commit canary host_updater_sha256 mismatch: {lines[0]}")
           if verdict.get("intake_archived") is not True or verdict.get("cleanup") != "not_needed":
               raise SystemExit(f"pre-commit canary cleanup/intake archival incomplete: {lines[0]}")
-          print(f"Pre-commit live shell canary passed on Hetzner for {deploy_sha} (session {verdict.get('session_id')})")
+          print(f"Pre-commit live full canary passed on Hetzner for {deploy_sha} (session {verdict.get('session_id')})")
           PY
       - name: Finalize deploy after all public smokes pass
         id: finalize_deploy
@@ -539,15 +655,48 @@ jobs:
             -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
             -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             "$SSH_TARGET" bash -s -- rollback < deploy/vm/deploy-release-transaction.sh
+      - name: Alert the deploy owner when an automatic deploy fails
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Hub2 auto-deploy failed: main is not live in production"
+          body="$(printf 'Automatic production deploy of main %s failed after green CI, so the merged fix is NOT deployed to hub.dtcdev.click or hosts.\n\nDeploy owner: %s (repository owner). Run: %s\n\nNext step: read the failed step; fix forward or rerun with gh workflow run deploy.yml --ref main -f dry_run=false. Close this issue once host-release.json reports a commit that contains %s.' "$DEPLOY_SHA" "$OWNER" "$RUN_URL" "$DEPLOY_SHA")"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            gh issue edit "$existing" --repo "$REPO" --add-assignee "$OWNER"
+          else
+            gh issue create --repo "$REPO" --title "$title" --assignee "$OWNER" --body "$body"
+          fi
+          echo "::error title=Hub2 auto-deploy failed::main $DEPLOY_SHA is not deployed; deploy owner $OWNER alerted via issue"
+      # Intake e19faefa: a rerun or a later merge that deploys cleanly used to
+      # leave the failure issue open. Runs after the alert step so a problem here
+      # never posts a false deploy-failed alert, and never turns a live deploy
+      # into a failed run: the open issue stays as the signal.
+      - name: Close the auto-opened failure issue once main is confirmed live
+        if: steps.finalize_deploy.outcome == 'success' && (inputs.release_mode || 'active') == 'active'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/close-auto-deploy-failure-issue.py --repo "$REPO" --sha "$DEPLOY_SHA" --run-url "$RUN_URL"
       - name: Remove the temporary SSH key
         if: always()
-        run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_known_hosts" "$RUNNER_TEMP/precommit-shell-canary.json"
+        run: rm -f -- "$RUNNER_TEMP/agent-hub-ssh/hub_vm_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_key" "$RUNNER_TEMP/agent-hub-ssh/hetzner_canary_known_hosts" "$RUNNER_TEMP/precommit-full-canary.json"
   rollback_pending:
     if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.rollback_pending
     concurrency:
       group: agent-hub-production
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 5
     environment: production
     steps:

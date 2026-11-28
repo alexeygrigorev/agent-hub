@@ -11,9 +11,21 @@ import { MeteredDb, initializeSchema, schemaMigrationCeiling } from './db';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { randomToken, safeEqual, sha256Hex } from './crypto';
 import { credentialKey, openCredential, sealCredential } from './credential-crypto';
-import { actorFrom, bodyObject, boundedString, boundedText, error, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
+import { actorFrom, bodyObject, boundedString, boundedText, error, forbiddenScope, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { modelPolicyCandidateViolation, type ModelPolicyRoute } from './model-policy';
 import { isLiveActiveSession, MAX_ACTIVE_SESSIONS } from './session-liveness';
+
+/** GrokBot <1% fallback (intake 408b585e): sanitized quota-evidence export,
+ * sticky-agent machine pins and forward grants. The statements are idempotent
+ * so the fresh SCHEMA and the version 8 migration share them verbatim. */
+const STICKY_QUOTA_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS quota_reports(account TEXT PRIMARY KEY,remaining REAL NOT NULL,threshold REAL NOT NULL DEFAULT 1,captured_at INTEGER NOT NULL,valid_until INTEGER NOT NULL,reset_at INTEGER,source TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS named_agent_pins(agent_id TEXT PRIMARY KEY,machine TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS agent_forward_grants(agent_id TEXT NOT NULL,family_id TEXT NOT NULL,enabled INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(agent_id,family_id)) WITHOUT ROWID',
+];
+const SHELL_GRANTS_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS shell_grants(actor_id TEXT NOT NULL,machine_id TEXT NOT NULL,enabled INTEGER NOT NULL,granted_by TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,revoked_at INTEGER,PRIMARY KEY(actor_id,machine_id)) WITHOUT ROWID',
+];
 import { CLAUDE_OAUTH, claudeAuthorization, claudeExchange } from './claude-oauth';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
@@ -71,6 +83,8 @@ const SCHEMA = [
     alias TEXT PRIMARY KEY, canonical_name TEXT NOT NULL REFERENCES repos(canonical_name)
   )`,
   'CREATE INDEX repo_aliases_owner_alias ON repo_aliases(canonical_name, alias)',
+  ...STICKY_QUOTA_SCHEMA,
+  ...SHELL_GRANTS_SCHEMA,
 ];
 
 const ONCALL_SCHEMA = [
@@ -85,6 +99,19 @@ const ENGINE_SCHEMA = [
  'CREATE TABLE IF NOT EXISTS hub2_engine_rollout(engine TEXT PRIMARY KEY,desired_version TEXT NOT NULL,latest TEXT NOT NULL,rollout_id TEXT,target_version TEXT,previous_version TEXT,canary_machine TEXT,state TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
  'CREATE TABLE IF NOT EXISTS hub2_engine_version_reports(machine_id TEXT NOT NULL,engine TEXT NOT NULL,installed TEXT,latest TEXT,result TEXT,updated_at INTEGER NOT NULL,PRIMARY KEY(machine_id,engine)) WITHOUT ROWID',
  'CREATE TABLE IF NOT EXISTS hub2_engine_sync_reports(machine_id TEXT NOT NULL,label TEXT NOT NULL,revision TEXT NOT NULL,state TEXT NOT NULL,error TEXT,credential_generation INTEGER,updated_at INTEGER NOT NULL,PRIMARY KEY(machine_id,label)) WITHOUT ROWID',
+];
+
+const ENGINE_REGISTRY_SCHEMA = [
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_registry(engine TEXT PRIMARY KEY,binary TEXT NOT NULL,version_command TEXT NOT NULL,update_command TEXT NOT NULL,updated_at INTEGER NOT NULL) WITHOUT ROWID',
+ 'CREATE TABLE IF NOT EXISTS hub2_engine_update_runs(id TEXT PRIMARY KEY,requested_by TEXT NOT NULL,engine_filter TEXT,machine_filter TEXT,jobs_json TEXT NOT NULL,created_at INTEGER NOT NULL) WITHOUT ROWID',
+];
+
+const DEFAULT_ENGINE_REGISTRY: ReadonlyArray<{ engine: string; binary: string; version_command: string; update_command: string }> = [
+ { engine: 'claude', binary: 'claude', version_command: 'claude --version', update_command: 'npm install -g @anthropic-ai/claude-code@latest' },
+ { engine: 'codex', binary: 'codex', version_command: 'codex --version', update_command: 'npm install -g @openai/codex@latest' },
+ { engine: 'opencode', binary: 'opencode', version_command: 'opencode --version', update_command: 'npm install -g @opencode/cli@latest' },
+ { engine: 'gemini', binary: 'gemini', version_command: 'gemini --version', update_command: 'npm install -g @google/gemini-cli@latest' },
+ { engine: 'antigravity', binary: 'agy', version_command: 'agy --version', update_command: 'agy update' },
 ];
 
 const CLAUDE_ENGINE_LABEL = 'hub-claude';
@@ -116,14 +143,14 @@ export class ControlDO {
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.pickerAlerts=new PickerAlerts(this.db,ctx);
-    this.ready=initializeSchema(ctx, this.db, 6, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA],async()=>{
+    this.ready=initializeSchema(ctx, this.db, 9, SCHEMA,[ONCALL_SCHEMA,['CREATE TABLE IF NOT EXISTS session_start_reservations(operation_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,expires_at INTEGER NOT NULL) WITHOUT ROWID', ...ENGINE_SCHEMA],ENGINE_SCHEMA,SHARED_MEMORY_SCHEMA,PICKER_ALERT_SCHEMA,ENGINE_REGISTRY_SCHEMA,STICKY_QUOTA_SCHEMA,SHELL_GRANTS_SCHEMA],async()=>{
       this.seedEngineRollout();
       if(this.db.schemaVersion>=6){
         try{this.pickerAlerts.beginCoverage(PICKER_COVERAGE_EPOCH);}
         catch{this.invalidatePickerCoverage();}
       }
       await this.scheduleWake();
-    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,6));
+    },1,schemaMigrationCeiling(env.HUB2_SCHEMA_MIGRATIONS,4,9));
     this.memory=new SharedMemory(ctx,this.db,this.env);
     this.deploymentCredentials=new DeploymentCredentials(ctx,this.db,this.env);
     this.auth=new ControlAuth(ctx,this.db,this.env);this.workers=new WorkerCredentials(ctx,this.db,this.env);
@@ -161,8 +188,17 @@ export class ControlDO {
       if (url.pathname.startsWith('/api/routes/') && request.method === 'GET') return this.lookupRoute(request);
       if (url.pathname === '/api/directory' && request.method === 'GET') return this.directory(request);
       if (url.pathname === '/api/named-agents') return await this.namedAgents(request);
+      if (url.pathname === '/api/shell-grants') return await this.shellGrants(request);
+      if (url.pathname === '/_internal/shell-grants/check' && request.method === 'POST') return await this.checkShellGrant(request);
+      if (url.pathname === '/_internal/shell-grants/hosts' && request.method === 'POST') return await this.listGrantedShellHosts(request);
       const grantMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/grants$/);
       if(grantMatch) return await this.agentGrants(request,decodeURIComponent(grantMatch[1]));
+      const stickyMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/sticky$/);
+      if(stickyMatch) return await this.agentSticky(request,decodeURIComponent(stickyMatch[1]));
+      const claimMatch=url.pathname.match(/^\/api\/named-agents\/([^/]+)\/claim$/);
+      if(claimMatch) return await this.agentClaim(request,decodeURIComponent(claimMatch[1]));
+      const quotaReportMatch=url.pathname.match(/^\/api\/quota\/([a-z][a-z0-9_-]{0,63})$/);
+      if(quotaReportMatch) return await this.quotaReports(request,decodeURIComponent(quotaReportMatch[1]));
       if (url.pathname === '/_verify' && request.method === 'POST') return await this.verify(request);
       if (url.pathname === '/_authorize' && request.method === 'POST') return await this.authorizeCurrent(request);
       if (url.pathname === '/api/enrollments/pair' && request.method === 'POST') return await this.createPairing(request);
@@ -180,10 +216,19 @@ export class ControlDO {
   }
 
   private seedEngineRollout(): void {
+    const now = Date.now();
     this.db.run(
       "INSERT OR IGNORE INTO hub2_engine_rollout(engine,desired_version,latest,state,updated_at) VALUES('claude',?,?, 'stable',?)",
-      CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, Date.now(),
+      CLAUDE_BASELINE_VERSION, CLAUDE_LATEST_VERSION, now,
     );
+    if (this.db.schemaVersion >= 7) {
+      for (const entry of DEFAULT_ENGINE_REGISTRY) {
+        this.db.run(
+          'INSERT OR IGNORE INTO hub2_engine_registry(engine,binary,version_command,update_command,updated_at) VALUES(?,?,?,?,?)',
+          entry.engine, entry.binary, entry.version_command, entry.update_command, now,
+        );
+      }
+    }
   }
 
   private async committedPickerDraw(request:Request):Promise<Response> {
@@ -307,12 +352,24 @@ export class ControlDO {
     if (path === '/api/engines/credential-logins' || /^\/api\/engines\/credential-logins\/[0-9a-f-]{36}$/i.test(path))
       return await this.engineCredentialLogin(request, path, actor);
     if (path === '/api/engines/update' && request.method === 'POST') return await this.startClaudeRollout(request, actor);
+    if (path === '/api/engines/registry' && request.method === 'GET') return await this.listEngineRegistry(actor);
+    const registryEngineMatch = path.match(/^\/api\/engines\/registry\/([a-z0-9][a-z0-9_-]{0,31})$/);
+    if (registryEngineMatch) {
+      if (request.method === 'PUT' || request.method === 'PATCH') return await this.upsertEngineRegistry(registryEngineMatch[1], request, actor);
+      if (request.method === 'DELETE') return await this.deleteEngineRegistry(registryEngineMatch[1], actor);
+      return error('method_not_allowed', 405);
+    }
+    if (path === '/api/engines/update-runs' && request.method === 'POST') return await this.startEngineUpdateRun(request, actor);
+    const updateRunMatch = path.match(/^\/api\/engines\/update-runs\/([0-9a-f-]{36})$/i);
+    if (updateRunMatch && request.method === 'GET') return await this.getEngineUpdateRun(updateRunMatch[1], actor);
     if (path === '/api/engines/versions' && request.method === 'GET') return await this.engineVersions(request, actor);
     if (path === '/api/engines/version-report' && request.method === 'POST') return await this.reportEngineVersions(request, actor);
     if (path === '/api/engines/sync-report' && request.method === 'POST') return await this.reportEngineSync(request, actor);
     if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL && request.method === 'POST') return await this.acknowledgeEngine(request, actor);
     if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL + '/generation' && request.method === 'GET')
       return await this.engineGenerationCheck(request, actor);
+    if (path === '/api/engines/' + CLAUDE_ENGINE_LABEL + '/passive-credential' && request.method === 'GET')
+      return await this.enginePassiveCredential(request, actor);
     const credentialRoute = path.match(/^\/api\/engines\/hub-claude\/(credential|rejection)$/);
     if (credentialRoute) return await this.engineCredential(request, credentialRoute[1] as 'credential' | 'rejection', actor);
     return error('not_found', 404);
@@ -378,6 +435,7 @@ export class ControlDO {
       credentials: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', generation: routing.credential_generation ?? null,
         status: routing.credential_status || 'unknown', hosts: hosts.map((host: any) => host.id) }],
       credential_rejections: [], account_migrations: [],
+      registry: this.db.schemaVersion >= 7 ? this.db.all<any>('SELECT engine,binary,version_command,update_command,updated_at FROM hub2_engine_registry ORDER BY engine') : [],
     });
   }
 
@@ -394,6 +452,41 @@ export class ControlDO {
     return json({ engines: [{ label: CLAUDE_ENGINE_LABEL, provider: 'claude', version, revision,
       files: credential.files, env: {}, args: [], credential_generation: credential.generation,
       credential_paths: ['.claude/.credentials.json'] }], logins: [], latest_version: this.engineRollout().latest });
+  }
+
+  // Approved-host passive retrieval of the current Claude generation's
+  // refresh-stripped material. Never refreshes, leases, logs in, discovers,
+  // allocates an account, syncs or acknowledges. Fenced on the desired engine
+  // revision and the exact generation captured before the awaits.
+  private async enginePassiveCredential(request: Request, actor?: Actor): Promise<Response> {
+    if (!actor || actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
+    if ([...new URL(request.url).searchParams.keys()].length || (await request.text()).length)
+      return error('invalid_passive_credential', 400);
+    const machineId = actor.resource_id;
+    const captured = await this.accountRequest('/api/account/credentials?metadata=1', 'GET', actor);
+    if (!captured.ok) return captured;
+    const metadata = await captured.json() as any;
+    if (metadata?.provider !== 'claude' || !Number.isSafeInteger(metadata?.generation) || metadata.generation < 1)
+      return error('managed_credential_unavailable', 503);
+    const generation = metadata.generation as number;
+    const version = this.engineVersionFor(machineId);
+    const revision = await this.engineRevision(version);
+    if (this.engineVersionFor(machineId) !== version) return error('revision_changed', 409);
+    const response = await this.accountRequest('/api/account/credentials?passive_generation=' + generation, 'GET', actor);
+    if (!response.ok) return response;
+    const credential = await response.json() as any;
+    if (credential?.provider !== 'claude' || credential?.generation !== generation || credential?.passive !== true
+      || !credential.files || typeof credential.files !== 'object' || Array.isArray(credential.files))
+      return error('generation_conflict', 409);
+    // Both the rollout revision and the exact generation may have moved while awaiting.
+    if (!await this.engineRevisionStable(machineId, revision)) return error('revision_changed', 409);
+    const latest = await this.accountRequest('/api/account/credentials?metadata=1', 'GET', actor);
+    if (!latest.ok) return latest;
+    if ((await latest.json() as any)?.generation !== generation) return error('generation_conflict', 409);
+    // The rollout can move during that last await: recheck the captured version
+    // synchronously, with no await between this check and the response.
+    if (this.engineVersionFor(machineId) !== version) return error('revision_changed', 409);
+    return json({ label: CLAUDE_ENGINE_LABEL, generation, revision, status: 'current', files: credential.files });
   }
 
   // Host release re-pin: fenced observation that this machine's engine revision
@@ -595,6 +688,166 @@ export class ControlDO {
       id, CLAUDE_LATEST_VERSION, canary, CLAUDE_LATEST_VERSION, now);
     return json({ status: 'canary_pending', engine: 'claude', target_version: CLAUDE_LATEST_VERSION,
       canary, rollout_id: id }, 202);
+  }
+
+  private resolveRegistryEngine(engine: string): string {
+    const clean = engine.trim().toLowerCase();
+    if (clean === 'agy') {
+      const direct = this.db.one<{ engine: string }>('SELECT engine FROM hub2_engine_registry WHERE engine=?', 'agy');
+      if (!direct) return 'antigravity';
+    }
+    return clean;
+  }
+
+  private async listEngineRegistry(actor?: Actor): Promise<Response> {
+    if (!actor || (!hasScope(actor, 'operator:admin') && actor.kind !== 'machine' && actor.kind !== 'agent')) {
+      return error('forbidden', 403);
+    }
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const engines = this.db.all<any>(
+      'SELECT engine,binary,version_command,update_command,updated_at FROM hub2_engine_registry ORDER BY engine',
+    );
+    return json({ engines });
+  }
+
+  private async upsertEngineRegistry(engine: string, request: Request, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const body = await bodyObject(request, 8192);
+    const cleanField = (value: unknown, max: number) =>
+      typeof value === 'string' && value.trim().length > 0 && value.length <= max && !/[\x00\r\n]/.test(value)
+        ? value.trim()
+        : null;
+    const binary = cleanField(body.binary, 120);
+    const versionCommand = cleanField(body.version_command, 240);
+    const updateCommand = cleanField(body.update_command, 400);
+    if (!binary || !versionCommand || !updateCommand) return error('invalid_engine_registry_entry', 400);
+    const now = Date.now();
+    this.db.run(
+      'INSERT INTO hub2_engine_registry(engine,binary,version_command,update_command,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(engine) DO UPDATE SET binary=excluded.binary,version_command=excluded.version_command,update_command=excluded.update_command,updated_at=excluded.updated_at',
+      engine, binary, versionCommand, updateCommand, now,
+    );
+    return json({ engine, binary, version_command: versionCommand, update_command: updateCommand, updated_at: now });
+  }
+
+  private async deleteEngineRegistry(engine: string, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const existing = this.db.one<{ engine: string }>('SELECT engine FROM hub2_engine_registry WHERE engine=?', engine);
+    if (!existing) return error('unknown_engine', 404);
+    this.db.run('DELETE FROM hub2_engine_registry WHERE engine=?', engine);
+    return json({ deleted: true, engine });
+  }
+
+  private async startEngineUpdateRun(request: Request, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const body = await bodyObject(request, 8192);
+    const engineInput = typeof body.engine === 'string' && body.engine.trim() ? body.engine.trim() : null;
+    const machineInput = typeof body.machine === 'string' && body.machine.trim() ? body.machine.trim() : null;
+    let engines: Array<{ engine: string; binary: string; version_command: string; update_command: string }>;
+    if (engineInput) {
+      const resolved = this.resolveRegistryEngine(engineInput);
+      const row = this.db.one<any>(
+        'SELECT engine,binary,version_command,update_command FROM hub2_engine_registry WHERE engine=?',
+        resolved,
+      );
+      if (!row) return error('unknown_engine', 404);
+      engines = [row];
+    } else {
+      engines = this.db.all<any>(
+        'SELECT engine,binary,version_command,update_command FROM hub2_engine_registry ORDER BY engine',
+      );
+    }
+    const registered = this.db.all<{ id: string }>(
+      "SELECT DISTINCT resource_id AS id FROM credentials WHERE kind='machine' AND revoked_at IS NULL AND resource_id IS NOT NULL ORDER BY resource_id",
+    ).map(r => r.id);
+    let machines: string[];
+    if (machineInput) {
+      if (!registered.includes(machineInput)) return error('unknown_machine', 404);
+      machines = [machineInput];
+    } else {
+      machines = registered;
+    }
+    if (!machines.length) return error('no_machines_registered', 404);
+
+    const runId = crypto.randomUUID();
+    const now = Date.now();
+    const jobs: Array<{ job_id: string; machine_id: string; engine: string }> = [];
+    for (const machineId of machines) {
+      for (const eng of engines) {
+        const jobId = crypto.randomUUID();
+        jobs.push({ job_id: jobId, machine_id: machineId, engine: eng.engine });
+        const dispatchRes = await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch(
+          new Request('https://machine.internal/_internal/engine-update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              job_id: jobId,
+              engine: eng.engine,
+              binary: eng.binary,
+              version_command: eng.version_command,
+              update_command: eng.update_command,
+            }),
+          }),
+        );
+        if (!dispatchRes.ok) return error('machine_dispatch_failed', dispatchRes.status >= 400 ? dispatchRes.status : 502);
+      }
+    }
+    this.db.run(
+      'INSERT INTO hub2_engine_update_runs(id,requested_by,engine_filter,machine_filter,jobs_json,created_at) VALUES(?,?,?,?,?,?)',
+      runId, actor!.id, engineInput, machineInput, JSON.stringify(jobs), now,
+    );
+    return json({ run_id: runId, jobs }, 202);
+  }
+
+  private async getEngineUpdateRun(runId: string, actor?: Actor): Promise<Response> {
+    if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+    if (this.db.schemaVersion < 7) return error('schema_upgrade_required', 503);
+    const run = this.db.one<{ id: string; jobs_json: string; created_at: number }>(
+      'SELECT id,jobs_json,created_at FROM hub2_engine_update_runs WHERE id=?',
+      runId,
+    );
+    if (!run) return error('not_found', 404);
+    const jobs = JSON.parse(run.jobs_json) as Array<{ job_id: string; machine_id: string; engine: string }>;
+    const results = await Promise.all(jobs.map(async job => {
+      const response = await this.env.MACHINES.get(this.env.MACHINES.idFromName(job.machine_id)).fetch(
+        new Request('https://machine.internal/_internal/engine-updates/' + job.job_id, { method: 'GET' }),
+      );
+      if (!response.ok) {
+        return {
+          job_id: job.job_id,
+          machine_id: job.machine_id,
+          engine: job.engine,
+          state: 'failed',
+          ok: false,
+          old_version: null,
+          new_version: null,
+          error: 'job_lookup_failed:' + response.status,
+        };
+      }
+      const row = await response.json() as any;
+      const oldV = row.old_version ?? null;
+      const newV = row.new_version ?? null;
+      const status = row.state === 'completed' ? (oldV !== newV ? 'updated' : 'unchanged') : (row.state === 'failed' ? 'failed' : row.state);
+      return {
+        job_id: job.job_id,
+        machine_id: job.machine_id,
+        engine: row.engine ?? job.engine,
+        state: row.state,
+        status,
+        ok: row.state === 'completed',
+        old_version: oldV,
+        new_version: newV,
+        exit_code: row.exit_code ?? null,
+        error: row.error ?? null,
+        output: row.output ?? null,
+        update_command: row.update_command ?? null,
+      };
+    }));
+    const done = results.every(r => r.state === 'completed' || r.state === 'failed');
+    const ok = done && results.every(r => r.state === 'completed');
+    return json({ run_id: runId, done, ok, results, created_at: run.created_at });
   }
 
   private async engineVersions(request: Request, actor?: Actor): Promise<Response> {
@@ -858,6 +1111,17 @@ export class ControlDO {
     const actor=actorFrom(request);
     if(!actor||!hasScope(actor,'operator:admin'))return error('forbidden',403);
     if(this.db.schemaVersion<6)return error('schema_migration_deferred',503);
+    if(url.pathname==='/api/picker-alerts/draw-diagnostics'){
+      if(actor.kind!=='operator')return error('forbidden',403);
+      if(request.method!=='GET')return error('method_not_allowed',405);
+      const keys=[...url.searchParams.keys()];
+      if(keys.some(key=>key!=='limit'&&key!=='since_receipt_seq')||new Set(keys).size!==keys.length)
+        return error('invalid_picker_diagnostic_query',400);
+      const limit=url.searchParams.get('limit')??'10',since=url.searchParams.get('since_receipt_seq')??'0';
+      if(!/^[1-9][0-9]?$/.test(limit)||!/^(?:0|[1-9][0-9]{0,15})$/.test(since))
+        return error('invalid_picker_diagnostic_query',400);
+      return json(await this.pickerAlerts.drawDiagnostics(Number(limit),Number(since)),200,{'Cache-Control':'no-store'});
+    }
     if(url.pathname==='/api/picker-alerts/counters'&&request.method==='GET'){
       try{
         return json({recipient:'dev@dtcdev.click',...this.pickerAlerts.counters(),coverage:this.pickerObserverDirty
@@ -927,8 +1191,11 @@ export class ControlDO {
 
   private showRepo(request: Request, name: string): Response {
     const actor = actorFrom(request);
-    if (!hasScope(actor, 'repos:read') && !hasScope(actor, 'operator:admin')) return error('forbidden', 403);
     const canonical = this.resolveRepoName(name);
+    const hasWorkerProject = !!canonical && hasScope(actor, 'worker_project:' + canonical);
+    if (!hasScope(actor, 'repos:read') && !hasScope(actor, 'operator:admin') && !hasWorkerProject) {
+      return forbiddenScope('repos:read', 'grant repos:read or operator:admin to read repository metadata');
+    }
     if (!canonical) return error('repo_not_found', 404);
     const row = this.db.one<Record<string, unknown>>(
       'SELECT canonical_name, canonical_url, purpose, status, duplicate_of, domains_json, metadata_json, updated_at FROM repos WHERE canonical_name = ?', canonical,
@@ -1010,12 +1277,23 @@ export class ControlDO {
     const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
     if(request.method==='GET'){
       const after=new URL(request.url).searchParams.get('after')||'';
-      const rows=this.db.all<{id:string}>('SELECT id,display_name,forward_session,enabled FROM named_agents WHERE id>? ORDER BY id LIMIT 51',after);
+      const v8=this.db.schemaVersion>=8;
+      const rows=this.db.all<{id:string;machine?:string|null}>(
+        v8
+          ?'SELECT n.id, n.display_name, n.forward_session, n.enabled, p.machine FROM named_agents n LEFT JOIN named_agent_pins p ON p.agent_id=n.id WHERE n.id>? ORDER BY n.id LIMIT 51'
+          :'SELECT id, display_name, forward_session, enabled, NULL AS machine FROM named_agents WHERE id>? ORDER BY id LIMIT 51',after);
       return json({items:rows.slice(0,50),next:rows.length>50?rows[49].id:null});
     }
     if(request.method!=='POST')return error('not_found',404);const b=await bodyObject(request,4096);
     const name=typeof b.name==='string'?b.name.replace(/^agent:/,''):'';
     if(!/^[a-z][a-z0-9_-]{0,63}$/.test(name)||!boundedString(b.display_name,120)||(b.enabled!==undefined&&typeof b.enabled!=='boolean'))return error('invalid_named_agent',400);
+    let machine:unknown=undefined;
+    if(b.machine!==undefined){
+      if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+      if(b.machine===null)machine=null;
+      else if(typeof b.machine==='string'&&/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine))machine=b.machine;
+      else return error('invalid_named_agent',400);
+    }
     const forward=b.forward_session??null;
     if(forward!==null&&(!boundedString(forward,120)||!this.db.one('SELECT id FROM object_routes WHERE kind=? AND id=?','session',forward)))return error('forward_session_not_found',400);
     const id='agent:'+name;
@@ -1023,9 +1301,14 @@ export class ControlDO {
       const prior=this.db.one<{forward_session:string|null;enabled:number}>('SELECT forward_session,enabled FROM named_agents WHERE id=?',id);
       this.db.run('INSERT INTO named_agents(id,display_name,forward_session,enabled) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,forward_session=excluded.forward_session,enabled=excluded.enabled',id,b.display_name,forward,Number(b.enabled!==false));
       if(forward&&b.enabled!==false&&(!prior||prior.forward_session!==forward||!prior.enabled))this.db.run("INSERT INTO mailbox_wakes(owner,revision,after_id,next_attempt) VALUES(?,1,'',?) ON CONFLICT(owner) DO UPDATE SET revision=revision+1,after_id='',next_attempt=excluded.next_attempt,attempt=0",id,Date.now());
+      if(machine!==undefined){
+        if(machine===null)this.db.run('DELETE FROM named_agent_pins WHERE agent_id=?',id);
+        else this.db.run('INSERT INTO named_agent_pins(agent_id,machine,updated_at) VALUES(?,?,?) ON CONFLICT(agent_id) DO UPDATE SET machine=excluded.machine,updated_at=excluded.updated_at',id,machine,Date.now());
+      }
     });
     await this.scheduleWake();
-    return json({agent:{id,display_name:b.display_name,forward_session:forward,enabled:b.enabled!==false}});
+    const v8=this.db.schemaVersion>=8;
+    return json({agent:{id,display_name:b.display_name,forward_session:forward,enabled:b.enabled!==false,machine:machine===undefined?(v8?this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id)?.machine??null:null):machine}});
   }
   private async agentGrants(request:Request,name:string):Promise<Response>{
     const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
@@ -1037,6 +1320,160 @@ export class ControlDO {
     const prior=this.db.one('SELECT agent_id FROM agent_grants WHERE agent_id=? AND family_id=? AND client_id=?',id,b.family_id,client);
     if(!prior&&this.db.all('SELECT family_id FROM agent_grants WHERE agent_id=? LIMIT 101',id).length>=100)return error('grant_capacity',409);
     this.db.run('INSERT INTO agent_grants(agent_id,family_id,client_id,can_send,can_read,enabled) VALUES(?,?,?,?,?,?) ON CONFLICT(agent_id,family_id,client_id) DO UPDATE SET can_send=excluded.can_send,can_read=excluded.can_read,enabled=excluded.enabled',id,b.family_id,client,Number(b.can_send),Number(b.can_read),Number(b.enabled));return json({recorded:true});
+  }
+  private async shellGrants(request:Request):Promise<Response>{
+    const actor=actorFrom(request);if(!actor||actor.kind!=='operator'||!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(this.db.schemaVersion<9)return error('schema_migration_deferred',503);
+    if(request.method==='GET'){
+      const items=this.db.all<{actor_id:string;machine_id:string;enabled:number;granted_by:string;created_at:number;updated_at:number;revoked_at:number|null}>('SELECT actor_id,machine_id,enabled,granted_by,created_at,updated_at,revoked_at FROM shell_grants ORDER BY actor_id,machine_id LIMIT 201');
+      return json({items:items.map(r=>({...r,enabled:!!r.enabled}))});
+    }
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    const b=await bodyObject(request,4096);
+    const actorId=typeof b.actor_id==='string'?b.actor_id.trim():'';
+    const machineId=typeof b.machine_id==='string'?b.machine_id.trim():'';
+    if(!boundedString(actorId,180)||!/^[A-Za-z0-9_.-]{1,80}$/.test(machineId))return error('invalid_shell_grant',400);
+    const revoke=b.revoke===true||b.enabled===false;
+    const now=Date.now();
+    if(revoke){
+      this.db.run('UPDATE shell_grants SET enabled=0,updated_at=?,revoked_at=? WHERE actor_id=? AND machine_id=?',now,now,actorId,machineId);
+      let cleanup:JsonRecord={status:'unavailable'};
+      try{
+        const response=await this.env.MACHINES.get(this.env.MACHINES.idFromName(machineId)).fetch('https://machine.internal/_internal/shell-grants/revoke',{
+          method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({actor_id:actorId,revoked_at:now}),
+        });
+        if(response.ok){
+          const body=await response.json() as JsonRecord;
+          cleanup={
+            status:'dispatched',
+            sessions_stopped:Number(body.sessions_stopped||0),
+            stop_requested:Number(body.stop_requested||0),
+            commands_cancelled:Number(body.commands_cancelled||0),
+            truncated:body.truncated===true,
+          };
+        }
+      }catch{}
+      return json({granted:false,revoked:true,actor_id:actorId,machine_id:machineId,cleanup});
+    }
+    this.db.run('INSERT INTO shell_grants(actor_id,machine_id,enabled,granted_by,created_at,updated_at,revoked_at) VALUES(?,?,1,?,?,?,NULL) ON CONFLICT(actor_id,machine_id) DO UPDATE SET enabled=1,granted_by=excluded.granted_by,updated_at=excluded.updated_at,revoked_at=NULL',actorId,machineId,actor.id,now,now);
+    return json({granted:true,actor_id:actorId,machine_id:machineId},201);
+  }
+  private async checkShellGrant(request:Request):Promise<Response>{
+    if(this.db.schemaVersion<9)return json({granted:false});
+    const b=await bodyObject(request,4096);
+    if(!boundedString(b.actor_id,180)||typeof b.machine_id!=='string'||!/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine_id))return json({granted:false});
+    const row=this.db.one<{enabled:number;revoked_at:number|null}>('SELECT enabled,revoked_at FROM shell_grants WHERE actor_id=? AND machine_id=?',b.actor_id,b.machine_id);
+    return json({granted:!!row&&row.enabled===1&&row.revoked_at===null});
+  }
+  private async listGrantedShellHosts(request:Request):Promise<Response>{
+    if(this.db.schemaVersion<9)return json({machine_ids:[]});
+    const b=await bodyObject(request,4096);
+    if(!boundedString(b.actor_id,180))return json({machine_ids:[]});
+    const rows=this.db.all<{machine_id:string}>('SELECT machine_id FROM shell_grants WHERE actor_id=? AND enabled=1 AND revoked_at IS NULL ORDER BY machine_id LIMIT 100',b.actor_id);
+    return json({machine_ids:rows.map(r=>r.machine_id)});
+  }
+  /** Sticky-session administration (intake 408b585e AC2): an operator sets the
+   * machine pin and per-family forward grants for a named agent. */
+  private async agentSticky(request:Request,name:string):Promise<Response>{
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    const id=name.startsWith('agent:')?name:'agent:'+name;
+    if(!this.db.one('SELECT id FROM named_agents WHERE id=?',id))return error('named_agent_not_found',404);
+    const b=await bodyObject(request,4096);
+    let machine:unknown=undefined;
+    if(b.machine!==undefined){
+      if(b.machine===null)machine=null;
+      else if(typeof b.machine==='string'&&/^[A-Za-z0-9_.-]{1,80}$/.test(b.machine))machine=b.machine;
+      else return error('invalid_sticky_config',400);
+    }
+    const family=typeof b.family_id==='string'&&boundedString(b.family_id,180)?b.family_id:undefined;
+    if(b.family_id!==undefined&&!family)return error('invalid_sticky_config',400);
+    if((b.revoke!==undefined&&typeof b.revoke!=='boolean')||(b.enabled!==undefined&&typeof b.enabled!=='boolean'))return error('invalid_sticky_config',400);
+    if(machine===undefined&&family===undefined)return error('invalid_sticky_config',400);
+    this.db.transaction(this.ctx,()=>{
+      if(machine!==undefined){
+        if(machine===null)this.db.run('DELETE FROM named_agent_pins WHERE agent_id=?',id);
+        else this.db.run('INSERT INTO named_agent_pins(agent_id,machine,updated_at) VALUES(?,?,?) ON CONFLICT(agent_id) DO UPDATE SET machine=excluded.machine,updated_at=excluded.updated_at',id,machine,Date.now());
+      }
+      if(family!==undefined){
+        if(b.revoke)this.db.run('DELETE FROM agent_forward_grants WHERE agent_id=? AND family_id=?',id,family);
+        else this.db.run('INSERT INTO agent_forward_grants(agent_id,family_id,enabled,updated_at) VALUES(?,?,?,?) ON CONFLICT(agent_id,family_id) DO UPDATE SET enabled=excluded.enabled,updated_at=excluded.updated_at',id,family,Number(b.enabled!==false),Date.now());
+      }
+    });
+    return json({agent:this.agentView(id)});
+  }
+  /** A sticky session claims its own named agent (intake 408b585e AC2). Only a
+   * current session worker holding an explicit forward-grant family qualifies;
+   * a configured machine pin must match the session's owning machine. The typed
+   * forward_grant_required refusal carries the caller's family so the operator
+   * can grant exactly that subject. */
+  private async agentClaim(request:Request,name:string):Promise<Response>{
+    const actor=actorFrom(request);if(!actor)return error('unauthorized',401);
+    if(request.method!=='POST')return error('method_not_allowed',405);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    if(actor.kind!=='agent'||!/^session:[0-9a-f-]{36}$/i.test(actor.id)||!boundedString(actor.resource_id,180))return error('worker_session_required',403);
+    const id=name.startsWith('agent:')?name:'agent:'+name;
+    const agent=this.db.one<{id:string}>('SELECT id FROM named_agents WHERE id=? AND enabled=1',id);
+    if(!agent)return error('named_agent_not_found',404);
+    const family=(actor as CredentialActor).family_id;
+    if(!boundedString(family,180))return error('forward_grant_required',403);
+    const grant=this.db.one<{enabled:number}>('SELECT enabled FROM agent_forward_grants WHERE agent_id=? AND family_id=?',id,family);
+    if(!grant||!grant.enabled)return json({error:'forward_grant_required',family_id:family},403);
+    const pin=this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id);
+    if(pin){
+      const route=this.db.one<{owner:string}>('SELECT owner FROM object_routes WHERE kind=? AND id=?','session',actor.id.slice(8));
+      if(!route||route.owner!==pin.machine)return json({error:'sticky_machine_mismatch',required_machine:pin.machine},403);
+    }
+    const session=actor.id.slice(8);
+    this.db.transaction(this.ctx,()=>{
+      this.db.run('UPDATE named_agents SET forward_session=? WHERE id=? AND enabled=1',session,id);
+      this.db.run("INSERT INTO mailbox_wakes(owner,revision,after_id,next_attempt) VALUES(?,1,'',?) ON CONFLICT(owner) DO UPDATE SET revision=revision+1,after_id='',next_attempt=excluded.next_attempt,attempt=0",id,Date.now());
+    });
+    await this.scheduleWake();
+    // Trimmed view: the claimant learns its own routing facts, not the agent's
+    // other forward-grant families.
+    const view=this.agentView(id);
+    return json({agent:{id:view.id,display_name:view.display_name,forward_session:session,enabled:view.enabled,machine:view.machine}});
+  }
+  /** GrokBot <1% quota export (intake 408b585e AC1). Any authenticated actor may
+   * read the sanitized evidence; stale or unknown evidence never reports
+   * below_threshold=true, so consumers can fail closed on that single flag.
+   * Only an operator admin records evidence; replayed/stale evidence is refused. */
+  private async quotaReports(request:Request,account:string):Promise<Response>{
+    const actor=actorFrom(request);if(!actor)return error('unauthorized',401);
+    if(this.db.schemaVersion<8)return error('schema_migration_deferred',503);
+    if(request.method==='GET'){
+      const row=this.db.one<{remaining:number;threshold:number;captured_at:number;valid_until:number;reset_at:number|null;source:string;updated_at:number}>('SELECT remaining,threshold,captured_at,valid_until,reset_at,source,updated_at FROM quota_reports WHERE account=?',account);
+      if(!row)return json({account,provider:'unknown',remaining_percent:null,threshold_percent:1,below_threshold:false,fresh:false,state:'unknown',observed_at:null,reset_at:null,source:null,updated_at:null});
+      const fresh=row.valid_until>Date.now();
+      return json({account,provider:account==='grokbot'?'grok':'unknown',remaining_percent:row.remaining,threshold_percent:row.threshold,below_threshold:fresh&&row.remaining<row.threshold,fresh,
+        state:!fresh?'stale':row.remaining<=row.threshold?'exhausted':'fresh',
+        observed_at:new Date(row.captured_at).toISOString(),reset_at:row.reset_at!==null?new Date(row.reset_at).toISOString():null,source:row.source,updated_at:row.updated_at});
+    }
+    if(request.method!=='PUT')return error('method_not_allowed',405);
+    if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const b=await bodyObject(request,4096),now=Date.now();
+    const isPercent=(v:unknown):v is number=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=100;
+    const captured=typeof b.captured_at==='number'&&Number.isSafeInteger(b.captured_at)?b.captured_at:undefined;
+    const validFor=typeof b.valid_for_ms==='number'&&Number.isSafeInteger(b.valid_for_ms)?b.valid_for_ms:undefined;
+    const resetAt=b.reset_at===undefined||b.reset_at===null?null:typeof b.reset_at==='number'&&Number.isSafeInteger(b.reset_at)?b.reset_at:undefined;
+    if(!isPercent(b.remaining)||captured===undefined||captured>now+5000||!boundedString(b.source,120))return error('invalid_quota_report',400);
+    if(resetAt===undefined&&b.reset_at!==null&&b.reset_at!==undefined)return error('invalid_quota_report',400);
+    if(b.threshold!==undefined&&!isPercent(b.threshold))return error('invalid_quota_report',400);
+    if(b.valid_for_ms!==undefined&&(validFor===undefined||validFor<1000||validFor>3600000))return error('invalid_quota_report',400);
+    const prior=this.db.one<{captured_at:number;threshold:number}>('SELECT captured_at,threshold FROM quota_reports WHERE account=?',account);
+    if(prior&&captured<prior.captured_at)return error('stale_quota_evidence',409);
+    const threshold=b.threshold??prior?.threshold??1,validUntil=captured+(validFor??300000);
+    this.db.run('INSERT INTO quota_reports(account,remaining,threshold,captured_at,valid_until,reset_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(account) DO UPDATE SET remaining=excluded.remaining,threshold=excluded.threshold,captured_at=excluded.captured_at,valid_until=excluded.valid_until,reset_at=excluded.reset_at,source=excluded.source,updated_at=excluded.updated_at',
+      account,b.remaining,threshold,captured,validUntil,resetAt,b.source,now);
+    return json({recorded:true,account,remaining_percent:b.remaining,threshold_percent:threshold,fresh:validUntil>now,valid_until:validUntil});
+  }
+  private agentView(id:string):JsonRecord{
+    const agent=this.db.one<{id:string;display_name:string;forward_session:string|null;enabled:number}>('SELECT id,display_name,forward_session,enabled FROM named_agents WHERE id=?',id);
+    const pin=this.db.one<{machine:string}>('SELECT machine FROM named_agent_pins WHERE agent_id=?',id);
+    const grants=this.db.all<{family_id:string;enabled:number;updated_at:number}>('SELECT family_id,enabled,updated_at FROM agent_forward_grants WHERE agent_id=? ORDER BY family_id LIMIT 101',id);
+    return {id:agent?.id??id,display_name:agent?.display_name??'',forward_session:agent?.forward_session??null,enabled:!!agent?.enabled,machine:pin?.machine??null,forward_grants:grants};
   }
   private grant(actor:CredentialActor,id:string):{can_send:number;can_read:number}|undefined{
     if(!actor.family_id)return undefined;
@@ -1064,11 +1501,48 @@ export class ControlDO {
   }
   private async recipient(request:Request):Promise<Response>{
     const b=await bodyObject(request,4096);if(!boundedString(b.recipient,180))return error('invalid_recipient',400);
+    if(b.recipient==='human:me')return this.humanMe(b.caller);
     const row=this.db.one<{id:string;forward_session:string|null}>('SELECT id,forward_session FROM named_agents WHERE id=? AND enabled=1',b.recipient);
     if(row)return json({mailbox:row.id,forward_session:row.forward_session});
     if(b.recipient.startsWith('agent:'))return error('recipient_unknown',404);
     const known=this.db.one<{id:string}>('SELECT id FROM actor_directory WHERE id=? AND enabled=1',b.recipient);
     return known?json({mailbox:known.id,forward_session:null}):error('recipient_unknown',404);
+  }
+  /** `human:me` (t3280u): the human the caller acts for. A human credential is
+   * itself; a session worker resolves to the human participant of its bound
+   * intake (one hop through a session-owned intake to that session's intake);
+   * a delegated named agent to the human owning its credential family. Only a
+   * caller with no tenancy context falls back to the hub's only enabled human.
+   * Never guesses between two humans. */
+  private humanMe(caller:unknown):Response{
+    const c=(caller&&typeof caller==='object'?caller:{}) as {id?:unknown;kind?:unknown;resource_id?:unknown;family_id?:unknown};
+    const humans=(ids:unknown[])=>[...new Set(ids.filter((v):v is string=>typeof v==='string'&&/^human:[^\s]{1,174}$/.test(v)))];
+    const pick=(ids:string[])=>ids.length===1?json({mailbox:ids[0],forward_session:null}):ids.length>1?error('ambiguous_recipient',409):undefined;
+    const participants=(kind:string,id:string):unknown[]|undefined=>{
+      const route=this.db.one<{participants_json:string}>('SELECT participants_json FROM object_routes WHERE kind=? AND id=?',kind,id);if(!route)return undefined;
+      const parsed=JSON.parse(route.participants_json) as unknown;if(!Array.isArray(parsed)||parsed.length>32)throw new HttpError('route_acl_corrupt',503);return parsed;
+    };
+    if(typeof c.id==='string'&&c.id.startsWith('human:'))return pick(humans([c.id]))||error('recipient_unknown',404);
+    if(c.kind==='agent'&&typeof c.id==='string'&&c.id.startsWith('session:')&&boundedString(c.resource_id,180)){
+      let direct:unknown[]|undefined;try{direct=participants('intake',c.resource_id);}catch{return error('route_acl_corrupt',503);}
+      // A session worker only ever reaches a human through its own intake; no global fallback.
+      if(!direct)return error('recipient_unknown',404);
+      {
+        const found=pick(humans(direct));if(found)return found;
+        // An intake opened by another session (e.g. the orchestrator) belongs to that session's human.
+        const owners:unknown[]=[];
+        for(const v of direct.filter((p):p is string=>typeof p==='string'&&/^session:[0-9a-f-]{36}$/i.test(p)).slice(0,4)){
+          const bound=this.db.one<{bound_intake_id:string|null}>('SELECT bound_intake_id FROM object_routes WHERE kind=? AND id=?','session',v.slice(8));
+          if(bound?.bound_intake_id){try{owners.push(...(participants('intake',bound.bound_intake_id)||[]));}catch{return error('route_acl_corrupt',503);}}
+        }
+        return pick(humans(owners))||error('recipient_unknown',404);
+      }
+    }
+    if(boundedString(c.family_id,180)){
+      const found=pick(humans(this.db.all<{id:string}>("SELECT DISTINCT resource_id AS id FROM credentials WHERE family_id=? AND kind='operator' LIMIT 3",c.family_id).map(v=>v.id)));if(found)return found;
+    }
+    const only=this.db.all<{id:string}>("SELECT id FROM actor_directory WHERE kind='human' AND enabled=1 ORDER BY id LIMIT 2").map(v=>v.id);
+    return pick(humans(only))||error('recipient_unknown',404);
   }
   private async registerRoute(request:Request):Promise<Response>{
     const b=await bodyObject(request,8192);
@@ -1094,10 +1568,11 @@ export class ControlDO {
     const match=new URL(request.url).pathname.match(/^\/api\/routes\/(intake|session|message|schedule)\/([^/]+)$/);if(!match)return error('not_found',404);
     const kind=match[1],value=decodeURIComponent(match[2]);if(!boundedString(value,180))return error('invalid_route_id',400);
     type Route={id:string;owner:string;resource_id:string;bound_intake_id:string|null};
-    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||hasScope(actor,'routing:read');
+    const columns='id,owner,resource_id,bound_intake_id',admin=hasScope(actor,'operator:admin')||(actor.kind!=='agent'&&hasScope(actor,'routing:read'));
     const bound=(r:Route)=>kind!=='message'&&hasScope(actor,'intake:read')&&((kind==='intake'&&actor.resource_id===r.id)||(kind==='session'&&!!r.bound_intake_id&&actor.resource_id===r.bound_intake_id)||hasScope(actor,'project:'+r.resource_id));
     const exact=this.db.one<Route>('SELECT '+columns+' FROM object_routes WHERE kind=? AND id=?',kind,value);
-    if(exact){if(!admin&&!bound(exact)&&!this.db.one('SELECT id FROM route_acl WHERE actor_id=? AND kind=? AND id=?',actor.id,kind,exact.id))return error('route_not_found',404);return json({route:{kind,...exact}});}
+    const denied=(id:string)=>forbiddenScope(kind==='message'?'message:read':kind==='schedule'?'schedule:read':'intake:read',`${kind} ${id} exists but is not visible to ${actor.id}; grant intake:read with project:<owner>, a route ACL, the bound or child-intake worker session, or operator:admin`);
+    if(exact){if(!admin&&!bound(exact)&&!this.db.one('SELECT id FROM route_acl WHERE actor_id=? AND kind=? AND id=?',actor.id,kind,exact.id))return denied(exact.id);return json({route:{kind,...exact}});}
     if(value.length<6)return error('prefix_too_short',400);
     const rows:Route[]=[],add=(items:Route[])=>{for(const item of items)if(!rows.some(v=>v.id===item.id))rows.push(item);};
     if(admin)add(this.db.all('SELECT '+columns+' FROM object_routes WHERE kind=? AND id>=? AND id<? ORDER BY id LIMIT 2',kind,value,value+'\uffff'));
@@ -1110,11 +1585,15 @@ export class ControlDO {
         for(const project of projects)add(this.db.all('SELECT '+columns+' FROM object_routes WHERE resource_id=? AND kind=? AND id>=? AND id<? ORDER BY id LIMIT 2',project,kind,value,value+'\uffff'));
       }
     }
-    if(rows.length>1)return error('ambiguous_prefix',409);return rows.length?json({route:{kind,...rows[0]}}):error('route_not_found',404);
+    if(rows.length>1)return error('ambiguous_prefix',409);if(rows.length)return json({route:{kind,...rows[0]}});
+    // Fail loudly: a prefix that names a real but invisible intake or session is a scope refusal, not a miss.
+    // Message and schedule ids stay a plain miss so prefix probing cannot enumerate them.
+    if(!admin&&(kind==='intake'||kind==='session')&&this.db.one('SELECT id FROM object_routes WHERE kind=? AND id>=? AND id<? LIMIT 1',kind,value,value+'\uffff'))return denied(value);
+    return error('route_not_found',404);
   }
 
   private directory(request:Request):Response{
-    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'routing:read')&&!hasScope(actor,'directory:read'))return error('forbidden',403);
+    const actor=actorFrom(request);if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'routing:read')&&!hasScope(actor,'directory:read'))return forbiddenScope('routing:read','grant routing:read, directory:read, or operator:admin');
     const q=new URL(request.url).searchParams,kind=q.get('kind')||'agents',after=q.get('after')||'',limit=Number(q.get('limit')||25);
     if(!['agents','machines'].includes(kind)||!Number.isInteger(limit)||limit<1||limit>50||after.length>180)return error('invalid_directory_query',400);
     const rows=kind==='agents'?this.db.all<{id:string}>('SELECT id,display_name FROM named_agents WHERE enabled=1 AND id>? ORDER BY id LIMIT ?',after,limit+1)
@@ -1124,7 +1603,7 @@ export class ControlDO {
 
   private async checkSessionCap(request:Request):Promise<Response>{
     const actor=actorFrom(request);
-    if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'session:start'))return error('forbidden',403);
+    if(!hasScope(actor,'operator:admin')&&!hasScope(actor,'session:start')&&!(actor?.kind==='operator'&&hasScope(actor,'shell:start')))return error('forbidden',403);
     const body=await bodyObject(request,4096);
     if(!boundedString(body.operation_id,180)||!boundedString(body.session_id,180))return error('invalid_session_start',400);
     const operationId=body.operation_id,sessionId=body.session_id;
@@ -1192,7 +1671,7 @@ export class ControlDO {
       if(!candidate||typeof candidate!=='object'||Array.isArray(candidate))throw new HttpError('invalid_model_candidate',400);
       const c=candidate as JsonRecord;
       if(Object.keys(c).some(k=>!['id','engine','model','effort','account_id','weight','capabilities','enabled'].includes(k)))throw new HttpError('unknown_model_candidate_field',400);
-      if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','max'].includes(String(c.effort))))throw new HttpError('invalid_model_candidate',400);
+      if(!['id','engine','model','account_id'].every(k=>boundedString(c[k],120)&&/^[A-Za-z0-9_.:/-]+$/.test(String(c[k])))||typeof c.weight!=='number'||!Number.isFinite(c.weight)||c.weight<=0||c.weight>1000000||typeof c.enabled!=='boolean'||!Array.isArray(c.capabilities)||c.capabilities.length>32||!c.capabilities.every(v=>boundedString(v,80))||(c.effort!==undefined&&!['low','medium','high','max'].includes(String(c.effort))))throw new HttpError('invalid_model_candidate',400);
       if(['shared-zai','zcodex'].includes(String(c.account_id))||['zcodex','goz','zai'].includes(String(c.engine))&&c.account_id!=='zai-central')throw new HttpError('zai_central_account_required',400);
       const policyViolation=modelPolicyCandidateViolation(c as unknown as ModelPolicyRoute);
       if(policyViolation)throw new HttpError(policyViolation,400);

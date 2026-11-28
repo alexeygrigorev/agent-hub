@@ -10,6 +10,7 @@ second Codex account (provider `codex`, account `codex-orin`). Filter it with
 """
 import json
 import re
+import time
 import urllib.parse
 
 # Canonical output providers only: legacy wire route keys (e.g. `codex-orin`,
@@ -28,10 +29,16 @@ def add_commands(sub):
     parser.add_argument("--admin-token-file", default=None, help="Use an existing private Hub operator token for this read")
     parser.add_argument("--json", action="store_true", help="Emit raw JSON instead of text")
     parser.add_argument("--enable", action="store_true", help="publish: also enable existing disabled quota accounts for routing")
-    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch", "publish"],
-                        help="TBM view: pacing, metrics, banked, or kill-switch (fleet filters do not apply)")
-    parser.add_argument("kill_action", nargs="?", default=None, choices=["on", "off"],
-                        help="kill-switch write: on|off (read when omitted)")
+    parser.add_argument("tbm", nargs="?", default=None, choices=["history", "pacing", "metrics", "banked", "kill-switch", "publish", "report", "check"],
+                        help="TBM view: pacing, metrics, banked, or kill-switch; quota evidence: report <account> | check <account>")
+    parser.add_argument("kill_action", nargs="?", default=None,
+                        help="kill-switch write: on|off (read when omitted); the account label (e.g. grokbot) for report/check")
+    parser.add_argument("--remaining", default=None, help="report: remaining quota percent (0-100)")
+    parser.add_argument("--captured-at", default=None, help="report: evidence capture time, epoch ms (default now)")
+    parser.add_argument("--valid-for-ms", default=None, help="report: freshness window in ms (1000-3600000, default 300000)")
+    parser.add_argument("--reset-at", default=None, help="report: provider reset time, epoch ms")
+    parser.add_argument("--threshold", default=None, help="report: below-threshold percent (default 1, sticky across reports)")
+    parser.add_argument("--source", default=None, help="report: bounded reporter label (required)")
     parser.add_argument("--reason", default=None, help="Reason for kill-switch on|off")
     parser.add_argument("--range", default="24h", choices=["24h", "7d", "30d"], help="Usage history range")
     parser.add_argument("--kind", default="quota_window", choices=["quota_window", "quota", "tokens"], help="Usage history dimension")
@@ -73,8 +80,80 @@ def fetch_quota(host=None, provider=None, engine=None, account=None, admin_token
     return bus._do_request("GET", path)
 
 
+def _quota_account(value):
+    if not isinstance(value, str) or not re.match(r"^[a-z][a-z0-9_-]{0,63}$", value):
+        raise ValueError("Invalid quota account label")
+    return value
+
+
+def _optional_int(value, what, low=None, high=None):
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        raise ValueError("Invalid %s" % what)
+    if (low is not None and parsed < low) or (high is not None and parsed > high):
+        raise ValueError("Invalid %s" % what)
+    return parsed
+
+
+def report_quota(account, remaining, source, captured_at=None, valid_for_ms=None, reset_at=None, threshold=None):
+    """PUT /api/quota/<account>: record sanitized remaining-quota evidence (admin)."""
+    from . import bus
+    label = str(source or "")
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_./:-]{0,119}$", label):
+        raise ValueError("Invalid --source (bounded reporter label)")
+    try:
+        remaining_value = float(remaining)
+    except (TypeError, ValueError):
+        raise ValueError("Invalid --remaining (0-100 percent)")
+    if not 0 <= remaining_value <= 100:
+        raise ValueError("Invalid --remaining (0-100 percent)")
+    body = {
+        "remaining": remaining_value,
+        "source": label,
+        "captured_at": _optional_int(captured_at, "captured-at") if captured_at is not None else int(time.time() * 1000),
+    }
+    if valid_for_ms is not None:
+        body["valid_for_ms"] = _optional_int(valid_for_ms, "valid-for-ms", 1000, 3600000)
+    if reset_at is not None:
+        body["reset_at"] = _optional_int(reset_at, "reset-at")
+    if threshold is not None:
+        try:
+            parsed = float(threshold)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid --threshold (0-100 percent)")
+        if not 0 <= parsed <= 100:
+            raise ValueError("Invalid --threshold (0-100 percent)")
+        body["threshold"] = parsed
+    return bus._do_request("PUT", "/api/quota/" + _quota_account(account), body)
+
+
+def check_quota(account):
+    """GET /api/quota/<account>: sanitized below-threshold export for consumers."""
+    from . import bus
+    return bus._do_request("GET", "/api/quota/" + _quota_account(account))
+
+
 def execute(args):
     tbm_view = getattr(args, "tbm", None)
+    if tbm_view in ("report", "check"):
+        for key in ("host", "provider", "engine", "account", "admin_token_file"):
+            if getattr(args, key, None) is not None:
+                raise ValueError("Invalid quota arguments: filters do not apply to '%s'" % tbm_view)
+        # The single optional positional carries the account label for these views.
+        account = getattr(args, "quota_account", None) or getattr(args, "kill_action", None)
+        if account in ("on", "off") or not account:
+            raise ValueError("%s requires an account label (e.g. grokbot)" % tbm_view)
+        if tbm_view == "check":
+            if any(getattr(args, key, None) is not None for key in ("remaining", "captured_at", "valid_for_ms", "reset_at", "threshold", "source")):
+                raise ValueError("check takes no evidence flags")
+            return check_quota(account)
+        if getattr(args, "remaining", None) is None:
+            raise ValueError("report requires --remaining")
+        if getattr(args, "source", None) is None:
+            raise ValueError("report requires --source")
+        return report_quota(account, args.remaining, args.source, captured_at=args.captured_at,
+                            valid_for_ms=args.valid_for_ms, reset_at=args.reset_at, threshold=args.threshold)
     if tbm_view is None:
         kwargs = dict(host=args.host, provider=args.provider, engine=args.engine, account=args.account)
         if getattr(args, 'admin_token_file', None) is not None:
@@ -125,6 +204,13 @@ def render_text(data):
     """Human-readable usage table; unknown stays unknown, never zero."""
     if not isinstance(data, dict):
         raise ValueError("Invalid quota payload")
+    if "below_threshold" in data and "threshold_percent" in data:
+        remaining = data.get("remaining_percent")
+        left = "unknown" if remaining is None else "%s%%" % remaining
+        return "%s: %s (%s left, threshold %s%%) below_threshold=%s fresh=%s observed %s" % (
+            data.get("account", "?"), data.get("state", "unknown"), left,
+            data.get("threshold_percent"), data.get("below_threshold"), data.get("fresh"),
+            data.get("observed_at") or "never")
     if isinstance(data.get('windows'), dict):
         from . import tbm as tbm_cli
         return tbm_cli.render_metrics_text(data)

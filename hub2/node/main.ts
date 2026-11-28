@@ -11,10 +11,28 @@
 
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, lstatSync, constants } from 'node:fs';
+import { mkdirSync, readFileSync, lstatSync, constants, writeSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { registerTypeScriptResolveHook, installCompatGlobals } from './compat.ts';
+
+// BEGIN bounded startup diagnostics (no error/config/path/object payloads).
+type StartupStage = 'preimport' | 'imports_env' | 'schema_probe_begin' | 'schema_probe_end' | 'runtime' | 'listening';
+const startupBegan = performance.now();
+let startupStage: StartupStage = 'preimport';
+function startupMarker(stage: StartupStage, objects?: number, failed = false): void {
+  startupStage = stage;
+  try {
+    const elapsed = Math.min(9999999999, Math.max(0, Math.floor(performance.now() - startupBegan)));
+    const count = Number.isSafeInteger(objects) && objects! >= 0 && objects! <= 5000 ? ` objects=${objects}` : '';
+    writeSync(2, `[hub2-startup-v1] stage=${stage} elapsed_ms=${elapsed}${count}${failed ? ' code=startup_failed' : ''}\n`);
+  } catch { /* Observability never changes startup outcome. */ }
+}
+// Monitor preserves Node's default fatal behavior; never stringify the error.
+function startupFailure(): void { startupMarker(startupStage, undefined, true); }
+process.on('uncaughtExceptionMonitor', startupFailure);
+startupMarker('preimport');
+// END bounded startup diagnostics.
 
 registerTypeScriptResolveHook();
 installCompatGlobals();
@@ -91,15 +109,26 @@ const [{ default: entry, ControlDO, ProjectDO, MachineDO, AccountDO, MailboxDO }
   ]);
 
 const envVars = await loadEnvironment(devVars === 'none' ? undefined : devVars, args['dev-vars'] !== undefined);
+startupMarker('imports_env');
 const classes = { CONTROL: ControlDO, PROJECTS: ProjectDO, MACHINES: MachineDO, ACCOUNTS: AccountDO, MAILBOXES: MailboxDO };
 // Optional observer code/config may be missing or broken without stopping the
 // primary server. A late bootstrap is never attached after primary ingress may
 // have begun: that incarnation stays unavailable, not retroactively complete.
+type BootstrapReason = 'not_configured' | 'source_measurement_unavailable' | 'directory_collision'
+  | 'load_failed' | 'load_after_ingress_cutoff';
+function unavailableObserver(reason: BootstrapReason): import('../src/types.ts').CredentialMonitorEvidence {
+  return {begin: () => null, finish: async () => {}, invalidate: () => {},
+    snapshot: async (nonce: string) => ({kind: 'hub_alert_evidence_unavailable_v1', available: false,
+      reason: 'coverage_unknown', nonce, unavailable_phase: 'bootstrap', unavailable_reason: reason})};
+}
+const bootstrapReasons: Record<string, BootstrapReason> = {credential_monitor: 'not_configured',
+  picker_excluded: 'not_configured', picker_quota_stale: 'not_configured'};
 let alertEvidence: import('../src/types.ts').CredentialMonitorEvidence | undefined;
 let acceptingObserver = true;
 const observerLoad = (async () => {
   if (!envVars.HUB2_ALERT_EVIDENCE_DIR) return undefined;
-  if (!loadedPrimarySources) return undefined;
+  if (!loadedPrimarySources) { bootstrapReasons.credential_monitor = 'source_measurement_unavailable'; return undefined; }
+  bootstrapReasons.credential_monitor = 'load_failed';
   const observerPath = join(here, 'alert-evidence.ts');
   const loadedArtifacts = { ...loadedPrimarySources, [observerPath]: await optionalObserverHash(observerPath) };
   const { AlertEvidence } = await import('./alert-evidence.ts');
@@ -111,17 +140,21 @@ const observerLoad = (async () => {
 void observerLoad.then(value => { if (acceptingObserver) alertEvidence = value; }).catch(() => {});
 const diagnosticEvidence: Partial<Record<import('../src/types.ts').PickerDiagnosticProducer,
   import('../src/types.ts').CredentialMonitorEvidence>> = {};
+const diagnosticSettled: Record<string, boolean> = {};
 const diagnosticLoad = Promise.all(([
   ['picker_excluded', envVars.HUB2_PICKER_EXCLUDED_EVIDENCE_DIR],
   ['picker_quota_stale', envVars.HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR],
 ] as const).map(async ([producer, directory]) => {
-  if (!directory || !loadedPrimarySources || !loadedDiagnosticSources) return;
+  try {
+  if (!directory) return;
+  if (!loadedPrimarySources || !loadedDiagnosticSources) { bootstrapReasons[producer] = 'source_measurement_unavailable'; return; }
+  bootstrapReasons[producer] = 'load_failed';
   let observer: (import('../src/types.ts').CredentialMonitorEvidence & {close(): Promise<void>}) | undefined;
   try {
     // Sharing a state directory between producers is a configuration error,
     // never permission to double-count one enrollment as another authority.
     if (directory === envVars.HUB2_ALERT_EVIDENCE_DIR
-        || directory === (producer === 'picker_excluded' ? envVars.HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR : envVars.HUB2_PICKER_EXCLUDED_EVIDENCE_DIR)) return;
+        || directory === (producer === 'picker_excluded' ? envVars.HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR : envVars.HUB2_PICKER_EXCLUDED_EVIDENCE_DIR)) { bootstrapReasons[producer] = 'directory_collision'; return; }
     const observerPath = join(here, 'alert-evidence.ts');
     const loadedArtifacts = {...loadedPrimarySources, ...loadedDiagnosticSources,
       [observerPath]: await optionalObserverHash(observerPath)};
@@ -130,22 +163,37 @@ const diagnosticLoad = Promise.all(([
     if (!acceptingObserver) { void observer.close().catch(() => {}); return; }
     diagnosticEvidence[producer] = observer;
   } catch { /* Optional diagnostics never alter credential/primary availability. */ }
+  } finally { diagnosticSettled[producer] = true; }
 }));
 let observerTimer: ReturnType<typeof setTimeout> | undefined;
+let credentialSettled = false;
+void observerLoad.finally(() => { credentialSettled = true; }).catch(() => {});
 try {
   await Promise.race([Promise.all([observerLoad.catch(() => undefined), diagnosticLoad]), new Promise<undefined>(resolve => {
-    observerTimer = setTimeout(() => resolve(undefined), 250);
+    observerTimer = setTimeout(() => {
+      if (!credentialSettled) bootstrapReasons.credential_monitor = 'load_after_ingress_cutoff';
+      for (const producer of ['picker_excluded', 'picker_quota_stale']) {
+        if (!diagnosticSettled[producer] && !diagnosticEvidence[producer as import('../src/types.ts').PickerDiagnosticProducer]
+            && bootstrapReasons[producer] === 'load_failed') bootstrapReasons[producer] = 'load_after_ingress_cutoff';
+      }
+      resolve(undefined);
+    }, 250);
   })]);
 } catch { /* No raw error/config/path reaches logs or primary responses. */ }
 finally { acceptingObserver = false; clearTimeout(observerTimer); }
 void observerLoad.then(value => { if (value !== alertEvidence) void value?.close().catch(() => {}); }).catch(() => {});
 const runtimeEnv = { ...envVars, ASSETS: assetFetcher(publicDir, cliReleaseRoot),
-  CREDENTIAL_MONITOR_EVIDENCE: alertEvidence, PICKER_DIAGNOSTIC_EVIDENCE: diagnosticEvidence };
+  CREDENTIAL_MONITOR_EVIDENCE: alertEvidence ?? unavailableObserver(bootstrapReasons.credential_monitor),
+  PICKER_DIAGNOSTIC_EVIDENCE: Object.fromEntries((['picker_excluded', 'picker_quota_stale'] as const)
+    .map(producer => [producer, diagnosticEvidence[producer] ?? unavailableObserver(bootstrapReasons[producer])])) };
 // Do not serve /health before existing object migrations and recovery finish.
 // This runs before Hub2Runtime starts its alarm sweep.
 mkdirSync(dataDir, { recursive: true });
 const { probeSchemaReadiness } = await import('./schema-readiness.ts');
-await probeSchemaReadiness({ classes: classes as never, env: runtimeEnv, dataDir });
+startupMarker('schema_probe_begin');
+const startupObjects = await probeSchemaReadiness({ classes: classes as never, env: runtimeEnv, dataDir });
+startupMarker('schema_probe_end', startupObjects);
+startupMarker('runtime');
 const runtime = new Hub2Runtime({
   classes: classes as never,
   entry,
@@ -155,6 +203,8 @@ const runtime = new Hub2Runtime({
 
 const publicOrigin = envVars.AUTH_CALLBACK_URL ? new URL(envVars.AUTH_CALLBACK_URL).origin : undefined;
 const listening = await startServer(runtime, { host, port, publicOrigin });
+startupMarker('listening');
+process.removeListener('uncaughtExceptionMonitor', startupFailure);
 console.log(
   `[hub2-node] listening http://${host}:${listening.port} release=${envVars.HUB2_RELEASE_MODE ?? 'unconfigured'} data=${dataDir}`,
 );

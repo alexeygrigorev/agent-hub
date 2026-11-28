@@ -58,27 +58,40 @@ refresh. The machine-derived GitHub URL is separate from human URLs.
 
 ```sh
 hub repos list
-hub repos list --org DataTalksClub --status active
-hub repos list --flagged
+hub repos list --status active
+hub repos list --limit 50            # one page; the response carries the next cursor
 hub repos show dtc-website
-hub repos edit dtc-website --file human-fields.json
+hub repos add alexeygrigorev/telegram-bridge --file entry.json
+hub repos edit Example/agent-hub --file human-fields.json
 ```
 
-The edit file is a JSON object containing any of `label`, `aliases` (string array),
-`purpose`, `stack`, `key_folders`, `urls`, `status`, `canonical`, or `allowed_machines`. The latter is a
-list of machine IDs; absent or `null` permits every enrolled host, and `[]`
-permits none. For example, `{"allowed_machines":["HOST_ID"]}` restricts both
-existing-checkout and clone routes. For example,
-`{"status":"duplicate","canonical":"dtc-website"}` marks an entry as a duplicate.
-The target must already exist and be active; self-links, missing/inactive targets,
-and duplicate cycles are rejected without changing the entry. Setting status to
-`active` or `archived` clears its canonical link. Edit/seed require an operator. A host can
-refresh only checkout rows bound to its authenticated machine; another host may report the same repository. Authorized host and
-agent readers can list/show. Legacy Hub1 API routes are `GET /api/repos`,
+`hub repos list` follows every page of the keyset listing by default (50 per
+page, bounded walk), so registries larger than one page are fully listed;
+`--limit` (1-100) returns a single page plus its `next` cursor and `--after`
+resumes from a cursor.
+
+`hub repos add <owner/name> --file` creates (or updates) a registry entry in
+one command; the file must contain `canonical_url` (https://, ≤2048 chars).
+`hub repos edit` updates an existing entry and refuses missing entries with a
+pointer to `hub repos add`. Both accept the Hub2 fields `canonical_url`,
+`purpose`, `status` (`active`/`archived`/`duplicate`), `duplicate_of`,
+`domains`, `aliases` and `metadata` (JSON object ≤4096 bytes). Duplicate
+entries require `duplicate_of`; setting `active`/`archived` clears the
+duplicate link server-side. Legacy Hub1 fields (`label`, `stack`,
+`key_folders`, `urls`, `canonical`, `allowed_machines`) are refused by name
+before any request so they can never be silently ignored by the Hub2 server;
+field errors are client-side and loud, and server rejections surface their
+specific slugs. Edit/add require an operator credential.
+
+`hub repos seed` and `hub repos refresh` target the legacy Hub1 API only. On
+Hub2 they fail loudly: the Hub2 API has no `POST /api/repos/seed` or
+`POST /api/repos/refresh` route, and the CLI refuses with that reason instead
+of a generic error. Legacy Hub1 API routes are `GET /api/repos`,
 `GET /api/repos/{name}`, `PATCH /api/repos/{name}`, `POST /api/repos/seed`,
-`POST /api/repos/refresh`; list filters are `org`, `status`, `flagged=true`, `host`, `missing_on`.
-Seed/refresh accept `{"repos": [...]}` in bounded batches. MCP tools `repos_list`,
-`repos_show`, `repos_edit` use the same routes and authorization.
+`POST /api/repos/refresh`; Hub2 serves `GET /api/repos`,
+`GET|PATCH /api/repos/{name}` only. Seed/refresh accept `{"repos": [...]}`
+in bounded batches. MCP tools `repos_list`, `repos_show`, `repos_edit` use
+the same routes and authorization.
 
 ## Deployment readiness: green edge is not a usable duplicate API
 

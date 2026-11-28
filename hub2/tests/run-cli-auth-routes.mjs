@@ -1,5 +1,6 @@
 // Real Node/SQLite routes plus the installed Python CLI, with synthetic credentials.
 import assert from 'node:assert/strict';
+import { qualifiedRepositoryWorkspace, REPOSITORY_IDENTITY_CAPABILITY } from '../src/repository-identity.ts';
 import WebSocket from 'ws';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -56,7 +57,7 @@ const fixture = await createFixture({ root, entry: wrappedEntry,
   env: { HUB2_RELEASE_MODE: 'active', HUB_ADMINS: 'cli@example.test' },
 });
 const headers = { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' };
-const call = (path, method = 'GET', body) => fixture.fetch(path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+const call = (path, method = 'GET', body, extraHeaders = {}) => fixture.fetch(path, { method, headers: { ...headers, ...extraHeaders }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 const scratch = await makeTempDir('cli-auth-routes-');
 let hostSocket;
 async function command(program, args, env = {}) {
@@ -90,6 +91,14 @@ try {
   assert.deepEqual((await (await call('/api/quota?provider=claude')).json()).pools, []);
   assert.equal((await call('/api/quota?host_id=b-full')).status, 400);
   assert.equal((await fixture.fetch('/api/quota')).status, 401);
+  // Assistant-only go-orin is visible in /api/quota with routing=disabled and excluded from model-policy.
+  assert.equal((await call('/api/accounts/go-orin/api/account', 'PATCH', { provider: 'go', enabled: false })).status, 200);
+  assert.equal((await call('/api/accounts/go-orin/api/account/quota', 'PUT', { remaining: 64, captured_at: now, valid_until: now + 60000, source: 'quse' })).status, 200);
+  pools = (await (await call('/api/quota?view=fleet&provider=go&engine=opencode&account=go-orin')).json()).pools;
+  assert.equal(pools.length, 1);
+  assert.deepEqual({ provider: pools[0].provider, account: pools[0].account, engines: pools[0].engines, routing: pools[0].routing, state: pools[0].state, remaining_percent: pools[0].remaining_percent },
+    { provider: 'go', account: 'go-orin', engines: ['opencode'], routing: 'disabled', state: 'fresh', remaining_percent: 64 });
+  assert.equal((await call('/api/model-policy', 'PUT', { candidates: [{ id: 'go-orin-route', engine: 'opencode', model: 'opencode-go/muse-spark-1.3-contributor', account_id: 'go-orin', weight: 1, capabilities: [], enabled: true }] })).status, 400);
 
   // Empty first host must still return a cursor to the populated second host.
   const first = await (await call('/api/sessions?limit=1')).json();
@@ -105,10 +114,14 @@ try {
   assert.equal((await (await call('/api/repos')).json()).items[0].canonical_name, 'owner/repo');
 
   // POST /api/sessions reports validation refusals clearly and includes the selected route on acceptance.
-  const start = (body) => call('/api/sessions', 'POST', body);
+  const start = (body, headers = {}) => call('/api/sessions', 'POST', body, headers);
   const base = { key: 'start-test-0001', workspace: '/tmp/ws', mode: 'headless', brief: 'do the thing', repo: 'owner/repo' };
   for (const [patch, status, code] of [
     [{ key: undefined }, 400, 'idempotency_key_required'],
+    [{ key: '' }, 400, 'idempotency_key_required'],
+    [{ key: '-bad' }, 400, 'idempotency_key_required'],
+    [{ key: 'gha-6' }, 503, 'no_connected_host'],
+    [{ key: 'k' }, 503, 'no_connected_host'],
     [{ brief: undefined }, 400, 'brief_required'],
     [{ purpose: 'Review' }, 400, 'invalid_purpose'],
     [{ purpose: null }, 400, 'invalid_purpose'],
@@ -117,6 +130,9 @@ try {
     const refused = await start({ ...base, ...patch });
     assert.equal(refused.status, status); assert.equal((await refused.json()).error, code);
   }
+  const headerKey = await start({ ...base, key: undefined }, { 'Idempotency-Key': 'gha-6' });
+  assert.equal(headerKey.status, 503);
+  assert.equal((await headerKey.json()).error, 'no_connected_host');
   const noWorkspace = await start({ ...base, key: 'start-no-workspace', workspace: undefined, repo: undefined });
   const noWorkspaceBody = await noWorkspace.json();
   assert.equal(noWorkspace.status, 400); assert.equal(noWorkspaceBody.error, 'workspace_required');
@@ -131,6 +147,14 @@ try {
     body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})})).status,200);
   hostSocket=new WebSocket(fixture.origin.replace('http:','ws:')+'/api/connect',{headers:{Authorization:'Bearer '+machine}});
   await new Promise((resolve,reject)=>{hostSocket.once('open',resolve);hostSocket.once('error',reject);});
+  // A connected older host without canonical-origin advertisement must refuse repo-only placement.
+  const oldHostRepoOnly = await start({ ...base, key: 'start-old-host-repo-only', workspace: undefined });
+  assert.equal(oldHostRepoOnly.status, 503);
+  const repositoryWorkspace = await qualifiedRepositoryWorkspace('https://github.com/owner/repo');
+  assert(repositoryWorkspace);
+  assert.equal((await fixture.fetch('/api/heartbeat',{method:'POST',headers:{Authorization:'Bearer '+machine,'Content-Type':'application/json'},
+    body:JSON.stringify({labels:[],engines:['codex'],capabilities:['headless',REPOSITORY_IDENTITY_CAPABILITY,
+      'workspace:'+repositoryWorkspace],native_sessions:[]})})).status,200);
   // --repo owner/name supplies its repository workspace when --workspace is omitted.
   const repoOnly = await start({ ...base, key: 'start-repo-only-01', workspace: undefined });
   const repoOnlyBody = await repoOnly.json();

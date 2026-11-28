@@ -49,6 +49,7 @@ export const DEFAULT_TOOL_EXCLUSIONS = [
 
 const PHASE2_CLI_EXCLUSIONS: Record<string, string> = {
   heartbeat: 'Host-only daemon callback; authenticated host agents report liveness directly.',
+  'sessions finish': 'Session-scoped completion-claim CLI alias; MCP retains existing intake append evidence. This does not report native exit or acceptance verification.',
   'sessions observe': 'Host-only lifecycle callback; authenticated host agents report observations directly.',
   'sessions pick': 'Hub2 routing preview has no retained Hub1 MCP counterpart; preview samples are not committed session picker evidence.',
   'sessions reap': 'Operator fleet reconciliation can stop native sessions; keep it an explicit operator CLI action, not a model tool.',

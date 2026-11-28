@@ -16,8 +16,9 @@ import time
 
 import pytest
 
-from harness import (MACHINE, MODEL, Cli, Host, Server, build_cli, configure_hub, new_key, scratch_root,
-                     stale_heartbeat_host_copy, wait_for)
+from pathlib import Path
+from harness import (MACHINE, MODEL, PROJECT, STUB_BIN, Cli, Host, Server, build_cli, configure_hub, new_key,
+                     scratch_root, stale_heartbeat_host_copy, wait_for)
 
 BRIEF = "E2E start-path brief: print a marker and keep running"
 START_DEADLINE_S = 60      # accept -> running on an idle loopback host
@@ -342,3 +343,157 @@ def test_server_restart_mid_session_host_reconnects(hub):
     stop = hub.cli.run("sessions", "stop", session_id, "--timeout", str(STOP_DEADLINE_S))
     assert stop.returncode == 0, (stop.stdout[-2000:], stop.stderr[-2000:])
     assert hub.wait_state(session_id, {"stopped", "failed"}, STOP_DEADLINE_S)["state"] == "stopped"
+
+
+def _install_interactive_shell_stub_a(hub):
+    """Install a test-local `a` wrapper in hub.root that supports stdin pumping and `a send`
+    without modifying the shared hub2/tests/e2e/bin/a file (whose SHA256 is pinned by
+    host/tests/fixtures/phase24_native_barrier.py)."""
+    import os
+    import sys
+    stub_dir = hub.root / "shell-stub-bin"
+    stub_dir.mkdir(exist_ok=True)
+    stub_a = stub_dir / "a"
+    base_text = (STUB_BIN / "a").read_text()
+    base_text = base_text.replace(
+        'FIXTURE = json.loads((Path(__file__).resolve().parents[1] / "fixtures" / "aplexer.json").read_text())',
+        'FIXTURE = json.loads((Path(%r) / "aplexer.json").read_text())' % str((STUB_BIN.parent / "fixtures").resolve())
+    )
+    # Replace cmd_supervise and cmd_kill and add cmd_send in the test-local copy only.
+    old_supervise = '''def cmd_supervise(session):
+    path = SESSIONS / (session + ".json")
+    row = json.loads(path.read_text())
+    env = dict(os.environ, **row["env"], APLEXER_SESSION_ID=session)
+    log = open(row["history_path"], "ab", buffering=0)
+    workload = subprocess.Popen(row["command"], cwd=row["cwd"], env=env, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    row.update(phase="running", state="running", worker_pid=os.getpid(), workload_pid=workload.pid)
+    write(path, row)
+    code = workload.wait()'''
+    new_supervise = '''def cmd_supervise(session):
+    path = SESSIONS / (session + ".json")
+    row = json.loads(path.read_text())
+    env = dict(os.environ, **row["env"], APLEXER_SESSION_ID=session)
+    log = open(row["history_path"], "ab", buffering=0)
+    r_fd, w_fd = os.pipe()
+    fifo_path = SESSIONS / (session + ".in")
+    row.update(stdin_path=str(fifo_path))
+    workload = subprocess.Popen(row["command"], cwd=row["cwd"], env=env, stdin=r_fd,
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    os.close(r_fd)
+    import threading
+    def pump():
+        offset = 0
+        while workload.poll() is None and not (SESSIONS / (session + ".stop")).exists():
+            if fifo_path.exists():
+                data = fifo_path.read_bytes()
+                if len(data) > offset:
+                    chunk = data[offset:]
+                    offset = len(data)
+                    try:
+                        os.write(w_fd, chunk)
+                    except OSError:
+                        break
+            time.sleep(0.05)
+        try:
+            os.close(w_fd)
+        except OSError:
+            pass
+    threading.Thread(target=pump, daemon=True).start()
+    row.update(phase="running", state="running", worker_pid=os.getpid(), workload_pid=workload.pid)
+    write(path, row)
+    code = workload.wait()'''
+    old_kill = '''    if row["phase"] == "running":
+        try:
+            os.killpg(row["workload_pid"], signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        until = time.monotonic() + 5'''
+    new_kill = '''    if row["phase"] == "running":
+        (SESSIONS / (row["id"] + ".stop")).write_text("1")
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                os.killpg(row["workload_pid"], sig)
+            except ProcessLookupError:
+                pass
+        until = time.monotonic() + 5'''
+    send_fn = '''def cmd_send(args):
+    selector = next((a for a in args if not a.startswith("-")), None)
+    row = resolve(selector) if selector else None
+    if not row or row.get("phase") != "running":
+        return fail("no such running session")
+    text = sys.stdin.read() if "--stdin" in args else ""
+    if "--enter" in args and not text.endswith("\\n"):
+        text += "\\n"
+    stdin_path = Path(row.get("stdin_path") or (SESSIONS / (row["id"] + ".in")))
+    with open(stdin_path, "ab") as f:
+        f.write(text.encode("utf-8"))
+    return 0
+
+
+def cmd_kill(args):'''
+    patched = base_text.replace(old_supervise, new_supervise).replace(old_kill, new_kill)
+    patched = patched.replace("def cmd_kill(args):", send_fn)
+    patched = patched.replace('    if command == "kill":\n        return cmd_kill(args)',
+                              '    if command == "kill":\n        return cmd_kill(args)\n    if command == "send":\n        return cmd_send(args)')
+    assert patched != base_text and "def cmd_send" in patched and "stdin_path" in patched and "(SESSIONS / (row[\"id\"] + \".stop\")).write_text" in patched
+    stub_a.write_text(patched)
+    stub_a.chmod(0o755)
+    hub.host.kill()
+    orig_env = hub.host.env
+    hub.host.env = lambda: dict(orig_env(), PATH=str(stub_dir) + os.pathsep + orig_env()["PATH"])
+    cfg = json.loads(hub.host.config.read_text())
+    cfg.setdefault("launcher", {})["aplexer"] = str(stub_a)
+    hub.host.config.write_text(json.dumps(cfg))
+    hub.start_host()
+
+
+def test_interactive_shell_e2e_grant_start_send_capture_retain_var_revoke_stop(hub):
+    _install_interactive_shell_stub_a(hub)
+    # 1. Negative: starting interactive shell without an explicit grant for human:dev on MACHINE is denied (403).
+    no_grant = hub.cli.run("sessions", "start", "--repo", PROJECT, "--machine", MACHINE,
+                           "--engine", "shell", "--interactive", "--key", new_key())
+    assert no_grant.returncode != 0, (no_grant.stdout, no_grant.stderr)
+    assert "403" in (no_grant.stdout + no_grant.stderr) or "forbidden" in (no_grant.stdout + no_grant.stderr), (no_grant.stdout, no_grant.stderr)
+
+    # 2. Grant human:dev on MACHINE; starting on another host is still denied (403).
+    hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE})
+    wrong_host = hub.cli.run("sessions", "start", "--repo", PROJECT, "--machine", "ungranted-host",
+                             "--engine", "shell", "--interactive", "--key", new_key())
+    assert wrong_host.returncode != 0, (wrong_host.stdout, wrong_host.stderr)
+
+    # 3. Start detachable interactive shell via real `hub` CLI.
+    started = hub.cli.json("sessions", "start", "--workspace", str(hub.host.workspace), "--machine", MACHINE,
+                           "--engine", "shell", "--interactive", "--key", new_key())
+    session_id = started["id"]
+    assert started.get("state") == "running", started
+
+    # 4. Send harmless session-local command setting a shell variable, then disconnect/reconnect by session_id and read it back.
+    sent1 = hub.cli.json("sessions", "send", session_id, "--prompt", "E2E_SHELL_VAR=retained_42; echo VAR_SET_OK",
+                         "--wait", "--timeout", "30")
+    assert sent1["command_wait"]["state"] == "acked", sent1
+    sent2 = hub.cli.json("sessions", "send", session_id, "--prompt", "echo RETAINED:$E2E_SHELL_VAR",
+                         "--wait", "--timeout", "30")
+    assert sent2["command_wait"]["state"] == "acked", sent2
+    captured = hub.cli.json("sessions", "capture", session_id, "--timeout", "30")
+    out = captured["command_wait"]["ack"]["capture"]
+    assert "VAR_SET_OK" in out and "RETAINED:retained_42" in out, out
+
+    # 5. Revoke grant: running session is stopped by bounded stop-only cleanup and further CLI access is denied.
+    revoked = hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE, "revoke": True})
+    assert revoked.get("revoked") is True and revoked.get("cleanup", {}).get("stop_requested") == 1, revoked
+    denied_send = hub.cli.run("sessions", "send", session_id, "--prompt", "echo should_fail")
+    assert denied_send.returncode != 0
+    wait_for(lambda: hub.native_row(session_id) is None, STOP_DEADLINE_S, label="revoked shell native process stopped")
+
+    # 6. Normal explicit CLI stop lifecycle on a fresh granted interactive shell session.
+    hub.server.ok("POST", "/api/shell-grants", {"actor_id": "human:dev", "machine_id": MACHINE})
+    started2 = hub.cli.json("sessions", "start", "--workspace", str(hub.host.workspace), "--machine", MACHINE,
+                            "--engine", "shell", "--interactive", "--key", new_key())
+    session_id2 = started2["id"]
+    assert started2.get("state") == "running", started2
+    stopped2 = hub.cli.json("sessions", "stop", session_id2, "--timeout", str(STOP_DEADLINE_S))
+    assert stopped2["stop_wait"].get("state") == "stopped" or stopped2["stop_wait"].get("stop_confirmed") is True, stopped2
+    assert hub.native_row(session_id2) is None, hub.host.native_rows()
+
+

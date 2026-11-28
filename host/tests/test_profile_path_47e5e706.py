@@ -40,9 +40,18 @@ def _admit(monkeypatch, tmp_path, capsys, bundles):
     monkeypatch.setattr(p, 'root', lambda: managed)
     state = []
     for b in bundles:
+        # Installed bundle.json carries the same revision as its state record;
+        # admission's login probe resolves the profile directory from it.
+        b = {**b, 'revision': '1'}
         state.append({'label': b['label'], 'revision': '1'})
         d = managed / (b['label'] + '-1')
         d.mkdir(mode=0o700)
+        if b.get('provider') == 'claude':
+            # profile_logged_in reads only the materialized home credential for
+            # Claude; a synthetic, non-secret file satisfies that contract.
+            cred = d / 'home' / '.claude' / '.credentials.json'
+            cred.parent.mkdir(parents=True, mode=0o700)
+            cred.write_text('{"synthetic": true}', encoding='utf-8')
         p.private_fs.atomic_write(d / 'bundle.json', json.dumps(b).encode(), 1048576)
     p.private_fs.atomic_write(managed / 'state.json', json.dumps(state).encode(), 1048576)
     monkeypatch.setattr(p, 'host_request', lambda *a, **k: {'launch_allowed': True, 'profile_supported': True})

@@ -14,14 +14,6 @@
       "quota_probe": ["quse", "codex", "--json"]
     },
     {
-      "account": "codex-orin",
-      "harness": "codex",
-      "provider": "codex",
-      "aplexer_profile": "hub-codex-orin",
-      "credential": {"mode": "managed-bundle", "bundle": "codex-orin"},
-      "quota_probe": ["quse", "codex-orin", "--json"]
-    },
-    {
       "account": "shared-claude",
       "harness": "claude",
       "provider": "claude",
@@ -133,6 +125,62 @@
   },
   "models": [
     {
+      "id": "antigravity-hydrogen-medium",
+      "model": "gemini-4-hydrogen-medium",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
+      "id": "antigravity-neon-low",
+      "model": "gemini-4-neon-low",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "low"
+    },
+    {
+      "id": "antigravity-neon-medium",
+      "model": "gemini-4-neon-medium",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
+      "id": "antigravity-neon-high",
+      "model": "gemini-4-neon-high",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "high"
+    },
+    {
+      "id": "antigravity-neon-xhigh",
+      "model": "gemini-4-neon-xhigh",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "max"
+    },
+    {
+      "id": "antigravity-orchestrator-neon",
+      "model": "gemini-pro-orchestrator-neon",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
+      "id": "antigravity-carbon-medium",
+      "model": "gemini-4-carbon-medium",
+      "provider": "gemini",
+      "engine": "antigravity",
+      "profile": null,
+      "effort": "medium"
+    },
+    {
       "id": "astra",
       "model": "gpt-6-astra",
       "provider": "codex",
@@ -182,11 +230,11 @@
     },
     {
       "id": "glm-flash",
-      "model": "glm-5.3-flash",
+      "model": "glm-5.4",
       "provider": "zai",
       "engine": "codex",
       "profile": "zcodex",
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "muse",
@@ -214,11 +262,11 @@
     },
     {
       "id": "glm-flash-zcodex",
-      "model": "glm-5.3-flash",
+      "model": "glm-5.4",
       "provider": "zai",
       "engine": "zcodex",
       "profile": null,
-      "effort": "high"
+      "effort": "medium"
     },
     {
       "id": "argon-gemini",

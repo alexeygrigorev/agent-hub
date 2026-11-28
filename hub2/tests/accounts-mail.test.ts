@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { AccountDO as ActualAccountDO } from '../src/account-do';
 function semanticEnv(env:any={}){return env;}
 class AccountDO extends ActualAccountDO { constructor(ctx:any,env:any={}){super(ctx,semanticEnv(env));} }
+import { MachineDO } from '../src/machine-do';
 import { ControlDO } from '../src/control-do';
 import { MailboxDO as ActualMailboxDO } from '../src/mailbox-do';
 class MailboxDO extends ActualMailboxDO { constructor(ctx:any,env:any){super(ctx,semanticEnv(env));} }
@@ -482,7 +483,9 @@ test('zai configuration and policy refuse retired account aliases without bannin
  const control=new ControlDO(state().ctx,{} as any),candidate={id:'central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'shared-zai'}]}))).status,400);
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,account_id:'zcodex'}]}))).status,400);
- assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,400,'zai-central must stay excluded even when paired with its maintained engine');
+ // GLM 5.4 (t3897u): the zcodex engine paired with zai-central is the one allowed Z.ai write.
+ assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[candidate]}))).status,200,'zcodex+zai-central is the maintained GLM write');
+ assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[{...candidate,engine:'codex'}]}))).status,400,'zai-central never pairs with an unrelated engine');
  const claude={id:'claude-sonnet-medium',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:['interactive'],enabled:true};
  assert.equal((await control.fetch(request('/api/model-policy','PUT',{candidates:[claude]}))).status,200);
  for(const invalid of [
@@ -715,5 +718,112 @@ test('passive account routing observes credentials without refresh, quota probes
    assert.equal(view.credential_generation,variant==='missing'?null:1);
    assert.deepEqual(view.hosts,[]);
   }finally{s.database.close();}
+ }
+});
+// Register the dedicated AccountDO credential-renewal regressions through this
+// CI-invoked entrypoint (npm run test:accounts-mail) so they cannot go unrun.
+await import('./account-credential-renewal.test.ts');
+// Passive approved-host Claude credential retrieval (AccountDO + ControlDO route), same CI entrypoint.
+await import('./account-passive-credential.test.ts');
+test('human:me resolves to the caller\'s own human for humans, intake owners for sessions and delegated families, and refuses ambiguity (t3280u)',async()=>{
+ const m=mailboxes(),db=m.controlState.database;
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');
+ db.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?)').run('intake','intake-1','proj','proj',1,'synthetic-fixture',JSON.stringify(['human:alexey','operator']));
+ db.prepare("INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,created_at) VALUES('credential:1','operator','human:alexey','g','h','[]','fam-1',1)").run();
+ clearFixtureCache(m.control);
+ const send=async(owner:string,actor:any,key:string)=>m.get(owner).fetch(request('/api/messages','POST',{recipient:'human:me',body:'Research link https://example.test/moats',key},actor,owner));
+ // A human credential posts into its own inbox, which the web Inbox lists.
+ const own=await send('human:alexey',{id:'human:alexey',kind:'operator',scopes:['operator:admin']},'self');assert.equal(own.status,201);
+ assert.equal((await data(own)).message.recipient,'human:alexey');
+ // A Hub session worker reaches the human participant of its bound intake.
+ const worker={id:'session:11111111-1111-4111-8111-111111111111',kind:'agent',resource_id:'intake-1',scopes:['message:send']};
+ const fromSession=await data(await send(worker.id,worker,'session'));assert.equal(fromSession.message.recipient,'human:alexey');assert.equal(fromSession.message.sender,worker.id);
+ // A delegated named agent resolves through the human owning its credential family.
+ const delegated=await data(await send('agent:a',{id:'agent:a',kind:'agent',scopes:[],family_id:'fam-1'},'delegated'));assert.equal(delegated.message.recipient,'human:alexey');
+ const inbox=await data(await m.fetch('human:alexey','/api/messages','GET',undefined,{id:'human:alexey',kind:'operator',scopes:['operator:admin']}));
+ assert.deepEqual(inbox.items.map((v:any)=>v.sender).sort(),['agent:a','human:alexey',worker.id].sort());
+ // With two humans and no binding, the alias never guesses.
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:other','human');clearFixtureCache(m.control);
+ const ambiguous=await send('agent:b',{id:'agent:b',kind:'agent',scopes:[]},'ambiguous');assert.equal(ambiguous.status,409);assert.equal((await data(ambiguous)).error,'ambiguous_recipient');
+});
+test('human:me for a session on a session-opened intake follows one hop and never falls back to another human (t3280u review)',async()=>{
+ const m=mailboxes(),db=m.controlState.database,orchestrator='22222222-2222-4222-8222-222222222222';
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');
+ const route=db.prepare('INSERT INTO object_routes(kind,id,owner,resource_id,bound_intake_id,epoch,digest,participants_json) VALUES(?,?,?,?,?,?,?,?)');
+ route.run('intake','intake-orch','proj','proj',null,1,'f',JSON.stringify(['human:bob']));
+ route.run('session',orchestrator,'h1','proj','intake-orch',1,'f','[]');
+ route.run('intake','intake-child','proj','proj',null,1,'f',JSON.stringify(['session:'+orchestrator]));
+ route.run('intake','intake-orphan','proj','proj',null,1,'f',JSON.stringify(['operator']));
+ route.run('intake','intake-corrupt','proj','proj',null,1,'f','{not json');
+ clearFixtureCache(m.control);
+ const worker=(intake:string)=>({id:'session:33333333-3333-4333-8333-333333333333',kind:'agent',resource_id:intake,scopes:['message:send']});
+ const send=async(intake:string,key:string)=>{const a=worker(intake);return m.get(a.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:'x',key},a,a.id));};
+ // The orchestrator's human (bob), not the only browser-registered human (alexey).
+ assert.equal((await data(await send('intake-child','hop'))).message.recipient,'human:bob');
+ const orphan=await send('intake-orphan','orphan');assert.equal(orphan.status,404);assert.equal((await data(orphan)).error,'recipient_unknown');
+ const corrupt=await send('intake-corrupt','corrupt');assert.equal(corrupt.status,503);assert.equal((await data(corrupt)).error,'route_acl_corrupt');
+ // The replay digest covers the resolved human: same key + body replays, never re-targets.
+ const again=await data(await send('intake-child','hop'));assert.equal(again.replayed,true);assert.equal(again.message.recipient,'human:bob');
+});
+test('human:me refuses a session worker whose intake route is missing and lists newest-first on order=desc (t3280u review)',async()=>{
+ const m=mailboxes(),db=m.controlState.database;
+ db.prepare('INSERT INTO actor_directory(id,kind,enabled) VALUES(?,?,1)').run('human:alexey','human');clearFixtureCache(m.control);
+ const worker={id:'session:44444444-4444-4444-8444-444444444444',kind:'agent',resource_id:'intake-unregistered',scopes:['message:send']};
+ const refused=await m.get(worker.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:'x',key:'k'},worker,worker.id));
+ assert.equal(refused.status,404);assert.equal((await data(refused)).error,'recipient_unknown');
+ const human={id:'human:alexey',kind:'operator',scopes:['operator:admin']};
+ for(const key of ['one','two','three'])assert.equal((await m.get(human.id).fetch(request('/api/messages','POST',{recipient:'human:me',body:key,key},human,human.id))).status,201);
+ m.stores.get('global')!.database.exec("UPDATE messages SET created_at=CASE body WHEN 'one' THEN 1 WHEN 'two' THEN 2 ELSE 3 END");
+ const first=await data(await m.fetch(human.id,'/api/messages?order=desc&limit=2','GET',undefined,human));
+ assert.deepEqual(first.items.map((v:any)=>v.body),['three','two']);
+ const rest=await data(await m.fetch(human.id,'/api/messages?order=desc&limit=2&cursor='+encodeURIComponent(first.next),'GET',undefined,human));
+ assert.deepEqual(rest.items.map((v:any)=>v.body),['one']);assert.equal(rest.next,null);
+ assert.equal((await m.fetch(human.id,'/api/messages?order=sideways','GET',undefined,human)).status,400);
+});
+
+// Legacy static caller cutover: reset observations are not redemption authority.
+test('reset expiry observations require explicit approval and expose no redemption or execution transport',async()=>{
+ const s=state();const calls:unknown[]=[];
+ const account=new AccountDO(s.ctx,{HUB2_PROVIDER_FETCH:(async(...args:unknown[])=>{
+  calls.push(args);throw new Error('synthetic provider must not execute');
+ }) as any});
+ try{
+  assert.equal((await account.fetch(request('/api/account','PATCH',{provider:'codex',enabled:true}))).status,200);
+  const grant={id:'synthetic-grant',expires_at:Date.now()+23*3600000,available:true,source:'synthetic-test'};
+  const recorded=await data(await account.fetch(request('/api/account/resets','PUT',grant)));
+  assert.deepEqual(recorded,{recorded:true,redemption:'explicit_approval_required'});
+  const denied=await account.fetch(request('/api/account/resets','PUT',grant,{id:'agent:test',kind:'agent',scopes:[]}));
+  assert.equal(denied.status,403);
+  // Even an operator's explicit flag is not a provider-redemption API.
+  for(const path of ['/api/account/resets','/api/account/resets/redeem','/api/account/resets/consume']){
+   assert.equal((await account.fetch(request(path,'POST',{id:grant.id,approved:true}))).status,404);
+  }
+  await account.alarm();await account.alarm();
+  const grants=await data(await account.fetch(request('/api/account/resets')));
+  assert.equal(grants.items.length,1);assert.equal(grants.items[0].id,grant.id);
+  assert.equal(grants.items[0].available,1);
+  const alerts=await data(await account.fetch(request('/api/account/alerts')));
+  assert.equal(alerts.items.filter((a:any)=>a.kind==='reset_expiry_24h'&&a.grant_id===grant.id).length,1);
+  assert.deepEqual(calls,[],'observation/alerts/refused redemption never call the fake provider');
+ }finally{s.database.close();}
+});
+test('maintained public host diagnostic projection is fixed, private and attempt-epoch fenced',()=>{
+ // Invoke the actual projection on its real prototype; no constructor/alarm or HTTP fixture.
+ const machine=Object.create(MachineDO.prototype);
+ {
+  const base={operation_id:'synthetic-operation',attempt:2,epoch:7,evidence_digest:null};
+  const diagnostic={...base,reason:'workspace_unavailable',stage:'host_launch',
+   detail:'token=synthetic-secret\u001b]0;private-path\u0007',gate_reason:'synthetic-secret',message:'synthetic-secret'};
+  const row={...base,evidence_json:JSON.stringify({_hub_host_start_diagnostic:diagnostic})};
+  const project=(value:any,reason='workspace_unavailable')=>(machine as any).hostStartDiagnostic(value,reason);
+  assert.deepEqual(project(row),{stage:'host_launch',detail:'path does not exist; Hub will not create it'});
+  assert.equal(JSON.stringify(project(row)).includes('synthetic-secret'),false);
+  for(const field of ['operation_id','attempt','epoch']){
+   const altered={...diagnostic,[field]:field==='operation_id'?'foreign':99};
+   assert.equal(project({...row,evidence_json:JSON.stringify({_hub_host_start_diagnostic:altered})}),null);
+  }
+  assert.equal(project({...row,evidence_digest:'committed-proof'}),null);
+  assert.equal(project({...row,evidence_json:'{}'}),null);
+  assert.equal(project(row,'token=synthetic-secret'),null);
  }
 });

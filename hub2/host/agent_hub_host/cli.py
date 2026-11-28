@@ -2,6 +2,7 @@
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 import time
@@ -15,7 +16,7 @@ DEFAULT_SERVER = "https://hub.dtcdev.click"
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="hub2")
+    parser = argparse.ArgumentParser(prog="hub host")
     parser.add_argument("--config", type=Path, default=Path.home() / ".config/agent-hub/v2.json")
     parser.add_argument("--server")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -23,10 +24,18 @@ def main(argv=None):
     enroll.add_argument("--code-env", default="HUB2_PAIRING_CODE")
     enroll.add_argument("--root", action="append", required=True)
     enroll.add_argument("--engine", action="append", default=[])
+    enroll.add_argument("--capability", action="append", default=[])
+    enroll.add_argument("--workspace", action="append", default=[], metavar="LABEL=PATH")
     serve = commands.add_parser("serve")
     serve.add_argument("--once", action="store_true")
+    serve.add_argument("--alert-handoff-fd", type=int, default=None, help=argparse.SUPPRESS)
     serve.add_argument("--aplexer", default="a")
     serve.add_argument("--label", action="append", default=[])
+    serve.add_argument("--log-file", type=Path, default=None,
+                       help="Append daemon logs here (default on Windows: %%LOCALAPPDATA%%\\agent-hub2\\serve.log)")
+    commands.add_parser("version", help="Print this host's release identity and credential mode")
+    mode = commands.add_parser("credential-mode", help="Show or set host-owned (local) or Hub-delivered (central) provider logins")
+    mode.add_argument("mode", nargs="?", choices=["local", "central"])
     heartbeat = commands.add_parser("heartbeat", help="Report machine health without reading offers or changing sessions")
     heartbeat.add_argument("--aplexer", default="a")
     heartbeat.add_argument("--label", action="append", default=[])
@@ -43,7 +52,39 @@ def main(argv=None):
     updater.add_argument("--base-url")
     updater.add_argument("--root", type=Path, default=Path.home() / ".local/share/agent-hub2")
     updater.add_argument("--no-restart", action="store_true")
-    args = parser.parse_args(argv)
+    updater.add_argument("--force", action="store_true", help="Windows: reinstall even when already current")
+    quota_dispatch_cmd = commands.add_parser("quota-dispatch", help="Staged opt-in same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--enable", action="store_true", default=False,
+                                    help="Opt in to staged same-process quota dispatch (default OFF)")
+    quota_dispatch_cmd.add_argument("--handoff-fd", type=int, default=None,
+                                    help="Inherited Root-prepared descriptor manifest pipe FD")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    natural_donation = None
+    if args.command == "serve":
+        if args.alert_handoff_fd is not None:
+            try:
+                from .quota_natural_startup import consume_natural_handoff
+                natural_donation = consume_natural_handoff(args.alert_handoff_fd)
+                # The receiver bound this stable name to the donated FD and our
+                # actual kernel image; child exec cannot depend on inherited FDs.
+                sys.executable = natural_donation.child_interpreter
+            except Exception:
+                pass  # Missing optional evidence never gates primary host startup.
+        elif not args.once:
+            try:
+                from .quota_natural_exec import maybe_exec_natural_host
+                maybe_exec_natural_host(raw_argv)
+            except Exception:
+                pass  # Missing optional helper/donation never gates primary host startup.
+    if args.command == "self-update" and os.name == "nt":
+        from .windows_host import windows_self_update
+        try:
+            config = json.loads(args.config.read_text()) if args.config.exists() else {}
+            return windows_self_update(args.base_url or config.get("server") or DEFAULT_SERVER, force=args.force)
+        except (OSError, ValueError) as error:
+            print(f"Hub2 self-update failed: {type(error).__name__}: {str(error)[:200]}", file=sys.stderr)
+            return 1
     if args.command == "self-update":
         import subprocess
         command = [sys.executable, str(args.root / "updater.py"), "--root", str(args.root)]
@@ -53,24 +94,65 @@ def main(argv=None):
             command.append("--no-restart")
         return subprocess.run(command).returncode
     try:
+        if args.command == "enroll":
+            roots = [str(Path(root).resolve(strict=True)) for root in args.root]
+            if not all(Path(root).is_dir() for root in roots):
+                raise ValueError("workspace roots must be directories")
         config = json.loads(args.config.read_text()) if args.config.exists() else {}
+        if args.command == "version":
+            from .windows_host import credential_mode, host_release
+            version, protocol = host_release()
+            print(json.dumps({"host_version": version, "protocol_version": protocol,
+                              "machine_id": config.get("machine_id"), "credential_mode": credential_mode(config)}))
+            return 0
+        if args.command == "credential-mode":
+            from .windows_host import credential_mode, set_credential_mode
+            if args.mode is not None:
+                config = set_credential_mode(config, args.mode)
+                save_config(args.config, config)
+            print(json.dumps({"credential_mode": credential_mode(config),
+                              "restart_required": args.mode is not None}))
+            return 0
         if args.command == "configure-host":
             from .advertisement import configure
             updated = configure(config, args.capability, args.workspace)
             save_config(args.config, updated)
             print(json.dumps({"configured": True, "restart_required": True}))
             return 0
+        if args.command == "quota-dispatch":
+            from .quota_dispatch_entry import run_quota_dispatch_cli
+            return run_quota_dispatch_cli(args, config)
         server = args.server or config.get("server") or DEFAULT_SERVER
         client = Client(server, os.environ.get("HUB2_TOKEN") or config.get("token", ""))
         if args.command not in ('auth', 'heartbeat') and not os.environ.get('HUB2_TOKEN') and config.get('refresh_token') and config.get('expires_at',float('inf'))<=time.time()+30:
             from .auth import refresh
             client=refresh(config,args.config,server)
         if args.command == "enroll":
+            from .advertisement import Advertisement, configure
+            previous = config if isinstance(config, dict) else {}
             code = os.environ.get(args.code_env) or getpass.getpass("Pairing code: ")
             enrolled = client.request("POST", "/api/enrollments/complete", {"code": code})
             config = {"server": server, "token": enrolled["token"], "machine_id": enrolled["machine_id"],
-                      "roots": [str(Path(root).resolve(strict=True)) for root in args.root],
+                      "roots": roots,
                       "engines": args.engine}
+            if isinstance(previous.get("launcher"), dict) and previous["launcher"]:
+                config["launcher"] = dict(previous["launcher"])
+            if args.capability or args.workspace:
+                config = configure(config, args.capability, args.workspace)
+            else:
+                preserved_caps = previous.get("capabilities") if isinstance(previous.get("capabilities"), list) else []
+                preserved_ws = {}
+                if isinstance(previous.get("workspaces"), dict):
+                    probe = Advertisement(roots)
+                    for label, ws_path in previous["workspaces"].items():
+                        try:
+                            preserved_ws[label] = str(probe.allowed_path(ws_path))
+                        except ValueError:
+                            continue
+                if preserved_caps or preserved_ws:
+                    observed = Advertisement(roots, preserved_caps, preserved_ws)
+                    config["capabilities"] = observed.capabilities
+                    config["workspaces"] = preserved_ws
             save_config(args.config, config)
             print(json.dumps({"enrolled": config["machine_id"]}))
         elif args.command == "request":
@@ -83,10 +165,25 @@ def main(argv=None):
             bridge.heartbeat(args.label, include_native_sessions=False)
             print(json.dumps({"ok": True}))
         elif args.command == "serve":
+            from .windows_host import configure_logging, credential_mode, default_log_file, host_release
+            log_file = configure_logging(args.log_file or default_log_file())
+            version, protocol = host_release()
+            logging.getLogger("agent_hub_host").info(
+                "Hub2 host starting machine=%s host_version=%s protocol=%s credential_mode=%s engines=%s log=%s",
+                config.get("machine_id"), version or "unreleased", protocol, credential_mode(config),
+                ",".join(config.get("engines") or []), log_file or "stderr")
+            observer = natural_donation
+            if args.alert_handoff_fd is None and 'alert_observer' in config:
+                try:
+                    from .alert_broker import configured
+                    observer = configured(config['alert_observer'])
+                except Exception:
+                    pass  # Optional evidence never prevents ordinary serve.
             bridge = Bridge(client, Journal(args.config.parent / "v2-journal.sqlite"),
                             config["roots"], config["engines"], args.aplexer,
                             launcher_config=config.get("launcher"),machine_id=config['machine_id'],
-                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"))
+                            capabilities=config.get("capabilities"), workspaces=config.get("workspaces"),
+                            alert_observer=observer)
             if args.once:
                 bridge.heartbeat(args.label)
                 bridge.drain()
@@ -95,10 +192,23 @@ def main(argv=None):
         else:
             print(json.dumps(execute(client, args, config)))
         return 0
-    except (ApiError, OSError, ValueError, KeyError, RuntimeError):
-        # Do not echo exceptions that can contain a token, prompt, local path or response.
-        print("Hub operation failed; no successful result recorded.", file=sys.stderr)
+    except (ApiError, OSError, ValueError, KeyError, RuntimeError) as error:
+        # Do not echo exceptions that can contain a token, prompt, local path or
+        # response; name the failure class and Hub's typed code so it is diagnosable.
+        reason = (f"{error.code} (HTTP {error.status})" if isinstance(error, ApiError) and error.code
+                  else type(error).__name__)
+        if args.command == "serve":
+            logging.getLogger("agent_hub_host").error("Hub2 serve stopped: %s", reason)
+        print(f"Hub operation failed ({args.command}: {reason}); no successful result recorded.", file=sys.stderr)
         return 1
+    finally:
+        # Before start the CLI owns the donation; afterwards the resident
+        # broker/probe closes borrowed resources on its existing exit path.
+        if natural_donation is not None and not natural_donation.started:
+            try:
+                natural_donation.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

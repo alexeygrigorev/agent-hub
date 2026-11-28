@@ -25,7 +25,7 @@ def _sanitized_body_detail(body_bytes) -> str:
     if not isinstance(data, dict):
         return ""
     parts = []
-    for key in ("error", "reason"):
+    for key in ("error", "reason", "missing_scope"):
         value = data.get(key)
         if isinstance(value, str) and _SAFE_BODY_TOKEN.match(value):
             parts.append(value)

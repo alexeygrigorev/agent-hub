@@ -32,11 +32,64 @@ the runtime's central credential provisioning path. Its `--local-profiles` flag
 is reserved for hosts already configured with native logins. Enrollment must
 advertise only engines the machine can actually launch; operators should set
 the supported engine list in that private configuration before starting
-production work. The helper is portable; Windows service/update automation
-requires its separate platform adapter and live verification.
+production work. The helper is portable; Windows uses the installer below.
 
-The host user unit runs `~/.local/share/agent-hub2/current/bin/hub2 serve`.
-Its update timer checks every five minutes, downloads all artifacts, verifies
+## Windows host (intake 41ef7048)
+
+`irm https://hub.dtcdev.click/cli/host-install.ps1 | iex` installs or updates a
+Windows host. Each release ships `host-install.ps1` with its sha256 in
+`host-release.json`. The legacy `/host/install.ps1` and `/host/install.sh` self-update
+routes now serve these installers, so an old Windows host that still runs
+`package_update` migrates instead of failing on a dead route. The installer:
+
+- verifies the published wheel against the manifest and installs it into
+  `%LOCALAPPDATA%\agent-hub2\venv` (`hub2 version` prints `host_version`);
+- registers the per-user logon task `AgentHub2Host`, which runs
+  `run-host.ps1`: `hub host serve --log-file %LOCALAPPDATA%\agent-hub2\serve.log`
+  restarts after 30 s on exit and sends an HTTP heartbeat in between;
+- registers the daily `AgentHub2HostUpdate` task (`hub host self-update`). On
+  Windows that downloads the verified installer and runs it detached in update
+  mode, so it can stop and restart `AgentHub2Host`;
+- retires the legacy supervisor: it writes `replace-pending` and the permanent
+  `retired-by-hub2` marker in `%LOCALAPPDATA%\Programs\agent-hub\controller`,
+  disables (never deletes) `AgentHubController-*`/`AgentHubSessionHost*`, and stops
+  only the supervisor processes and `hub-controller-*` aplexer shell sessions.
+  Codex/Claude workers are never touched.
+
+`HUB2_CREDENTIAL_MODE=local` (or `hub2 credential-mode local`) makes the host use
+its own provider logins and advertise `credentials:local:*`. `central` uses
+Hub-delivered provider homes, which require the operator to add the machine to
+that account's approved hosts. Otherwise the account refuses with
+`host_not_approved`, Hub tries another allowed route, and serve.log records
+`LAUNCH REFUSED session=... reason=host_not_approved`.
+
+A running host that has been disconnected for more than 15 minutes raises
+`HOST_DISCONNECTED alert=dev@dtcdev.click`. The evidence is HTTP heartbeats
+without a socket, or live sessions. `hub routing-machines` shows the
+`host_alert`, and `scripts/hub-intake-recovery-alerts.py` mails it to the
+developer once per disconnect episode.
+
+The host user unit runs `~/.local/share/agent-hub2/current/bin/hub host serve`.
+Its update timer checks every five minutes. Automatic activation is batched at
+least six hours after the last activation. Once eligible, it waits for the
+managed-launch journal to become idle, for at most two more hours. Newer
+published releases replace the candidate without resetting that wait. Missing
+or unreadable session state is treated as busy for the same bounded window.
+The private `activation-policy.json` receipt and updater stdout record the
+candidate, decision, reason, managed-session count (null means unknown), and
+next check time. Failed activations retain their existing retry backoff.
+Explicit `--install-service` setup, initial enrollment, and non-timer starts
+(such as `systemctl --user start agent-hub2-host-update.service` from the
+deploy canary or an operator) remain immediate; only timer-triggered runs
+(`TRIGGER_UNIT=*.timer`) apply the batching and busy-wait deferral. Recovery/rollback is
+also immediate. The batching limit covers automatic successful activations,
+not crashes, rollbacks, or explicit operator restarts. This P9 batching policy
+supersedes the earlier expectation of automatic host adoption within 15 minutes:
+an eligible batch can wait up to two hours for sessions, and a release published
+just after activation can wait six hours before becoming eligible. The updater
+still checks every five minutes; check frequency is not rollout latency.
+
+After the activation gate permits the latest release, it downloads all artifacts, verifies
 their hashes, builds a new environment under `releases/<commit>` offline from
 the shipped wheels, checks the heartbeat signature, then switches `current`
 atomically and restarts the daemon. It observes the service for 30 seconds and
@@ -54,9 +107,30 @@ protocol. No existing
 environment, legacy CLI or unrelated service is replaced. The full CLI from
 the same commit is `current/hub.pyz`, exposed as `current/bin/hub` in an
 activated release shell. `hub --version` and `hub sessions list` use that
-operator CLI; `hub2` remains the host administration command. Same-version
+operator CLI. There is no `hub2` command: host administration is `hub host ...`
+(enroll, serve, heartbeat, configure-host, credential-mode, version, request,
+self-update), which runs the release venv's daemon module. The daemon's
+`~/.config/agent-hub/v2.json` is the host (machine) profile of that one CLI;
+it is deliberately not merged into the human `cli.json` login. Same-version
 updater checks repair older wheel-generated `bin/hub` entry points after
-verifying the zipapp against the installed release receipt.
+verifying the zipapp against the installed release receipt. The daemon entry
+contract follows the selected release, not the updater: a retained release
+whose verified wheel still declares the private `bin/hub2` launcher keeps it
+(its unit ExecStart names it and its zipapp has no `host` command). The wheel
+console `hub` entry exposes only the `hub host ...` namespace by re-running
+the daemon module in isolated mode; the full operator CLI remains the zipapp.
+During the unification rollout the release wheel additionally declares the
+legacy daemon entry (`hub2 = agent_hub_host.cli:main`) beside the unified
+entry: enrolled hosts still run pre-unification updaters whose release
+preparation entry-checks and daemon readiness probes go through that
+launcher, so retiring it before those updaters have advanced would fail
+every candidate release on every host. Drop-in ExecStart entries that name
+the legacy launcher keep working unchanged (the daemon keeps the `serve`,
+`request` and enrollment surface); a drop-in pinning a transitional release
+by exact `releases/<id>` path is refused unchanged rather than guessed at.
+Retiring the transitional entry again is a reviewed change guarded by the
+release packaging tests, safe only once every enrolled host runs a
+post-unification updater that hands off to the release's own updater.
 
 The transport wheel is downloaded in CI with `--require-hashes` against the
 reviewed root `uv.lock`; installs have no package-index access. Artifact trust
@@ -75,3 +149,45 @@ CI workflow hooks, immutable artifact delivery, runtime version reporting,
 canary rollback and desktop enrollment are coordinated changes; acceptance
 requires their integrated evidence. Linux user units do not install a Windows
 service or prove enrollment on an offline desktop.
+
+The shell start canary runs every 15 minutes; the full probe remains every 30
+minutes. Both retain their existing failure alert path. Cadence reduces probe
+volume but cannot guarantee a launch-share percentage independently of real
+traffic; measure both counts over the same 24-hour window after deployment.
+
+## Automatic production deploy after green main CI (intake bf07f437)
+
+Every push to `main` deploys itself: the `deploy` job of the "Hub 2 production"
+workflow (`.github/workflows/deploy.yml`) runs once its `test`, `hub2` and
+`distribution` jobs pass, after it confirms that the same commit's Python host
+tests and release-tooling run are green. It publishes `/cli/host-release.json`
+for that commit, starts the Hetzner host updater immediately (the six-hour
+timer batching does not apply), and accepts the deploy only when the canary sees
+hetzner-aplexer report that `host_version`. Pull requests never deploy. Newer
+pushes queue behind the `agent-hub-production` concurrency group, so the newest
+pending commit wins. Manual `gh workflow run deploy.yml --ref main -f dry_run=false`
+remains for bootstrap mode, retries and rollback.
+
+The deploy canary's explicit `systemctl --user start` must not be mistaken
+for a timer run. systemd (verified on 255) keeps the previous timer
+activation's `TRIGGER_UNIT` and `TRIGGER_TIMER_REALTIME_USEC` on a later manual
+start. The updater therefore treats a run as timer-triggered only when that
+trigger time is at most 15 s old. Before this fix every canary start was
+deferred by `release_batch_interval`. The canary then timed out with
+`timeout_candidate_release_not_installed`, the deploy rolled back the
+publication, and hosts stayed on the old release. A host that still runs an
+updater older than this fix needs one direct run during a deploy's canary
+window (`python3 ~/.local/share/agent-hub2/updater.py` with no `TRIGGER_*`
+variables set). That run installs the fixed updater.
+
+A failed automatic deploy rolls back. It then opens or updates the GitHub issue
+"Hub2 auto-deploy failed: main is not live in production", assigned to the
+repository owner (the deploy owner), with the run link, and marks the run with an
+`::error` annotation.
+
+Hub2 has no per-machine host pin. The Hub1 `PUT /api/fleet/routing/host-release/<id>`
+route is not served, which is why the old command showed a bare 404. Now
+`hub host-release --machine <id> --sha <sha>` reads the published manifest and
+reports `state` (`current`, `published_pending_host_update` or `published`).
+When the commit is not published it exits 1 with `host_release_not_published`,
+naming the published SHA and this deploy path.

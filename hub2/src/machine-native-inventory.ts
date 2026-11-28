@@ -3,6 +3,7 @@ import {MeteredDb} from './db';
 import {sha256Hex} from './crypto';
 import {HttpError} from './http';
 import type {JsonRecord} from './types';
+import {HOST_INVENTORY_LOST_MS,LIVE_SNAPSHOT_TTL_MS} from './session-liveness';
 
 export const NATIVE_INVENTORY_SCHEMA = [
   'CREATE TABLE native_inventory_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),metadata_json TEXT NOT NULL)',
@@ -13,7 +14,7 @@ export const NATIVE_INVENTORY_SCHEMA = [
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_BYTES=16*1024*1024, CHUNK_BYTES=24000, FRESH_MS=90_000;
 const fields=['id','tag','workspace','engine','agent','profile','agent_profile','phase','cwd','created_at_ms','last_activity_ms','state','worker_alive'];
-type Meta={snapshot_id:string;started_at_ms:number;observed_at_ms:number;row_count:number;chunk_count:number;sha256:string};
+export type Meta={snapshot_id:string;started_at_ms:number;observed_at_ms:number;row_count:number;chunk_count:number;sha256:string};
 export type NativeRow={id:string;tag:string;workspace:string;engine:string|null;agent:string|null;profile:string|null;agent_profile:string|null;phase:string;cwd:string|null;created_at_ms:number|null;last_activity_ms:number|null;state:string;worker_alive:boolean|null};
 function fail(code='invalid_native_inventory',status=400):never{throw new HttpError(code,status);}
 function timestamp(value:unknown):value is number{return Number.isSafeInteger(value)&&Number(value)>=0;}
@@ -41,7 +42,7 @@ function meta(body:JsonRecord,now:number):Meta{
 function newer(a:Meta,b:Meta){return a.observed_at_ms>b.observed_at_ms||a.observed_at_ms===b.observed_at_ms&&a.snapshot_id>b.snapshot_id;}
 export class MachineNativeInventory {
  private queue:Promise<unknown>=Promise.resolve();
- constructor(private db:MeteredDb,private ctx:DurableObjectState){}
+ constructor(private db:MeteredDb,private ctx:DurableObjectState,private afterCommit?:(snapshot:Meta,previous:Meta|undefined)=>Promise<void>){}
  receive(body:JsonRecord):Promise<JsonRecord>{
   const next=this.queue.then(()=>this.accept(body));this.queue=next.catch(()=>undefined);return next;
  }
@@ -75,7 +76,16 @@ export class MachineNativeInventory {
    this.db.run('INSERT OR REPLACE INTO native_inventory_meta(singleton,metadata_json) VALUES(1,?)',encoded);
    this.db.run('DELETE FROM native_inventory_chunks');this.db.run('DELETE FROM native_inventory_upload');
   });
+  await this.afterCommit?.(m,active);
   return {complete:true,snapshot_id:m.snapshot_id,row_count:rows.length};
+ }
+ absentOrNonliving(nativeId:string):boolean{
+  const row=this.db.one<{row_json:string}>('SELECT row_json FROM native_inventory_rows WHERE native_id=?',nativeId);
+  if(!row)return true;
+  const native=JSON.parse(row.row_json) as NativeRow;
+  // Complete enumeration is not qualified liveness. Unknown or conflicting
+  // presence inhibits loss; only explicit nonliving metadata or omission counts.
+  return native.worker_alive===false&&['exited','failed','broken'].includes(native.state);
  }
  metadata():Meta|undefined{
   const row=this.db.one<{metadata_json:string}>('SELECT metadata_json FROM native_inventory_meta WHERE singleton=1');
@@ -84,4 +94,31 @@ export class MachineNativeInventory {
  status(now=Date.now()):JsonRecord{
   const m=this.metadata();return m?{...m,complete:true,fresh:now>=m.observed_at_ms-30_000&&now-m.observed_at_ms<=FRESH_MS}:{complete:false,fresh:false};
  }
+}
+
+
+// Logical registry loss is not native exit or containment evidence.
+export type NativeAbsenceEvidence={first:Meta;latest:Meta;first_seen_at:number;last_seen_at:number;observations:number};
+export function nativeAbsenceObservation(value:unknown):value is NativeAbsenceEvidence{
+ if(!value||typeof value!=='object'||Array.isArray(value))return false;
+ const v=value as NativeAbsenceEvidence;
+ if(Object.keys(v).sort().join(',')!=='first,first_seen_at,last_seen_at,latest,observations')return false;
+ const snapshot=(m:Meta)=>!!m&&typeof m==='object'&&!Array.isArray(m)
+  &&Object.keys(m).sort().join(',')==='chunk_count,observed_at_ms,row_count,sha256,snapshot_id,started_at_ms'
+  &&typeof m.snapshot_id==='string'&&UUID.test(m.snapshot_id)&&timestamp(m.started_at_ms)&&timestamp(m.observed_at_ms)
+  &&m.observed_at_ms>=m.started_at_ms&&m.observed_at_ms-m.started_at_ms<=6000
+  &&Number.isInteger(m.row_count)&&m.row_count>=0&&m.row_count<=5000
+  &&Number.isInteger(m.chunk_count)&&m.chunk_count>=1&&m.chunk_count<=Math.ceil(MAX_BYTES/CHUNK_BYTES)
+  &&typeof m.sha256==='string'&&/^[0-9a-f]{64}$/.test(m.sha256);
+ return snapshot(v.first)&&snapshot(v.latest)&&timestamp(v.first_seen_at)&&timestamp(v.last_seen_at)
+  &&v.last_seen_at>=v.first_seen_at&&Number.isSafeInteger(v.observations)&&v.observations>=1;
+}
+export function validNativeAbsenceEvidence(value:unknown,now:number):value is NativeAbsenceEvidence{
+ if(!nativeAbsenceObservation(value))return false;
+ const v=value;
+ return timestamp(now)&&v.first.snapshot_id!==v.latest.snapshot_id&&v.observations>=2
+  &&v.latest.started_at_ms-v.first.observed_at_ms>=HOST_INVENTORY_LOST_MS
+  &&v.last_seen_at-v.first_seen_at>=HOST_INVENTORY_LOST_MS
+  &&now>=v.last_seen_at&&now-v.last_seen_at<=LIVE_SNAPSHOT_TTL_MS
+  &&now>=v.latest.observed_at_ms&&now-v.latest.observed_at_ms<=LIVE_SNAPSHOT_TTL_MS;
 }

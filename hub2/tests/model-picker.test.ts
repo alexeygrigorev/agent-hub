@@ -1,7 +1,44 @@
+import {readFileSync} from 'node:fs';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pickModelRoute, pickModelRouteDetailed, weightedChoice, buildRoutingPool } from '../src/model-picker.ts';
+import type { RoutingSnapshot } from '../src/routing-pool.ts';
+import {eligibleCandidates} from '../src/routing-pool.ts';
+import {inheritedModelConstraints,normalizeModelConstraint,modelConstraintsAllow} from '../src/intake-model-constraints.ts';
+
+test('semantic intake restrictions precede every advisory fallback and explicit hint',()=>{
+ const sonnet={id:'renamed-sonnet-row',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const opus={...sonnet,id:'renamed-opus-row',model:'opus',weight:1e9};
+ const rules=[{models_by_engine:{claude:['sonnet']},efforts:['medium','unspecified']}];
+ assert.deepEqual(eligibleCandidates({version:22,candidates:[opus,sonnet]},
+   {interactive:true,model_constraints:rules}).map(row=>row.id),[sonnet.id]);
+ for(const input of [{model:'opus'},{tier:'deep'},{effort:'high'}]){
+  const policy={version:22,candidates:[opus,{...opus,id:'opus-high',effort:'high'}]};
+  assert.throws(()=>eligibleCandidates(policy,{interactive:true,model_constraints:rules,...input}),/model_policy_unavailable/);
+ }
+ assert.equal(modelConstraintsAllow({...sonnet,engine:'go',model:'muse',effort:undefined},rules),true);
+ assert.equal(modelConstraintsAllow({...sonnet,engine:'go',model:'muse',effort:'high'},rules),false);
+ assert.equal(eligibleCandidates({version:22,candidates:[opus,sonnet]},{interactive:true}).length,2,'global pool untouched');
+});
+
+test('intake constraint schema is closed, bounded and canonical; corrupt ancestry fails explicitly',()=>{
+ assert.deepEqual(normalizeModelConstraint({models_by_engine:{CLAUDE:['sonnet','SONNET']},efforts:['medium','low']}),
+   {models_by_engine:{claude:['sonnet']},efforts:['low','medium']});
+ for(const invalid of [{},{models_by_engine:{}},{models_by_engine:{claude:[]}},{efforts:[]},
+   {efforts:['turbo']},{efforts:['Medium']},{models_by_engine:{claude:['sonnet'],CLAUDE:['opus']}},{weight:0}])
+  assert.throws(()=>normalizeModelConstraint(invalid),/invalid_model_constraints/);
+ const root={id:'root',source_json:JSON.stringify({model_constraints:{models_by_engine:{claude:['sonnet']}}})};
+ const child={id:'child',parent_intake_id:'root',source_json:JSON.stringify({model_constraints:{models_by_engine:{claude:['opus','sonnet']}}})};
+ const rows=new Map([['root',root],['child',child]]);
+ const inherited=inheritedModelConstraints('child',id=>rows.get(id));
+ assert.equal(inherited.length,2);
+ assert.equal(modelConstraintsAllow({engine:'claude',model:'opus'},inherited.map(row=>row.constraint)),false);
+ assert.equal(modelConstraintsAllow({engine:'claude',model:'sonnet'},inherited.map(row=>row.constraint)),true);
+ assert.throws(()=>inheritedModelConstraints('missing',()=>undefined),/ancestor_missing/);
+ assert.throws(()=>inheritedModelConstraints('loop',()=>({id:'loop',parent_intake_id:'loop'})),/ancestry_invalid/);
+ assert.throws(()=>inheritedModelConstraints('bad',()=>({id:'bad',source_json:'{"model_constraints":{"weight":0}}'})),/constraints_invalid/);
+});
 
 const candidates=[
  {id:'codex',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -11,7 +48,7 @@ const candidates=[
  {id:'astra-high',engine:'codex',model:'gpt-6-astra',effort:'max',account_id:'codex',weight:100,capabilities:[],enabled:true},
  {id:'argon-high',engine:'gemini',model:'gemini-4-argon',effort:'max',account_id:'gemini',weight:100,capabilities:[],enabled:true},
  {id:'luna-medium',engine:'codex',model:'gpt-6-luna',effort:'medium',account_id:'codex',weight:100,capabilities:[],enabled:true},
- {id:'zai-central',engine:'zcodex',model:'glm-flash',account_id:'zai-central',weight:100,capabilities:[],enabled:true},
+ {id:'zai-central',engine:'zai',model:'glm-flash',account_id:'zai-central',weight:100,capabilities:[],enabled:true},
  {id:'haiku',engine:'claude',model:'haiku',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
  {id:'claude-sonnet-high',engine:'claude',model:'sonnet',effort:'max',account_id:'claude',weight:100,capabilities:[],enabled:true},
  {id:'claude-fable-5-2',engine:'claude',model:'fable',effort:'medium',account_id:'claude',weight:100,capabilities:[],enabled:true},
@@ -41,10 +78,10 @@ test('weighted choice follows quota headroom and can select a non-default engine
  assert.ok(requests.some(value=>value.includes('/_routing-policy')));
 });
 
-test('unhealthy credentials and missing quota do not become placement refusals',async()=>{
+test('unhealthy credentials and missing quota do not become placement refusals for non-Codex engines',async()=>{
  const {env}=envFor({},false);
- const route=await pickModelRoute(env,{interactive:true,model:'gpt-6.1-sol',override_reason:'test explicit model'},()=>0);
- assert.equal(route.policy_id,'codex');
+ const route=await pickModelRoute(env,{interactive:true,model:'sonnet',override_reason:'test explicit model'},()=>0);
+ assert.equal(route.policy_id,'claude');
  assert.equal(route.quota_remaining,null);
 });
 
@@ -59,7 +96,7 @@ test('Fable is excluded from automatic picks and available only when explicitly 
 });
 
 test('fallback can exclude failed candidates while enforcing model policy',async()=>{
- const {env}=envFor({codex:10,claude:90},false);
+ const {env}=envFor({codex:80,claude:90},false);
  const route=await pickModelRoute(env,{interactive:true,model:'gpt-6.1-sol',override_reason:'test explicit model',exclude_policy_ids:['claude']},()=>0);
  assert.equal(route.policy_id,'codex');
  assert.equal(route.model,'gpt-6.1-sol');
@@ -139,6 +176,9 @@ os.environ.clear();os.environ.update(HOME=str(home),PATH=str(binary))
 workspace=home/'project-测试';workspace.mkdir()
 agent_module.local_claude_missing_contexts=lambda contexts,modes,environment:local_claude_missing_contexts(contexts,modes,environment,filesystem_root=home)
 bridge=Bridge.__new__(Bridge);bridge.roots=[workspace];bridge.engines={'claude','codex'};bridge.launcher=NativeLauncher({'private_provider_homes':False})
+# This fixture qualifies Claude auth observations, not a real Codex wrapper or
+# release-pinned profile. Keep unrelated installed-host readiness deterministic.
+bridge.launcher._codex_advertisable=lambda route:True
 def heartbeat(labels,engines,capabilities):print(json.dumps({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities,'workspace':str(workspace)}))
 bridge.client=types.SimpleNamespace(heartbeat=heartbeat)
 bridge.heartbeat([],include_native_sessions=False)
@@ -227,8 +267,10 @@ test('fresh quota affects weight, but expired quota never preserves stale prefer
  const fresh=await pickModelRouteDetailed(observationEnv(observed(100,now),other),{interactive:false},()=>0);
  assert.ok(Math.abs(fresh.diagnostics.pool[0].share-(.03+.94*2/3))<1e-9);
  assert.deepEqual(fresh.diagnostics.warnings,[]);
- const stale=await pickModelRouteDetailed(observationEnv({fresh:true,quota:{remaining:100,captured_at:now-31*60000,valid_until:now+60000}},other),{interactive:false},()=>0);
- assert.equal(stale.diagnostics.pool[0].share,0.5);
+ // Neutral staleness applies to non-Codex providers; stale Codex is excluded outright (see Codex reserve tests).
+ const stale=await pickModelRouteDetailed(observationEnv(other,{fresh:true,quota:{remaining:100,captured_at:now-31*60000,valid_until:now+60000}}),{interactive:false},()=>0.9);
+ assert.equal(stale.diagnostics.pool[1].share,0.5);
+ assert.equal(stale.route.engine,'claude');
  assert.equal(stale.route.quota_remaining,null,'neutral weight is not a measured balance');
  assert.equal(stale.diagnostics.warnings?.[0].reason,'quota_stale');
 });
@@ -246,14 +288,20 @@ test('missing, invalidated, expired and malformed quota use equal neutral weight
   {fresh:true,quota:{remaining:99,captured_at:now,valid_until:now+900000.5}},
  ];
  for(const row of cases){
-  const result=await pickModelRouteDetailed(observationEnv(row,fresh),{interactive:false},()=>0);
+  // Non-Codex provider: neutral weight, never a refusal.
+  const result=await pickModelRouteDetailed(observationEnv(fresh,row),{interactive:false},()=>0.9);
+  assert.equal(result.route.engine,'claude',JSON.stringify(row));
   assert.equal(result.route.quota_remaining,null,JSON.stringify(row));
-  assert.equal(result.diagnostics.pool[0].share,0.5,JSON.stringify(row));
-  assert.deepEqual(result.diagnostics.warnings?.map(x=>[x.account_id,x.reason]),[['codex','quota_stale']]);
+  assert.equal(result.diagnostics.pool[1].share,0.5,JSON.stringify(row));
+  assert.deepEqual(result.diagnostics.warnings?.map(x=>[x.account_id,x.reason]),[['claude','quota_stale']]);
+  // Codex with the same observation fails closed: only Claude may be offered.
+  const codex=await pickModelRouteDetailed(observationEnv(row,fresh),{interactive:false},()=>0);
+  assert.deepEqual(codex.diagnostics.pool.map(x=>x.engine),['claude'],JSON.stringify(row));
+  assert.ok(codex.diagnostics.excluded.some(x=>x.policy_id==='codex-sol-medium'&&x.reason==='codex_reserve'),JSON.stringify(row));
  }
  const allUnknown=await pickModelRouteDetailed(observationEnv({},{}),{interactive:false},()=>0.9);
  assert.equal(allUnknown.route.engine,'claude');
- assert.equal(allUnknown.diagnostics.pool.length,2);
+ assert.deepEqual(allUnknown.diagnostics.pool.map(x=>x.engine),['claude'],'unknown Codex is excluded, unknown Claude stays neutral');
  assert.equal(allUnknown.diagnostics.warnings?.length,2);
 });
 
@@ -261,23 +309,26 @@ test('quota freshness expires at the earlier provider validity or thirty-minute 
  const now=Date.now();
  const near=await pickModelRouteDetailed(observationEnv({fresh:true,quota:{remaining:80,captured_at:now-29*60000,valid_until:now+60000}},observed(50,now)),{interactive:false},()=>0);
  assert.equal(near.route.quota_remaining,80);
- const providerExpired=await pickModelRouteDetailed(observationEnv({fresh:false,quota:{remaining:80,captured_at:now-60000,valid_until:now+60000}},observed(50,now)),{interactive:false},()=>0);
+ const providerExpired=await pickModelRouteDetailed(observationEnv(observed(50,now),{fresh:false,quota:{remaining:80,captured_at:now-60000,valid_until:now+60000}}),{interactive:false},()=>0.9);
  assert.equal(providerExpired.route.quota_remaining,null);
+ const codexExpired=await pickModelRouteDetailed(observationEnv({fresh:false,quota:{remaining:80,captured_at:now-60000,valid_until:now+60000}},observed(50,now)),{interactive:false},()=>0);
+ assert.deepEqual(codexExpired.diagnostics.pool.map(row=>row.engine),['claude']);
 });
 const healthy={codex:true,claude:true,'shared-go':true,'zai-central':true,gemini:true};
 const left={codex:95,claude:87,'shared-go':40,'zai-central':73,gemini:90};
 
-test('pool spreads across engines, keeps astra/unadvertised engines out and caps luna',async()=>{
+test('pool spreads across engines and keeps automatic Luna/Astra/unadvertised engines out',async()=>{
  const env=poolEnv(healthy,left);
  const seen=new Map<string,number>();
  for(let i=0;i<200;i++){
   const route=await pickModelRoute(env,{interactive:false},()=>(i+0.5)/200);
   seen.set(route.policy_id,(seen.get(route.policy_id)||0)+1);
  }
- assert.ok(seen.size>=5,[...seen.keys()].join());
+ assert.deepEqual([...seen.keys()].sort(),['codex-sol-medium','claude-sonnet-medium','claude-opus-medium','go-muse'].sort(),'all four surviving default routes stay usable');
+ assert.ok(!seen.has('zai-glm-flash'),'No zai-central in the Hub picker, even from a stored policy row');
  assert.ok(!seen.has('codex-astra-medium'));
  assert.ok(!seen.has('gemini-argon-medium'),'engine no host advertises is not picked');
- assert.ok((seen.get('codex-luna-max')||0)<=(seen.get('codex-sol-medium')||0)*1.2+1,'luna never dominates');
+ assert.ok(!seen.has('codex-luna-max'),'Luna must never be an automatic default');
 });
 
 test('expired credentials are excluded from every pick',async()=>{
@@ -360,7 +411,7 @@ function fleetEnv(hosts:Record<string,{os?:string;connected?:boolean}>){
   const parsed=new URL(url);
   if(kind==='control'&&parsed.pathname==='/_routing-policy')return Response.json({version:1,candidates:policy});
   if(kind==='control'&&parsed.pathname==='/api/directory')return Response.json({items:Object.keys(hosts).map(id=>({id})),next:null});
-  if(kind==='accounts')return Response.json({account:{enabled:true},quota:{remaining:80},hosts:[],credential_usable:true});
+  if(kind==='accounts')return Response.json({account:{enabled:true},quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:[],credential_usable:true});
   if(kind==='machines')return Response.json({machine_id:id,connected:hosts[id]?.connected??true,engines:['codex'],...(hosts[id]?.os?{os:hosts[id].os}:{})});
   return Response.json({}, {status:404});
  }})});
@@ -474,7 +525,7 @@ test('--with-goal on the live hetzner-aplexer advertisement only draws goal-capa
  ]};
  const accounts=new Map(['codex','claude','shared-go','zai','gemini'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['hetzner-aplexer'],...observed(80,now)}]));
  // Claude has the most headroom; a quota-only preference must still not revive it for a goal start.
- accounts.get('codex')!.quota!.remaining=1;
+ accounts.get('codex')!.quota!.remaining=16;
  const machines=new Map([['hetzner-aplexer',{connected:true,os:'linux',engines:['antigravity','claude','codex','go','shell','zai'],capabilities:live}]]);
  for(const input of [{interactive:true,with_goal:true,tier:'deep',workspace:'agent-hub'},
   {interactive:true,with_goal:true,tier:'deep',workspace:'agent-hub',machine_id:'hetzner-aplexer'}]){
@@ -505,11 +556,12 @@ test('advertising goal:claude admits Opus and Sonnet to the real weighted goal d
   accounts:new Map(['codex','claude','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:[host],...observed(80,now)}])),
   machines:new Map([[host,{connected:true,os:'linux',engines:['codex','claude','zai'],capabilities}]]),
  };
- const input={interactive:true,with_goal:true,machine_id:host,tier:'deep'};
- assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex','zai']);
+ // Review purpose keeps the non-ordinary ZAI route eligible without the deep-tier strong preference.
+ const input={interactive:true,with_goal:true,machine_id:host,purpose:'review' as const};
+ assert.deepEqual(buildRoutingPool(snapshot,input).options.map(row=>row.value.engine).sort(),['codex']);
  capabilities.push('goal:claude');
  const result=buildRoutingPool(snapshot,input);
- assert.deepEqual(result.options.map(row=>row.value.model).sort(),['glm-5.3-flash','gpt-6.1-sol','opus','sonnet']);
+ assert.deepEqual(result.options.map(row=>row.value.model).sort(),['gpt-6.1-sol','opus','sonnet']);
  let cumulative=0;
  const total=result.options.reduce((sum,row)=>sum+row.weight,0);
  const drawn=new Set<string>();
@@ -562,13 +614,13 @@ test('capability preference cannot revive a candidate excluded by fresh quota ob
  snapshot.accounts.get('codex')!.quota!.remaining=1;
  const result=buildRoutingPool(snapshot,{interactive:true});
  assert.deepEqual(result.options.map(row=>row.value.engine),['claude']);
- assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='quota_below_minimum'));
+ assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.reason==='codex_reserve'));
  assert.ok(result.diagnostics.advisories?.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='capability_not_advertised'));
 });
 
 test('--with-goal keeps a low-quota goal-capable engine instead of an incapable one',()=>{
  const snapshot=capabilitySnapshot(['interactive:codex','goal:codex','effort:codex']);
- snapshot.accounts.get('codex')!.quota!.remaining=1;
+ snapshot.accounts.get('codex')!.quota!.remaining=16;
  const result=buildRoutingPool(snapshot,{interactive:true,with_goal:true});
  assert.deepEqual(result.options.map(row=>row.value.engine),['codex']);
  assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='claude-opus-medium'&&row.reason==='goal_not_advertised'));
@@ -618,4 +670,558 @@ test('managed picker mode validates exact selector, Opus/medium/headless and can
   assert.throws(()=>buildRoutingPool(snapshot,{...input,...changed} as any),/invalid_managed_credential_route/);
  snapshot.policy.candidates[0].account_id='foreign-claude';
  assert.throws(()=>buildRoutingPool(snapshot,input),/model_policy_unavailable/);
+});
+
+const hydrogenPolicy = JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url), 'utf8'));
+function hydrogenFixture(): RoutingSnapshot {
+ const now=Date.now();
+ const candidates=[...hydrogenPolicy.candidates,{id:'zai-glm-flash',engine:'zai',model:'glm-5.3-flash',account_id:'zai-central',weight:1_000_000,capabilities:[],enabled:true}];
+ return {policy:{version:6,candidates},observed_at:now,
+  accounts:new Map(candidates.map((row:any)=>[row.account_id,{account:{enabled:true},credential_usable:true,fresh:true,hosts:['h1'],quota:{remaining:80,captured_at:now,valid_until:now+900000}}])),
+  machines:new Map([['h1',{connected:true,engines:['codex','claude','antigravity','go','zai'],capabilities:['headless','interactive','effort:codex','effort:claude','effort:antigravity']} ]])};
+}
+test('ordinary default/fix/implement in both modes and quick/daily excludes Argon and Antigravity Flash',()=>{
+ for(const purpose of [undefined,'fix','implement'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,purpose,tier});
+  const models=result.options.map(row=>row.value.model);
+  assert(models.includes('gemini-4-hydrogen-medium'));
+  assert(models.includes('gpt-6.1-sol'));
+  assert(!models.includes('glm-5.3-flash'),'No zai-central in the Hub picker');
+  assert(!models.some(model=>/gemini-4-(?:argon|flash)/.test(model)));
+  for(const draw of [0,.25,.5,.75,.999999])assert(!/gemini-4-(?:argon|flash)/.test(weightedChoice(result.options,()=>draw).model));
+ }
+});
+test('review/think/deep and explicit Sol/Fable/Argon preserve existing selection',()=>{
+ for(const input of [{purpose:'review' as const},{purpose:'think' as const},{tier:'deep',effort:'medium'}]){
+  const models=buildRoutingPool(hydrogenFixture(),{interactive:false,...input}).options.map(row=>row.value.model);
+  assert(models.includes('gemini-4-argon-medium'));
+ }
+ for(const model of ['gemini-4-argon-medium','antigravity-argon-medium','gpt-6.1-sol','fable']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive:false,model});
+  assert(result.options.every(row=>row.value.model===model||row.value.policy_id===model));
+ }
+});
+test('an Antigravity-only ordinary automatic pool selects Hydrogen, never Argon fallback',()=>{
+ const snapshot=hydrogenFixture();
+ const result=buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'});
+ assert(result.options.length>0);
+ assert(result.options.every(row=>['gemini-4-hydrogen-medium','gemini-4-neon-medium'].includes(row.value.model))&&result.options.some(row=>row.value.model==='gemini-4-hydrogen-medium'));
+ snapshot.policy.candidates=snapshot.policy.candidates.filter(row=>row.model!=='gemini-4-hydrogen-medium'&&row.model!=='gemini-4-neon-medium');
+ assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,engine:'antigravity'}),(e:any)=>e.code==='model_policy_unavailable');
+ assert.equal(buildRoutingPool(snapshot,{interactive:false,engine:'antigravity',model:'gemini-4-argon-medium'}).options[0].value.model,'gemini-4-argon-medium');
+});
+
+
+test('Every Z.ai shape except the committed GLM 5.4 zcodex route stays out of the picker', () => {
+ assert(hydrogenPolicy.candidates.filter((row:any)=>['zai','goz'].includes(row.engine)||['shared-zai','zcodex'].includes(row.account_id)).length===0);
+ const glm54=hydrogenPolicy.candidates.find((row:any)=>row.account_id==='zai-central');
+ assert.deepEqual([glm54.id,glm54.engine,glm54.model,glm54.effort],['glm-flash-zcodex','zcodex','glm-5.4','medium']);
+ // hydrogenFixture still carries a zai-engine zai-central row with a huge weight, a healthy account and an advertised zai engine.
+ const snapshot=hydrogenFixture();
+ snapshot.machines.get('h1')!.capabilities!.push('effort:zai');
+ for(const purpose of [undefined,'fix','implement','review','think'] as const)for(const interactive of [false,true])for(const tier of [undefined,'quick','daily','deep']){
+  const result=buildRoutingPool(snapshot,{interactive,purpose,tier});
+  assert(!result.options.some(row=>row.value.engine==='zai'||row.value.engine==='goz'||['shared-zai','zcodex'].includes(row.value.account_id)));
+  // The committed zcodex candidate is only pooled where a host advertises the engine.
+  assert(result.options.every(row=>row.value.engine!=='zcodex'));
+ }
+ for(const input of [{engine:'zai'},{model:'glm-5.3-flash'},{model:'zai-glm-flash'},{engine:'zai',model:'glm-5.3-flash',effort:'medium'}]){
+  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,...input}),(e:any)=>e.code==='model_policy_unavailable',JSON.stringify(input));
+ }
+});
+
+test('the GLM 5.4 zcodex route is selectable: ordinary, pinned engine and pinned model', () => {
+ const snapshot=hydrogenFixture();
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude','antigravity','go','zcodex'],
+  capabilities:['headless','interactive','effort:codex','effort:claude','effort:antigravity','effort:zcodex']});
+ // Ordinary default pool carries the medium-effort GLM 5.4 route next to the others.
+ const ordinary=buildRoutingPool(snapshot,{interactive:false});
+ const glm54=ordinary.options.filter(row=>row.value.engine==='zcodex');
+ assert.equal(glm54.length,1);
+ assert.deepEqual([glm54[0].value.policy_id,glm54[0].value.model,glm54[0].value.account_id],['glm-flash-zcodex','glm-5.4','zai-central']);
+ // Explicit --engine zcodex pins the route even without other surviving candidates.
+ const pinned=buildRoutingPool(snapshot,{interactive:false,engine:'zcodex'});
+ assert.deepEqual(pinned.options.map(row=>row.value.model),['glm-5.4']);
+ const byModel=buildRoutingPool(snapshot,{interactive:false,model:'glm-5.4'});
+ assert.equal(byModel.options[0].value.policy_id,'glm-flash-zcodex');
+ const byId=buildRoutingPool(snapshot,{interactive:false,model:'glm-flash-zcodex'});
+ assert.equal(byId.options[0].value.model,'glm-5.4');
+});
+
+// ---- Codex reserve (AGENTS.md quota gate): fresh known quota strictly above 15%, fail closed ----
+const reservePolicy=[
+ ...pool.filter(row=>row.engine!=='zai'),
+ {id:'zai-glm-flash',engine:'zai',model:'glm-5.3-flash',effort:'medium',account_id:'zai-central',weight:1,capabilities:[],enabled:true},
+ {id:'codex-orin-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-orin',weight:1,capabilities:[],enabled:true},
+];
+function reserveSnapshot(obs:Record<string,any>,policy:any[]=reservePolicy,machineEngines=['codex','claude','go','zai','antigravity']):RoutingSnapshot{
+ const now=Date.now(),ids=[...new Set(policy.map(row=>row.account_id))];
+ return {policy:{version:9,candidates:policy},observed_at:now,
+  accounts:new Map(ids.map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['h1'],
+   ...(typeof obs[id]==='number'?observed(obs[id],now):obs[id]??{})}])) as any,
+  machines:new Map([['h1',{connected:true,engines:machineEngines,capabilities:['headless','interactive',...machineEngines.map(engine=>`effort:${engine}`)]}]])};
+}
+const codexIds=(result:ReturnType<typeof buildRoutingPool>)=>result.options.filter(row=>row.value.engine==='codex').map(row=>row.value.policy_id);
+const allSeeds=[0,.1,.25,.5,.75,.9,.999999];
+
+test('Codex reserve boundary: 6 and 15 are excluded, above 15 stays eligible, every purpose and tier',()=>{
+ for(const purpose of [undefined,'fix','implement','review','think'] as any[]) for(const tier of [undefined,'light','deep','serious']){
+  const input={interactive:false,purpose,tier};
+  for(const left of [6,15,0,14.99]){
+   const result=buildRoutingPool(reserveSnapshot({codex:left,'codex-orin':80,claude:80,'shared-go':80,'zai-central':80}),input as any);
+   assert.ok(!codexIds(result).includes('codex-sol-medium')&&!codexIds(result).includes('codex-luna-max'),`${left} ${purpose} ${tier}`);
+   assert.ok(result.diagnostics.excluded.some(row=>row.policy_id==='codex-sol-medium'&&row.account_id==='codex'&&row.reason==='codex_reserve'));
+   assert.ok(codexIds(buildRoutingPool(reserveSnapshot({codex:left,'codex-orin':80,claude:80}),input as any)).includes('codex-orin-route'),'the other healthy Codex account remains eligible');
+  }
+  for(const left of [15.01,16,100]){
+   const result=buildRoutingPool(reserveSnapshot({codex:left,'codex-orin':80,claude:80,'shared-go':80}),input as any);
+   assert.ok(codexIds(result).includes('codex-sol-medium'),`${left} ${purpose} ${tier}`);
+   assert.ok(!result.diagnostics.excluded.some(row=>row.reason==='codex_reserve'));
+  }
+ }
+});
+
+test('Codex reserve fails closed for missing, stale, invalid and unknown observations on every account',()=>{
+ const now=Date.now(),good=observed(80,now);
+ const bad:any[]=[undefined,{},{fresh:true},{fresh:true,quota:null},{...good,fresh:false},{quota:good.quota},
+  {fresh:true,quota:{remaining:80,captured_at:now-31*60000,valid_until:now+60000}},
+  {fresh:true,quota:{remaining:80,captured_at:now-60000,valid_until:now-1}},
+  {fresh:true,quota:{remaining:80,captured_at:now+60000,valid_until:now+900000}},
+  ...[-1,101,Number.NaN,Infinity,'80',true,null].map(remaining=>({fresh:true,quota:{remaining,captured_at:now,valid_until:now+900000}})),
+  {fresh:true,quota:{remaining:80,captured_at:now,valid_until:now+3600001}}];
+ for(const row of bad){
+  const result=buildRoutingPool(reserveSnapshot({codex:row,'codex-orin':good,claude:80}),{interactive:false});
+  assert.deepEqual(codexIds(result),['codex-orin-route'],JSON.stringify(row));
+  assert.ok(result.options.some(opt=>opt.value.engine==='claude'));
+  // The second account fails closed independently of the first.
+  const second=buildRoutingPool(reserveSnapshot({codex:good,'codex-orin':row,claude:80}),{interactive:false});
+  assert.ok(codexIds(second).every(id=>id!=='codex-orin-route'),JSON.stringify(row));
+  assert.ok(codexIds(second).includes('codex-sol-medium'));
+ }
+});
+
+test('Codex reserve is not restorable by explicit model/engine, override, effort or an exhausted pool',()=>{
+ const low=reserveSnapshot({codex:6,'codex-orin':null,claude:80,'shared-go':80,'zai-central':80,gemini:80} as any);
+ for(const input of [{model:'gpt-6.1-sol'},{engine:'codex'},{model:'gpt-6-luna',engine:'codex'},{engine:'codex',effort:'medium'},
+  {model:'gpt-6.1-sol',override_reason:'explicit please',machine_id:'h1'},{engine:'codex',tier:'deep',interactive:true}]){
+  assert.throws(()=>buildRoutingPool(low,{interactive:false,...input} as any),(e:any)=>e.code==='model_policy_unavailable'&&e.status===503,JSON.stringify(input));
+ }
+ const onlyCodex=reserveSnapshot({codex:10,'codex-orin':10},reservePolicy.filter(row=>row.engine==='codex'));
+ for(const input of [{},{tier:'deep'},{with_goal:true},{machine_id:'h1'},{workspace:'agent-hub'}])
+  assert.throws(()=>buildRoutingPool(onlyCodex,{interactive:true,...input} as any),(e:any)=>e.code==='model_policy_unavailable'&&e.status===503,JSON.stringify(input));
+ // One fresh >15 account in an otherwise exhausted pool is the only survivor, even when explicit.
+ const mixedAccounts=reserveSnapshot({codex:10,'codex-orin':20},reservePolicy.filter(row=>row.engine==='codex'));
+ assert.deepEqual(codexIds(buildRoutingPool(mixedAccounts,{interactive:true,engine:'codex'})),['codex-orin-route']);
+});
+
+test('Codex reserve leaves other providers on advisory 5% and unknown semantics, and ZAI is never picked',()=>{
+ const snap=reserveSnapshot({codex:6,'codex-orin':6,claude:7,'shared-go':5,'zai-central':null,gemini:6} as any);
+ const result=buildRoutingPool(snap,{interactive:false});
+ const engines=new Set(result.options.map(row=>row.value.engine));
+ assert.ok(!engines.has('codex'));
+ for(const engine of ['claude','go'])assert.ok(engines.has(engine),engine);
+ const below=buildRoutingPool(reserveSnapshot({codex:100,claude:4.99,'shared-go':4.99,'zai-central':null,'codex-orin':100,gemini:6} as any),{interactive:false});
+ assert.ok(below.diagnostics.excluded.some(row=>row.policy_id==='go-muse'&&row.reason==='quota_below_minimum'));
+ // No zai-central in the Hub picker: a stored zai-central row stays unselectable even with healthy quota and an explicit request.
+ assert.ok(!engines.has('zai'));
+ assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:6,'codex-orin':6,claude:80,'zai-central':80}),{interactive:false,model:'glm-5.3-flash'}),(e:any)=>e.code==='model_policy_unavailable');
+ assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:6,claude:80,'zai-central':80}),{interactive:false,engine:'zai',tier:'deep'}),(e:any)=>e.code==='model_policy_unavailable');
+ // Every provider below 5% still follows the existing advisory fallback, never a refusal.
+ const exhaustedOthers=buildRoutingPool(reserveSnapshot({codex:100,'codex-orin':100,claude:1,'shared-go':1,'zai-central':1,gemini:1}),{interactive:false});
+ assert.ok(exhaustedOthers.options.length>0);
+});
+
+test('Codex reserve keeps weights and multiplicity while Luna stays explicit-only',()=>{
+ const snap=reserveSnapshot({codex:6,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60});
+ const result=buildRoutingPool(snap,{interactive:false});
+ assert.ok(Math.abs(result.diagnostics.pool.reduce((sum,row)=>sum+row.share,0)-1)<1e-12);
+ assert.ok(result.diagnostics.pool.every(row=>row.share>=.03));
+ assert.ok(!result.diagnostics.pool.some(row=>row.policy_id==='codex-sol-medium'||row.policy_id==='codex-luna-max'));
+ assert.equal(result.diagnostics.share_floor?.applied,true);
+ const withLuna=buildRoutingPool(reserveSnapshot({codex:90,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60}),{interactive:false});
+ assert.ok(!withLuna.diagnostics.pool.some(row=>row.policy_id==='codex-luna-max'));
+ const explicitLuna=buildRoutingPool(reserveSnapshot({codex:90,'codex-orin':60,claude:60,'shared-go':60,'zai-central':60,gemini:60}),{interactive:false,model:'codex-luna-max'});
+ assert.deepEqual(explicitLuna.options.map(row=>row.value.policy_id),['codex-luna-max']);
+});
+
+test('Codex reserve: seeded draws never select an excluded Codex candidate, including through the actual picker',async()=>{
+ const snap=reserveSnapshot({codex:6,'codex-orin':15,claude:80,'shared-go':80,'zai-central':80,gemini:80});
+ const result=buildRoutingPool(snap,{interactive:false});
+ let excludedCodex=0;
+ for(let i=0;i<500;i++){
+  const chosen=weightedChoice(result.options,()=>(i+.5)/500);
+  if(chosen.engine==='codex')excludedCodex++;
+ }
+ assert.equal(excludedCodex,0);
+ for(const draw of allSeeds)assert.notEqual(weightedChoice(result.options,()=>draw).engine,'codex');
+ // Live-shaped: first Codex account fresh 6%, second account stale/unknown.
+ const env=poolEnv({codex:true,claude:true,'shared-go':true,'zai-central':true,gemini:true},{codex:6,claude:80,'shared-go':60,'zai-central':60,gemini:60});
+ for(const draw of allSeeds){
+  const route=await pickModelRoute(env,{interactive:false},()=>draw);
+  assert.notEqual(route.engine,'codex');
+ }
+});
+
+
+// These exercise production routing decisions and their observer/log seam, not
+// evidence enrollment, SMTP delivery, or a fabricated healthy coverage baseline.
+async function quotaClassificationPick(options: {codex?: number; muse?: number; expiredMuse?: boolean; staleCodex?: boolean; policy?: any[]} = {}) {
+ const policy = options.policy ?? JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url),'utf8')).candidates
+   .filter((row:any)=>['codex-luna-max','codex-sol-medium','claude-sonnet-medium','claude-opus-medium','antigravity-hydrogen-medium','go-muse'].includes(row.id));
+ const env = poolEnv({codex:true,claude:true,gemini:true,'shared-go':!options.expiredMuse},
+   {claude:80,gemini:80,...(options.staleCodex?{}:{codex:options.codex??6}),'shared-go':options.muse??4},
+   ['codex','claude','antigravity','go'],policy);
+ const decisions:Record<string,string[]>={picker_excluded:[],picker_quota_stale:[]};
+ env.PICKER_DIAGNOSTIC_EVIDENCE=Object.fromEntries(Object.keys(decisions).map(producer=>[producer,{
+   begin:()=>producer, invalidate:()=>assert.fail('unexpected observer invalidation'),
+   finish:async(identity:unknown,decision:string)=>{assert.equal(identity,producer);decisions[producer].push(decision);},
+ }]));
+ const logs:{level:string;args:any[]}[]=[];
+ const error=console.error,info=console.info;
+ console.error=(...args:any[])=>{logs.push({level:'error',args});};
+ console.info=(...args:any[])=>{logs.push({level:'info',args});};
+ try { return {...await pickModelRouteDetailed(env,{interactive:true},()=>0.5),decisions,logs}; }
+ finally {console.error=error;console.info=info;}
+}
+
+test('quota classification: healthy three-model pool keeps routine exclusions without alert decisions',async()=>{
+ for(const codex of [6,15]) {
+  const result=await quotaClassificationPick({codex});
+  assert.equal(result.diagnostics.pool_degraded,false);
+  assert.deepEqual(new Set(result.diagnostics.pool.map(row=>row.model)),new Set(['sonnet','opus','gemini-4-hydrogen-medium']));
+  assert.deepEqual(new Set(result.diagnostics.excluded.map(row=>row.reason)),new Set(['codex_reserve','quota_below_minimum']));
+  assert.deepEqual(result.decisions,{picker_excluded:['observation'],picker_quota_stale:['observation']});
+  assert.equal(result.logs.length,1);assert.equal(result.logs[0].level,'info');
+  assert.ok(result.logs[0].args[0].includes('observation'));assert.ok(!result.logs[0].args[0].includes('alert='));
+  assert.deepEqual(JSON.parse(result.logs[0].args[1]),result.diagnostics.excluded,'all excluded rows remain visible');
+  assert.notEqual(result.route.engine,'codex');
+ }
+});
+
+test('quota classification: mixed real credential exclusions remain alerting with routine rows intact',async()=>{
+ const result=await quotaClassificationPick({expiredMuse:true});
+ assert.equal(result.diagnostics.pool_degraded,false);
+ assert.ok(result.diagnostics.excluded.some(row=>row.reason==='codex_reserve'));
+ assert.ok(result.diagnostics.excluded.some(row=>row.reason==='credential_expired'));
+ assert.deepEqual(result.decisions.picker_excluded,['alert']);
+ const log=result.logs.find(row=>String(row.args[0]).includes('MODEL_PICKER_EXCLUDED'))!;
+ assert.equal(log.level,'error');assert.ok(log.args[0].includes('alert=dev@dtcdev.click'));
+ assert.deepEqual(JSON.parse(log.args[1]),result.diagnostics.excluded);
+});
+
+test('quota classification: missing quota still alerts stale and excludes Codex without revival',async()=>{
+ const result=await quotaClassificationPick({staleCodex:true});
+ assert.ok(result.diagnostics.warnings?.some(row=>row.account_id==='codex'&&row.reason==='quota_stale'));
+ assert.deepEqual(result.decisions,{picker_excluded:['observation'],picker_quota_stale:['alert']});
+ assert.ok(result.logs.some(row=>row.level==='error'&&String(row.args[0]).includes('QUOTA_STALE alert=dev@')));
+ assert.notEqual(result.route.engine,'codex');assert.equal(result.diagnostics.pool_degraded,false);
+});
+
+test('quota classification: only the two exact routine reasons are non-alerting, including mixed future reasons',async()=>{
+ const {pickerExclusionsNeedAlert}=await import('../src/model-picker.ts');
+ const row=(reason:string)=>({policy_id:'synthetic-boundary',account_id:'synthetic',reason});
+ assert.equal(pickerExclusionsNeedAlert([]),false);
+ for(const reason of ['codex_reserve','quota_below_minimum']) assert.equal(pickerExclusionsNeedAlert([row(reason)]),false);
+ for(const reason of ['credential_expired','local_credentials_missing','central_credentials_unavailable','engine_not_advertised',
+  'goal_not_advertised','future_reason','','CODEX_RESERVE','quota_below_minimum ']) {
+  assert.equal(pickerExclusionsNeedAlert([row(reason)]),true,reason);
+  assert.equal(pickerExclusionsNeedAlert([row('codex_reserve'),row(reason),row('quota_below_minimum')]),true,reason);
+ }
+});
+
+test('quota classification: degraded pool remains degraded after normal reserve filtering',async()=>{
+ const policy=JSON.parse(readFileSync(new URL('../../config/model-policy.json', import.meta.url),'utf8')).candidates
+   .filter((row:any)=>['codex-sol-medium','claude-sonnet-medium'].includes(row.id));
+ const result=await quotaClassificationPick({policy});
+ assert.equal(result.diagnostics.pool_degraded,true);assert.equal(result.route.model,'sonnet');
+ assert.deepEqual(result.decisions.picker_excluded,['observation']);
+});
+
+
+function firstFaultPair(env:any, fail?:'begin'|'sync_finish'|'async_finish') {
+ const records=Object.fromEntries(['picker_excluded','picker_quota_stale'].map(role=>[role,{reasons:[] as unknown[],finished:0}]));
+ env.PICKER_DIAGNOSTIC_EVIDENCE=Object.fromEntries(Object.entries(records).map(([role,row])=>[role,{
+  begin(){if(fail==='begin')throw new Error('TOKEN=synthetic-begin');return 1;},
+  finish(){row.finished++;if(fail==='sync_finish')throw new Error('TOKEN=synthetic-finish');
+   return fail==='async_finish'?Promise.reject(new Error('TOKEN=synthetic-finish')):Promise.resolve();},
+  invalidate(reason:unknown){row.reasons.push(reason);},snapshot:async()=>({})
+ }]));
+ return records;
+}
+function firstFaultControl(env:any, replacement:(path:string)=>Response|undefined) {
+ const previous=env.CONTROL;
+ env.CONTROL={idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(url:string,init?:any)=>
+  replacement(new URL(url).pathname)??previous.get(id).fetch(url,init)})};
+}
+
+test('first fault picker snapshot and pool failures retain original business error and safe stage',async()=>{
+ const cases=[
+  ['snapshot','picker_snapshot_failed'],['data','picker_snapshot_data_unavailable'],
+  ['snapshot_host','picker_snapshot_no_host'],['policy','picker_snapshot_policy_unavailable'],
+  ['pool_host','picker_pool_no_host'],['pool_policy','picker_pool_policy_unavailable']
+ ] as const;
+ for(const [kind,expected] of cases){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+  const injected=new Error('TOKEN=synthetic provider path /private/not-for-wire');
+  if(kind==='snapshot')env.CONTROL={idFromName:(x:string)=>x,get:()=>({fetch:async()=>{throw injected;}})};
+  if(kind==='data')firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({}, {status:503}):undefined);
+  if(kind==='policy')firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({version:1,candidates:[]}):undefined);
+  if(kind==='snapshot_host'){
+   firstFaultControl(env,path=>path==='/api/directory'?Response.json({items:[],next:null}):undefined);
+   env.ACCOUNTS={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({hosts:[]})})};
+  }
+  if(kind==='pool_host')env.MACHINES={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:false,engines:[]})})};
+  if(kind==='pool_policy'){
+   firstFaultControl(env,path=>path==='/_routing-policy'?Response.json({version:1,candidates:[candidates[0]]}):undefined);
+   env.ACCOUNTS={idFromName:(x:string)=>x,get:()=>({fetch:async()=>Response.json({hosts:['h1'],quota:{remaining:0,captured_at:Date.now(),valid_until:Date.now()+900000}})})};
+  }
+  await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>0),error=>kind==='snapshot'?error===injected:true);
+  for(const row of Object.values(records)){assert.deepEqual(row.reasons,[expected]);assert.equal(row.finished,0);}
+  assert.ok(!JSON.stringify(records).includes('TOKEN='));
+ }
+});
+test('first fault picker begin and sync or async finish errors never change successful choice',async()=>{
+ for(const fail of ['begin','sync_finish','async_finish'] as const){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env,fail);
+  const result=await pickModelRouteDetailed(env,{interactive:true},()=>0);
+  assert.equal(result.route.engine,'codex');
+  await new Promise<void>(done=>setImmediate(done));
+  for(const row of Object.values(records))assert.deepEqual(row.reasons,[fail==='begin'?'picker_begin_failed':'picker_finish_failed']);
+ }
+});
+test('first fault completed decisions stay settled when weighted choice itself throws',async()=>{
+ const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+ const original=new Error('TOKEN=synthetic-choice');
+ await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>{throw original;}),error=>error===original);
+ for(const row of Object.values(records)){assert.equal(row.finished,1);assert.deepEqual(row.reasons,[]);}
+});
+
+test('first fault unknown public code or throwing code getter keeps stage fallback and original error',async()=>{
+ const {HttpError}=await import('../src/http.ts');
+ for(const throwingGetter of [false,true]){
+  const {env}=envFor({codex:80,claude:80});const records=firstFaultPair(env);
+  const original=new HttpError('TOKEN=synthetic-unknown-code',503,'/private/provider/detail');
+  if(throwingGetter)Object.defineProperty(original,'code',{get(){throw new Error('private getter failure');}});
+  env.CONTROL={idFromName:(id:string)=>id,get:()=>({fetch:async()=>{throw original;}})};
+  await assert.rejects(pickModelRouteDetailed(env,{interactive:true},()=>0),error=>error===original);
+  for(const row of Object.values(records))assert.deepEqual(row.reasons,['picker_snapshot_failed']);
+ }
+});
+
+
+// ---- intake 10a76faa: --effort high and --tier deep route to a strong model at high effort ----
+test('--effort high routes to Opus at high effort instead of model_policy_unavailable',()=>{
+ for(const interactive of [false,true])for(const tier of [undefined,'deep']){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,effort:'high',tier});
+  assert(result.options.length>0);
+  for(const draw of [0,.25,.5,.75,.999999]){
+   const picked=weightedChoice(result.options,()=>draw);
+   assert.deepEqual([picked.policy_id,picked.engine,picked.model,picked.effort],['claude-opus-high','claude','opus','high']);
+  }
+ }
+});
+test('--tier deep without effort picks a strong high-effort route, never Hydrogen',()=>{
+ for(const tier of ['deep','complex','serious','DEEP'])for(const interactive of [false,true]){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive,tier});
+  assert.deepEqual([...new Set(result.options.map(row=>row.value.policy_id))],['claude-opus-high']);
+  assert(result.diagnostics.excluded.some(row=>row.policy_id==='antigravity-hydrogen-medium'&&row.reason==='deep_prefers_strong_model'));
+ }
+});
+test('deep tier falls back to strong medium routes when the high-effort account is unusable, and never refuses',()=>{
+ const snapshot=hydrogenFixture();
+ for(const id of ['claude'])snapshot.accounts.set(id,{...snapshot.accounts.get(id)!,quota:{remaining:1,captured_at:snapshot.observed_at,valid_until:snapshot.observed_at+900000}});
+ const result=buildRoutingPool(snapshot,{interactive:false,tier:'deep'});
+ const models=new Set(result.options.map(row=>row.value.model));
+ assert.deepEqual([...models].sort(),['gemini-4-argon-medium','gpt-6.1-sol']);
+ assert(result.diagnostics.advisories!.some(row=>row.reason==='deep_prefers_high_effort'));
+});
+test('high effort never joins ordinary picks or plain --model opus, and stays opt-in by effort, policy id or deep tier',()=>{
+ for(const input of [{},{tier:'daily'},{tier:'quick'},{purpose:'review' as const},{purpose:'implement' as const},{model:'opus'},{engine:'claude'}]){
+  const result=buildRoutingPool(hydrogenFixture(),{interactive:false,...input});
+  assert(!result.options.some(row=>row.value.effort==='high'),JSON.stringify(input));
+ }
+ assert.deepEqual([...new Set(buildRoutingPool(hydrogenFixture(),{interactive:false,model:'claude-opus-high'}).options.map(row=>row.value.policy_id))],['claude-opus-high']);
+ // Astra stays review/think-only and explicit; Sol/Argon stay at bounded effort, so no high route exists for them.
+ assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model:'gpt-6-astra'}),/astra_not_for_implementation/);
+ for(const model of ['gpt-6.1-sol','gemini-4-argon-medium'])
+  assert.throws(()=>buildRoutingPool(hydrogenFixture(),{interactive:false,effort:'high',model}),(e:any)=>e.code==='model_policy_unavailable');
+});
+
+// Explicit model intent, not placement/purpose/effort hints, authorizes Luna.
+test('Luna never joins model-less pools across purposes tiers engines and effort hints',()=>{
+ const policy=[...reservePolicy,{id:'claude-opus-high',engine:'claude',model:'opus',effort:'high',account_id:'claude',weight:1,capabilities:[],enabled:true}];
+ for(const purpose of [undefined,'implement','fix','review','think'] as any[])
+  for(const tier of [undefined,'quick','daily','deep'])for(const effort of [undefined,'medium','max'])
+   for(const engine of [undefined,'codex'])for(const interactive of [false,true]){
+    const snapshot=reserveSnapshot({codex:90,'codex-orin':90,claude:90,'shared-go':90,'zai-central':90,gemini:90},policy);
+    const input={interactive,purpose,tier,effort,engine};
+    try{
+     const result=buildRoutingPool(snapshot,input as any);
+     assert.ok(result.options.every(row=>!/luna/i.test(row.value.model+' '+row.value.policy_id)),JSON.stringify(input));
+     assert.ok(result.diagnostics.pool.every(row=>!/luna/i.test(row.model+' '+row.policy_id)),JSON.stringify(input));
+    }catch(error){assert.equal((error as any).code,'model_policy_unavailable',JSON.stringify(input));}
+   }
+});
+test('explicit Luna canonical alias and exact policy remain usable without a new reason gate',async()=>{
+ for(const model of ['gpt-6-luna','luna','codex-luna-max']){
+  const snapshot=reserveSnapshot({codex:90,'codex-orin':90,claude:90,'shared-go':90,'zai-central':90});
+  for(const purpose of ['implement','fix','review','think'] as Array<'implement'|'fix'|'review'|'think'>){
+   const result=buildRoutingPool(snapshot,{interactive:false,model,purpose});
+   assert.deepEqual(result.options.map(row=>row.value.policy_id),['codex-luna-max']);
+   assert.equal(result.options[0].value.model,'gpt-6-luna');assert.equal(result.options[0].value.effort,'max');
+  }
+ }
+ const opaque=reservePolicy.map(row=>row.id==='codex-luna-max'?{...row,id:'work-route-17'}:row);
+ assert.deepEqual(buildRoutingPool(reserveSnapshot({codex:90},opaque),{interactive:false,model:'work-route-17'}).options.map(row=>row.value.policy_id),['work-route-17']);
+ const {env}=envFor({codex:90},true);
+ const route=await pickModelRoute(env,{interactive:false,model:'luna'},()=>0);
+ assert.equal(route.model,'gpt-6-luna');assert.equal(route.override_reason,'explicit_route');
+});
+test('explicit Luna still refuses disabled quota-stale unknown reserve and disconnected hosts',()=>{
+ for(const model of ['gpt-6-luna','luna','codex-luna-max']){
+  for(const left of [0,6,15,null])assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:left as any}),{interactive:false,model}),
+   (error:any)=>error.code==='model_policy_unavailable');
+  const stale=reserveSnapshot({codex:90});stale.accounts.get('codex')!.quota!.valid_until=stale.observed_at;
+  assert.throws(()=>buildRoutingPool(stale,{interactive:false,model}),(error:any)=>error.code==='model_policy_unavailable');
+  const disabled=reserveSnapshot({codex:90},reservePolicy.map(row=>({...row,enabled:row.id!=='codex-luna-max'})));
+  assert.throws(()=>buildRoutingPool(disabled,{interactive:false,model}),(error:any)=>error.code==='model_policy_unavailable');
+  const host=reserveSnapshot({codex:90});host.machines.get('h1')!.connected=false;
+  assert.throws(()=>buildRoutingPool(host,{interactive:false,model}),(error:any)=>error.code==='no_connected_host');
+ }
+});
+test('non-Luna and Fable model aliases never authorize a hidden Luna policy',()=>{
+ const luna=reservePolicy.find(row=>row.id==='codex-luna-max')!;
+ const catalog=JSON.parse(readFileSync(new URL('../../config/model-routing.json',import.meta.url),'utf8'));
+ const names=new Set<string>(['fable','claude-fable-5-2',...catalog.models.filter((row:any)=>!/luna/i.test(row.id+' '+row.model)).flatMap((row:any)=>[row.id,row.model])]);
+ for(const model of names){
+  const policy=[{...luna,id:model}];
+  assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:90},policy),{interactive:false,model,purpose:'think'}),
+   (error:any)=>error.code==='model_policy_unavailable',model);
+ }
+ const collision=[{...luna,id:'gpt-6.1-sol'},...reservePolicy.filter(row=>row.id==='codex-sol-medium')];
+ const result=buildRoutingPool(reserveSnapshot({codex:90},collision),{interactive:false,model:'gpt-6.1-sol'});
+ assert.deepEqual(result.options.map(row=>row.value.policy_id),['codex-sol-medium']);
+});
+test('explicit Luna selector collisions never authorize an unrelated model or default fallback',()=>{
+ const luna=reservePolicy.find(row=>row.id==='codex-luna-max')!;
+ const nonLuna={...reservePolicy.find(row=>row.id==='codex-sol-medium')!,id:'luna'};
+ for(const model of ['luna','gpt-6-luna']){
+  const colliding={...nonLuna,id:model};
+  assert.throws(()=>buildRoutingPool(reserveSnapshot({codex:90},[luna,colliding]),{interactive:false,model}),
+   (error:any)=>error.code==='model_policy_unavailable');
+ }
+ const only=reserveSnapshot({codex:90},[luna]);
+ assert.throws(()=>buildRoutingPool(only,{interactive:false}),(error:any)=>error.code==='model_policy_unavailable');
+ assert.throws(()=>buildRoutingPool(only,{interactive:false,engine:'codex',effort:'max',tier:'deep'}),
+  (error:any)=>error.code==='model_policy_unavailable');
+});
+
+test('valid non-Luna models retain custom Luna-text policy IDs for default and explicit picks',()=>{
+ const policy=[{...reservePolicy.find(row=>row.id==='codex-sol-medium')!,id:'luna-compat'}];
+ for(const model of [undefined,'gpt-6.1-sol','luna-compat']){
+  const result=buildRoutingPool(reserveSnapshot({codex:90},policy),{interactive:false,model});
+  assert.deepEqual(result.options.map(row=>row.value.model),['gpt-6.1-sol']);
+  assert.deepEqual(result.options.map(row=>row.value.policy_id),['luna-compat']);
+ }
+});
+
+
+test('actual mixed Python heartbeat preserves interactive Codex and excludes its unready headless mode',async()=>{
+ const {spawnSync}=await import('node:child_process'),{fileURLToPath}=await import('node:url');
+ const {mkdtempSync,mkdirSync,rmSync}=await import('node:fs'),{join}=await import('node:path');
+ const temp=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(temp,{recursive:true});
+ const home=mkdtempSync(join(temp,'codex-mode-heartbeat-'));
+ try{
+  const script=`import sys,os,json,types
+os.environ.clear();os.environ.update(HOME=sys.argv[2],PATH='/usr/bin:/bin')
+sys.path.insert(0,sys.argv[1])
+from unittest.mock import patch
+from agent_hub_host.agent import Bridge
+from agent_hub_host.native_launch import NativeLauncher
+from agent_hub_host.advertisement import Advertisement
+bridge=Bridge.__new__(Bridge);bridge.roots=[];bridge.engines={'codex','zai'}
+bridge.launcher=NativeLauncher({'private_provider_homes':False,'routes':{'codex':{'provider':'codex','profile':'hub-shared-codex'}}})
+bridge.publish_managed_readiness=lambda:None
+published=[]
+bridge.client=types.SimpleNamespace(heartbeat=lambda labels,engines,capabilities:published.append({'machine_id':'h1','connected':True,'engines':engines,'capabilities':capabilities}))
+with patch('agent_hub_host.native_launch.shutil.which',return_value='/synthetic/installed'),patch('agent_hub_host.native_launch.codex_launch_wrapper',return_value='/synthetic/verified-wrapper'),patch.object(bridge.launcher,'codex_exec_readiness',return_value=None):
+ bridge.heartbeat([],include_native_sessions=False)
+ for count in (29,30,31):
+  tags=['tool:accepted-'+str(i) for i in range(count)]
+  bridge.advertisement=Advertisement([],tags)
+  bridge.heartbeat([],include_native_sessions=False)
+print(json.dumps(published))
+`;
+  const child=spawnSync('python3',['-I','-S','-B','-c',script,fileURLToPath(new URL('../host',import.meta.url)),home],{
+   encoding:'utf8',timeout:10000,maxBuffer:65536,env:{HOME:home,TMPDIR:home,PATH:process.env.PATH || '/usr/bin:/bin'}});
+  assert.equal(child.status,0,child.stderr);
+  const [machine,fullDeclarations,partialDeclarations,resourceOnly]=JSON.parse(child.stdout);
+  for(const [observed,count] of [[fullDeclarations,29],[partialDeclarations,30],[resourceOnly,31]] as const){
+   assert.equal(observed.capabilities.length,32);
+   assert.deepEqual(observed.capabilities.slice(0,count),Array.from({length:count},(_,i)=>'tool:accepted-'+i).sort());
+   for(const marker of observed.capabilities.filter((v:string)=>v.startsWith('modes:')))
+    assert.match(marker,/^modes:v1:(codex|zai):(i|hi)$/,'declarations are indivisible, never truncated pairs');
+  }
+  assert(fullDeclarations.capabilities.includes('modes:v1:codex:i'));
+  assert(fullDeclarations.capabilities.includes('modes:v1:zai:hi'));
+  assert(partialDeclarations.capabilities.includes('modes:v1:codex:i'));
+  assert(!partialDeclarations.capabilities.includes('modes:v1:zai:hi'));
+  assert(!resourceOnly.capabilities.some((v:string)=>v.startsWith('modes:')),'full accepted tag budget leaves mode authority unknown');
+  assert(machine.capabilities.includes('headless'),'existing global hint remains unchanged');
+  assert(!machine.capabilities.includes('interactive:codex'),'modes:v1 supersedes the legacy hint (intake a59390a6: it evicted repo-identity:v1)');
+  assert(machine.capabilities.includes('modes:v1:codex:i'));
+  assert(machine.capabilities.includes('modes:v1:zai:hi'));
+  assert(!machine.capabilities.includes('headless:codex'));
+  assert(!machine.capabilities.includes('headless:zai'),'compact declaration avoids redundant legacy hints');
+  // Flash is intentionally outside ordinary implement defaults; review is its supported source-audit purpose.
+  // A stored zai-central row stays unselectable (No zai-central in the Hub picker), so only Codex can route here.
+  const now=Date.now(),policy={version:1,candidates:[...hydrogenPolicy.candidates.filter((row:any)=>row.id==='codex-sol-medium'),
+   {id:'zai-glm-5-3-flash',engine:'zai',model:'glm-5.3-flash',effort:'medium',account_id:'zai-central',weight:1,capabilities:[],enabled:true}]};
+  const snapshot:RoutingSnapshot={policy,observed_at:now,machines:new Map([['h1',machine]]),accounts:new Map(
+   ['codex','zai-central'].map(id=>[id,{account:{enabled:true},credential_usable:true,hosts:['h1'],...observed(80,now)}]))};
+  assert.throws(()=>buildRoutingPool(snapshot,{interactive:false,purpose:'review'}),(error:any)=>error.code==='model_policy_unavailable','unready headless Codex is excluded and zai-central is never a fallback');
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,with_goal:true,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
+  const onlyCodex={...snapshot,policy:{...policy,candidates:policy.candidates.filter((row:any)=>row.engine==='codex')}};
+  assert.throws(()=>buildRoutingPool(onlyCodex,{interactive:false,purpose:'review'}),(error:any)=>error.code==='model_policy_unavailable');
+  snapshot.machines.set('h1',{...machine,capabilities:['headless','interactive','effort']});
+  assert.deepEqual(buildRoutingPool(snapshot,{interactive:false,purpose:'review'}).options.map(row=>row.value.engine).sort(),['codex']);
+ }finally{rmSync(home,{recursive:true,force:true});}
+});
+
+test('engine mode declarations do not override unrelated global capabilities or legacy fallback',()=>{
+ const snapshot=capabilitySnapshot(['headless','interactive:codex','headless:claude','effort','custom-global','modes:v1:codex:i','modes:v1:claude:h']);
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:true,required_capabilities:['custom-global']}).options.map(row=>row.value.engine),['codex']);
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude']);
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort']});
+ assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2);
+ assert.equal(buildRoutingPool(snapshot,{interactive:true}).options.length,2);
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive:codex','interactive:claude','effort:codex','effort:claude']});
+ assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2,'old mixed-marker heartbeat has no authoritative declaration');
+ for(const unknown of ['modes:v2:codex:i','modes:v1:codex:','modes:v1:codex:ih','modes:v1:other:i']){
+  snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort',unknown]});
+  assert.equal(buildRoutingPool(snapshot,{interactive:false}).options.length,2,'unrecognized declarations do not redefine legacy hints');
+ }
+ snapshot.machines.set('h1',{connected:true,engines:['codex','claude'],capabilities:['headless','interactive','effort','modes:v1:codex:i','modes:v1:codex:hi']});
+ assert.deepEqual(buildRoutingPool(snapshot,{interactive:false}).options.map(row=>row.value.engine),['claude'],'another positive declaration cannot heal a complete negative');
+});
+
+test('intake 62ccfa1e: an engine that failed its preflight check on a machine is routed around there, never a refusal',async()=>{
+ const policy=pool.filter(row=>['go-muse','claude-sonnet-medium'].includes(row.id));
+ const view=(unhealthy:unknown[])=>({idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({machine_id:'h1',connected:true,
+  engines:['claude','go'],capabilities:['headless'],unhealthy_engines:unhealthy})})});
+ const env=poolEnv({'shared-go':true,claude:true},{'shared-go':90,claude:90},['claude','go'],policy);
+ const failed={engine:'go',reason:'engine_auth_check_unavailable',session_id:'s',failed_at:Date.now(),until:Date.now()+60_000};
+ env.MACHINES=view([failed]);
+ for(const draw of [0,0.5,0.99]){
+  const picked=await pickModelRouteDetailed(env,{interactive:false,machine_id:'h1'},()=>draw);
+  assert.equal(picked.route.engine,'claude','the unhealthy engine is never drawn on that machine');
+  assert.deepEqual(picked.diagnostics.excluded.filter(row=>row.reason==='engine_unhealthy').map(row=>row.policy_id),['go-muse']);
+ }
+ const pinned=await pickModelRouteDetailed(env,{interactive:false,engine:'go'},()=>0);
+ assert.equal(pinned.route.engine,'go','an explicit engine with nothing else left narrows, it does not refuse');
+ assert(pinned.diagnostics.advisories?.some(row=>row.reason==='engine_unhealthy'));
+ env.MACHINES=view([{...failed,until:Date.now()-1}]);
+ const lapsed=await pickModelRouteDetailed(env,{interactive:false},()=>0);
+ assert.equal(lapsed.diagnostics.excluded.some(row=>row.reason==='engine_unhealthy'),false,'an expired hold restores the engine');
 });

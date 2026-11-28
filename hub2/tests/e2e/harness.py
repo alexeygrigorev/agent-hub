@@ -179,8 +179,14 @@ class Host:
         self.workspace = self.workspace_root / "e2e-repo"
         self.workspace.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
-        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin",
-                        "https://github.com/" + PROJECT + ".git"], check=True)
+        # A real local origin/main keeps implement isolation in the integrated
+        # server/daemon/CLI test without network access.
+        subprocess.run(["git", "-C", str(self.workspace), "checkout", "-b", "main"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+                        "commit", "--allow-empty", "-m", "fixture main"], check=True, capture_output=True)
+        origin = root / "origin.git"
+        subprocess.run(["git", "clone", "--bare", str(self.workspace), str(origin)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.workspace), "remote", "add", "origin", str(origin)], check=True)
         self.state = root / "aplexer-state"
         self.state.mkdir()
         self.config_dir = root / "host-config"
@@ -189,23 +195,50 @@ class Host:
         self.config.write_text(json.dumps({
             "server": server.origin, "token": token, "machine_id": MACHINE,
             "roots": [str(self.workspace_root)], "engines": ["codex"],
-            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state)}}))
+            "launcher": {"routes": {"codex": {"provider": "codex"}}, "aplexer_state_dir": str(self.state), "private_provider_homes": True,
+                         # Stub workloads only: the 4 GB shared CI runner cannot satisfy the production
+                         # 10 GiB floor or the 1500 MB per-worker allowance.
+                         "reserved_floor_mb": 256, "memory_mb": 64}}))
         self.config.chmod(0o600)
         self.log_path = root / "host.log"
         self.process = None
         self.source = REPO / "hub2/host"
+        # Codex starts require the maintained quota wrapper (canonical body). The
+        # e2e wrapper runs a no-op gate and then the stub `codex` only.
+        wrapper_dir = root / "codex-wrapper"
+        wrapper_dir.mkdir(mode=0o700)
+        (wrapper_dir / "quota-gate.py").write_text("raise SystemExit(0)\n")
+        self.codex_wrapper = wrapper_dir / "launch-codex.sh"
+        self.codex_wrapper.write_text("#!/usr/bin/env bash\nset -euo pipefail\npython3 %s\nexec %s \"$@\"\n" % (
+            wrapper_dir / "quota-gate.py", STUB_BIN / "codex"))
+        self.codex_wrapper.chmod(0o700)
 
     def env(self):
         env = dict(os.environ, PATH=str(STUB_BIN) + os.pathsep + os.environ.get("PATH", ""),
-                   PYTHONPATH=os.pathsep.join(filter(None, [str(self.source), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1")
+                   PYTHONPATH=os.pathsep.join(filter(None, [str(self.source), os.environ.get("PYTHONPATH")])), APLEXER_STATE_DIR=str(self.state), PYTHONUNBUFFERED="1",
+                   CODEX_LAUNCH_WRAPPER=str(self.codex_wrapper))
         for name in ("HUB_TOKEN", "HUB_CONFIG_FILE", "HUB2_TOKEN", "HUB_URL"):
             env.pop(name, None)
         return env
 
     def start(self):
         log = open(self.log_path, "ab")
+        # Hermetic synthetic physical-RAM measurement for the REAL daemon on
+        # CI runners below the 10GiB admission floor. This is fixture-only:
+        # the bootstrap lives in this test's private root, patches the one
+        # measurement seam inside the daemon process the fixture itself
+        # spawns, and then runs the unmodified real CLI entrypoint. There is
+        # no production bypass: no env/config/floor key exists, the shipped
+        # entrypoint and the real sampler are byte-identical, and admission
+        # tests keep the real low-RAM refusal controls.
+        bootstrap = self.root / "host-bootstrap.py"
+        bootstrap.write_text(
+            "from agent_hub_host import cli, resource_admission\n"
+            "resource_admission.sample_available_bytes = "
+            "lambda deadline, platform=None: 64 * 1024**3\n"
+            "cli.main()\n")
         self.process = subprocess.Popen(
-            [sys.executable, "-m", "agent_hub_host.cli", "--config", str(self.config), "serve", "--label", "e2e"],
+            [sys.executable, str(bootstrap), "--config", str(self.config), "serve", "--label", "e2e"],
             cwd=self.root, env=self.env(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
     def alive(self):

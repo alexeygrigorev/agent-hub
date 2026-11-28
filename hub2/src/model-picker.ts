@@ -1,5 +1,5 @@
 import { HttpError } from './http';
-import type { CredentialMonitorEvidence, Hub2Env, PickerDiagnosticProducer } from './types';
+import type { CredentialMonitorEvidence, EvidenceInvalidationReason, Hub2Env, PickerDiagnosticProducer } from './types';
 import { buildRoutingPool, eligibleCandidates, weightedChoice, type AccountView, type MachineView,
   type RoutingPolicy, type RoutingSnapshot, type PickInput, type PickedRoute, type PickDiagnostics } from './routing-pool';
 export { weightedChoice, buildRoutingPool } from './routing-pool';
@@ -70,37 +70,73 @@ export async function pickModelRoute(env: Hub2Env, input: PickInput, random = Ma
 /** Optional diagnostics count the existing decisions; primary work never awaits IO. */
 function diagnosticObservation(env: Hub2Env, producer: PickerDiagnosticProducer) {
   let observer: CredentialMonitorEvidence | undefined, identity: unknown, settled = false;
-  const invalidate = () => { try { observer?.invalidate(); } catch {} };
+  const invalidate = (reason: EvidenceInvalidationReason) => { try { observer?.invalidate(reason); } catch {} };
   try { observer = env.PICKER_DIAGNOSTIC_EVIDENCE?.[producer]; identity = observer?.begin(); }
-  catch { invalidate(); observer = undefined; }
+  catch { invalidate('picker_begin_failed'); observer = undefined; }
   return {
     complete(alert: boolean) {
-      if (settled) { invalidate(); return; }
+      if (settled) { invalidate('picker_finish_failed'); return; }
       settled = true;
       try {
         // finish updates its memory/queue synchronously, but its durability is
         // awaited only by the fresh evidence barrier, never by a start/draw.
-        void observer?.finish(identity, alert ? 'alert' : 'observation').catch(invalidate);
-      } catch { invalidate(); }
+        void observer?.finish(identity, alert ? 'alert' : 'observation').catch(() => invalidate('picker_finish_failed'));
+      } catch { invalidate('picker_finish_failed'); }
     },
-    uncertain() { if (!settled) invalidate(); },
+    uncertain(reason: EvidenceInvalidationReason) { if (!settled) invalidate(reason); },
   };
+}
+
+type PickerStage = 'snapshot' | 'pool' | 'decision';
+function pickerFailureReason(stage: PickerStage, caught: unknown): EvidenceInvalidationReason {
+  const fallback = stage === 'snapshot' ? 'picker_snapshot_failed'
+    : stage === 'pool' ? 'picker_pool_failed' : 'picker_decision_incomplete';
+  // Read only a few known public codes; never message/detail/provider strings.
+  // Even a throwing code getter must not replace the original business error.
+  try {
+    if (caught instanceof HttpError) {
+      if (stage === 'snapshot' && caught.code === 'model_picker_data_unavailable') return 'picker_snapshot_data_unavailable';
+      if (stage !== 'decision' && caught.code === 'no_connected_host')
+        return stage === 'snapshot' ? 'picker_snapshot_no_host' : 'picker_pool_no_host';
+      if (stage !== 'decision' && (caught.code === 'model_policy_unavailable' || caught.code === 'model_policy_unconfigured'))
+        return stage === 'snapshot' ? 'picker_snapshot_policy_unavailable' : 'picker_pool_policy_unavailable';
+    }
+  } catch { /* Diagnostics cannot change or expose an unknown exception. */ }
+  return fallback;
+}
+
+/** Only normal quota filtering is non-alerting; new/unknown reasons stay actionable. */
+export function pickerExclusionsNeedAlert(excluded: PickDiagnostics['excluded']): boolean {
+  return excluded.some(row => row.reason !== 'codex_reserve' && row.reason !== 'quota_below_minimum');
 }
 
 export async function pickModelRouteDetailed(env: Hub2Env, input: PickInput, random = Math.random): Promise<{route: PickedRoute; diagnostics: PickDiagnostics}> {
   const excluded = diagnosticObservation(env, 'picker_excluded');
   const quota = diagnosticObservation(env, 'picker_quota_stale');
+  let stage: PickerStage = 'snapshot';
+  let failureReason: EvidenceInvalidationReason = 'picker_decision_incomplete';
   try {
-    const {options, diagnostics} = buildRoutingPool(await loadRoutingSnapshot(env, input), input);
-    excluded.complete(diagnostics.excluded.length > 0);
-    if (diagnostics.excluded.length) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', JSON.stringify(diagnostics.excluded));
+    const snapshot = await loadRoutingSnapshot(env, input);
+    stage = 'pool';
+    const {options, diagnostics} = buildRoutingPool(snapshot, input);
+    stage = 'decision';
+    const exclusionAlert = pickerExclusionsNeedAlert(diagnostics.excluded);
+    excluded.complete(exclusionAlert);
+    if (diagnostics.excluded.length) {
+      const message = JSON.stringify(diagnostics.excluded);
+      if (exclusionAlert) console.error('[hub2] MODEL_PICKER_EXCLUDED alert=dev@dtcdev.click', message);
+      else console.info('[hub2] MODEL_PICKER_EXCLUDED observation', message);
+    }
     quota.complete(!!diagnostics.warnings?.length);
     if (diagnostics.warnings?.length) console.error('[hub2] QUOTA_STALE alert=dev@dtcdev.click', JSON.stringify(diagnostics.warnings));
     return {route: weightedChoice(options, random), diagnostics};
+  } catch (caught) {
+    failureReason = pickerFailureReason(stage, caught);
+    throw caught;
   } finally {
     // Unknown input/decision outcomes must not become a clean healthy sample.
     // Completed decisions remain counted even if weightedChoice later refuses.
-    excluded.uncertain(); quota.uncertain();
+    excluded.uncertain(failureReason); quota.uncertain(failureReason);
   }
 }
 

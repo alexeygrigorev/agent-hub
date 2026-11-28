@@ -106,8 +106,8 @@ def main(args):
                   'Never print credentials, edit other projects, or contact other services. After these checks, mark this native goal complete and wait for controller cleanup; do not start more work.')
         intake = operator.request('POST', '/api/intakes' + project_query, {'key': 'intake-' + suffix,
             'title': 'Approved central native goal acceptance fixture', 'text': prompt,
-            'acceptance_criteria': ['Correct central SDK credential source', 'Authoritative exact-thread goal proof',
-                                    'Real worker scoped CLI read', 'Owned native cleanup and lease release']})['intake']
+            'acceptance_criteria': ['Correct central SDK credential source', 'Authoritative exact-thread goal proof t1',
+                                    'Real worker scoped CLI read t1', 'Owned native cleanup and lease release t1']})['intake']
         proof['intake_id'] = intake['id']
         host_log = (output / 'host.log').open('w')
         private_file(output / 'host.log')

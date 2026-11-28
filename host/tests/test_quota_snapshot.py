@@ -813,7 +813,7 @@ class TestHubAbsentWindowConsistency(unittest.TestCase):
                 "status": "ok",
                 "windows": {"7d": {"percent_remaining": 68.0, "reset_at": "2026-10-25T00:00:00Z"}},
             },
-            "codex-orin": {
+            "grok": {
                 "status": "ok",
                 "windows": {"7d": {"percent_remaining": 99.0, "reset_at": "2026-10-25T00:00:00Z"}},
             },
@@ -829,7 +829,7 @@ class TestHubAbsentWindowConsistency(unittest.TestCase):
         self.assertEqual(codex["observed_at"], "2026-10-18T20:00:00Z")
         self.assertEqual(codex["windows"]["7d"]["percent_remaining"], 68.0)
 
-        orin = snap["routes"]["codex-orin"]
+        orin = snap["routes"]["grok"]
         self.assertEqual(orin["status"], "ok")
         self.assertEqual(orin["observed_at"], "2026-10-18T20:00:00Z")
         self.assertEqual(orin["windows"]["7d"]["percent_remaining"], 99.0)

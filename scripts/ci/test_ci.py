@@ -10,7 +10,6 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 VALIDATE_SCRIPT = REPO_ROOT / "scripts" / "ci" / "validate-workflow.py"
-ROLLBACK_SCRIPT = REPO_ROOT / "scripts" / "ci" / "rollback.py"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 
@@ -28,7 +27,7 @@ class TestCICD(unittest.TestCase):
         self.assertEqual(package["project"]["version"], "2.0.0")
         self.assertEqual(package["project"]["dependencies"], ["websockets==16.0"])
         self.assertEqual(package["tool"]["setuptools"]["package-dir"], {"": "hub2/host"})
-        self.assertEqual(set(package["project"]["scripts"]), {"hub", "hub2"})
+        self.assertEqual(set(package["project"]["scripts"]), {"hub"})  # no hub2 console script
 
 
 class TestRollbackContract(unittest.TestCase):

@@ -10,6 +10,7 @@
 # Installs $HUB_INSTALL_DIR/hub (a python3 zipapp launcher). Fails atomically
 # on any error; never touches global dirs or the `aplexer` binary.
 set -eu
+umask 077 # Only this installer subprocess: private verified-download staging.
 
 BASE_DEFAULT="https://hub.dtcdev.click"
 BASE="${HUB_BASE_URL:-$BASE_DEFAULT}"
@@ -61,12 +62,36 @@ else
 fi
 [ "$ACTUAL" = "$EXPECTED" ] || fail "sha256 mismatch (manifest $EXPECTED vs actual $ACTUAL)"
 
-# Atomic user-local install: only ever writes $INSTALL_DIR/hub.
-mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
-TMP_BIN="$INSTALL_DIR/.hub.tmp.$$"
-cp "$WORK/hub.pyz" "$TMP_BIN" || fail "copy failed"
-chmod 755 "$TMP_BIN" || fail "chmod failed"
-mv -f "$TMP_BIN" "$INSTALL_DIR/hub" || fail "install move failed"
+# Future Linux regular installs and previously owned regular entries use the
+# shared publisher. Existing unowned entries retain explicit manual semantics.
+OWNED_ROOT="$HOME/.local/share/agent-hub2"
+REGULAR_DECISION=unmanaged
+if [ "$(uname -s)" = Linux ]; then
+  curl -fsSL "$BASE/cli/host-release.json" -o "$WORK/host-release.json" || fail "host release manifest download failed"
+  # Verified Python performs strict nofollow selection; shell -e/-L would
+  # collapse EACCES into absence and bypass an established owned writer.
+  REGULAR_DECISION="$(python3 -I -S -c "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('agent_hub_host.regular_cli',run_name='__main__')" \
+    "$WORK/hub.pyz" --root "$OWNED_ROOT" --target "$INSTALL_DIR/hub" \
+    --archive "$WORK/hub.pyz" --manifest "$WORK/host-release.json" --select-install)" \
+    || fail "regular CLI ownership selection unavailable; no manual fallback"
+  case "$REGULAR_DECISION" in owned|new|unmanaged) ;; *) fail "invalid regular CLI selection" ;; esac
+fi
+if [ "$REGULAR_DECISION" = owned ] || [ "$REGULAR_DECISION" = new ]; then
+  CREATE=""
+  if [ "$REGULAR_DECISION" = new ]; then CREATE="--create"; fi
+  python3 -I -S -c "import runpy,sys;sys.path.insert(0,sys.argv.pop(1));runpy.run_module('agent_hub_host.regular_cli',run_name='__main__')" \
+    "$WORK/hub.pyz" --root "$OWNED_ROOT" --target "$INSTALL_DIR/hub" \
+    --archive "$WORK/hub.pyz" --manifest "$WORK/host-release.json" $CREATE \
+    || fail "owned regular CLI publication refused; retained state requires reconciliation"
+else
+  # Atomic user-local install: only ever writes $INSTALL_DIR/hub.
+  mkdir -p "$INSTALL_DIR" || fail "cannot create $INSTALL_DIR"
+  TMP_BIN="$INSTALL_DIR/.hub.tmp.$$"
+  cp "$WORK/hub.pyz" "$TMP_BIN" || fail "copy failed"
+  chmod 755 "$TMP_BIN" || fail "chmod failed"
+  mv -f "$TMP_BIN" "$INSTALL_DIR/hub" || fail "install move failed"
+  
+fi
 
 # Sanity: installed launcher answers --help/--version without network.
 "$INSTALL_DIR/hub" --help >/dev/null 2>&1 || fail "installed hub --help failed"

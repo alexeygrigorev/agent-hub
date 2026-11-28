@@ -1,22 +1,26 @@
+import { spawnSync } from 'node:child_process';
+import { fstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { MachineDO } from '../src/machine-do.ts';
-import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, isLiveActiveSession } from '../src/session-liveness.ts';
+import { HOST_INVENTORY_LOST_MS, LIVE_SNAPSHOT_TTL_MS, CLAIMED_WITHOUT_NATIVE_GRACE_MS, isLiveActiveSession } from '../src/session-liveness.ts';
 
 const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',generation:'1',scopes:['machine:heartbeat','session:report']};
 const header={'Content-Type':'application/json','x-hub2-actor':JSON.stringify(machineActor)};
 
 function fixture(revokeFailures=0,projectFailures=0){
  const database=new DatabaseSync(':memory:'),events:Array<{path:string;body:any}>=[],sockets:any[]=[];
- const revocations:any[]=[];
+ const revocations:any[]=[],kv=new Map<string,unknown>();let kvHook:((key:string)=>void)|undefined,kvDeleteHook:(()=>void)|undefined;
  let alarm:number|null=null;
  const ctx:any={id:{toString:()=> 'machine-h1'},storage:{sql:{exec(query:string,...args:unknown[]){
   const statement=database.prepare(query);let rows:unknown[]=[],rowsRead=0,rowsWritten=0;
   if(statement.columns().length){rows=statement.all(...args as any);rowsRead=rows.length;}
   else{const result=statement.run(...args as any);rowsWritten=Number(result.changes);}
   return{toArray:()=>rows,rowsRead,rowsWritten};
- }},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(error){database.exec('ROLLBACK');throw error;}}},
+ }},async get(key:string){return structuredClone(kv.get(key));},async put(key:string,value:unknown){kv.set(key,structuredClone(value));kvHook?.(key);},async delete(key:string){kvDeleteHook?.();return kv.delete(key);},async getAlarm(){return alarm;},async setAlarm(value:number){alarm=value;},async deleteAlarm(){alarm=null;},transactionSync<T>(fn:()=>T):T{database.exec('BEGIN');try{const result=fn();database.exec('COMMIT');return result;}catch(error){database.exec('ROLLBACK');throw error;}}},
   blockConcurrencyWhile(fn:()=>unknown){return Promise.resolve(fn());},getWebSockets(){return sockets;}};
  const env:any={
   CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
@@ -37,7 +41,7 @@ function fixture(revokeFailures=0,projectFailures=0){
  };
  let machine=new MachineDO(ctx,env);
  const call=(path:string,method='GET',body?:unknown,headers:Record<string,string>={})=>machine.fetch(new Request('https://machine.test'+path,{method,headers:{...header,...headers},...(body===undefined?{}:{body:JSON.stringify(body)})}));
- return{database,get machine(){return machine;},restart:()=>machine=new MachineDO(ctx,env),call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
+ return{database,kv,onKvDelete:(fn:(()=>void)|undefined)=>{kvDeleteHook=fn;},onKvPut:(fn:((key:string)=>void)|undefined)=>{kvHook=fn;},get machine(){return machine;},restart:()=>machine=new MachineDO(ctx,env),call,events,sockets,revocations,clearCache:()=>((machine as any).db.cache.clear()),get alarm(){return alarm;}};
 }
 
 async function startClaimed(f:ReturnType<typeof fixture>,sessionId:string,nativeId:string|null){
@@ -348,6 +352,41 @@ test('host launch refusal terminally fails an unclaimed offer with a visible rea
  assert.equal(f.events.at(-1)?.body.epoch,epoch);assert.equal(f.events.at(-1)?.body.reason,'host_launch_refused');
  assert.equal(f.events.at(-1)?.body.failure_reason,'workspace_label_unavailable');
  assert.equal(f.events.at(-1)?.body.launch_failed,true);
+ // A workspace/request refusal is not an engine fault: the engine stays routable.
+ assert.equal((await (await f.call('/_internal/routing')).json() as any).unhealthy_engines,undefined);
+ // An untyped host launch failure marks the engine unhealthy on this machine.
+ const other='untyped-host-failure',otherEpoch=await startOffered(f,other);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:other,
+  operation_id:'op-'+other,epoch:otherEpoch,stage:'host_launch',reason:'opaque_untyped_failure'}));
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(other) as any).reason,'host_operation_failed');
+ const unhealthy=(await (await f.call('/_internal/routing')).json() as any).unhealthy_engines;
+ assert.deepEqual(unhealthy?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','host_operation_failed',other]]);
+});
+
+test('running antigravity first-run block raises named attention and fails finish loudly',async()=>{
+ const f=fixture(),sessionId='agy-tos-blocked',nativeId='11111111-2222-3333-4444-555555555555';
+ const epoch=await startClaimed(f,sessionId,nativeId);
+ const admittedAt=Date.now();
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(
+  JSON.stringify({workspace:'/tmp',engine:'antigravity',model:'gemini-4-hydrogen-medium',prompt:'test work',interactive:true,timeout_seconds:1800}),sessionId);
+ f.database.prepare('INSERT INTO launch_admissions(operation_id,session_id,epoch,observed_at) VALUES(?,?,?,?)').run('op-'+sessionId,sessionId,epoch,admittedAt);
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+ f.sockets.push(socket);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:sessionId,
+  operation_id:'op-'+sessionId,epoch,stage:'host_runtime',reason:'antigravity_first_run_blocked'}));
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'antigravity_first_run_blocked');
+ const finished=await f.call(`/api/sessions/${sessionId}/finish`,'POST',{
+  operation_id:'op-'+sessionId,epoch,native_id:nativeId,exit_code:143,native_exit_confirmed:true,
+  failure_reason:'antigravity_first_run_blocked',
+  evidence:{source:'aplexer_status',native_identity:{id:nativeId,tag:'task-hub2-'+sessionId,workspace:'/tmp'},
+   containment_empty:true,native_exit:{code:143,exited_at_ms:admittedAt+1000},
+   native_deadline:{deadline_ms:admittedAt+1800*1000,exceeded:false},launcher_state:'finalized'},
+ });
+ assert.equal(finished.status,201);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(sessionId) as any).state,'failed');
+ assert.equal((f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(sessionId) as any).reason,'antigravity_first_run_blocked');
+ assert.equal(f.events.at(-1)?.body.failure_reason,'antigravity_first_run_blocked');
+ assert.equal(f.events.at(-1)?.body.detail,'Antigravity is blocked on first-run onboarding or Terms of Service.');
 });
 
 test('authentication refusal from an unclaimed offer routes to model fallback',async()=>{
@@ -622,6 +661,47 @@ test('an unclaimed offer has one terminal acceptance deadline and never requeues
  assert.ok(!f.events.some(event=>event.path==='/_internal/requeue'));
 });
 
+test('t4016u: a burst start the host reports as queued waits under its lease, reads queued on host, then launches',async()=>{
+ const f=fixture(),frames:any[]=[],admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(value:string)=>frames.push(JSON.parse(value))};
+ f.sockets.push(socket);
+ const queued='burst-queued',epoch=await startOffered(f,queued);
+ // Old enough that the ordinary 2 minute grace has lapsed.
+ const created=Date.now()-150_000;
+ f.database.prepare('UPDATE sessions SET created_at=?,offer_expires_at=? WHERE id=?').run(created,created+120_000,queued);f.clearCache();
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:queued,epoch,operation_id:'op-'+queued,depth:3,cause:'launch_slots'}));
+ const reply=frames.find(frame=>frame.type==='offer_queued');
+ assert.equal(reply.session_id,queued);assert.ok(reply.expires_at>Date.now()+60_000,'the queued offer lease is extended');
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'offered','queued start must not fail');
+ assert.ok(!f.events.some(event=>event.path==='/_internal/reaped'),'no launch failure reported for a queued start');
+ const view=(await (await f.call('/api/sessions/'+queued,'GET',undefined,admin)).json() as any).session;
+ assert.equal(view.start_state,'queued_on_host');assert.equal(view.host_queue.state,'queued');assert.equal(view.attention.reason,'host_launch_queued');
+ // The slot frees: the host claims it and gets the full launch grace from the claim.
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:queued,epoch}));
+ assert.ok(frames.some(frame=>frame.type==='ack'&&frame.session_id===queued),'a lease-extended offer is still claimable');
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'claimed');
+ const started=await f.call('/api/sessions/'+queued+'/started','POST',{operation_id:'op-'+queued,epoch,native_id:'00000000-0000-4000-8000-000000004016'});
+ assert.equal(started.status,201);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(queued) as any).state,'running');
+ assert.equal(f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(queued),undefined,'queued attention clears on start');
+
+ // Without fresh reports the lease lapses and the ordinary timeout applies.
+ const silent='burst-silent',silentEpoch=await startOffered(f,silent);
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:silent,epoch:silentEpoch,depth:1,cause:'launch_slots'}));
+ f.database.prepare('UPDATE sessions SET created_at=?,offer_expires_at=? WHERE id=?').run(Date.now()-300_000,Date.now()-1,silent);
+ f.database.prepare('UPDATE attention SET observed_at=? WHERE session_id=?').run(Date.now()-91_000,silent);f.clearCache();
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(silent) as any).state,'failed');
+ // And the overall queue wait is bounded even while the host keeps reporting.
+ const capped='burst-capped',cappedEpoch=await startOffered(f,capped);
+ f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-31*60_000,capped);f.clearCache();
+ await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_queued',session_id:capped,epoch:cappedEpoch,depth:1,cause:'launch_slots'}));
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(capped) as any).state,'failed');
+});
+
 test('claim timestamps cannot extend the original start deadline',async()=>{
  const f=fixture(),session='late-claim';await startClaimed(f,session,null);
  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(Date.now()-120_001,Date.now(),session);
@@ -823,7 +903,7 @@ test('latest schema preserves pending version-six commands and adds capture mode
  assert.equal(listed.status,200);assert.equal((await listed.json() as any).commands[0].id,created.command_id);
  const row=f.database.prepare('SELECT * FROM session_commands WHERE id=?').get(created.command_id) as any;
  assert.equal(row.capture_mode,null);assert.equal(row.state,'pending');
- assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,9);
+ assert.equal((f.database.prepare('SELECT version FROM hub2_schema').get() as any).version,10);
 });
 
 
@@ -947,7 +1027,7 @@ test('legacy absence receipt rejects invented exit, incomplete census and identi
  assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
 });
 
-test('a first legacy receipt for a superseded attempt refuses unavailable launch metadata without effects',async()=>{
+test('a first legacy receipt for a superseded attempt preserves lifecycle and raises a diagnostic alert',async()=>{
  const f=fixture(),session='legacy-superseded',epoch=await startClaimed(f,session,null),receipt=legacyUnobserved(session,epoch);
  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run(receipt.operation_id,session,epoch,Date.now()-100);
  f.database.prepare("UPDATE machine_session_operations SET state='expired' WHERE operation_id=?").run(receipt.operation_id);
@@ -957,7 +1037,8 @@ test('a first legacy receipt for a superseded attempt refuses unavailable launch
  const outboxes=f.database.prepare('SELECT * FROM machine_outbox').all();
  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',receipt)).status,409);
  assert.deepEqual(f.database.prepare('SELECT * FROM sessions WHERE id=?').get(session),before);
- assert.deepEqual(f.database.prepare('SELECT * FROM machine_outbox').all(),outboxes);
+ assert.deepEqual(f.database.prepare("SELECT * FROM machine_outbox WHERE kind<>'finish-dead-letter'").all(),outboxes);
+ assert.equal(f.events.filter(event=>event.path==='/_internal/finish-dead-letter').length,1);
  assert.equal(f.revocations.length,0);
  assert.equal(f.events.some(event=>event.path==='/_internal/reaped'),false);
 });
@@ -1303,4 +1384,794 @@ test('oversized unfiltered history refuses explicitly while selected receipts st
  assert.deepEqual(foreign,{commands:[],next_cursor:null});
  const denied={'x-hub2-actor':JSON.stringify({id:'agent',kind:'agent',resource_id:'foreign',scopes:['session:read']})};
  assert.equal((await f.call('/api/sessions/'+session+'/commands?command_id='+target,'GET',undefined,denied)).status,404);
+});
+
+
+const failedStopActor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+async function failedPrelaunchFixture(label:string){
+ const f=fixture(),epoch=await startClaimed(f,label,null),frames:any[]=[];
+ f.database.prepare("UPDATE sessions SET state='failed' WHERE id=?").run(label);
+ f.database.prepare("UPDATE machine_session_operations SET state='failed' WHERE session_id=?").run(label);f.clearCache();
+ f.sockets.push({readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:(v:string)=>frames.push(JSON.parse(v))});
+ return {f,epoch,frames,base:'/api/sessions/'+label+'/commands'};
+}
+
+test('failed prelaunch stop waits for exact host dispatch fence and replays without fabricating native exit',async()=>{
+ const {f,epoch,frames,base}=await failedPrelaunchFixture('failed-fenced-stop');
+ const queued=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(queued.status,201);
+ const {command}=await queued.json() as any;
+ assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'pending');
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-fenced-stop') as any).state,'failed');
+ assert.equal(frames.at(-1).command.id,command.id);assert.equal(frames.at(-1).command.pre_native,true);
+ const beforeEvents=f.events.length;f.restart();
+ const repeated=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal((await repeated.json() as any).command.id,command.id);
+ const body={epoch,result:{stopped:true,evidence:'dispatch_fenced'}};
+ assert.equal((await f.call(base+'/'+command.id+'/ack','POST',body)).status,200);
+ assert.deepEqual({...f.database.prepare('SELECT state,native_id FROM sessions WHERE id=?').get('failed-fenced-stop') as any},{state:'stopped',native_id:null});
+ const stopEvents=f.events.slice(beforeEvents).filter(e=>e.body.reason==='stop_confirmed');assert.equal(stopEvents.length,1);
+ assert.equal(stopEvents[0].body.no_dispatch,true);assert.equal(stopEvents[0].body.native_id,null);
+ assert.equal(stopEvents[0].body.native_exit_confirmed,undefined);
+ assert.deepEqual(await (await f.call(base+'/'+command.id+'/ack','POST',body)).json(),{acknowledged:true,duplicate:true});
+ assert.equal(f.events.slice(beforeEvents).filter(e=>e.body.reason==='stop_confirmed').length,1);
+});
+
+test('failed prelaunch stop refuses missing proof and native-exit substitution without changing historical failure',async()=>{
+ for(const [i,result] of [{stopped:true},{stopped:true,evidence:'native_exit',native_id:'invented-native'},{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}].entries()){
+  const {f,epoch,base}=await failedPrelaunchFixture('failed-unconfirmed-'+i);
+  const response=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(response.status,201);
+  const {command}=await response.json() as any;
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',{epoch,result})).status,200);
+  const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+  assert.equal(row.state,'failed');assert.equal(JSON.parse(row.result_json).error,'stop_unconfirmed');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-unconfirmed-'+i) as any).state,'failed');
+  assert.equal(f.events.filter(e=>e.body.reason==='stop_confirmed').length,0);
+ }
+});
+
+test('failed prelaunch stop fences foreign actors stale epoch and native race',async()=>{
+ for(const mode of ['foreign','epoch','successor','native']){
+  const {f,epoch,base}=await failedPrelaunchFixture('failed-fence-'+mode);
+  const response=await f.call(base,'POST',{kind:'stop',key:'owned-stop'},failedStopActor);assert.equal(response.status,201);
+  const {command}=await response.json() as any;
+  if(mode==='native')f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('actual-native','failed-fence-'+mode);
+  if(mode==='successor')f.database.prepare('UPDATE sessions SET epoch=epoch+1 WHERE id=?').run('failed-fence-'+mode);
+  f.clearCache();
+  const headers=mode==='foreign'?{'x-hub2-actor':JSON.stringify({...machineActor,resource_id:'foreign'})}:{};
+  const ack=await f.call(base+'/'+command.id+'/ack','POST',{epoch:mode==='epoch'?epoch+1:epoch,result:{stopped:true,evidence:'dispatch_fenced'}},headers);
+  assert([200,409].includes(ack.status));
+  assert.notEqual((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(command.id) as any).state,'acked');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get('failed-fence-'+mode) as any).state,'failed');
+ }
+});
+
+test('failed prelaunch stop does not authorize send capture foreign owner or failed native sessions',async()=>{
+ const {f,base}=await failedPrelaunchFixture('failed-not-running');
+ for(const kind of ['send','capture'])assert.equal((await f.call(base,'POST',{kind,key:'key-'+kind,...(kind==='send'?{text:'no'}:{})},failedStopActor)).status,409);
+ const foreign={'x-hub2-actor':JSON.stringify({id:'other',kind:'operator',resource_id:'other',scopes:['session:stop']})};
+ assert.equal((await f.call(base,'POST',{kind:'stop',key:'foreign'},foreign)).status,403);
+ f.database.prepare('UPDATE sessions SET native_id=? WHERE id=?').run('native-existing','failed-not-running');f.clearCache();
+ assert.equal((await f.call(base,'POST',{kind:'stop',key:'native-stop'},failedStopActor)).status,409);
+});
+
+test('finishWithoutDispatch surfaces attention and events on sessions show and events',async()=>{
+ const f=fixture(),session='no-dispatch-events',epoch=await startClaimed(f,session,null);
+ f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());
+ f.clearCache();
+ const reply=await f.call('/api/sessions/'+session+'/finish','POST',{
+  operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+  failure_reason:'native_launch_route_missing',detail:'RuntimeError: native_launch_route_missing'});
+ assert.equal(reply.status,200);
+ const admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const shown=await f.call('/api/sessions/'+session,'GET',undefined,admin);
+ assert.equal(shown.status,200);
+ const view=(await shown.json() as any).session;
+ assert.equal(view.attention?.reason,'native_launch_route_missing');
+ assert.equal(view.attention?.detail,'Native launch route is unavailable.');
+ const eventsRes=await f.call('/api/sessions/'+session+'/events','GET',undefined,admin);
+ assert.equal(eventsRes.status,200);
+ const eventsBody=(await eventsRes.json() as any);
+ assert.ok(eventsBody.events.some((e:any)=>e.kind==='attention'&&e.reason==='native_launch_route_missing'));
+});
+
+// Missing status is an observation failure, not authority to retire the bound native.
+test('unconfirmed custody survives missing null foreign and partial native observations',async()=>{
+ for(const observed of ['native-original',null,'native-foreign','omitted']){
+  const f=fixture(),session='custody-'+String(observed),epoch=await startClaimed(f,session,'native-original');
+  const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+  const queued=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'first-stop',kind:'stop'},actor);
+  const {command}=await queued.json() as any;
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:observed==='omitted'?[]:[{
+   session_id:session,native_id:observed,phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+  }]})).status,200);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+  const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+  assert.equal(reap.reaped,0);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  const later=await f.call(`/api/sessions/${session}/commands`,'POST',{key:'qualified-stop',kind:'stop'},actor);
+  assert.equal(later.status,201);
+  const next=(await later.json() as any).command;
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${next.id}/ack`,'POST',{epoch:epoch+1,result:{stopped:true,evidence:'native_exit',native_id:'native-original'}})).status,409);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${next.id}/ack`,'POST',{epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-foreign'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal((f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(next.id) as any).state,'failed');
+  const final=(await (await f.call(`/api/sessions/${session}/commands`,'POST',{key:'final-qualified-stop',kind:'stop'},actor)).json() as any).command;
+  assert(final);
+  const proof={epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-original'}};
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${final.id}/ack`,'POST',proof)).status,200);
+  assert.equal((await f.call(`/api/sessions/${session}/commands/${final.id}/ack`,'POST',proof)).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+ }
+});
+
+
+test('native control diagnostics retain closed failures without qualifying stop or changing old ACKs',async()=>{
+ for(const kind of ['stop','capture']){
+  const f=fixture(),session='native-diagnostic-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'diagnostic-'+kind},actor);
+   assert.equal(response.status,201);const command=(await response.json() as any).command;
+   const diagnostic={native_control_stage:kind==='stop'?'stop_verify':'capture_retained',native_control_error:'timeout'};
+   const result=kind==='stop'?{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...diagnostic}
+     :{error:'task_output_unavailable',reason:'task_output_unavailable',...diagnostic};
+   const ack=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(ack.status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'failed');const stored=JSON.parse(row.result_json);
+   assert.equal(stored.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(stored.native_control_error,'timeout');
+   const listing=await (await f.call(`/api/sessions/${session}/commands`,'GET',undefined,actor)).json() as any;
+   const listed=listing.commands.find((item:any)=>item.id===command.id);
+   assert.equal(listed.ack.native_control_stage,diagnostic.native_control_stage);
+   assert.equal(listed.ack.native_control_error,'timeout');
+   if(kind==='stop')assert.equal(listed.ack.confirmed_exit,false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+   const duplicate=await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{epoch,result});
+   assert.equal(duplicate.status,200);
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics strip arbitrary fields and preserve old missing metadata',async()=>{
+ for(const extra of [{},{native_control_stage:'PRIVATE_PATH',native_control_error:'PRIVATE_TOKEN'},
+                     {native_control_stage:'stop_verify',native_control_error:true}]){
+  const f=fixture(),session='native-private-diagnostic',native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind:'stop',key:'private-diagnostic'},actor);
+   const command=(await response.json() as any).command;
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop',...extra}})).status,200);
+   const stored=JSON.parse((f.database.prepare('SELECT result_json FROM session_commands WHERE id=?').get(command.id) as any).result_json);
+   assert.equal(JSON.stringify(stored).includes('PRIVATE'),false);
+   if(Object.keys(extra).length){assert.equal(stored.native_control_stage,'unknown');assert.equal(stored.native_control_error,'unknown');}
+   else assert.deepEqual(stored,{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'});
+  }finally{f.database.close();}
+ }
+});
+
+test('native control diagnostics never alter successful qualified control wire',async()=>{
+ for(const kind of ['capture','stop']){
+  const f=fixture(),session='native-healthy-'+kind,native='11111111-2222-4333-8444-555555555555';
+  try{
+   const epoch=await startClaimed(f,session,native);
+   const actor={'x-hub2-actor':JSON.stringify({id:'operator',kind:'operator',scopes:['operator:admin']})};
+   const response=await f.call(`/api/sessions/${session}/commands`,'POST',{kind,key:'healthy-'+kind},actor);
+   const command=(await response.json() as any).command;
+   const result=kind==='stop'?{stopped:true,evidence:'native_exit',native_id:native}:{output:'synthetic returned output'};
+   assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',{
+    epoch,result:{...result,native_control_stage:kind==='stop'?'stop_verify':'capture_rpc',native_control_error:'timeout'}})).status,200);
+   const row=f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(command.id) as any;
+   assert.equal(row.state,'acked');const stored=JSON.parse(row.result_json);
+   assert.equal('native_control_stage' in stored,false);assert.equal('native_control_error' in stored,false);
+   for(const [key,value] of Object.entries(result))assert.deepEqual(stored[key],value);
+  }finally{f.database.close();}
+ }
+});
+
+
+test('launch privacy closes receipt reason and detail before actual public persistence',async()=>{
+ const admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ for(const [i,reason] of ['opaque_secret','/PRIVATE/path prompt','workspace_unavailable','headless_effort_unsupported'].entries()){
+  const f=fixture(),session='privacy-receipt-'+i;
+  try{
+   const epoch=await startClaimed(f,session,null);
+   f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());f.clearCache();
+   const response=await f.call('/api/sessions/'+session+'/finish','POST',{
+    operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+    failure_reason:reason,detail:'PRIVATE /secret/path prompt and opaque_secret'});
+   assert.equal(response.status,200);
+   const expected=['workspace_unavailable','headless_effort_unsupported'].includes(reason)?reason:'native_dispatch_not_started';
+   const stored=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+   assert.equal(stored.reason,expected);
+   const view=await (await f.call('/api/sessions/'+session,'GET',undefined,admin)).json() as any;
+   const events=await (await f.call('/api/sessions/'+session+'/events','GET',undefined,admin)).json() as any;
+   assert.equal(view.session.attention.reason,expected);
+   const publicText=JSON.stringify({view,events,forwarded:f.events});
+   for(const value of ['PRIVATE','/secret/path','opaque_secret','prompt and'])assert.equal(publicText.includes(value),false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'failed');
+   assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{
+    operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,
+    failure_reason:reason,detail:'PRIVATE'})).status,200);
+  }finally{f.database.close();}
+ }
+});
+
+test('launch privacy projects historical stored diagnostics without changing rows',async()=>{
+ const f=fixture(),session='privacy-legacy',admin={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ try{
+  const epoch=await startClaimed(f,session,null);
+  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,Date.now());f.clearCache();
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{
+   operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true})).status,200);
+  const row=f.database.prepare('SELECT attempt FROM sessions WHERE id=?').get(session) as any;
+  f.database.prepare('UPDATE attention SET reason=? WHERE session_id=?').run('opaque_secret',session);
+  f.database.prepare('UPDATE sessions SET evidence_json=? WHERE id=?').run(JSON.stringify({_hub_host_start_diagnostic:{
+   operation_id:'op-'+session,attempt:row.attempt,epoch,reason:'opaque_secret',stage:'host_launch',detail:'PRIVATE /secret/path prompt'}}),session);
+  f.database.prepare('UPDATE machine_outbox SET payload_json=? WHERE operation_id=?').run(JSON.stringify({
+   session_id:session,reason:'opaque_secret',failure_reason:'opaque_secret',detail:'PRIVATE /secret/path prompt'}),'op-'+session);
+  f.clearCache();
+  const before=JSON.stringify(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session));
+  const view=await (await f.call('/api/sessions/'+session,'GET',undefined,admin)).json();
+  const events=await (await f.call('/api/sessions/'+session+'/events','GET',undefined,admin)).json();
+  for(const value of ['PRIVATE','/secret/path','opaque_secret'])assert.equal(JSON.stringify({view,events}).includes(value),false);
+  assert.equal(JSON.stringify(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)),before);
+ }finally{f.database.close();}
+});
+
+test('launch privacy closes authenticated host attention while retaining known fallback',async()=>{
+ for(const reason of ['opaque_secret','workspace_label_unavailable','provider_auth_failed']){
+  const f=fixture(),session='privacy-attention';
+  try{
+   await startOffered(f,session);
+   const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'socket'}),send:()=>{}};
+   f.sockets.push(socket);
+   await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'host.error',session_id:session,
+    operation_id:'op-'+session,stage:'host_launch',reason,detail:'PRIVATE /secret/path prompt'}));
+   const stored=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+   assert.equal(stored.reason,reason==='opaque_secret'?'host_operation_failed':reason);
+   assert.equal(JSON.stringify(f.events).includes('PRIVATE'),false);
+   assert.equal(JSON.stringify(f.events).includes('opaque_secret'),false);
+   assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,
+                reason==='provider_auth_failed'?'expired':'failed');
+  }finally{f.database.close();}
+ }
+});
+
+test('missing native after startup grace retains custody and requests qualified STOP',async()=>{
+ const f=fixture(),session='missing-after-start-grace';await startClaimed(f,session,'native-absent');
+ f.database.prepare('UPDATE sessions SET created_at=? WHERE id=?').run(Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000,session);
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+  session_id:session,native_id:'native-absent',phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false,
+ }]})).status,200);
+ const reap=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(reap.reaped,0);assert.equal(reap.stop_requested,1);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+ assert.equal(f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session),undefined);
+ const again=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+ assert.equal(again.reaped,0);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ const command=f.database.prepare("SELECT id,epoch FROM session_commands WHERE session_id=? AND kind='stop' AND state='pending'").get(session) as any;
+ assert(command);
+ const proof={epoch:command.epoch,result:{stopped:true,evidence:'native_exit',native_id:'native-absent'}};
+ assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',proof)).status,200);
+ assert.equal((await f.call(`/api/sessions/${session}/commands/${command.id}/ack`,'POST',proof)).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+ assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+});
+
+
+test('recurring heartbeats cannot postpone the pending reaper alarm or hide an absent native',async(t)=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now);
+ const f=fixture(),session='heartbeat-reaper-bound',native='11111111-2222-4333-8444-555555555555';
+ const epoch=await startClaimed(f,session,native),revokedBefore=f.revocations.length;
+ const old=now-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
+ f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,old,session);
+ const due=f.alarm;assert.equal(typeof due,'number');assert(Number(due)<=now+180_000);
+ while(now+15_000<Number(due)){
+  now+=15_000;
+  f.database.prepare('INSERT OR REPLACE INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({
+   snapshot_id:'fixture',started_at_ms:now-1,observed_at_ms:now,
+  }));f.clearCache();
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+  assert.equal(f.alarm,due,'a heartbeat must not push the scheduled reaper into the future');
+ }
+ now=Number(due)+1;
+ assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+ assert.equal(f.alarm,due,'an overdue alarm also survives a heartbeat racing the poller');
+ await f.machine.alarm();
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal(f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session),undefined);
+ assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0,
+              'an overdue alarm is not physical-exit or capacity-release proof');
+ assert.equal(f.revocations.length,revokedBefore);
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ const path='/api/sessions/'+session+'/commands';
+ const first=(await (await f.call(path,'POST',{kind:'stop',key:'heartbeat-unconfirmed'},actor)).json() as any).command;
+ assert(first);
+ assert.equal((await f.call(path+'/'+first.id+'/ack','POST',{epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+ assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0);
+ assert.equal(f.revocations.length,revokedBefore);
+ const final=(await (await f.call(path,'POST',{kind:'stop',key:'heartbeat-qualified'},actor)).json() as any).command;
+ assert(final);
+ const proof={epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+ assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+ assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+ assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+ assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+ assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+ f.database.close();
+});
+
+test('qualified native exits tolerate bounded host clock skew without relaxing the deadline fence',async()=>{
+ for(const skew of [300,5000,5001]){
+  const f=fixture(),session='exit-clock-'+skew,native='native-clock',epoch=await startClaimed(f,session,native),admitted=Date.now();
+  const launch=JSON.parse((f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(session) as any).launch_json);
+  launch.timeout_seconds=1800;f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify(launch),session);
+  f.database.prepare('INSERT OR REPLACE INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,admitted);
+  const response=await f.call('/api/sessions/'+session+'/finish','POST',{operation_id:'op-'+session,epoch,native_id:native,exit_code:127,native_exit_confirmed:true,evidence:{
+   source:'aplexer_retirement',containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_exit:{code:127,signal:null,exited_at_ms:admitted-skew},native_deadline:{deadline_ms:admitted+1800_000,exceeded:false},
+  }});
+  assert.equal(response.status,skew<=5000?201:409,await response.clone().text());
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,skew<=5000?'failed':'running');
+ }
+});
+
+
+test('complete census omission retains custody in all six modes until qualified STOP',async()=>{
+ for(const mode of ['complete','incomplete','stale','present','new-start','predates-start']){
+  const f=fixture(),session='census-omitted-'+mode,native='11111111-2222-4333-8444-555555555555';
+  const epoch=await startClaimed(f,session,native);
+  const old=Date.now()-CLAIMED_WITHOUT_NATIVE_GRACE_MS-1000;
+  f.database.prepare('UPDATE sessions SET created_at=?,updated_at=? WHERE id=?').run(old,mode==='new-start'?Date.now():old,session);
+  const observed=mode==='stale'?Date.now()-100_000:Date.now();
+  const started=mode==='predates-start'?old-1:observed-1;
+  if(mode!=='incomplete')f.database.prepare('INSERT INTO native_inventory_meta VALUES(1,?)').run(JSON.stringify({snapshot_id:'fixture',started_at_ms:started,observed_at_ms:observed}));
+  if(mode==='present')f.database.prepare('INSERT INTO native_inventory_rows VALUES(?,?)').run(native,'{}');
+  const revokedBefore=f.revocations.length;
+  const result=await (await f.call('/_internal/reap','POST',{dry_run:false})).json() as any;
+  assert.equal(result.reaped,0);
+  assert.equal(result.stop_requested,0,'omission alone must not invent a missing row');
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0,
+               'no terminal/cap-release message may cross into Project');
+  assert.equal(f.revocations.length,revokedBefore,'unknown omission cannot revoke the worker');
+  const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+  const path='/api/sessions/'+session+'/commands';
+  const first=(await (await f.call(path,'POST',{kind:'stop',key:'census-unconfirmed'},actor)).json() as any).command;
+  assert(first);
+  assert.equal((await f.call(path+'/'+first.id+'/ack','POST',{epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.equal(f.events.filter(e=>['/_internal/reaped','/_internal/stopped'].includes(e.path)).length,0);
+  const final=(await (await f.call(path,'POST',{kind:'stop',key:'census-qualified'},actor)).json() as any).command;
+  assert(final);
+  const proof={epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+  assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+  assert.equal((await f.call(path+'/'+final.id+'/ack','POST',proof)).status,200);
+  assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'stopped');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+  assert.equal(f.events.filter(e=>e.path==='/_internal/stopped').length,1);
+  f.database.close();
+ }
+});
+
+
+async function commitNativeSnapshot(f:ReturnType<typeof fixture>,at:number,sequence:number,rows:unknown[]=[],finish=true){
+ const {sha256Hex}=await import('../src/crypto.ts');
+ const data=JSON.stringify(rows),body={snapshot_id:'aaaaaaaa-aaaa-4aaa-8aaa-'+String(sequence).padStart(12,'0'),
+  started_at_ms:at,observed_at_ms:at,row_count:rows.length,chunk_count:finish?1:2,
+  sha256:await sha256Hex(data),chunk_index:0,data};
+ const response=await f.call('/api/native-inventory','POST',body);
+ assert.equal(response.status,200,JSON.stringify(await response.clone().json()));
+ return response.json() as Promise<any>;
+}
+
+test('complete native absence durably loses the exact managed attempt without inventing native exit',async()=>{
+ const f=fixture(),session='full-inventory-orphan',native='77777777-7777-4777-8777-777777777777';
+ const epoch=await startClaimed(f,session,native),clock=Date.now;let now=clock()+1_000;
+ const actor={'x-hub2-actor':JSON.stringify({id:'admin',kind:'operator',scopes:['operator:admin']})};
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<=5;i++){
+   if(i){now+=60_000;f.restart();}
+   assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+   await commitNativeSnapshot(f,now,i+1);
+   if(i<5)assert.equal((f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  }
+  const view=(await (await f.call('/api/sessions/'+session,'GET',undefined,actor)).json() as any).session;
+  assert.equal(view.state,'lost');assert.equal(view.native_id,native);assert.equal(view.epoch,epoch);
+  assert.equal(view.evidence,null);assert.notEqual(view.stop_confirmed,true);
+  assert.equal(f.database.prepare('SELECT exit_code FROM sessions WHERE id=?').get(session)?.exit_code,null);
+  assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM session_commands').get()?.n,0);
+  const loss=f.events.filter(e=>e.path==='/_internal/reaped');assert.equal(loss.length,1);
+  assert.equal(loss[0].body.reason,'native_inventory_absent');assert.equal(loss[0].body.lost,true);
+  for(const key of ['stopped','reaped','native_exit_confirmed','exit_code','containment_empty'])assert.equal(loss[0].body[key],undefined);
+  assert.equal(loss[0].body.epoch,epoch);assert.equal(loss[0].body.native_id,native);
+  const snapshot=(await (await f.call('/_internal/live-sessions')).json() as any).sessions;
+  assert.equal(snapshot.length,0,'logical loss must not manufacture a native observation');
+  await commitNativeSnapshot(f,now,6);
+  f.restart();await f.machine.alarm();
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,1);
+  assert.equal(f.revocations.length,1);
+  const liveList=await (await f.call('/api/sessions?live=1','GET',undefined,actor)).json() as any;
+  assert.equal(liveList.items.some((item:any)=>item.id===session),false);
+  // Reappearance cannot rewrite the recorded loss or manufacture exit. Existing
+  // exact future controls and native evidence remain available on the lost row.
+  now+=1000;await commitNativeSnapshot(f,now,7,[observedNative(native)]);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost');
+  const base='/api/sessions/'+session+'/commands';
+  const command=(await (await f.call(base,'POST',{kind:'stop',key:'later-qualified'},actor)).json() as any).command;
+  assert(command);
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',{epoch:epoch+1,result:{stopped:true,evidence:'native_exit',native_id:native}})).status,409);
+  const stop={epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',stop)).status,200);
+  assert.equal((await f.call(base+'/'+command.id+'/ack','POST',stop)).status,200);
+  assert.equal((await (await f.call('/api/sessions/'+session,'GET',undefined,actor)).json() as any).session.stop_confirmed,true);
+  const start=now-600000;
+  f.database.prepare('INSERT INTO launch_admissions VALUES(?,?,?,?)').run('op-'+session,session,epoch,start);
+  f.database.prepare("UPDATE sessions SET launch_json=json_set(launch_json,'$.timeout_seconds',1800) WHERE id=?").run(session);f.clearCache();
+  const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:0,native_exit_confirmed:true,evidence:{source:'aplexer_retirement',
+   containment_empty:true,native_identity:{id:native,tag:'task-hub2-'+session,workspace:'/tmp'},
+   native_deadline:{deadline_ms:start+1800000,exceeded:false},native_exit:{code:0,exited_at_ms:now}}};
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',{...finish,native_id:'foreign'})).status,409);
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+  assert.equal((await (await f.call('/api/sessions/'+session+'/finish','POST',finish)).json() as any).duplicate,true);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,1);
+ }finally{Date.now=clock;f.database.close();}
+});
+
+
+function observedNative(native:string,state='running',worker=true){
+ return {id:native,tag:'unit-native',workspace:'/tmp',engine:'codex',agent:null,profile:null,agent_profile:null,
+  phase:state==='running'?'running':'exited',cwd:'/tmp',created_at_ms:null,last_activity_ms:null,state,worker_alive:worker};
+}
+
+test('complete native absence resets on every live reappearance and never uses alarm or replay age',async()=>{
+ const f=fixture(),session='transient-absence',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000,sequence=0;
+ const state=()=>f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<4;i++){await commitNativeSnapshot(f,now,++sequence);now+=60000;}
+  // Reappearance and disappearance are both committed before any alarm runs.
+  await commitNativeSnapshot(f,now,++sequence,[observedNative(native)]);
+  now+=1;await commitNativeSnapshot(f,now,++sequence);
+  for(let i=0;i<4;i++){now+=60000;await commitNativeSnapshot(f,now,++sequence);}
+  assert.equal(state(),'running');
+  const marker=structuredClone(f.kv.get('native-absence:'+session));
+  assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[]})).status,200);
+  for(let i=0;i<3;i++){await commitNativeSnapshot(f,now,sequence);await f.machine.alarm();}
+  assert.deepEqual(f.kv.get('native-absence:'+session),marker);
+  assert.equal(state(),'running');
+  now+=60000;await commitNativeSnapshot(f,now,++sequence);assert.equal(state(),'lost');
+ }finally{Date.now=clock;f.database.close();}
+});
+
+test('complete native absence cannot bridge stale partial equal-time or changed-attempt observations',async()=>{
+ for(const mode of ['gap','partial','equal-time','epoch','native','operation','late-kv']){
+  const f=fixture(),session='absence-negative-'+mode,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<5;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+   if(mode==='gap')now+=LIVE_SNAPSHOT_TTL_MS;
+   if(mode==='epoch'||mode==='native'||mode==='operation')f.onKvPut(key=>{
+    if(!key.startsWith('native-absence:'))return;
+    const assignment=mode==='epoch'?'epoch=epoch+1':mode==='native'?"native_id='88888888-8888-4888-8888-888888888888'":"operation_id='changed-operation'";
+    f.database.prepare('UPDATE sessions SET '+assignment+' WHERE id=?').run(session);f.clearCache();f.onKvPut(undefined);
+   });
+   if(mode==='late-kv')f.onKvPut(key=>{if(key.startsWith('native-absence:')){now+=LIVE_SNAPSHOT_TTL_MS+1;f.onKvPut(undefined);}});
+   if(mode==='equal-time'){now-=60000;await commitNativeSnapshot(f,now,6);}
+   else await commitNativeSnapshot(f,now,6,[],mode!=='partial');
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running',mode);
+   assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0,mode);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+test('complete native absence uses live inventory predicate without manufacturing terminal exit',async()=>{
+ for(const mode of ['live','terminal','unknown-worker','live-heartbeat']){
+  const f=fixture(),session='inventory-predicate-'+mode,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<=5;i++){
+    const rows=mode==='live'?[observedNative(native)]:mode==='terminal'?[observedNative(native,'exited',false)]
+     :mode==='unknown-worker'?[{...observedNative(native),state:'unknown',worker_alive:null}]:[];
+    if(mode==='live-heartbeat')assert.equal((await f.call('/api/heartbeat','POST',{labels:[],engines:['codex'],capabilities:['headless'],native_sessions:[{
+     session_id:session,native_id:native,phase:'running',last_activity_at:now,exit_code:null,containment_empty:false,
+    }]})).status,200);
+    await commitNativeSnapshot(f,now,i+1,rows);if(i<5)now+=60000;
+   }
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,['live','live-heartbeat','unknown-worker'].includes(mode)?'running':'lost',mode);
+   assert.equal(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)?.evidence_json,null);
+   assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM session_commands').get()?.n,0);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+
+async function lossProjectFixture(receipt:any){
+ const {ProjectDO}=await import('../src/project-do.ts');
+ const db=new DatabaseSync(':memory:'),releases:any[]=[];let alarm:number|null=null;
+ const ctx:any={id:{toString:()=> 'project-test'},storage:{sql:{exec(q:string,...args:any[]){
+  const p=db.prepare(q);let rows:any[]=[],written=0;if(p.columns().length)rows=p.all(...args);else written=Number(p.run(...args).changes);
+  return {toArray:()=>rows,rowsRead:rows.length,rowsWritten:written};
+ }},transactionSync(fn:()=>unknown){db.exec('BEGIN');try{const r=fn();db.exec('COMMIT');return r;}catch(e){db.exec('ROLLBACK');throw e;}},
+ async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ const unused={idFromName:(id:string)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{
+  const request=input instanceof Request?input:new Request(input,init);
+  if(new URL(request.url).pathname==='/_internal/session-cap/release')releases.push(await request.json());
+  return Response.json({ok:true});
+ }})};
+ const project=new ProjectDO(ctx,{CONTROL:unused,MACHINES:unused,ACCOUNTS:unused,MAILBOXES:unused} as any);
+ const call=(path:string,body:any)=>project.fetch(new Request('https://project.test'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
+ await project.fetch(new Request('https://project.test/_metrics'));
+ db.prepare(`INSERT INTO intakes(id,project,title,text,acceptance_criteria_json,status,assigned_machine_id,session_id,created_at,updated_at)
+  VALUES(?,'project-test','test','test','[]','in-progress',?,?,?,?)`).run(receipt.intake_id,receipt.machine_id,receipt.session_id,Date.now(),Date.now());
+ db.prepare(`INSERT INTO dispatch_sagas(operation_id,request_digest,request_key,intake_id,session_id,machine_id,attempt_operation_id,
+  launch_spec_json,native_id,epoch,state,attempt,created_at,updated_at) VALUES(?,'digest','key',?,?,?,?,'{}',?,?,'running',0,?,?)`)
+  .run(receipt.operation_id,receipt.intake_id,receipt.session_id,receipt.machine_id,receipt.attempt_operation_id,receipt.native_id,receipt.epoch,Date.now(),Date.now());
+ return {db,call,releases};
+}
+
+test('complete native absence Project boundary rejects false exit and stale binding then records one truthful loss',async()=>{
+ const f=fixture(),session='project-native-loss',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000,p:Awaited<ReturnType<typeof lossProjectFixture>>|undefined;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<=5;i++){await commitNativeSnapshot(f,now,i+1);if(i<5)now+=60000;}
+  const receipt=f.events.find(e=>e.path==='/_internal/reaped')!.body;p=await lossProjectFixture(receipt);
+  for(const patch of [{epoch:receipt.epoch+1},{native_id:'foreign-native'},
+    {native_inventory_absence:{...receipt.native_inventory_absence,observations:1}},
+    {native_inventory_absence:{...receipt.native_inventory_absence,latest:receipt.native_inventory_absence.first}},
+    {stopped:true},{reaped:true},{native_exit_confirmed:true},{exit_code:0},{containment_empty:true}]){
+   const response=await p.call('/_internal/reaped',{...receipt,...patch});assert([400,409].includes(response.status),JSON.stringify(patch));
+   assert.equal(p.db.prepare('SELECT state FROM dispatch_sagas').get()?.state,'running');assert.equal(p.releases.length,0);
+  }
+  assert.equal((await p.call('/_internal/reaped',receipt)).status,200);
+  const final=JSON.parse(p.db.prepare('SELECT final_evidence_json FROM intakes').get()!.final_evidence_json as string);
+  assert.equal(final.lost,true);assert.equal(final.native_outcome,'unconfirmed');assert.equal(final.reaped,false);
+  assert.equal(final.stopped,undefined);assert.equal(final.native_exit_confirmed,undefined);assert.equal(final.exit_code,undefined);
+  assert.equal(final.native_id,native);assert.equal(p.db.prepare('SELECT last_reason FROM dispatch_sagas').get()?.last_reason,'native_inventory_absent');
+  // Delivery retries validate the original observation time, not a renewed window.
+  now+=600000;assert.equal((await (await p.call('/_internal/reaped',receipt)).json() as any).duplicate,true);
+  assert.deepEqual(await (await p.call('/_internal/started',receipt)).json(),{started:false,lost:true,duplicate:true});
+  assert.deepEqual(await (await p.call('/_internal/claim',receipt)).json(),{claimed:false,lost:true,duplicate:true});
+  assert.equal(p.db.prepare("SELECT COUNT(*) AS n FROM intake_events WHERE kind='session_lost'").get()?.n,1);
+  assert.equal(p.releases.length,2,'existing idempotent start-reservation release is preserved');
+ }finally{Date.now=clock;p?.db.close();f.database.close();}
+});
+
+
+test('complete native absence resets unknown and conflicting UUID presence instead of treating it as omission',async()=>{
+ for(const [state,alive] of [['running',null],['unknown',null],['exited',true],['running',false]] as const){
+  const f=fixture(),session='uncertain-native-'+state+'-'+alive,native='77777777-7777-4777-8777-777777777777';
+  await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+  try{
+   Date.now=()=>now;
+   for(let i=0;i<5;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+   await commitNativeSnapshot(f,now,6,[{...observedNative(native),state,worker_alive:alive}]);
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running',state+'/'+alive);
+   assert.equal(f.kv.has('native-absence:'+session),false,'uncertain/conflicting presence resets the absence chain');
+   for(let i=0;i<5;i++){now+=60000;await commitNativeSnapshot(f,now,i+7);}
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running','new omission has not passed its own grace');
+   now+=60000;await commitNativeSnapshot(f,now,12);
+   assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'lost','genuine later omission still converges');
+   assert.equal(f.database.prepare('SELECT evidence_json FROM sessions WHERE id=?').get(session)?.evidence_json,null);
+  }finally{Date.now=clock;f.database.close();}
+ }
+});
+
+
+test('complete native absence cannot bridge a committed reappearance whose KV reset fails',async()=>{
+ const f=fixture(),session='failed-presence-reset',native='77777777-7777-4777-8777-777777777777';
+ await startClaimed(f,session,native);const clock=Date.now;let now=clock()+1000;
+ try{
+  Date.now=()=>now;
+  for(let i=0;i<4;i++){await commitNativeSnapshot(f,now,i+1);now+=60000;}
+  f.onKvDelete(()=>{throw new Error('synthetic KV reset failure');});
+  await assert.rejects(()=>commitNativeSnapshot(f,now,5,[observedNative(native)]));
+  f.onKvDelete(undefined);
+  assert(f.database.prepare('SELECT native_id FROM native_inventory_rows WHERE native_id=?').get(native),'reappearance really committed despite observer failure');
+  now+=1;await commitNativeSnapshot(f,now,6);
+  now+=60000;await commitNativeSnapshot(f,now,7);
+  assert.equal(f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session)?.state,'running');
+  assert.equal(f.events.filter(e=>e.path==='/_internal/reaped').length,0);
+ }finally{Date.now=clock;f.database.close();}
+});
+
+// Real Bridge.command/Journal in an isolated child, with only the native adapter fake.
+function ordinarySendHost(root:string,command:any,native:string,mode='fail'){
+ const python=String.raw`
+import json,os,sqlite3,subprocess,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from agent_hub_host.agent import Bridge,Journal
+from agent_hub_host.native_launch import canonical
+import hashlib
+root=Path(sys.argv[2]);command=json.loads(sys.argv[3]);native_id=sys.argv[4];mode=sys.argv[5]
+journal=Journal(root/'journal.sqlite')
+try:
+ with journal.db:
+  journal.db.execute('INSERT OR IGNORE INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,?,?)',('op-'+command['session_id'],command['session_id'],command['epoch'],'fixture',str(root),'task-hub2-'+command['session_id'],native_id,'running',1))
+ bridge=Bridge.__new__(Bridge);bridge.journal=journal
+ bridge.resolve_launch_native=lambda row:(row['native_id'],None)
+ effects=root/'effects.json'
+ counts=json.loads(effects.read_text()) if effects.exists() else {'send':0,'capture':0}
+ def fake_native(kind,*args,**kwargs):
+  counts[kind]+=1;effects.write_text(json.dumps(counts))
+  if mode=='queued':
+   if kind=='send':return subprocess.CompletedProcess([],0,'','')
+   return subprocess.CompletedProcess([],0,'busy\\nalt+m to send immediately\\nPress up to edit queued messages\\n','')
+  if kind=='send':raise subprocess.TimeoutExpired('synthetic owned input',60)
+  assert kind=='capture'
+  return subprocess.CompletedProcess([],0,'actual owned fixture capture\\n','')
+ bridge.native=fake_native
+ bridge.INPUT_OBSERVE_SECONDS=0.05;bridge.INPUT_POLL_SECONDS=0.005;bridge.BUSY_WAIT_SECONDS=0.05
+ if mode=='executing':
+  with journal.db:bridge.begin_command(command['id'],hashlib.sha256(canonical(command).encode()).hexdigest())
+ frames=[]
+ class Socket:
+  def send(self,raw):frames.append(json.loads(raw))
+ try:bridge.dispatch({'type':'session.command','command':command},Socket(),None);error=None
+ except Exception as exc:error=type(exc).__name__
+ row=journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+ queued=journal.db.execute('SELECT * FROM outbox WHERE key=?',('command:'+command['id'],)).fetchone()
+ launch=journal.db.execute('SELECT state,native_id FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+ print(json.dumps({'result':json.loads(row['result']) if row and row['result'] else None,'frame':frames[0] if frames else None,'error_class':error,'command_state':row['state'] if row else None,'payload':json.loads(queued['payload']) if queued else None,'path':queued['path'] if queued else None,'launch':dict(launch),'effects':counts}))
+finally:journal.close_thread()
+`;
+ const home=join(root,'home'),tmp=join(root,'tmp');mkdirSync(home,{recursive:true,mode:0o700});mkdirSync(tmp,{recursive:true,mode:0o700});
+ const env:Record<string,string>={HOME:home,TMPDIR:tmp,PATH:process.env.PATH??'/usr/bin:/bin',LANG:'C.UTF-8'};
+ for(const [key,value]of Object.entries(process.env))if(key.startsWith('AGENT_HUB_HEAVY_TEST_')&&value!==undefined)env[key]=value;
+ const stdio:any[]=['ignore','pipe','pipe'];
+ if(env.AGENT_HUB_HEAVY_TEST_HELD){fstatSync(9);while(stdio.length<9)stdio.push('ignore');stdio.push(9);}
+ const child=spawnSync('python3',['-I','-S','-B','-c',python,fileURLToPath(new URL('../host',import.meta.url)),root,JSON.stringify(command),native,mode],{env,stdio,encoding:'utf8',timeout:10000,maxBuffer:65536});
+ assert.equal(child.error,undefined);assert.equal(child.status,0,'isolated actual Host fixture setup must settle');
+ return JSON.parse(child.stdout);
+}
+
+async function sendQueueFixture(){
+ const f=fixture(),sender='uncertain-sender',other='other-capture';
+ const native='11111111-2222-4333-8444-555555555555',otherNative='22222222-2222-4222-8222-222222222222';
+ const epoch=await startClaimed(f,sender,native);await startClaimed(f,other,otherNative);
+ const row=f.database.prepare('SELECT launch_json FROM sessions WHERE id=?').get(sender) as any;
+ f.database.prepare('UPDATE sessions SET launch_json=? WHERE id=?').run(JSON.stringify({...JSON.parse(row.launch_json),interactive:true}),sender);f.clearCache();
+ const {socket,frames}=captureSocket(f);
+ const made=await f.call('/api/sessions/'+sender+'/commands','POST',{kind:'send',text:'synthetic input',key:'ordinary-send-once'},captureOperator);assert.equal(made.status,201);
+ const send=(await made.json() as any).command;
+ f.database.prepare('UPDATE session_commands SET created_at=1 WHERE id=?').run(send.id);
+ const madeCapture=await f.call('/api/sessions/'+other+'/commands','POST',{kind:'capture',mode:'screen',key:'other-capture-once'},captureOperator);assert.equal(madeCapture.status,201);
+ const capture=(await madeCapture.json() as any).command;
+ frames.length=0;await(f.machine as any).sendPendingCommands(socket,'h1');assert.equal(frames.at(-1).command.id,send.id);
+ return{f,sender,other,native,otherNative,epoch,send,capture,socket,frames};
+}
+
+test('a send the engine left in its composer queue is a failed/unconfirmed send end to end, idempotent on replay and in history',async()=>{
+ const q=await sendQueueFixture();let root:string|undefined;
+ try{
+  const base=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(base,{recursive:true,mode:0o700});root=mkdtempSync(join(base,'queued-send-'));
+  const report=ordinarySendHost(root,q.send,q.native,'queued');
+  assert.deepEqual(report.result,{error:'native_input_queued',reason:'native_input_queued'});
+  assert.notEqual(report.payload?.result?.delivery,'native_acknowledged');
+  assert.equal((await q.f.call(report.path,'POST',report.payload)).status,200);
+  const row=q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any;
+  assert.equal(row.state,'failed','typed negative is never stored as acked');
+  const listing=await(await q.f.call('/api/sessions/'+q.sender+'/commands?command_id='+q.send.id,'GET',undefined,captureOperator)).json() as any;
+  assert.equal(listing.commands[0].state,'failed');assert.equal(listing.commands[0].ack.error,'native_input_queued');
+  const replay=await q.f.call('/api/sessions/'+q.sender+'/send','POST',{key:'ordinary-send-once',body:'synthetic input'},captureOperator);
+  const legacy=await replay.json() as any;assert.equal(legacy.delivery,'unconfirmed');assert.equal(legacy.state,'failed');
+  assert.equal((await q.f.call(report.path,'POST',report.payload)).status,200,'idempotent replay of the same ack');
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed');
+ }finally{q.f.database.close();if(root)rmSync(root,{recursive:true,force:true});}
+});
+
+test('ordinary send uncertainty joined real Host error event releases other-session capture without delivery or custody change',async()=>{
+ const q=await sendQueueFixture();let root:string|undefined;
+ try{
+  const base=fileURLToPath(new URL('../../.local/tmp/',import.meta.url));mkdirSync(base,{recursive:true,mode:0o700});root=mkdtempSync(join(base,'ordinary-send-joined-'));
+  const report=ordinarySendHost(root,q.send,q.native);
+  q.frames.length=0;await(q.f.machine as any).sendPendingCommands(q.socket,'h1');assert.equal(q.frames.at(-1).command.id,q.send.id,'no ACK still blocks before settlement');
+  assert.deepEqual(report.result,{error:'command_outcome_uncertain',reason:'command_outcome_uncertain'});
+  assert.equal(report.command_state,'done');assert.equal(report.effects.send,1);assert.equal(report.launch.state,'running');
+  assert.equal(report.path,null);assert.equal(report.payload,null,'negative uncertainty must never use normal ACK on old servers');
+  assert.equal(report.frame.type,'host.error');assert.equal(report.frame.epoch,q.epoch);assert.equal(report.frame.operation_id,'op-'+q.sender);assert.equal(report.frame.native_id,q.native);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(report.frame));
+  assert.equal(q.frames.at(-1).command.id,q.capture.id);
+  const listing=await(await q.f.call('/api/sessions/'+q.sender+'/commands?command_id='+q.send.id,'GET',undefined,captureOperator)).json() as any;
+  assert.equal(listing.commands[0].state,'failed');assert.deepEqual(listing.commands[0].ack,report.result);
+  const replay=await q.f.call('/api/sessions/'+q.sender+'/send','POST',{key:'ordinary-send-once',body:'synthetic input'},captureOperator);
+  const legacy=await replay.json() as any;assert.equal(legacy.delivery,'unconfirmed');assert.equal(legacy.state,'failed');
+  const again=ordinarySendHost(root,q.send,q.native);assert.equal(again.effects.send,1);assert.deepEqual(again.frame,report.frame);assert.equal(again.payload,null);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(again.frame));
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.send.id) as any).state,'failed','lost event replay is idempotent');
+  const captured=ordinarySendHost(root,q.capture,q.otherNative);
+  assert.equal(captured.effects.capture,2,'one read-only readiness poll before the single send, plus this capture');assert.equal(captured.effects.send,1);assert.match(captured.result.output,/actual owned fixture capture/);
+  assert.equal((await q.f.call(captured.path,'POST',captured.payload)).status,200);
+  assert.equal((q.f.database.prepare('SELECT state FROM session_commands WHERE id=?').get(q.capture.id) as any).state,'acked');
+  for(const session of[q.sender,q.other])assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(session) as any).state,'running');
+  assert.ok(!q.f.events.some(x=>/finish|stopped/.test(x.path)));
+ }finally{q.f.database.close();if(root)rmSync(root,{recursive:true,force:true});}
+});
+
+test('ordinary send terminal error event rejects legacy loose fields stale epoch and settled STOP races',async()=>{
+ const q=await sendQueueFixture();
+ try{
+  const event={type:'host.error',stage:'host_command',reason:'command_outcome_uncertain',session_id:q.sender,
+   message_id:q.send.id,epoch:q.epoch,operation_id:'op-'+q.sender,native_id:q.native,command_kind:'send',command_state:'done'};
+  const before=q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id);
+  const loose={type:'host.error',stage:'host_command',reason:'command_outcome_uncertain',session_id:q.sender,message_id:q.send.id};
+  for(const bad of[loose,{...event,epoch:q.epoch+1},{...event,epoch:true},{...event,operation_id:'foreign'},
+    {...event,native_id:q.otherNative},{...event,command_kind:'wake_send'},{...event,command_state:'executing'},
+    {...event,message_id:q.capture.id}]){
+   await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(bad));
+   assert.deepEqual(q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id),before);
+  }
+  const stop=await q.f.call('/api/sessions/'+q.sender+'/commands','POST',{kind:'stop',key:'qualified-stop-race'},captureOperator);assert.equal(stop.status,201);
+  const command=(await stop.json() as any).command;
+  assert.equal((await q.f.call('/api/sessions/'+q.sender+'/commands/'+command.id+'/ack','POST',{epoch:q.epoch,result:{stopped:true,evidence:'native_exit',native_id:q.native}})).status,200);
+  const stopped=q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id);
+  await q.f.machine.webSocketMessage(q.socket as any,JSON.stringify(event));
+  assert.deepEqual(q.f.database.prepare('SELECT state,result_json FROM session_commands WHERE id=?').get(q.send.id),stopped);
+  assert.equal((q.f.database.prepare('SELECT state FROM sessions WHERE id=?').get(q.sender) as any).state,'stopped');
+ }finally{q.f.database.close();}
+});
+
+test('a launcher exit 75 within seconds marks the engine unhealthy on the machine; an ordinary task exit does not',async()=>{
+ const errors:string[]=[],original=console.error;
+ console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
+ try{
+  for(const [exit,expected] of [[1,false],[75,true],[127,true]] as const){
+   const f=fixture(),session='fast-exit-'+exit,epoch=await startOffered(f,session);
+   const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'c-'+exit}),send:()=>{}};
+   f.sockets.push(socket);
+   const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/enrolled/relay'};
+   await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+   const native='11111111-2222-4333-8444-55555555555'+exit;
+   assert.equal((await f.call('/api/sessions/'+session+'/started','POST',{operation_id:'op-'+session,epoch,native_id:native})).status,201);
+   const admission=f.database.prepare('SELECT observed_at FROM launch_admissions WHERE operation_id=?').get('op-'+session) as any;
+   const finish={operation_id:'op-'+session,epoch,native_id:native,exit_code:exit,native_exit_confirmed:true,evidence:{
+    source:'aplexer_status',native_identity:{id:native,tag:'task-hub2-'+session,workspace:binding.resolved_workspace},
+    containment_empty:true,native_exit:{code:exit,exited_at_ms:Date.now()},native_deadline:{deadline_ms:admission.observed_at+1800_000,exceeded:false}}};
+   assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,201);
+   const view=await (await f.call('/_internal/routing')).json() as any;
+   if(expected){
+    const reason='native_exit_'+exit;
+    assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex',reason,session]]);
+    assert.ok(view.unhealthy_engines[0].until>Date.now()+29*60_000);
+    assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes(reason)),errors.join('\n'));
+   }else assert.equal(view.unhealthy_engines,undefined,JSON.stringify(view.unhealthy_engines));
+  }
+ }finally{console.error=original;}
+});
+
+test('engine_binary_unavailable launch failure marks engine unhealthy and preserves failure_reason',async()=>{
+ const errors:string[]=[],original=console.error;
+ console.error=(...args:unknown[])=>{errors.push(args.map(String).join(' '));};
+ try{
+  const f=fixture(),session='preflight-bin-missing',epoch=await startOffered(f,session);
+  const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'c-bin'}),send:()=>{}};
+  f.sockets.push(socket);
+  const binding={version:1,requested_workspace:'relay',resolved_workspace:'/owned/enrolled/relay'};
+  await f.machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:session,epoch,workspace_binding:binding}));
+  const finish={operation_id:'op-'+session,epoch,native_id:null,launch_failed:true,no_dispatch:true,failure_reason:'engine_binary_unavailable'};
+  assert.equal((await f.call('/api/sessions/'+session+'/finish','POST',finish)).status,200);
+  const view=await (await f.call('/_internal/routing')).json() as any;
+  assert.deepEqual(view.unhealthy_engines?.map((row:any)=>[row.engine,row.reason,row.session_id]),[['codex','engine_binary_unavailable',session]]);
+  const attention=f.database.prepare('SELECT reason FROM attention WHERE session_id=?').get(session) as any;
+  assert.equal(attention?.reason,'engine_binary_unavailable');
+  const forwarded=f.events.find((req:any)=>req.path.includes('/_internal/reaped'));
+  assert.equal(forwarded?.body?.failure_reason,'engine_binary_unavailable');
+  assert.ok(errors.some(line=>line.includes('ENGINE_UNHEALTHY')&&line.includes('engine_binary_unavailable')),errors.join('\n'));
+ }finally{console.error=original;}
 });

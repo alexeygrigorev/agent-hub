@@ -19,9 +19,10 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 python3 "$script_dir/hub-picker-alerts.py" --base-url "$BASE_URL" --cli-json "$CLI_JSON" --helper "$ALERT_CMD" || delivery_status=$?
 mkdir -p "$(dirname "$STATE")"
 token="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$CLI_JSON")"
-excluded="$(curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+pick_json="$(curl -fsS --max-time 30 -X POST -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
   -H 'X-Hub-Alert-Producer: credential_monitor' \
-  -d '{}' "$BASE_URL/api/model-picker/pick" \
+  -d '{}' "$BASE_URL/api/model-picker/pick")"
+excluded="$(printf '%s' "$pick_json" \
   | python3 -I -c 'import json,sys; print(",".join(sorted("%s=%s" % (r["policy_id"], r["reason"]) for r in json.load(sys.stdin).get("excluded", []))))')"
 now="$(date +%s)"
 if [[ -z "$excluded" ]]; then rm -f -- "$STATE"; echo "ok: no candidate excluded"; exit "$delivery_status"; fi

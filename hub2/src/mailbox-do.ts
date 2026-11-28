@@ -65,16 +65,22 @@ export class MailboxDO{
    ...this.db.all<Mail>('SELECT * FROM messages WHERE recipient=? AND visible=1 AND id>=? AND id<? ORDER BY id LIMIT 2',owner,id,id+'\uffff')];
   const unique=[...new Map(rows.map(m=>[m.id,m])).values()];return unique.length===1?unique[0]:error(unique.length?'ambiguous_prefix':'message_not_found',unique.length?409:404);
  }
- private async directory(recipient:string,effectEnv:Env=this.env):Promise<{mailbox:string;forward_session?:string|null}>{
-  const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({recipient})}));
-  if(!response.ok)throw new HttpError('recipient_unknown',response.status===404?404:503);const result=await response.json() as {mailbox:string;forward_session?:string|null};
+ private async directory(recipient:string,effectEnv:Env=this.env,caller?:Actor):Promise<{mailbox:string;forward_session?:string|null}>{
+  const response=await effectEnv.CONTROL.get(effectEnv.CONTROL.idFromName('global')).fetch(new Request('https://control.internal/_recipient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(caller&&recipient==='human:me'?{recipient,caller:{id:caller.id,kind:caller.kind,resource_id:caller.resource_id,family_id:caller.family_id}}:{recipient})}));
+  if(!response.ok){
+   // Keep Control's own code: a 503 route_acl_corrupt is a server fault, not an unknown recipient.
+   const code=await response.json().then(v=>(v as {error?:unknown}).error).catch(()=>undefined);
+   throw response.status===404?new HttpError('recipient_unknown',404):response.status===409?new HttpError('ambiguous_recipient',409):new HttpError(typeof code==='string'&&/^[a-z_]{1,60}$/.test(code)?code:'directory_unavailable',503);
+  }const result=await response.json() as {mailbox:string;forward_session?:string|null};
   if(!boundedString(result.mailbox,180))throw new HttpError('invalid_directory_result',503);return result;
  }
  private async send(r:Request,owner:string):Promise<Response>{
   const b=await bodyObject(r);if(!boundedString(b.recipient,180)||!boundedString(b.body,12000)||!boundedString(b.key,120)||(b.reply_to!==undefined&&!boundedString(b.reply_to,120)))return error('invalid_message',400);
-  const digest=await sha256Hex(JSON.stringify([b.recipient,b.body,b.reply_to??null,b.parent_sender??null]));
+  // human:me is resolved before the digest, so a replayed key can never stand for a different human (t3280u).
+  const alias=b.recipient==='human:me'?await this.directory('human:me',this.env,actorFrom(r)):undefined;
+  const digest=await sha256Hex(JSON.stringify([alias?alias.mailbox:b.recipient,b.body,b.reply_to??null,b.parent_sender??null]));
   const prior=this.db.one<Mail>('SELECT * FROM messages WHERE sender=? AND key=?',owner,b.key);if(prior)return prior.digest===digest?json({message:this.view(prior),replayed:true}):error('idempotency_conflict',409);
-  const target=await this.directory(String(b.recipient));let thread=crypto.randomUUID();
+  const target=alias||await this.directory(String(b.recipient));let thread=crypto.randomUUID();
   if(b.reply_to){
    const parent=this.db.one<Mail>('SELECT * FROM messages WHERE id=?',b.reply_to);
    if(!boundedString(b.parent_sender,180))return error('parent_sender_required',400);
@@ -91,10 +97,12 @@ export class MailboxDO{
  private list(r:Request,owner:string):Response{
   const q=new URL(r.url).searchParams,limit=Number(q.get('limit')||25),folder=q.get('folder')||'inbox',state=q.get('state'),thread=q.get('thread');
   if(!Number.isInteger(limit)||limit<1||limit>50||!['inbox','sent'].includes(folder)||state&&!['received','claimed','read','acked','delivered','accepted','completed'].includes(state)||thread&&!boundedString(thread,120))return error('invalid_list_query',400);
-  let cursor:[number,string]=[0,''];if(q.has('cursor')){try{cursor=JSON.parse(q.get('cursor')!);}catch{return error('invalid_cursor',400);}}
+  // order=desc (t3280u): newest first, so a client reads its latest mail in one bounded page.
+  const order=q.get('order')||'asc';if(!['asc','desc'].includes(order))return error('invalid_list_query',400);const desc=order==='desc';
+  let cursor:[number,string]=desc?[Number.MAX_SAFE_INTEGER,'\uffff']:[0,''];if(q.has('cursor')){try{cursor=JSON.parse(q.get('cursor')!);}catch{return error('invalid_cursor',400);}}
   if(!Array.isArray(cursor)||cursor.length!==2||!Number.isSafeInteger(cursor[0])||!boundedString(cursor[1]||'empty',120))return error('invalid_cursor',400);
   const extra=folder==='sent'?'':state?' AND state=?':thread?' AND thread_id=?':'',args:unknown[]=folder==='sent'?[]:state?[state]:thread?[thread]:[];
-  const rows=this.db.all<Mail>('SELECT * FROM messages WHERE '+(folder==='sent'?'sender=?':'recipient=? AND visible=1')+extra+' AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?',owner,...args,...cursor,limit+1),scanned=rows.slice(0,limit);
+  const rows=this.db.all<Mail>('SELECT * FROM messages WHERE '+(folder==='sent'?'sender=?':'recipient=? AND visible=1')+extra+(desc?' AND (created_at,id)<(?,?) ORDER BY created_at DESC,id DESC LIMIT ?':' AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT ?'),owner,...args,...cursor,limit+1),scanned=rows.slice(0,limit);
   const filtered=folder==='sent'&&!!(state||thread)||!!state&&!!thread,shown=scanned.filter(m=>(!state||m.state===state)&&(!thread||m.thread_id===thread)),last=scanned[scanned.length-1];
   return json({items:shown.map(m=>this.view(m)),filtered_page:filtered,next:rows.length>limit&&last?JSON.stringify([last.created_at,last.id]):null});
  }
@@ -143,7 +151,7 @@ export class MailboxDO{
   const b=await bodyObject(r,4096);if(!boundedString(b.recipient,180)||!boundedString(b.key,120)||!Number.isSafeInteger(b.epoch))return error('readdress_key_epoch_required',400);
   const digest=await sha256Hex(JSON.stringify([m.id,b.recipient,b.epoch])),old=this.db.one<Move>('SELECT * FROM readdress_operations WHERE sender=? AND key=?',m.sender,b.key);
   if(old){if(old.digest!==digest)return error('idempotency_conflict',409);if(old.result_json)return json(JSON.parse(old.result_json));}
-  const target=await this.directory(String(b.recipient));
+  const target=await this.directory(String(b.recipient),this.env,actor);
   const refused=this.db.transaction(this.ctx,()=>{
    const race=this.db.one<Move>('SELECT * FROM readdress_operations WHERE sender=? AND key=?',m.sender,b.key);
    if(race){if(race.digest!==digest)throw new HttpError('idempotency_conflict',409);return undefined;}

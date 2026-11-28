@@ -434,6 +434,44 @@ class TestHumanStatusLogout(unittest.TestCase):
             with auth.human_refresh_guard():
                 raise RuntimeError("boom")
 
+    def test_enospc_before_refresh_keeps_old_token_without_server_replay(self):
+        import errno
+        self._write_human()
+        calls = []
+        with patch.object(config.private_fs, "atomic_write", side_effect=OSError(errno.ENOSPC, "No space left on device")), \
+                patch("agent_hub_host.api.safe_http_json", side_effect=self._rotating_endpoint(calls)):
+            with self.assertRaisesRegex(RuntimeError, "Config save failed"):
+                human_auth.human_refresh()
+        self.assertEqual(calls, [])
+        cfg = config.load_human_config()
+        self.assertEqual(cfg.get("access_token"), "h-acc")
+        self.assertEqual(cfg.get("refresh_token"), "h-ref")
+        self.assertNotIn("refresh_pending", cfg)
+
+    def test_enospc_on_commit_prevents_replay_of_consumed_refresh_token(self):
+        import errno
+        self._write_human()
+        calls = []
+        orig_write = config.private_fs.atomic_write
+        write_count = {"n": 0}
+
+        def fail_on_second_write(path, data, max_bytes):
+            write_count["n"] += 1
+            if write_count["n"] == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return orig_write(path, data, max_bytes)
+
+        with patch.object(config.private_fs, "atomic_write", side_effect=fail_on_second_write), \
+                patch("agent_hub_host.api.safe_http_json", side_effect=self._rotating_endpoint(calls)):
+            with self.assertRaisesRegex(RuntimeError, "Config save failed"):
+                human_auth.human_refresh()
+        self.assertEqual(calls, ["h-ref"])
+        # Subsequent refresh attempt must refuse to replay the consumed refresh_token
+        with patch("agent_hub_host.api.safe_http_json", side_effect=self._rotating_endpoint(calls)):
+            with self.assertRaises(human_auth.HumanSessionExpired):
+                human_auth.human_refresh()
+        self.assertEqual(calls, ["h-ref"])
+
     def test_logout_revokes_human_and_preserves_host(self):
         self._write_human()
         config.save_host_config({"base_url": "https://hub.example.com",

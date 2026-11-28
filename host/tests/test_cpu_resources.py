@@ -42,7 +42,7 @@ class CpuResourcesTests(unittest.TestCase):
         import json
         from pathlib import Path
         from agent_hub_host.cpu_resources import sanitize_cpu_admission
-        fixture = json.loads((Path(__file__).resolve().parents[2] / "test/fixtures/cpu-admission-v2.json").read_text())
+        fixture = json.loads((Path(__file__).resolve().parents[2] / "host/tests/fixtures/cpu-admission-v2.json").read_text())
         self.assertEqual(sanitize_cpu_admission(fixture["cpu"]), fixture["cpu"])
 
     def test_proc_stat_guest_fields_and_heartbeat_shape(self):

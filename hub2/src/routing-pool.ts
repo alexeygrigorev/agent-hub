@@ -3,12 +3,14 @@
 // otherwise loads only Workers globals. @types/node is already a dependency.
 import { createHash } from 'node:crypto';
 import { HttpError } from './http';
-import { isDeepWorkModel, isExplicitOnlyModel, isModelPolicyCandidateAllowed } from './model-policy';
+import { explicitLunaIntent, isLunaModel, matchesModelIntent, isDeepWorkModel, isElevatedEffort, isExplicitOnlyModel, isModelPolicyCandidateAllowed, isNeonPinnedOnlyModel, isNonDefaultEffort, isOrdinaryWorkModel, isStrongModel, isThinkOnlyModel } from './model-policy';
 import { allowsAstra, sessionPurpose, type SessionPurpose } from './session-purpose';
+import {modelConstraintsAllow,normalizeModelConstraint,type ModelConstraint} from './intake-model-constraints';
 
 export type Candidate = { id: string; engine: string; model: string; effort?: string; account_id: string; weight: number; capabilities: string[]; enabled: boolean };
 export type AccountView = { credential_status?: string; account?: { min_remaining?: number; enabled?: boolean | number } | null; quota?: { remaining?: number; captured_at?: number; valid_until?: number } | null; fresh?: boolean; hosts?: string[]; credential_usable?: boolean };
-export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string };
+export type MachineView = { machine_id?: string; engines?: string[]; capabilities?: string[]; connected?: boolean; last_seen?: number; os?: string;
+  unhealthy_engines?: Array<{ engine: string; reason: string; until: number }> };
 export type PickedRoute = {
   machine_id: string; engine: string; model: string; effort?: string; account_id: string;
   policy_id: string; policy_version: unknown; override_reason: string | null;
@@ -23,6 +25,8 @@ export type PickDiagnostics = {
   share_floor?: { minimum_share: number; applied: boolean; reason: 'pool_too_large' | null };
 };
 // Base headroom knobs follow model-roulette; Hub adds exploration after Luna clipping.
+// OpenAI Codex only: fresh known quota must be strictly above this reserve (AGENTS.md quota gate, fail closed).
+const CODEX_RESERVE = 15;
 const MIN_HEADROOM = 5;      // % quota left below which a pool has no headroom
 const DEEP_BIAS = 3;         // opus/sol multiplier for tier deep/complex/serious
 const NEUTRAL_QUOTA = 50;    // unknown observations get a neutral weight, never fabricated quota
@@ -30,6 +34,8 @@ const MIN_SHARE = 0.03;     // per eligible candidate; the remaining mass follow
 const QUOTA_MAX_AGE_MS = 30 * 60 * 1000;
 const DEEP_TIERS = new Set(['deep', 'complex', 'serious']);
 export type PickInput = {
+  /** ProjectDO-derived intake ancestry; never a start-body preference. */
+  model_constraints?: ModelConstraint[];
   purpose?: SessionPurpose;
   /** Server-authorized explicit central delivery, never inferred from a capability hint. */
   managed_credential_label?: 'hub-claude';
@@ -38,6 +44,39 @@ export type PickInput = {
   /** Launch workspace: a label or an absolute path on the target host. */
   workspace?: string;
 };
+
+const REPOSITORY_IDENTITY_CAPABILITY = 'repo-identity:v1';
+const QUALIFIED_REPOSITORY_WORKSPACE = /^repo-[0-9a-f]{59}$/i;
+function isQualifiedRepositoryWorkspace(value: string | undefined): boolean {
+  return !!value && QUALIFIED_REPOSITORY_WORKSPACE.test(value);
+}
+function requiredCapabilitiesFor(input: PickInput): string[] {
+  return [...new Set([
+    input.interactive ? 'interactive' : 'headless',
+    ...(input.with_goal ? ['goal'] : []),
+    ...(isQualifiedRepositoryWorkspace(input.workspace) ? [REPOSITORY_IDENTITY_CAPABILITY] : []),
+    ...(input.required_capabilities || []),
+  ])];
+}
+
+// Additive closed capability string: never reinterpret old interactive:<engine>
+// as absence of headless. Multiple complete declarations intersect conservatively.
+export function declaredEngineModes(machine: { capabilities?: string[] } | undefined, engine: string): string[] | null {
+  if (!/^[A-Za-z0-9_.-]{1,48}$/.test(engine)) return null;
+  const prefix = `modes:v1:${engine}:`;
+  const declarations = (machine?.capabilities || []).filter(value => value.startsWith(prefix))
+    .map(value => value.slice(prefix.length)).filter(bits => ['h', 'i', 'hi'].includes(bits));
+  if (!declarations.length) return null;
+  return ['headless', 'interactive'].filter((mode, index) => declarations.every(bits => bits.includes(index === 0 ? 'h' : 'i')));
+}
+
+export function hostSupportsEngineMode(machine: { capabilities?: string[]; engines?: string[] } | undefined, engine: string, mode: 'headless' | 'interactive'): boolean {
+  if (!machine) return false;
+  const modes = declaredEngineModes(machine, engine);
+  if (modes !== null) return modes.includes(mode);
+  const capabilities = machine.capabilities || [];
+  return capabilities.includes(mode) || capabilities.includes(`${mode}:${engine}`);
+}
 
 export type RoutingPolicy = {version: unknown; candidates: Candidate[]};
 export type RoutingSnapshot = {policy: RoutingPolicy; accounts: Map<string, AccountView>; machines: Map<string, MachineView>; observed_at: number};
@@ -65,7 +104,19 @@ export function weightedChoice<T>(values: Array<{ value: T; weight: number }>, r
   return values[values.length - 1].value;
 }
 
+/** An exact model name is an explicit pick of that one variant only when no other candidate shares the name (so `opus` never admits opus-high). */
+function exactUniqueModel(policy: RoutingPolicy, candidate: Candidate, model?: string): boolean {
+  return !!model && model === candidate.model && policy.candidates.filter(c => c.model === model).length === 1;
+}
+
 export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Candidate[] {
+  if(input.model_constraints!==undefined&&(!Array.isArray(input.model_constraints)||input.model_constraints.length>32))
+    throw new HttpError('invalid_model_constraints',400);
+  const constraints=(input.model_constraints??[]).map(value=>{
+    const constraint=normalizeModelConstraint(value);
+    if(!constraint)throw new HttpError('invalid_model_constraints',400);
+    return constraint;
+  });
   const purpose = sessionPurpose(input.purpose);
   if(input.managed_credential_label!==undefined&&(input.managed_credential_label!=='hub-claude'
     ||input.engine!=='claude'||input.model!=='opus'||input.effort!=='medium'||input.interactive||input.with_goal))
@@ -76,24 +127,41 @@ export function eligibleCandidates(policy: RoutingPolicy, input: PickInput): Can
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
   if (input.override_reason && input.override_reason.length > 500)
     throw new HttpError('invalid_override_reason', 400);
-  const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
+  const required = requiredCapabilitiesFor(input);
   if (required.length > 32 || required.some(value => typeof value !== 'string' || !value || value.length > 80))
     throw new HttpError('invalid_required_capabilities', 400);
 
   if (!Array.isArray(policy.candidates) || !policy.candidates.length || policy.candidates.length > 32)
     throw new HttpError('model_policy_unconfigured', 503);
+  const requestedThinkOnly = input.model && policy.candidates.find(candidate =>
+    (input.model === candidate.id || input.model === candidate.model) && isThinkOnlyModel(candidate));
+  if (requestedThinkOnly && purpose !== 'think')
+    throw new HttpError('think_only_model_requires_think_purpose', 400);
   if (input.model && !allowsAstra(purpose) && policy.candidates.some(candidate =>
     (input.model === candidate.id || input.model === candidate.model) && isExplicitOnlyModel(candidate)))
     throw new HttpError('astra_not_for_implementation', 400);
+  const lunaRequested = explicitLunaIntent(policy.candidates, input.model);
   const excluded=new Set(input.exclude_policy_ids||[]);
+  const deep = DEEP_TIERS.has((input.tier || '').toLowerCase());
+  const ordinaryAutomatic = !input.model && !allowsAstra(purpose) && !deep;
   const candidates = policy.candidates.filter(candidate => candidate.enabled && !excluded.has(candidate.id)
+    && modelConstraintsAllow(candidate,constraints)
+    && (!isLunaModel(candidate) || lunaRequested)
+    && (!ordinaryAutomatic || isOrdinaryWorkModel(candidate))
+    // High effort is opt-in: an explicit --effort, the exact policy id or a deep tier.
+    && (!isElevatedEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || deep || exactUniqueModel(policy, candidate, input.model))
+    // Every model defaults to medium (Haiku/Luna max); any other effort only when requested by effort, id or exact model.
+    && (!isNonDefaultEffort(candidate) || input.effort === candidate.effort || input.model === candidate.id || exactUniqueModel(policy, candidate, input.model) || deep)
+    && (!isThinkOnlyModel(candidate) || purpose === 'think' && !!input.model
+      && (input.model === candidate.model || input.model === candidate.id))
     && (!isExplicitOnlyModel(candidate) || allowsAstra(purpose))
+    && (!isNeonPinnedOnlyModel(candidate) || !!input.model && (input.model === candidate.id || input.model === candidate.model))
     && (candidate.id !== 'claude-fable-5-2' || input.model === candidate.id || input.model === candidate.model)
     && (!isExplicitOnlyModel(candidate) || (override && !!input.model && (input.model === candidate.model || input.model === candidate.id)))
     && isModelPolicyCandidateAllowed(candidate)
     && (input.managed_credential_label===undefined||candidate.account_id==='claude')
     && (!input.engine || input.engine === candidate.engine)
-    && (!input.model || input.model === candidate.model || input.model === candidate.id)
+    && (!input.model || matchesModelIntent(candidate, input.model))
     && (!input.effort || input.effort === candidate.effort));
   if (!candidates.length) throw new HttpError('model_policy_unavailable', 503);
 
@@ -106,7 +174,7 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const accountIds = [...new Set(candidates.map(candidate => candidate.account_id))];
   const ids = new Set([...machines.keys()].sort());
   const override = !!(input.machine_id || input.engine || input.model || input.effort);
-  const required = [...new Set([input.interactive ? 'interactive' : 'headless', ...(input.with_goal ? ['goal'] : []), ...(input.required_capabilities || [])])];
+  const required = requiredCapabilitiesFor(input);
   for (const id of ids) if (machines.get(id)?.connected !== true) ids.delete(id);
   if (input.machine_id && !ids.has(input.machine_id) || !ids.size)
     throw new HttpError('no_connected_host', 503, JSON.stringify({machines:[...machines].map(([id,machine])=>({machine_id:id,connected:machine.connected===true,last_seen:machine.last_seen??null,age_ms:typeof machine.last_seen==='number'?Math.max(0,snapshot.observed_at-machine.last_seen):null}))}));
@@ -131,6 +199,14 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     return { account_id: id, reason: 'quota_stale', captured_at: Number.isSafeInteger(captured) && captured! >= 0 ? captured! : null };
   });
   const headroom = (candidate: Candidate): number | null => observations.get(candidate.account_id) ?? null;
+  // Hard Codex reserve, before any advisory narrowing: missing/stale/invalid/<=15 quota never
+  // survives, and no override, explicit route or exhausted pool restores it. Other engines
+  // (including ZAI/zcodex runtimes) keep the advisory MIN_HEADROOM semantics.
+  const reserveOk = (candidate: Candidate): boolean => candidate.engine !== 'codex' || (headroom(candidate) ?? -1) > CODEX_RESERVE;
+  const reserveDropped: PickDiagnostics['excluded'] = candidates.filter(candidate => !reserveOk(candidate))
+    .map(candidate => ({ policy_id: candidate.id, account_id: candidate.account_id, reason: 'codex_reserve' }));
+  const live = candidates.filter(reserveOk);
+  if (!live.length) throw new HttpError('model_policy_unavailable', 503);
   const managedCentral=input.managed_credential_label==='hub-claude';
   const dropped: PickDiagnostics['excluded'] = [], advisories: NonNullable<PickDiagnostics['advisories']> = [];
   const centralReady = (candidate: Candidate): boolean => {
@@ -159,7 +235,8 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     const matching = hosts.filter(id => machines.get(id)?.engines?.includes(candidate.engine));
     return matching.length ? matching : hosts;
   };
-  const scored = candidates.map(candidate => {
+  dropped.push(...reserveDropped);
+  const scored = live.map(candidate => {
     const left = headroom(candidate);
     const base = Math.max(0.0001, candidate.weight) * (left === null ? NEUTRAL_QUOTA : Math.max(0.01, left)) * (deep && isDeepWorkModel(candidate) ? DEEP_BIAS : 1);
     const originalHosts = hostsFor(candidate), observedHosts = originalHosts.filter(id=>!localMissing(candidate,id));
@@ -180,7 +257,32 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
     });
     return kept.length ? kept : rows;
   };
-  let pool = scored;
+  // A complete engine declaration is actual mode support, not an advisory
+  // credential/health observation. A known denial cannot be restored by narrow().
+  const mode = input.interactive ? 'interactive' : 'headless';
+  let pool = scored.map(row => ({...row, hosts:row.hosts.filter(id => {
+    const modes = declaredEngineModes(machines.get(id), row.candidate.engine);
+    return modes === null || modes.includes(mode);
+  })})).filter((row, index) => {
+    const denied = scored[index].hosts.length > 0 && row.hosts.length === 0;
+    if (denied) dropped.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'capability_not_advertised'});
+    return !denied;
+  });
+  if (!pool.length) throw new HttpError('model_policy_unavailable', 503);
+  // An engine that failed its auth/preflight check on a machine is unhealthy
+  // there (intake 62ccfa1e): route around it, but never refuse when it is all that is left.
+  const unhealthyOn = (id: string, engine: string) => (machines.get(id)?.unhealthy_engines || [])
+    .some(entry => entry?.engine === engine && Number(entry.until) > snapshot.observed_at);
+  const healthy = pool.map(row => ({...row, hosts: row.hosts.filter(id => !unhealthyOn(id, row.candidate.engine))}));
+  const lost = (index: number) => pool[index].hosts.length > 0 && healthy[index].hosts.length === 0;
+  if (healthy.some(row => row.hosts.length > 0)) {
+    for (const [index, row] of pool.entries()) if (lost(index))
+      dropped.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'engine_unhealthy'});
+    pool = healthy.filter((_row, index) => !lost(index));
+  } else {
+    for (const [index, row] of pool.entries()) if (lost(index))
+      advisories.push({policy_id:row.candidate.id,account_id:row.candidate.account_id,reason:'engine_unhealthy'});
+  }
   // --with-goal is a launch requirement, not a preference (intake baab076a): a picked
   // engine must run where the host advertises goal:<engine>, or the host refuses it with
   // launcher_capability_unavailable. Filter before the advisory narrows so quota/credential
@@ -213,26 +315,55 @@ export function buildRoutingPool(snapshot: RoutingSnapshot, input: PickInput) {
   const compatibleHosts = (row: typeof scored[number]) => row.hosts.filter(id => {
     const machine = machines.get(id), engine = row.candidate.engine;
     const needed = [...required, ...(row.candidate.effort ? ['effort'] : [])];
+    const capabilities = machine?.capabilities || [];
+    const modes = declaredEngineModes(machine, engine);
     return machine?.engines?.includes(engine) && needed.every(capability =>
       capability.startsWith('os:') ? machine.os?.toLowerCase() === capability.slice(3).toLowerCase()
-        : machine.capabilities?.includes(capability) || machine.capabilities?.includes(`${capability}:${engine}`));
+        : modes !== null && (capability === 'headless' || capability === 'interactive')
+          ? modes.includes(capability)
+          : capabilities.includes(capability) || capabilities.includes(`${capability}:${engine}`));
   });
   const compatible = new Map(pool.map(row => [row.candidate.id, compatibleHosts(row)]));
   pool = narrow(pool, row => compatible.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+  const hadCompatibleBeforeWorkspace = pool.some(row => (compatible.get(row.candidate.id) || []).length > 0);
   if (pool.some(row => compatible.get(row.candidate.id)!.length > 0))
     pool = pool.map(row => ({...row, hosts: compatible.get(row.candidate.id)!}));
-  // Workspace advertisements are optional placement hints. A missing label
-  // must not make every launch capability look unknown and restore an engine
-  // already excluded because another engine can satisfy the requested goal.
+  // Ordinary workspace advertisements are optional placement hints. A
+  // missing label must not restore an engine excluded by another hard check.
   const label = input.workspace && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(input.workspace)
     ? `workspace:${input.workspace.toLowerCase()}` : null;
   if (label) {
-    const workspaceHosts = new Map(pool.map(row => [row.candidate.id,
-      row.hosts.filter(id => machines.get(id)?.capabilities?.includes(label))]));
-    pool = narrow(pool, row => workspaceHosts.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
-    if (pool.some(row => workspaceHosts.get(row.candidate.id)!.length > 0))
-      pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
+    const qualifiedRepository = isQualifiedRepositoryWorkspace(input.workspace);
+    if (qualifiedRepository) {
+      // Repo-only selectors are identities, not optional placement hints. Use
+      // only hosts that satisfy the ordinary engine/capability checks and also
+      // advertise the exact token; old hosts fail closed with no basename path.
+      pool = pool.flatMap(row => {
+        const hosts = (compatible.get(row.candidate.id) || []).filter(id =>
+          machines.get(id)?.capabilities?.includes(label));
+        return hosts.length ? [{...row, hosts}] : [];
+      });
+      if (!pool.length) {
+        if (hadCompatibleBeforeWorkspace) {
+          throw new HttpError('repository_checkout_missing', 400, 'no checkout under enrolled roots; pass --cwd after creating it');
+        }
+        throw new HttpError('repository_workspace_unavailable', 503);
+      }
+    } else {
+      // Ordinary explicit labels remain advisory: a missing observation must
+      // not make every launch capability look unknown or restore an excluded engine.
+      const workspaceHosts = new Map(pool.map(row => [row.candidate.id,
+        row.hosts.filter(id => machines.get(id)?.capabilities?.includes(label))]));
+      pool = narrow(pool, row => workspaceHosts.get(row.candidate.id)!.length > 0, () => 'capability_not_advertised');
+      if (pool.some(row => workspaceHosts.get(row.candidate.id)!.length > 0))
+        pool = pool.map(row => ({...row, hosts: workspaceHosts.get(row.candidate.id)!}));
+    }
   }
+  // A deep/complex/serious tier prefers a strong model (Opus, Sol, Argon) and, without an explicit
+  // effort, its high-effort route. Applied after every hard and advisory observation, so the
+  // preference never restores an excluded route and never refuses when no strong route survives.
+  if (deep) pool = narrow(pool, row => isStrongModel(row.candidate), () => 'deep_prefers_strong_model');
+  if (deep && !input.effort) pool = narrow(pool, row => isElevatedEffort(row.candidate), () => 'deep_prefers_high_effort');
   for (const row of pool) if (row.localHosts.length) advisories.push({policy_id:row.candidate.id, account_id:row.candidate.account_id, reason:'local_login_unverified'});
   const others = pool.filter(row => !/luna/i.test(row.candidate.model)).map(row => row.base);
   const cap = others.length ? others.reduce((sum, weight) => sum + weight, 0) / others.length : Infinity;

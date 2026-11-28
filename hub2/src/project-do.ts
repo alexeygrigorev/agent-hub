@@ -1,36 +1,76 @@
+import {validNativeAbsenceEvidence} from './machine-native-inventory';
+import {terminalReceipt} from './terminal-receipts';
 import { SessionIntakeLink } from './session-intake-link';
+import { IntakeRelations } from './intake-relations';
 import {listProjectIntakes} from './intake-list';
-import {boundWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
+import {buildIntakeStats} from './intake-stats';
+import {boundWorkspace,checkoutWorkspace,mergeWorkspaceBinding,type WorkspaceBinding} from './workspace-binding';
 import { MeteredDb, initializeSchema } from './db';
+import { hostSupportsEngineMode } from './routing-pool';
 import { SqlReceiptMeter, SQL_PROBE_HEADER, wrapSqlNamespaces } from './sql-receipt';
 import { sha256Hex } from './crypto';
-import { actorFrom, bodyObject, boundedString, error, hasScope, HttpError, json } from './http';
+import { actorFrom, bodyObject, boundedString, error, forbiddenScope, hasScope, HttpError, json } from './http';
 import { advanceDispatch } from './dispatch';
 import { pickCommittedModelRoute, type PickedRoute, type PickDiagnostics } from './model-picker';
 import {buildStartPickerEvidence, normalizeStartPickerEvidence} from './start-picker-evidence';
 import { sessionPurpose } from './session-purpose';
+import {inheritedModelConstraints,normalizeModelConstraint,type InheritedModelConstraint} from './intake-model-constraints';
+import { codeTask, mergeEvidenceShapeError, mergeGateAll, mergeGaps, readOnlyBrief } from './merge-gate';
 import { nativeReturncode } from './native-exit';
 import { HOST_INVENTORY_LOST_MS } from './session-liveness';
 import { PROJECT_WORK_SCHEMA, ProjectWork, type ProjectWorkHooks } from './project-work';
 import {
-  COMPLETION_ACTOR, DEVELOPER_ALERT_RECIPIENT, MAX_AUTO_CONTINUATIONS, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES,
-  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, promptWithContract, retryDelay, stripCompletion,
-  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot,
+  BLOCKED_WAIT_MS, COMPLETION_ACTOR, ENGINE_PREFLIGHT_FAILURES, isFastStartRefusal, RETRY_ACTOR, VERIFICATION_ACTOR, DEVELOPER_ALERT_RECIPIENT, HARD_BLOCKERS, DEADLINE_REASON, OOM_REASON, MAX_DEADLINE_CONTINUATIONS, continuationLimit, MAX_AUTO_CONTINUATIONS, MAX_AUTO_RETRIES, MAX_CONTINUATION_TRIES, MAX_DELIVERY_TRIES, MAX_RETRY_START_TRIES, MAX_VERIFICATION_ATTEMPTS, MAX_VERIFICATION_START_TRIES,
+  LAUNCH_SPEC_LIMIT, basePrompt, completionClaim, continuationBudget, continuationPrompt, deliveryBody, exitCause, promptWithContract, retryDelay, retryPrompt, stripCompletion, taskBlocker, unwrapEvidence, verificationPrompt, verificationVerdict, verdictProblem, verifierNoVerdictCause,
+  type CompletionClaim, type CompletionRecord, type ContinuationSnapshot, type TaskBlocker, type VerificationAction, type VerificationVerdict,
 } from './task-completion';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 // Use exactly the same pending/current-attempt predicate for the bounded
 // drain and its alarm. Terminal actions never expire with intake age.
 const COMPLETION_DUE = `CASE
+  WHEN json_extract(i.final_evidence_json,'$.completion.verification.state')='pending'
+    THEN json_extract(i.final_evidence_json,'$.completion.verification.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.continuation.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.continuation.next_action_at')
   WHEN json_extract(i.final_evidence_json,'$.completion.delivery.state')='pending'
     THEN json_extract(i.final_evidence_json,'$.completion.delivery.next_action_at') END`;
-const COMPLETION_ELIGIBLE = `i.status IN ('open','failed','completed-awaiting-review')
+// Accepted is terminal and grows forever; only its pending delivery needs the
+// completion loop, and delivery retries (<=30 min apart) refresh updated_at, so
+// accepted rows are scanned only inside a bounded recent window (indexed by
+// intakes_status_updated). The window start is the one bound parameter.
+export const ACCEPTED_COMPLETION_WINDOW_MS = 7 * 24 * 60 * 60_000;
+const COMPLETION_ELIGIBLE = `(i.status IN ('open','failed','completed-awaiting-review')
+    OR (i.status='accepted' AND i.updated_at>=?))
   AND json_extract(i.final_evidence_json,'$.completion.controlled')=1
   AND json_extract(i.final_evidence_json,'$.completion.session_id')=i.session_id
   AND EXISTS(SELECT 1 FROM dispatch_sagas s WHERE s.session_id=i.session_id AND s.intake_id=i.id
     AND json_extract(s.routing_json,'$.completion_contract')=1)`;
+
+// Failed attempts whose saga carries no completion contract (operator shells,
+// scheduled runs, legacy starts) have no completion loop: Hub retries them
+// itself. The scan joins the completed saga of the current attempt, skips
+// operator stops and completion-owned records, and derives the due time from
+// the durable retry marker, else one first backoff step after the saga
+// completed (which also adopts intakes that failed before this loop existed).
+const FIRST_RETRY_DELAY_MS = 60_000;
+const FAILED_RETRY_CANDIDATES = `SELECT i.id, i.project, i.status, i.session_id, i.final_evidence_json, i.updated_at,
+    s.updated_at AS saga_updated_at, s.created_at AS saga_created_at, s.launch_spec_json, s.routing_json, s.operation_id AS saga_operation_id, s.machine_id AS saga_machine_id,
+    COALESCE(json_extract(i.final_evidence_json,'$.auto_retry.next_action_at'), s.updated_at + ${FIRST_RETRY_DELAY_MS}) AS retry_due
+  FROM intakes i JOIN dispatch_sagas s ON s.session_id=i.session_id AND s.intake_id=i.id AND s.state='complete'
+  WHERE i.status='failed' AND i.schedule_id IS NULL AND i.route_registered=1
+    AND json_extract(i.final_evidence_json,'$.completion.controlled') IS NOT 1
+    AND json_extract(i.final_evidence_json,'$.stop_requested') IS NOT 1
+    AND COALESCE(json_extract(i.final_evidence_json,'$.reason'),'')<>'stop_confirmed'
+    AND json_extract(i.final_evidence_json,'$.auto_retry.state') IS NULL`;
+// The scan keeps the earliest-due candidates; the pass writes terminal
+// markers (bound spent, hard blocker) as soon as a row is scanned, so the
+// due filter only gates starting a new session.
+const FAILED_RETRY_DUE = `SELECT * FROM (${FAILED_RETRY_CANDIDATES}) ORDER BY retry_due, updated_at, id LIMIT 8`;
+type FailedRetryRow = {
+  id: string; project: string; status: string; session_id: string; final_evidence_json: string | null; updated_at: number;
+  saga_updated_at: number; saga_created_at: number; launch_spec_json: string; routing_json: string | null; saga_operation_id: string; saga_machine_id: string; retry_due: number;
+};
 
 const SCHEMA = [
   `CREATE TABLE intakes (
@@ -94,6 +134,7 @@ export class ProjectDO {
   private readonly env: Hub2Env;
   private readonly work: ProjectWork;
   private readonly sessionLinks: SessionIntakeLink;
+  private readonly relations: IntakeRelations;
   private readonly ready: Promise<void>;
   private constructorMs = 0;
   private readonly eventSequences=new Map<string,number>();
@@ -104,6 +145,12 @@ export class ProjectDO {
     const started = performance.now();
     this.db = new MeteredDb(ctx.storage.sql);
     this.sessionLinks = new SessionIntakeLink(this.db, callback => this.transaction(callback), (...args) => this.appendEvent(...args));
+    this.relations = new IntakeRelations(this.db, {
+      transaction: callback => this.transaction(callback),
+      append: (...args) => this.appendEvent(...args),
+      canRead: (actor, intake) => this.canReadIntake(actor, intake as IntakeRow),
+      canWrite: (actor, intake) => this.canProject(actor, intake.project, 'intake:write'),
+    });
     this.sqlReceipts = new SqlReceiptMeter(this.db);
     this.env = wrapSqlNamespaces(env, this.sqlReceipts) as Hub2Env;
     this.work = new ProjectWork(ctx, this.db, {
@@ -127,6 +174,10 @@ export class ProjectDO {
     const url = new URL(request.url);
     try {
       await this.ready;
+      if (['/_internal/finish-dead-letter','/_internal/stopped-finish'].includes(url.pathname) && request.method==='POST')
+        return await terminalReceipt(request,this.db,fn=>this.transaction(fn),(...args)=>this.appendEvent(...args),id=>this.intakeContext(id));
+      if(url.pathname==='/_internal/session-wake'&&request.method==='POST')return await this.sessionWakeInternal(request);
+      if(url.pathname==='/_internal/evidence-read'&&request.method==='POST')return await this.evidenceRead(request);
       if (url.pathname === '/_internal/finish' && request.method === 'POST') return await this.finishInternal(request);
       if (url.pathname === '/_internal/started' && request.method === 'POST') return await this.startedInternal(request);
       if ((url.pathname === '/_internal/stopped' || url.pathname === '/_internal/reaped') && request.method === 'POST') return await this.stoppedInternal(request);
@@ -150,13 +201,24 @@ export class ProjectDO {
       if (url.pathname === '/_internal/session-link' && request.method === 'POST') return await this.sessionLinks.receive(request);
       if (url.pathname === '/api/intakes' && request.method === 'POST') return await this.createIntake(request);
       if (url.pathname === '/api/intakes' && request.method === 'GET') return this.listIntakes(request);
-      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard))?$/);
+      const relation = url.pathname.match(/^\/api\/intakes\/([^/]+)\/(depend|links|artifacts)(?:\/([^/]+))?$/);
+      if (relation) return await this.relations.fetch(request, decodeURIComponent(relation[1]), relation[2], relation[3] && decodeURIComponent(relation[3]))
+        ?? error('method_not_allowed', 405, `${request.method} is not supported on /${relation[2]}`);
+      const prerequisites = url.pathname.match(/^\/_internal\/prerequisites\/([^/]+)$/);
+      if (prerequisites && request.method === 'GET') return this.relations.internalPrerequisites(decodeURIComponent(prerequisites[1]));
+      const match = url.pathname.match(/^\/api\/intakes\/([^/]+)(?:\/(start|history|append|events|context|audit|discard|finished|merge-evidence|merge-state|reevaluate|stats|promote))?$/);
       if (!match) return error('not_found', 404);
-      const intakeId = decodeURIComponent(match[1]);
+      const intakeId = this.resolveIntakeRef(actorFrom(request), decodeURIComponent(match[1]));
       if (match[2] === 'start' && request.method === 'POST') return await this.startIntake(request, intakeId);
       if (match[2] === 'discard' && request.method === 'POST') return await this.discardUnused(request, intakeId);
       if (match[2] === 'history' && request.method === 'GET') return this.history(request, intakeId);
       if(match[2]==='append'&&request.method==='POST')return await this.appendIntake(request,intakeId);
+      if(match[2]==='finished'&&request.method==='POST')return await this.sessionFinished(request,intakeId);
+      if(match[2]==='merge-evidence'&&request.method==='POST')return await this.mergeEvidence(request,intakeId);
+      if(match[2]==='merge-state'&&request.method==='GET')return this.mergeState(request,intakeId);
+      if(match[2]==='reevaluate'&&request.method==='POST')return await this.reevaluate(request,intakeId);
+      if(match[2]==='stats')return request.method==='GET'?this.statsIntake(request,intakeId):error('method_not_allowed',405);
+      if(match[2]==='promote')return request.method==='POST'?await this.promoteIntake(request,intakeId):error('method_not_allowed',405);
       if(match[2]==='events'&&request.method==='POST')return await this.eventsCompat(request,intakeId);
       if(match[2]==='context'&&request.method==='GET')return this.contextView(request,intakeId);
       if(match[2]==='audit'&&request.method==='GET')return this.history(request,intakeId);
@@ -183,6 +245,7 @@ export class ProjectDO {
         if (!await this.dispatchSaga(row.operation_id)) break;
       }
       await this.runCompletionActions(now);
+      await this.runFailedIntakeRetries(now);
     } catch (caught) {
       console.error('[hub2] project alarm failed:', caught);
     } finally {
@@ -193,16 +256,26 @@ export class ProjectDO {
   private async createIntake(request: Request): Promise<Response> {
     const actor = actorFrom(request);
     const project = new URL(request.url).searchParams.get('project') || '';
-    if (!project || project.length > 180 || !this.canProject(actor, project, 'intake:write')) return error('forbidden', 403);
+    if (!project || project.length > 180) return error('forbidden', 403);
+    if (!this.canCreateIntake(actor, project)) {
+      return forbiddenScope('intake:write', `grant intake:write with project:${project} (or worker intake:create with worker_project:${project}) or operator:admin`);
+    }
     const body = await bodyObject(request, 16_384);
     normalizeCriteria(body);
+    if(body.model_constraints!==undefined){
+      if(!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can set model constraints');
+      body.model_constraints=normalizeModelConstraint(body.model_constraints);
+    }
+    if (body.code_task !== undefined && typeof body.code_task !== 'boolean') return error('invalid_code_task',400);
+    if (body.parent_intake_id !== undefined && body.parent_intake_id !== null && (typeof body.parent_intake_id !== 'string' || !body.parent_intake_id.trim())) return error('invalid_parent_intake_id', 400);
+    if (typeof body.parent_intake_id === 'string' && body.parent_intake_id.trim().length < 6) return error('prefix_too_short', 400, 'parent_intake_id prefix must be at least 6 characters');
     if (typeof body.title !== 'string' || body.title.trim().length < 1 || body.title.length > 240) return error('invalid_title', 400);
     if (typeof body.text !== 'string' || body.text.trim().length < 1 || new TextEncoder().encode(body.text).byteLength > 8192) return error('invalid_text', 400);
-    if (!Array.isArray(body.acceptance_criteria) || body.acceptance_criteria.length < 1 || body.acceptance_criteria.length > 32
-      || !body.acceptance_criteria.every(item => typeof item === 'string' && item.trim().length > 0 && item.length <= 1000)) return error('acceptance_criteria_required', 400);
+    const criteriaProblem = criteriaError(body.acceptance_criteria);
+    if (criteriaProblem) return criteriaProblem;
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
-    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: body.acceptance_criteria.map(value => (value as string).trim()) };
+    const normalized = { title: body.title.trim(), text: body.text, acceptance_criteria: (body.acceptance_criteria as string[]).map(value => value.trim()), code_task:typeof body.code_task==='boolean'?body.code_task:!readOnlyBrief(body.title,body.text,body.acceptance_criteria as string[]), ...(body.parent_intake_id !== undefined ? { parent_intake_id: body.parent_intake_id } : {}),...(body.model_constraints!==undefined?{model_constraints:body.model_constraints}:{}) };
     const digest = await sha256Hex(JSON.stringify(normalized));
     const prior = this.idempotent('intake:create', key, digest);
     if (prior instanceof Response) return prior;
@@ -215,9 +288,20 @@ export class ProjectDO {
     }
     const now = Date.now();
     const id = crypto.randomUUID();
+    let explicitParentId: string | null | undefined;
+    if (body.parent_intake_id !== undefined) {
+      if (!hasScope(actor, 'operator:admin')) return forbiddenScope('operator:admin', 'only an operator can set parent_intake_id');
+      const resolved = this.resolveParentIntakeId(id, body.parent_intake_id as string | null);
+      if (resolved instanceof Response) return resolved;
+      explicitParentId = resolved;
+    }
+    const parentIntakeId = explicitParentId !== undefined
+      ? explicitParentId
+      : (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id
+        && !this.canProject(actor, project, 'intake:write') ? actor.resource_id : null);
     this.transaction(() => {
-      this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority)
-        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user'}),2);
+      this.db.run(`INSERT INTO intakes(id, project, title, text, acceptance_criteria_json, status, assigned_machine_id, assigned_actor_id, session_id, final_evidence_json, created_at, updated_at, owner_actor_id, route_registered, route_next_action_at,original_title,original_text,source_json,priority,parent_intake_id)
+        VALUES (?, ?, ?, ?, ?, 'open', NULL, ?, NULL, NULL, ?, ?, ?, 0, ?,?,?,?,?,?)`, id, project, normalized.title, normalized.text, JSON.stringify(normalized.acceptance_criteria), actor?.id || 'operator', now, now, actor?.id || 'operator', now,normalized.title,normalized.text,JSON.stringify({type:'user',code_task:normalized.code_task,...(normalized.model_constraints?{model_constraints:normalized.model_constraints}:{})}),2,parentIntakeId);
       this.appendEvent(id, `intake:${id}:created`, actor?.id || 'operator', 'created', { title: normalized.title, acceptance_criteria: normalized.acceptance_criteria }, now);
       this.db.run('INSERT INTO idempotency(scope, request_key, request_digest, response_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)',
         'intake:create', key, digest, JSON.stringify({ id }), now, now + 180 * 24 * 60 * 60_000);
@@ -231,7 +315,8 @@ export class ProjectDO {
   private listIntakes(request: Request): Response {
     const actor = actorFrom(request), query = new URL(request.url).searchParams;
     const project = query.get('project') || '';
-    if (!this.canProject(actor, project, 'intake:read')) return error('forbidden',403);
+    if (!this.canProject(actor, project, 'intake:read'))
+      return forbiddenScope('intake:read', `listing intakes of ${project || 'a project'} needs intake:read with project:${project || '<owner/name>'} or operator:admin; a worker session reads its own and parent intake by id`);
     return listProjectIntakes(this.db,query,project);
   }
 
@@ -239,13 +324,85 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
-    return json({ intake: this.viewIntake(row), task: this.taskCompat(row) }, status);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
+    return json({ intake: { ...this.viewIntake(row), depends_on: this.relations.prerequisites(row.id), artifacts: this.relations.artifacts(row.id) },
+      task: this.taskCompat(row) }, status);
   }
 
-  /** Version handle for compare-and-set callers (CLI `intake close/update`): the row's updated_at. */
+  /** Version handle for compare-and-set callers (CLI `intake close/update/promote`): the row's updated_at. */
   private taskCompat(row: IntakeRow): JsonRecord {
-    return { id: row.id, updated_at: row.updated_at, ...this.intakeContext(row.id), control: { version: row.updated_at } };
+    return { id: row.id, updated_at: row.updated_at, promoted_at: this.promotedAt(row), ...this.intakeContext(row.id), control: { version: row.updated_at } };
+  }
+
+  private promotedAt(row: IntakeRow): number | null {
+    const source = this.parse(row.source_json) as JsonRecord | null;
+    return typeof source?.promoted_at === 'number' && Number.isSafeInteger(source.promoted_at) && source.promoted_at > 0 ? source.promoted_at : null;
+  }
+
+  /** `hub intake stats <id>`: read-only timing, attempts, engines/accounts and blockers for one intake. */
+  private statsIntake(request: Request, intakeId: string): Response {
+    const actor = actorFrom(request);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+    if (!row) return error('intake_not_found', 404);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
+    const sagas = this.db.all<SagaRow & { updated_at: number }>(
+      'SELECT operation_id, session_id, machine_id, account_id, launch_spec_json, routing_json, retry_count, native_id, state, attempt, last_reason, created_at, updated_at FROM dispatch_sagas WHERE intake_id = ? ORDER BY created_at ASC, operation_id ASC LIMIT 200',
+      row.id,
+    );
+    const events = this.db.all<IntakeEventRow>(
+      "SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? AND kind IN ('native_session_started','finish_evidence_received','session_stopped','session_reaped','session_lost','session_launch_failed','task_retry_started','task_continuation_started','worker_append','task_acceptance_verified','intake_updated') ORDER BY seq ASC LIMIT 500",
+      row.id,
+    );
+    const dependencies = this.relations.prerequisites(row.id);
+    return json({ stats: buildIntakeStats(row, sagas, events, dependencies.length, Date.now()) });
+  }
+
+  /** `hub intake promote <id>`: stamp promoted_at on a queueable intake with CAS and idempotency. */
+  private async promoteIntake(request: Request, intakeId: string): Promise<Response> {
+    const actor = actorFrom(request);
+    const body = await bodyObject(request, 4096);
+    const key = this.idempotencyKey(request, body);
+    if (!key) return error('idempotency_key_required', 400);
+    const allowed = ['key', 'expected_version', 'expected_updated_at'];
+    if (Object.keys(body).some(field => !allowed.includes(field))) return error('unknown_intake_field', 400);
+    const expected = body.expected_version !== undefined ? body.expected_version : body.expected_updated_at;
+    if (body.expected_version !== undefined && body.expected_updated_at !== undefined && body.expected_version !== body.expected_updated_at) {
+      return error('invalid_expected_version', 400);
+    }
+    if (expected !== undefined && (typeof expected !== 'number' || !Number.isSafeInteger(expected) || expected < 0)) {
+      return error('invalid_expected_version', 400);
+    }
+    const digest = await sha256Hex(JSON.stringify(body));
+    const scope = 'intake:promote:' + intakeId;
+    const replay = this.idempotent(scope, key, digest);
+    if (replay instanceof Response) return replay;
+    return this.transaction(() => {
+      const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
+      if (!row) return error('intake_not_found', 404);
+      if (!this.canProject(actor, row.project, 'intake:write')) {
+        return forbiddenScope('intake:write', `promoting intake ${row.id} needs intake:write with project:${row.project} or operator:admin`);
+      }
+      if (replay) return json({ intake: this.viewIntake(row), task: this.taskCompat(row), duplicate: true });
+      if (expected !== undefined && expected !== row.updated_at) return error('version_conflict', 409);
+      if (!['open', 'failed', 'needs_attention'].includes(row.status)) {
+        return error(
+          'intake_not_promotable',
+          409,
+          `intake ${row.id} has status ${row.status} and cannot be promoted; reopen with \`hub intake update ${row.id} --status open\` and start with \`hub sessions start --intake-task-id ${row.id}\``,
+        );
+      }
+      const at = Math.max(Date.now(), row.updated_at + 1);
+      const source = { ...((this.parse(row.source_json) as JsonRecord | null) ?? {}), promoted_at: at };
+      const sourceJson = JSON.stringify(source);
+      this.db.run('UPDATE intakes SET source_json = ?, updated_at = ? WHERE id = ?', sourceJson, at, row.id);
+      this.appendEvent(row.id, 'promote:' + row.id + ':' + key, actor!.id, 'intake_promoted', { promoted_at: at }, at);
+      this.db.run(
+        'INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',
+        scope, key, digest, JSON.stringify({ id: row.id, promoted_at: at }), at, at + 180 * 86400000,
+      );
+      const updated = { ...row, source_json: sourceJson, updated_at: at } as IntakeRow;
+      return json({ intake: this.viewIntake(updated), task: this.taskCompat(updated) });
+    });
   }
 
   /** `hub intake context`: the intake plus its most recent events, bounded. */
@@ -253,9 +410,14 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, row)) return error('forbidden', 403);
+    if (!this.canReadIntake(actor, row) && !(this.isWorkerParent(actor, row) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(row);
     const rows = this.db.all<IntakeEventRow>('SELECT seq, actor_id, kind, body_json, at FROM intake_events WHERE task_id = ? ORDER BY seq DESC LIMIT 50', intakeId).reverse();
-    return json({ intake: this.viewIntake(row), task: this.taskCompat(row),
+    const waiting=this.db.one<{wake_at_ms:number}>(`SELECT CAST(json_extract(e.body_json,'$.wake_at_ms') AS INTEGER) AS wake_at_ms FROM intake_events e
+      WHERE e.task_id=? AND e.kind='session_wake_updated' AND json_extract(e.body_json,'$.wake_state')='pending'
+      AND json_extract(e.body_json,'$.wake_at_ms')>? AND NOT EXISTS(SELECT 1 FROM intake_events n WHERE n.task_id=e.task_id
+        AND n.kind IN ('session_wake_updated','session_wake_missed') AND n.seq>e.seq AND json_extract(n.body_json,'$.wake_id')=json_extract(e.body_json,'$.wake_id'))
+      AND json_extract(e.body_json,'$.session_id')=? ORDER BY wake_at_ms LIMIT 1`,intakeId,Date.now(),row.session_id);
+    return json({ intake: this.viewIntake(row), task: this.taskCompat(row),...(waiting?{waiting_until:new Date(waiting.wake_at_ms).toISOString()}:{}),
       events: rows.map(r => ({ seq: r.seq, actor_id: r.actor_id, kind: r.kind, at: r.at, body: this.parse(r.body_json) })) });
   }
 
@@ -278,11 +440,11 @@ export class ProjectDO {
     const body = await bodyObject(request.clone(), 16384);
     const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!row) return error('intake_not_found', 404);
-    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', 'force', 'verification', 'project', ...INTAKE_CONTEXT_FIELDS];
+    const supported = ['key', 'expected_version', 'title', 'priority', 'acceptance_criteria', 'status', 'reason', 'note', 'outcome', 'superseded_by', 'force', 'verification', 'project', 'code_task', 'parent_intake_id', ...INTAKE_CONTEXT_FIELDS];
     if (Object.keys(body).some(field => !supported.includes(field))) return error('unknown_intake_field', 400);
     const mapped: JsonRecord = { key: body.key };
     if (typeof body.expected_version === 'number') mapped.expected_updated_at = body.expected_version;
-    for (const field of ['title', 'priority', 'acceptance_criteria', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
+    for (const field of ['title', 'priority', 'acceptance_criteria', 'project', 'code_task', 'parent_intake_id', ...INTAKE_CONTEXT_FIELDS]) if (body[field] !== undefined) mapped[field] = body[field];
     if (body.status !== undefined) {
       const forceClose = body.force === true || body.outcome === 'closed_unverified';
       const unverifiedSession = row.session_id !== null && row.status !== 'completed-awaiting-review' && !forceClose;
@@ -301,7 +463,7 @@ export class ProjectDO {
     const actor = actorFrom(request);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
-    if (!this.canReadIntake(actor, intake)) return error('forbidden', 403);
+    if (!this.canReadIntake(actor, intake) && !(this.isWorkerParent(actor, intake) && hasScope(actor, 'intake:read'))) return this.intakeReadDenied(intake);
     const rawAfter = new URL(request.url).searchParams.get('after') || '0';
     const after = Number(rawAfter);
     if (!Number.isSafeInteger(after) || after < 0) return error('invalid_cursor', 400);
@@ -347,14 +509,40 @@ export class ProjectDO {
   private async appendIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
     if(!key||Object.keys(body).some(k=>!['key','note','evidence'].includes(k)))return error('invalid_append',400);
+    // A record the CLI wrapped twice ({evidence:{evidence:{kind}}}) is stored as written by its author.
+    if(body.evidence!==undefined)body.evidence=unwrapEvidence(body.evidence);
     if(body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.evidence!==undefined&&(!body.evidence||typeof body.evidence!=='object'||Array.isArray(body.evidence)||!Object.keys(body.evidence).length)||body.note===undefined&&body.evidence===undefined)return error('invalid_append',400);
     const digest=await sha256Hex(JSON.stringify([body.note??null,body.evidence??null])),eventKey='append:'+intakeId+':'+key;
     return this.transaction(()=>{
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!intake)return error('intake_not_found',404);
-      if(!actor||!hasScope(actor,'operator:admin')&&!(actor.resource_id===intake.id&&hasScope(actor,'intake:append')))return error('forbidden',403);
+      if(!actor||!hasScope(actor,'operator:admin')&&!((actor.resource_id===intake.id||this.isWorkerParent(actor,intake))&&hasScope(actor,'intake:append')))
+        return forbiddenScope('intake:append',`append to intake ${intake.id} needs intake:append on that intake, its child-intake worker session, or operator:admin`);
       // A completion claim may come only from that session itself or an operator.
-      const claimed=(body.evidence as JsonRecord|undefined)?.kind==='task_complete'?(body.evidence as JsonRecord).session_id:undefined;
+      const claimKind=(body.evidence as JsonRecord|undefined)?.kind;
+      // A child's session reports progress to its parent; it never writes records the parent's gates read.
+      if(!hasScope(actor,'operator:admin')&&actor.resource_id!==intake.id&&claimKind!==undefined
+        &&['merge_gate','task_complete','session_finished','task_blocked','acceptance_verification'].includes(String(claimKind)))
+        return forbiddenScope('operator:admin',`a child-intake worker session may append notes and evidence to parent ${intake.id}, not ${String(claimKind)} records`);
+      const claimed=['task_complete','session_finished'].includes(String(claimKind))?(body.evidence as JsonRecord).session_id:undefined;
       if(claimed!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(claimed))return error('completion_claim_forbidden',403);
+      if(claimed!==undefined&&intake.session_id!==claimed)return error('completion_claim_stale',409);
+      const blockedBy=(body.evidence as JsonRecord|undefined)?.kind==='task_blocked'?(body.evidence as JsonRecord).session_id:undefined;
+      if(blockedBy!==undefined&&!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(blockedBy))return error('blocker_record_forbidden',403);
+      if(blockedBy!==undefined&&intake.session_id!==blockedBy)return error('blocker_record_stale',409);
+      const verdict=(body.evidence as JsonRecord|undefined)?.kind==='acceptance_verification'?(body.evidence as JsonRecord).session_id:undefined;
+      if(verdict!==undefined){
+        if(!hasScope(actor,'operator:admin')&&actor.id!=='session:'+String(verdict))return error('verification_record_forbidden',403);
+        if(intake.session_id!==verdict)return error('verification_record_stale',409);
+        const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',String(verdict),intake.id);
+        if(!saga||(this.parse(saga.routing_json) as JsonRecord|null)?.acceptance_verification!==true)return error('verification_record_forbidden',403);
+        const criteria=this.parse(intake.acceptance_criteria_json);
+        if(!verificationVerdict(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0))
+          return error('invalid_verification_record',400,verdictProblem(body.evidence,String(verdict),Array.isArray(criteria)?criteria.length:0));
+      }
+      if(claimKind==='merge_gate'){
+        const problem=mergeEvidenceShapeError(body.evidence);
+        if(problem)return error('invalid_merge_evidence',400,problem);
+      }
       const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
       if(previous)return (JSON.parse(previous.body_json) as JsonRecord).request_digest===digest?json({appended:true,duplicate:true,intake_id:intakeId}):error('idempotency_conflict',409);
       this.appendEvent(intake.id,eventKey,actor.id,'worker_append',{...(body.note?{note:body.note}:{}),...(body.evidence?{evidence:body.evidence}:{}),request_digest:digest},Date.now());
@@ -362,31 +550,228 @@ export class ProjectDO {
     });
   }
 
+  /** Agent-facing completion event. It is explicitly session-scoped and has
+   * the same full-criteria proof requirements as the legacy task_complete. */
+  private async sessionFinished(request:Request,intakeId:string):Promise<Response>{
+    const body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','kind','session_id','summary','acceptance'].includes(k)))return error('invalid_session_finished',400);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!['queued','running'].includes(intake.status)||intake.session_id!==body.session_id)return error('session_finish_stale',409);
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    if(body.kind!=='session_finished'||typeof body.session_id!=='string'
+      ||!completionClaim(body,body.session_id,Array.isArray(criteria)?criteria.length:0))return error('invalid_session_finished',400);
+    const actor=actorFrom(request);
+    const mapped={key,evidence:body};
+    return await this.appendIntake(new Request(request.url,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(mapped)}),intakeId);
+  }
+
+  /** Accept one bounded CLI-collected GitHub observation, including failures;
+   * failed observations stay visible and keep code work from being accepted. */
+  private async mergeEvidence(request:Request,intakeId:string):Promise<Response>{
+    const body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','evidence'].includes(k))||!body.evidence)return error('invalid_merge_evidence',400);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!codeTask(this.parse(intake.source_json)))return error('merge_gate_not_required',409);
+    const problem=mergeEvidenceShapeError(body.evidence);
+    if(problem)return error('invalid_merge_evidence',400,problem);
+    const actor=actorFrom(request);
+    return await this.appendIntake(new Request(request.url,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify({key,evidence:body.evidence})}),intakeId);
+  }
+
+  /** `hub intake merge-state`: the programmatic merge gate of one intake, as
+   * Hub evaluates it on acceptance. Readable by intake readers (operators and
+   * the intake's own worker credential). */
+  private mergeState(request:Request,intakeId:string):Response{
+    const actor=actorFrom(request);
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+    if(!intake)return error('intake_not_found',404);
+    if(!this.canReadIntake(actor,intake)&&!(this.isWorkerParent(actor,intake)&&hasScope(actor,'intake:read')))return this.intakeReadDenied(intake);
+    const gate=this.intakeMergeGate(intake);
+    const completion=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined;
+    return json({intake_id:intake.id,project:intake.project,status:intake.status,code_task:gate.required,
+      merge_gate:{required:gate.required,ok:gate.ok,problems:gate.problems,evidence:gate.evidence??null},
+      verification:completion?.verification?{state:completion.verification.state,attempts:completion.verification.attempts,
+        ...(completion.verification.gaps?{gaps:completion.verification.gaps}:{}),...(completion.verification.last_reason?{last_reason:completion.verification.last_reason}:{})}:null,
+      next_step:!gate.required?'Not a code intake: no merge evidence is required.'
+        :gate.ok?'Merge gate satisfied.':`Merge the PR to main with green checks for its exact head, then run hub intake merge-check ${intake.id} --pr <PR URL>.`});
+  }
+
+  /** Operator: re-run Hub's gate on an intake that ended failed (or is waiting
+   * for review): an independent verifier checks every criterion and the merge
+   * gate; a pass accepts the intake, a fail sends it back with named gaps. */
+  private async reevaluate(request:Request,intakeId:string):Promise<Response>{
+    const actor=actorFrom(request),body=await bodyObject(request,4096),key=this.idempotencyKey(request,body);
+    if(!key||Object.keys(body).some(k=>!['key','reason'].includes(k)))return error('invalid_reevaluation',400);
+    if(body.reason!==undefined&&(typeof body.reason!=='string'||body.reason.length>500))return error('invalid_reevaluation',400);
+    if(!hasScope(actor,'operator:admin'))return error('forbidden',403);
+    const eventKey='reevaluate:'+intakeId+':'+key,round='re'+(await sha256Hex(eventKey)).slice(0,12);
+    const result=this.transaction(()=>{
+      const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);
+      if(!intake)return error('intake_not_found',404);
+      const previous=this.db.one<{body_json:string}>('SELECT body_json FROM intake_events WHERE event_key=?',eventKey);
+      if(previous)return json({reevaluation:'requested',duplicate:true,intake_id:intake.id,...(this.parse(previous.body_json) as JsonRecord)});
+      if(!['failed','completed-awaiting-review'].includes(intake.status))return error('reevaluation_not_applicable',409,`intake is ${intake.status}; only failed or completed-awaiting-review intakes are re-evaluated`);
+      const saga=intake.session_id?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',intake.session_id,intake.id):undefined;
+      if(!saga||saga.state!=='complete')return error('reevaluation_session_active',409,'the intake has no finished session to re-evaluate');
+      const criteria=this.parse(intake.acceptance_criteria_json);
+      if(!Array.isArray(criteria)||!criteria.length)return error('acceptance_criteria_required',409);
+      const launch=(this.parse(saga.launch_spec_json) as JsonRecord|null)??{};
+      if(String(launch.engine??'').toLowerCase()==='shell')return error('reevaluation_not_applicable',409,'shell sessions carry no completion contract');
+      // The work under review is the implementation session: when the intake
+      // last ran a verifier, re-evaluate that verifier's origin, never the verifier.
+      const lastRoute=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+      const origin=lastRoute.acceptance_verification===true
+        ?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',String(lastRoute.verification_origin_session_id??''),intake.id):saga;
+      if(!origin||origin.state!=='complete')return error('reevaluation_origin_missing',409,'the implementation session of the last verification is unknown');
+      for(const row of [saga,origin]){
+        const route=(this.parse(row.routing_json) as JsonRecord|null)??{};
+        if(route.completion_contract!==true)
+          this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',JSON.stringify({...route,completion_contract:true}),row.operation_id);
+      }
+      const now=Date.now();
+      const reason=typeof body.reason==='string'&&body.reason.trim()?body.reason.trim():'operator re-evaluation';
+      const summary=`Re-evaluation requested (${reason}). Check the current state of the work (merged PRs, deployed code, recorded notes), not only the last session.`;
+      const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+      const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:'reevaluation_requested',depth:0,summary,
+        verification:{state:'pending',key:'verify:'+origin.session_id+':'+round+':1',attempts:0,tries:0,next_action_at:now,original_session_id:origin.session_id,
+          summary,excluded_policy_ids:[],round}};
+      const at=Math.max(now,intake.updated_at+1);
+      this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',JSON.stringify({...evidence,completion:record}),at,intake.id);
+      const view={session_id:saga.session_id,original_session_id:origin.session_id,round,reason,previous_status:intake.status};
+      this.appendEvent(intake.id,eventKey,actor!.id,'task_reevaluation_requested',view,at);
+      return json({reevaluation:'requested',intake_id:intake.id,...view},202);
+    });
+    await this.scheduleNext();
+    return result;
+  }
+
+  /** Every merge observation of the intake, newest first: work may be merged
+   * in several repositories, so the gate reads the newest one of each. */
+  private mergeEvidenceRecords(intakeId:string):unknown[]{
+    const found:unknown[]=[];
+    for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' ORDER BY seq DESC LIMIT 200",intakeId)){
+      const append=this.parse(row.body_json) as JsonRecord|null,evidence=append?.evidence as JsonRecord|undefined;
+      if(evidence?.kind==='merge_gate')found.push(evidence);
+    }
+    return found;
+  }
+
+  private intakeMergeGate(intake:IntakeRow){
+    const required=codeTask(this.parse(intake.source_json));
+    if(!required)return mergeGateAll(false,[]);
+    // Citations: the intake text and worker-written records (notes, DONE records),
+    // never merge observations or Hub's own refusal/alert records, which quote the URL.
+    let corpus:string|undefined;
+    const cited=(url:string)=>{
+      if(corpus===undefined){
+        const parts=[intake.title,intake.text];
+        for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' ORDER BY seq DESC LIMIT 2000",intake.id)){
+          const body=this.parse(row.body_json) as JsonRecord|null;
+          if((body?.evidence as JsonRecord|undefined)?.kind==='merge_gate')continue;
+          parts.push(row.body_json);
+        }
+        corpus=parts.join('\n').toLowerCase();
+      }
+      // Not a prefix of a longer PR number (pull/1 vs pull/12).
+      const needle=url.toLowerCase();
+      for(let at=corpus.indexOf(needle);at>=0;at=corpus.indexOf(needle,at+1))
+        if(!/[0-9]/.test(corpus.charAt(at+needle.length)))return true;
+      return false;
+    };
+    return mergeGateAll(true,this.mergeEvidenceRecords(intake.id),intake.project,cited);
+  }
+
+  /** The independent verifier passed every criterion and only the merge gate
+   * held acceptance back: once the gate is satisfied, an operator's `done`
+   * (the Developer's live check) accepts without another verifier round. */
+  private onlyMergeBlocked(intake:IntakeRow,completion:CompletionRecord|undefined):boolean{
+    const v=completion?.verification;
+    if(!v||v.state!=='failed')return false;
+    if(v.merge_gate_only===true)return true;
+    // Records written before merge_gate_only existed: Hub's own verification
+    // event says the merge gate blocked, and every gap is a Hub merge-gate gap.
+    const event=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='task_acceptance_verification_failed' ORDER BY seq DESC LIMIT 1",intake.id);
+    const body=event?this.parse(event.body_json) as JsonRecord|null:null;
+    return body?.merge_gate_blocked===true&&Array.isArray(v.gaps)&&v.gaps.length>0
+      &&v.gaps.every(gap=>typeof gap==='string'&&gap.startsWith('Merge gate: ')&&gap.endsWith('Run hub intake merge-check after updating the PR and CI.'));
+  }
+
   private async editIntake(request:Request,intakeId:string):Promise<Response>{
     const actor=actorFrom(request),body=await bodyObject(request,16384),key=this.idempotencyKey(request,body);normalizeCriteria(body);
     if(!key)return error('idempotency_key_required',400);
-    const allowed=['key','expected_updated_at','title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS];
-    if(!['title','text','acceptance_criteria','status','priority','note',...INTAKE_CONTEXT_FIELDS].some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    const editable=['title','text','acceptance_criteria','status','priority','note','project','code_task','parent_intake_id','model_constraints',...INTAKE_CONTEXT_FIELDS],allowed=['key','expected_updated_at',...editable];
+    if(!editable.some(k=>body[k]!==undefined)||Object.keys(body).some(k=>!allowed.includes(k)))return error('unknown_intake_field',400);
+    if(body.code_task!==undefined&&typeof body.code_task!=='boolean')return error('invalid_code_task',400);
+    if(body.model_constraints!==undefined){
+      if(!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can set model constraints');
+      body.model_constraints=normalizeModelConstraint(body.model_constraints);
+    }
+    if(body.parent_intake_id!==undefined&&body.parent_intake_id!==null&&(typeof body.parent_intake_id!=='string'||!body.parent_intake_id.trim()))return error('invalid_parent_intake_id',400);
+    if(typeof body.parent_intake_id==='string'&&body.parent_intake_id.trim().length<6)return error('prefix_too_short',400,'parent_intake_id prefix must be at least 6 characters');
+    if(body.project!==undefined&&(typeof body.project!=='string'||!/^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/.test(body.project)))return error('invalid_intake_project',400);
     if(body.title!==undefined&&(typeof body.title!=='string'||!body.title.trim()||body.title.length>240)||body.text!==undefined&&(typeof body.text!=='string'||!body.text.trim()||new TextEncoder().encode(body.text).length>8192)||body.note!==undefined&&(typeof body.note!=='string'||!body.note.trim()||body.note.length>4000)||body.priority!==undefined&&(!Number.isInteger(body.priority)||Number(body.priority)<0||Number(body.priority)>3)||body.status!==undefined&&!['open','archived','needs_attention','accepted'].includes(String(body.status)))return error('invalid_intake_edit',400);
     if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined&&body[field]!==null&&(typeof body[field]!=='string'||new TextEncoder().encode(body[field] as string).length>8192)))return error('invalid_intake_context',400);
-    if(body.acceptance_criteria!==undefined&&(!Array.isArray(body.acceptance_criteria)||!body.acceptance_criteria.length||body.acceptance_criteria.length>32||!body.acceptance_criteria.every(v=>typeof v==='string'&&v.trim()&&v.length<=1000)))return error('acceptance_criteria_required',400);
+    if(body.acceptance_criteria!==undefined){const problem=criteriaError(body.acceptance_criteria);if(problem)return problem;}
     const digest=await sha256Hex(JSON.stringify(body)),scope='intake:edit:'+intakeId;
     const replay=this.idempotent(scope,key,digest);if(replay instanceof Response)return replay;
     const result=this.transaction(()=>{
       const row=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',intakeId);if(!row)return error('intake_not_found',404);
       if(!this.canProject(actor,row.project,'intake:write'))return error('forbidden',403);
       if(replay)return json({intake:this.viewIntake(row),duplicate:true});
+      if(body.project!==undefined&&body.project!==row.project&&!this.canProject(actor,body.project as string,'intake:write'))return error('forbidden',403);
       if(body.expected_updated_at!==undefined&&body.expected_updated_at!==row.updated_at)return error('intake_version_conflict',409);
+      if(body.code_task!==undefined&&!hasScope(actor,'operator:admin'))return error('forbidden',403,'only an operator can reclassify an intake');
+      if(body.parent_intake_id!==undefined&&!hasScope(actor,'operator:admin'))return forbiddenScope('operator:admin','only an operator can set parent_intake_id');
+      let nextParentId=row.parent_intake_id;
+      if(body.parent_intake_id!==undefined){
+        const resolved=this.resolveParentIntakeId(row.id,body.parent_intake_id as string|null);
+        if(resolved instanceof Response)return resolved;
+        nextParentId=resolved;
+      }
+      let mergeReleased=false;
+      if(body.status==='accepted'){
+        const gate=this.intakeMergeGate(row);
+        if(!gate.ok){
+          const at=Date.now(),alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'merge_gate_blocked',session_id:row.session_id,
+            problems:gate.problems,head_sha:gate.evidence?.head_sha??null,pr_url:gate.evidence?.pr_url??null};
+          this.appendEvent(row.id,'merge-gate-blocked:'+row.id+':'+key,COMPLETION_ACTOR,'developer_alert_raised',alert,at);
+          this.appendEvent(row.id,'merge-gate-owner:'+row.id+':'+key,COMPLETION_ACTOR,'intake_context_updated',{
+            ...this.intakeContext(row.id),owner:DEVELOPER_ALERT_RECIPIENT,
+            current_state:'Hub refused to accept code work because the programmatic GitHub merge gate is not satisfied.',
+            next_step:'Developer: inspect the merge-gate problems, merge the PR to main, verify green checks for the exact head, then run hub intake merge-check.'},at);
+          console.error('[hub2] MERGE_GATE_BLOCKED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:row.id,...alert}));
+          return error('merge_gate',409,JSON.stringify({problems:gate.problems,pr_url:gate.evidence?.pr_url??null,head_sha:gate.evidence?.head_sha??null}));
+        }
+        const final=this.parse(row.final_evidence_json??'{}') as JsonRecord;
+        const completion=final.completion as CompletionRecord|undefined;
+        mergeReleased=hasScope(actor,'operator:admin')&&row.status==='failed'&&this.onlyMergeBlocked(row,completion);
+        if(completion?.controlled===true&&completion.verification?.state!=='passed'&&!mergeReleased)
+          return error('acceptance_verification_required',409,'Independent acceptance verification must pass before this intake can be accepted. When the merge gate is now satisfied, run hub intake reevaluate.');
+      }
       const changesCore=body.title!==undefined||body.text!==undefined||body.acceptance_criteria!==undefined||body.status!==undefined;
       if(changesCore&&(['queued','running'].includes(row.status)||(row.session_id&&this.db.one<SagaRow>("SELECT * FROM dispatch_sagas WHERE session_id=? AND state<>'complete'",row.session_id))))return error('intake_active',409);
-      if(body.status==='accepted'&&(row.status!=='completed-awaiting-review'||!hasScope(actor,'operator:admin')))return error('review_required',409);
+      if(body.status==='accepted'&&(!['completed-awaiting-review','accepted'].includes(row.status)&&!mergeReleased||!hasScope(actor,'operator:admin')))return error('review_required',409);
       if(body.status==='archived'&&row.session_id!==null&&row.status!=='completed-awaiting-review'&&typeof body.note!=='string')return error('review_required',409);
-      const at=Date.now(),next={title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2};
-      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,updated_at=? WHERE id=?',next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,at,row.id);
+      const at=Date.now(),next={project:typeof body.project==='string'?body.project:row.project,title:typeof body.title==='string'?body.title.trim():row.title,text:body.text??row.text,acceptance_criteria_json:body.acceptance_criteria?JSON.stringify(body.acceptance_criteria):row.acceptance_criteria_json,status:body.status??row.status,priority:body.priority??row.priority??2,parent_intake_id:nextParentId};
+      this.db.run('UPDATE intakes SET original_title=COALESCE(original_title,title),original_text=COALESCE(original_text,text),project=?,title=?,text=?,acceptance_criteria_json=?,status=?,priority=?,parent_intake_id=?,updated_at=? WHERE id=?',next.project,next.title,next.text,next.acceptance_criteria_json,next.status,next.priority,next.parent_intake_id,at,row.id);
       if(INTAKE_CONTEXT_FIELDS.some(field=>body[field]!==undefined)){
         const context={...this.intakeContext(row.id)};
         for(const field of INTAKE_CONTEXT_FIELDS)if(body[field]!==undefined)context[field]=body[field];
         this.appendEvent(row.id,'context:'+row.id+':'+key,actor!.id,'intake_context_updated',context,at);
+      }
+      if(typeof body.code_task==='boolean'||body.model_constraints!==undefined){
+        const source={...((this.parse(row.source_json) as JsonRecord|null)??{})},was=codeTask(source);
+        if(typeof body.code_task==='boolean')source.code_task=body.code_task;
+        if(body.model_constraints!==undefined){
+          if(body.model_constraints===null)delete source.model_constraints;
+          else source.model_constraints=body.model_constraints;
+        }
+        row.source_json=JSON.stringify(source);
+        this.db.run('UPDATE intakes SET source_json=? WHERE id=?',row.source_json,row.id);
+        if(typeof body.code_task==='boolean')this.appendEvent(row.id,'code-task:'+row.id+':'+key,actor!.id,'intake_reclassified',{code_task:body.code_task,was,...(body.note?{note:body.note}:{})},at);
+        if(body.model_constraints!==undefined)this.appendEvent(row.id,'model-constraints:'+row.id+':'+key,actor!.id,'intake_model_constraints_updated',{model_constraints:body.model_constraints},at);
       }
       this.appendEvent(row.id,'edit:'+row.id+':'+key,actor!.id,'intake_updated',{...next,...(body.note?{note:body.note}:{})},at);
       this.db.run('INSERT INTO idempotency(scope,request_key,request_digest,response_json,created_at,expires_at) VALUES(?,?,?,?,?,?)',scope,key,digest,JSON.stringify({id:row.id}),at,at+180*86400000);
@@ -406,6 +791,10 @@ export class ProjectDO {
     return saga?this.startResponse(saga,['offered','claimed','running'].includes(saga.state)?201:202):error('dispatch_state_unavailable',503);
   }
 
+  private modelConstraintSnapshot(intakeId:string):InheritedModelConstraint[]{
+    return inheritedModelConstraints(intakeId,id=>this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',id));
+  }
+
   private async serializeRouting<T>(action:()=>Promise<T>):Promise<T>{
     const previous=this.routingQueue;
     let release!:()=>void;
@@ -417,11 +806,70 @@ export class ProjectDO {
   private async prepareStartIntake(request: Request, intakeId: string): Promise<Response|string> {
     const actor = actorFrom(request);
     const body = await bodyObject(request, 16_384);
+    if(body.model_constraints!==undefined)return error('model_constraints_start_forbidden',403,'model constraints belong to operator-owned intake metadata');
     const key = this.idempotencyKey(request, body);
     if (!key) return error('idempotency_key_required', 400);
     const intake = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id = ?', intakeId);
     if (!intake) return error('intake_not_found', 404);
-    if (!this.canProject(actor, intake.project, 'session:start')) return error('forbidden', 403);
+    if (!this.canStartIntake(actor, intake)
+      && !(typeof body.engine === 'string' && body.engine.toLowerCase() === 'shell' && body.interactive === true
+        && actor?.kind === 'operator' && this.canProject(actor, intake.project, 'shell:start'))) {
+      if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id === intake.id) {
+        return forbiddenScope('operator:admin', 'a worker session cannot start a new session on its own intake; create a child intake first or use operator:admin');
+      }
+      return forbiddenScope('session:start', `grant session:start with project:${intake.project} or operator:admin`);
+    }
+    const verificationOf=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_of_session_id==='string'?body.verification_of_session_id:undefined;
+    const verificationOrigin=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_origin_session_id==='string'?body.verification_origin_session_id:undefined;
+    const verificationAttempt=body.verification_attempt;
+    const verificationRound=actor?.id===VERIFICATION_ACTOR&&typeof body.verification_round==='string'&&/^re[0-9a-f]{12}$/.test(body.verification_round)?body.verification_round:undefined;
+    if((body.verification_of_session_id!==undefined||body.verification_origin_session_id!==undefined||body.verification_attempt!==undefined||body.verification_round!==undefined)
+      &&actor?.id!==VERIFICATION_ACTOR)return error('verification_start_forbidden',403);
+    if(body.verification_round!==undefined&&verificationRound===undefined)return error('verification_start_stale',409);
+    let verificationPrevious:SagaRow|undefined,verificationOriginal:SagaRow|undefined;
+    const retryStart=actor?.id===RETRY_ACTOR;
+    // A Hub continuation excludes the route whose engine failed its preflight check.
+    const fallbackStart=retryStart||actor?.id===COMPLETION_ACTOR;
+    let excludedPolicyIds:string[]=[];
+    const rawExclude=body.exclude_policy_ids;
+    if(rawExclude!==undefined){
+      if(actor?.id!==VERIFICATION_ACTOR&&!fallbackStart)return error('exclude_policy_forbidden',403,'only Hub verifier, retry and continuation starts may exclude routing policies');
+      if(!Array.isArray(rawExclude)||rawExclude.length>16||rawExclude.some(v=>typeof v!=='string'||!v.trim()||v.length>128))return error('invalid_policy_exclusions',400);
+      excludedPolicyIds=[...new Set(rawExclude as string[])];
+    }
+    let excludedMachineIds:string[]|undefined;
+    if(body.exclude_machine_ids!==undefined){
+      if(!retryStart)return error('exclude_machine_forbidden',403,'only Hub retry starts may exclude machines');
+      const raw=body.exclude_machine_ids;
+      if(!Array.isArray(raw)||raw.length>8||raw.some(v=>typeof v!=='string'||!/^[A-Za-z0-9_.-]{1,80}$/.test(v)))return error('invalid_machine_exclusions',400);
+      excludedMachineIds=[...new Set(raw as string[])];
+    }
+    if(verificationOf!==undefined){
+      if(intake.session_id!==verificationOf||typeof verificationOrigin!=='string'||!Number.isSafeInteger(verificationAttempt)
+        ||Number(verificationAttempt)<1||Number(verificationAttempt)>MAX_VERIFICATION_ATTEMPTS)return error('verification_start_stale',409);
+      verificationPrevious=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOf,intake.id);
+      verificationOriginal=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',verificationOrigin,intake.id);
+      const previousRoute=(this.parse(verificationPrevious?.routing_json??'{}') as JsonRecord|null)??{};
+      // The first verifier of an operator re-evaluation checks the intake's last
+      // finished session itself, whatever that session claimed.
+      const pending=((this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)?.completion as CompletionRecord|undefined)?.verification;
+      const reevaluationStart=verificationRound!==undefined&&verificationAttempt===1&&verificationOf===intake.session_id
+        &&pending?.state==='pending'&&pending.round===verificationRound&&pending.original_session_id===verificationOrigin;
+      if(verificationRound!==undefined&&!reevaluationStart&&previousRoute.verification_round!==verificationRound)return error('verification_start_stale',409);
+      if(!verificationPrevious||!verificationOriginal||!this.completionControlled(verificationOriginal)
+        ||!['completed-awaiting-review','failed'].includes(intake.status)
+        ||(intake.status==='completed-awaiting-review'&&verificationAttempt!==1)
+        ||(intake.status==='failed'&&!reevaluationStart&&(previousRoute.acceptance_verification!==true||Number(verificationAttempt)!==Number(previousRoute.verification_attempt)+1
+          ||previousRoute.verification_origin_session_id!==verificationOrigin)))return error('verification_start_stale',409);
+      if(intake.status==='completed-awaiting-review'&&!reevaluationStart&&(!this.findCompletionClaim(intake,verificationOriginal)
+        ||verificationOf!==verificationOrigin))return error('verification_start_stale',409);
+      const originalRoute=(this.parse(verificationOriginal.routing_json??'{}') as JsonRecord|null)??{};
+      const originalPicker=(originalRoute.picker as JsonRecord|undefined)??{};
+      if(typeof originalPicker.policy_id==='string'&&!excludedPolicyIds.includes(originalPicker.policy_id))return error('verification_model_not_independent',409);
+      if(Number(verificationAttempt)>1&&typeof previousRoute.picker==='object'&&previousRoute.picker
+        &&typeof (previousRoute.picker as JsonRecord).policy_id==='string'
+        &&!excludedPolicyIds.includes(String((previousRoute.picker as JsonRecord).policy_id)))return error('verification_model_not_independent',409);
+    }
     if (intake.route_registered !== 1 && !await this.registerIntakeRoute(intake)) {
       await this.scheduleNext();
       return error('route_registration_pending', 503);
@@ -434,10 +882,19 @@ export class ProjectDO {
     const modelInput = body.model;
     const effortInput = body.effort;
     const purpose = sessionPurpose(body.purpose);
+    const intakeWorktree = body.intake_worktree === undefined ? undefined : body.intake_worktree;
+    if (intakeWorktree !== undefined && intakeWorktree !== 'detached' && intakeWorktree !== 'successor')
+      return error('invalid_intake_worktree', 400);
+    if(verificationOf!==undefined&&purpose!=='review')return error('verification_purpose_required',400);
     const reasonInput = body.override_reason === undefined ? body.reason : body.override_reason;
     const prompt = typeof body.prompt === 'string' ? body.prompt : intake.text;
+    if(body.verification_summary!==undefined&&(actor?.id!==VERIFICATION_ACTOR||typeof body.verification_summary!=='string'||body.verification_summary.length>1200))
+      return error('invalid_verification_summary',400);
     const interactive = body.interactive === undefined ? false : body.interactive;
-    const timeoutSeconds = body.timeout_seconds === undefined ? 1800 : body.timeout_seconds;
+    // Implementation/fix sessions do real multi-step work (PR, CI, deploy) and
+    // must not be killed at 30 minutes; review/think keep the short default.
+    const timeoutSeconds = body.timeout_seconds === undefined
+      ? (purpose === 'implement' || purpose === 'fix' ? 7200 : 1800) : body.timeout_seconds;
     const absoluteWorkspace = typeof workspace === 'string' && (workspace.startsWith('/') || /^[A-Za-z]:\\/.test(workspace));
     const workspaceLabel = typeof workspace === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(workspace);
     if (typeof workspace !== 'string' || workspace.length > 1024
@@ -472,6 +929,11 @@ export class ProjectDO {
       effort: effortInput ?? null, override_reason: overrideReason ?? null,
       required_capabilities: requiredCapabilities, with_goal: withGoal,
       ...(purpose !== 'implement' ? { purpose } : {}),
+      ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
+      ...(verificationOf!==undefined?{verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,
+        verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),
+      ...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
+      ...(excludedMachineIds?{exclude_machine_ids:excludedMachineIds}:{}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     const digest = await sha256Hex(JSON.stringify({
@@ -489,13 +951,45 @@ export class ProjectDO {
     const operationId = `${operationHash.slice(0,8)}-${operationHash.slice(8,12)}-5${operationHash.slice(13,16)}-a${operationHash.slice(17,20)}-${operationHash.slice(20,32)}`;
     const sessionHash = await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intakeId,key]));
     const sessionId = `${sessionHash.slice(0,8)}-${sessionHash.slice(8,12)}-5${sessionHash.slice(13,16)}-a${sessionHash.slice(17,20)}-${sessionHash.slice(20,32)}`;
+    const modelConstraints=this.modelConstraintSnapshot(intakeId);
     let route: PickedRoute;
     let diagnostics:PickDiagnostics;
     if (typeof engineInput === 'string' && engineInput.toLowerCase() === 'shell') {
-      if (!hasScope(actor, 'operator:admin')) return error('forbidden', 403);
+      if (!actor) return error('forbidden', 403);
+      // Interactive shells are default-deny with no admin exception: an
+      // authenticated operator (holding operator:admin from standard Hub
+      // login/device approval, or shell:start) needs an explicit per-host
+      // grant in shell_grants. Admin rights administer grants (/api/shell-grants)
+      // and do not bypass the grant check. Legacy headless shells stay
+      // admin-only, unchanged.
+      const isAdmin = !interactive && hasScope(actor, 'operator:admin');
+      if (interactive) {
+        if (actor.kind !== 'operator') return error('forbidden', 403);
+        if (!hasScope(actor, 'operator:admin') && !hasScope(actor, 'shell:start')) return error('forbidden', 403);
+      } else if (!isAdmin) {
+        return error('forbidden', 403);
+      }
       const hostIds = new Set<string>();
-      if (typeof machineInput === 'string') hostIds.add(machineInput);
-      else {
+      if (typeof machineInput === 'string') {
+        if (!isAdmin) {
+          const check = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
+            'https://control.internal/_internal/shell-grants/check',
+            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id, machine_id: machineInput }) },
+          );
+          const granted = check.ok && ((await check.json()) as { granted?: boolean }).granted === true;
+          if (!granted) return error('forbidden', 403, 'explicit shell grant required for this user and host');
+        }
+        hostIds.add(machineInput);
+      } else if (!isAdmin) {
+        const granted = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
+          'https://control.internal/_internal/shell-grants/hosts',
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ actor_id: actor.id }) },
+        );
+        if (!granted.ok) return error('model_picker_data_unavailable', 503);
+        const { machine_ids } = (await granted.json()) as { machine_ids?: string[] };
+        for (const id of machine_ids || []) if (typeof id === 'string') hostIds.add(id);
+        if (!hostIds.size) return error('forbidden', 403, 'explicit shell grant required for this user and host');
+      } else {
         let after = '';
         do {
           const response = await this.env.CONTROL.get(this.env.CONTROL.idFromName('global')).fetch(
@@ -514,11 +1008,24 @@ export class ProjectDO {
           headers: { 'x-hub2-actor': JSON.stringify(actor) },
         });
         if (!response.ok) throw new HttpError('model_picker_data_unavailable', 503);
-        const host = await response.json() as { connected?: boolean; last_seen?: number };
+        const host = await response.json() as { connected?: boolean; last_seen?: number; capabilities?: string[]; engines?: string[] };
         return { machine_id, connected: host.connected === true, last_seen: host.last_seen ?? null,
+          capabilities: Array.isArray(host.capabilities) ? host.capabilities : [],
+          engines: Array.isArray(host.engines) ? host.engines : [],
           age_ms: typeof host.last_seen === 'number' ? Math.max(0, Date.now() - host.last_seen) : null };
       }));
-      const selected = hosts.find(host => host.connected);
+      const connected = hosts.filter(host => host.connected);
+      const eligible = interactive
+        ? connected.filter(host => hostSupportsEngineMode(host, 'shell', 'interactive'))
+        : connected;
+      if (interactive && connected.length && !eligible.length) {
+        return error('launcher_capability_unavailable_interactive', 409, 'shell supports headless only; interactive is not advertised on any target host');
+      }
+      // A retry prefers any other connected host; the failed machine is only
+      // reused when no alternative is connected at all.
+      const selected = excludedMachineIds?.length
+        ? eligible.find(host => !excludedMachineIds!.includes(host.machine_id)) ?? eligible[0]
+        : eligible[0];
       if (!selected) return error('no_connected_host', 503, JSON.stringify({ machines: hosts }));
       route = {
         machine_id: selected.machine_id, engine: 'shell', model: 'shell', account_id: '', policy_id: 'operator-shell',
@@ -529,16 +1036,25 @@ export class ProjectDO {
         effort:route.effort??null,weight:1,share:1}],excluded:[]};
     } else {
       const picked = await pickCommittedModelRoute(this.env, {
+          ...(modelConstraints.length?{model_constraints:modelConstraints.map(row=>row.constraint)}:{}),
           ...(typeof machineInput === 'string' ? { machine_id: machineInput } : {}),
           ...(typeof engineInput === 'string' ? { engine: engineInput } : {}),
           ...(typeof modelInput === 'string' ? { model: modelInput } : {}),
           ...(typeof effortInput === 'string' ? { effort: effortInput } : {}),
           ...(typeof body.tier === 'string' ? { tier: body.tier } : {}),
           ...(overrideReason ? { override_reason: overrideReason } : {}),
+          ...(verificationOf!==undefined?{exclude_policy_ids:excludedPolicyIds}:{}),
+          ...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),
           interactive, purpose, with_goal: withGoal, required_capabilities: requiredCapabilities, workspace,
           ...(managedLabel!==undefined?{managed_credential_label:'hub-claude' as const}:{}),
         }, {project_id:intake.project,operation_id:operationId,attempt:0});
       route=picked.route;diagnostics=picked.diagnostics;
+      if(verificationOf!==undefined){
+        const originalLaunch=this.parse(verificationOriginal!.launch_spec_json) as JsonRecord;
+        const sameModel=String(route.engine).toLowerCase()===String(originalLaunch.engine).toLowerCase()
+          &&String(route.model).toLowerCase()===String(originalLaunch.model).toLowerCase();
+        if(sameModel||/(?:astra|haiku)/i.test(`${route.policy_id} ${route.model}`))return error('independent_verification_route_unavailable',503);
+      }
     }
     if(managedLabel!==undefined){
       if(route.engine!=='claude'||route.model!=='opus'||route.effort!=='medium'||route.account_id!=='claude')
@@ -551,6 +1067,19 @@ export class ProjectDO {
       const host=await response.json() as JsonRecord;
       if(host.connected!==true||!Array.isArray(host.capabilities)||!host.capabilities.includes('managed:hub-claude:opus:medium:v1'))
         return error('managed_exec_unavailable',409);
+    }
+    if (absoluteWorkspace) {
+      try {
+        const preflightResponse = await this.env.MACHINES.get(this.env.MACHINES.idFromName(route.machine_id)).fetch(
+          'https://machine.internal/_internal/workspace-preflight',
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-hub2-actor': JSON.stringify(actor) }, body: JSON.stringify({ workspace }) },
+        );
+        if (preflightResponse.ok) {
+          const preflight = await preflightResponse.json() as { checked?: boolean; ok?: boolean; reason?: string; detail?: string };
+          if (preflight.checked === true && preflight.ok === false)
+            return error(preflight.reason || 'workspace_unavailable', 400, preflight.detail || 'path does not exist; Hub will not create it');
+        }
+      } catch {}
     }
     const picker=buildStartPickerEvidence(route,diagnostics);
     const raced = this.idempotent(scope, key, digest);
@@ -566,12 +1095,15 @@ export class ProjectDO {
     const launchSpec = {
       workspace, engine: route.engine, model: route.model, ...(route.effort ? { effort: route.effort } : {}),
       prompt, interactive, purpose, with_goal:withGoal, timeout_seconds: Number(timeoutSeconds), start_deadline_at: Date.now()+120_000,
-      ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason } : {}),
+      ...(intakeWorktree !== undefined ? { intake_worktree: intakeWorktree } : {}),
+      ...(route.engine.toLowerCase() === 'shell' ? { shell_reason: overrideReason, ...(interactive && actor ? { shell_actor_id: actor.id } : {}) } : {}),
       ...(managedLabel!==undefined?{managed_credential_label:managedLabel}:{}),
     };
     let contractOmitted = false;
     if (completionControlled) {
-      launchSpec.prompt = promptWithContract(prompt, { ...launchSpec, prompt: '' }, intakeId, sessionId, criteria as string[]);
+      // Verifiers receive their own verdict contract; the implementation
+      // contract would ask them to submit a worker completion claim instead.
+      launchSpec.prompt = verificationOf!==undefined?prompt:promptWithContract(prompt, { ...launchSpec, prompt: '' }, intakeId, sessionId, criteria as string[]);
       // The Machine counts the escaped JSON; a start that fits today must still fit.
       if (new TextEncoder().encode(JSON.stringify(launchSpec)).byteLength > LAUNCH_SPEC_LIMIT) { launchSpec.prompt = prompt; contractOmitted = true; }
     }
@@ -585,16 +1117,21 @@ export class ProjectDO {
     try {
       this.transaction(() => {
         const current = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', intakeId);
+        if(JSON.stringify(this.modelConstraintSnapshot(intakeId))!==JSON.stringify(modelConstraints))
+          throw new HttpError('intake_model_constraints_changed',409);
         if (current && continuationOf !== undefined && current.session_id !== continuationOf)
           throw new HttpError('intake_already_assigned', 409, 'continuation superseded');
-        if (!current || (current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
+      const allowedVerification=verificationOf!==undefined&&current?.session_id===verificationOf&&['completed-awaiting-review','failed'].includes(current.status);
+      if (!current || (!allowedVerification&&current.status !== 'open' && !(current.status === 'queued' && current.session_id === null)&&!this.retryableFailure(current)))
           throw new HttpError('intake_already_assigned', 409, !current ? undefined : ['queued','running'].includes(current.status)||current.status==='failed'
             ? `intake is ${current.status} with session ${current.session_id}; stop it first (hub sessions stop ${current.session_id}), then start again on this intake`
             : `intake is ${current.status}; reopen it first (hub intake update ${current.id} --status open), then start again on this intake`);
         this.db.run(`INSERT INTO dispatch_sagas(operation_id, request_digest, request_key, intake_id, session_id, machine_id, account_id, attempt_operation_id, launch_spec_json, routing_json, epoch, state, attempt, next_action_at, last_reason, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending_machine', 0, ?, NULL, ?, ?)`, operationId, digest, key, intakeId, sessionId, machineId, accountId, `${operationId}:0`, JSON.stringify(launchSpec), JSON.stringify({...route,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[route.policy_id],picker,initial_picker:picker,...(completionControlled?{completion_contract:true}:{}),...(fallbackStart&&excludedPolicyIds.length?{exclude_policy_ids:excludedPolicyIds}:{}),...(verificationOf!==undefined?{acceptance_verification:true,verification_of_session_id:verificationOf,verification_origin_session_id:verificationOrigin,verification_attempt:Number(verificationAttempt),exclude_policy_ids:excludedPolicyIds,verification_summary:body.verification_summary??'',...(verificationRound?{verification_round:verificationRound}:{})}:{}),...(contractOmitted?{completion_contract_omitted:'launch_budget'}:{})}), now + 30_000, now, now);
         // A Hub continuation keeps the original requester as the assigned actor.
-        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, continuationOf !== undefined ? current.assigned_actor_id ?? actor?.id ?? 'operator' : actor?.id || 'operator', sessionId, now, intakeId);
+        const assignedActor=verificationOf!==undefined?current.assigned_actor_id??actor?.id??'operator'
+          :continuationOf!==undefined?current.assigned_actor_id??actor?.id??'operator':actor?.id||'operator';
+        this.db.run("UPDATE intakes SET status = 'queued', assigned_machine_id = ?, assigned_actor_id = ?, session_id = ?, final_evidence_json=NULL, updated_at = ? WHERE id = ?", machineId, assignedActor, sessionId, now, intakeId);
         this.appendEvent(intakeId, `start:${operationId}:requested`, actor?.id || 'operator', 'session_start_requested', {
           operation_id: operationId, session_id: sessionId, machine_id: machineId, account_id: accountId, routing_decision: route,...(current.status==='failed'?{retry_of_session:current.session_id}:{}),
         }, now);
@@ -690,7 +1227,7 @@ export class ProjectDO {
       const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=? AND session_id=?',saga.intake_id,saga.session_id);
       const completion=intake&&this.completionControlled(current)?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
       this.db.run("UPDATE intakes SET status='failed',final_evidence_json=?,updated_at=? WHERE id=? AND session_id=?",
-        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id,...(completion?{completion}:{})}),now,saga.intake_id,saga.session_id);
+        JSON.stringify({launch_failed:true,native_id_absent:true,reason,session_id:saga.session_id,operation_id:saga.operation_id,...(completion?{completion}:{auto_retry:this.failedRetryMarker(saga.intake_id,now)})}),now,saga.intake_id,saga.session_id);
       this.appendEvent(saga.intake_id,`dispatch-failed:${saga.attempt_operation_id}`, 'hub2-dispatch','session_launch_failed',
         {session_id:saga.session_id,reason},now);
       return true;
@@ -752,7 +1289,7 @@ export class ProjectDO {
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_claim', 409);
     const binding=this.workspaceBinding(saga,body.workspace_binding);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale') return json({claimed:false,lost:true,duplicate:true});
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason))) return json({claimed:false,lost:true,duplicate:true});
     if (saga.state === 'claimed' || saga.state === 'admitted' || saga.state === 'running') {
       this.transaction(()=>this.pinWorkspaceBinding(saga,binding));
       return json({ claimed: true, duplicate: true });
@@ -828,7 +1365,7 @@ export class ProjectDO {
           const completion=active&&intake.session_id===saga.session_id&&this.completionControlled(current)
             ?this.completionOutcome(intake,saga,undefined,'launch_failed',false,true,now):undefined;
           this.db.run('UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?',active?'failed':intake.status,
-            JSON.stringify({...stripCompletion(previous),...stripCompletion(payload),operation_id:saga.operation_id,...(completion?{completion}:{})}),now,intake.id);
+            JSON.stringify({...stripCompletion(previous),...stripCompletion(payload),operation_id:saga.operation_id,...(completion?{completion}:{...(active?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})})}),now,intake.id);
         }else if(terminalObservation&&intakeMatches){
           const previous=this.parse(intake.final_evidence_json) as JsonRecord|null;
           this.db.run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',
@@ -851,17 +1388,20 @@ export class ProjectDO {
     const body=await bodyObject(request,12_288);
     if(body.reason==='legacy_launch_unobserved')return this.legacyLaunchUnobserved(body,reaped);
     if(typeof body.operation_id!=='string'||typeof body.attempt_operation_id!=='string'||typeof body.session_id!=='string'
-      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale'].includes(String(body.reason)))
+      ||typeof body.machine_id!=='string'||!Number.isSafeInteger(body.epoch)||!['dead','idle','stop_confirmed','launch_timeout_no_native','host_no_response','host_launch_refused','host_inventory_stale','native_inventory_absent'].includes(String(body.reason)))
       return error('invalid_stopped_receipt',400);
     const launchTimedOut=['launch_timeout_no_native','host_no_response'].includes(String(body.reason));
     const launchRefused=body.reason==='host_launch_refused';
     const launchFailed=launchTimedOut||launchRefused;
-    const lost=body.reason==='host_inventory_stale';
+    const lost=['host_inventory_stale','native_inventory_absent'].includes(String(body.reason));
+    const nativeAbsent=body.reason==='native_inventory_absent';
     if (lost && (!reaped || body.lost!==true || body.stopped!==undefined
       || typeof body.native_id!=='string' || body.native_id.length<8 || body.native_id.length>128
       || !Number.isSafeInteger(body.observed_at)
-      || (body.inventory_observed_at!==null && (!Number.isSafeInteger(body.inventory_observed_at)
-        || Number(body.observed_at)-Number(body.inventory_observed_at)<HOST_INVENTORY_LOST_MS)))) return error('invalid_lost_receipt',400);
+      || (nativeAbsent?(!validNativeAbsenceEvidence(body.native_inventory_absence,Number(body.observed_at))
+        ||['stopped','reaped','native_exit_confirmed','exit_code','containment_empty'].some(key=>Object.hasOwn(body,key)))
+        :(body.inventory_observed_at!==null && (!Number.isSafeInteger(body.inventory_observed_at)
+        || Number(body.observed_at)-Number(body.inventory_observed_at)<HOST_INVENTORY_LOST_MS))))) return error('invalid_lost_receipt',400);
     const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',body.operation_id);
     if(!saga||saga.session_id!==body.session_id||saga.machine_id!==body.machine_id)return error('stale_stopped_receipt',409);
     const exactAttempt=saga.attempt_operation_id===body.attempt_operation_id&&saga.epoch===body.epoch;
@@ -872,7 +1412,7 @@ export class ProjectDO {
       &&saga.state==='complete'&&saga.last_reason==='stop_confirmed'&&previousAttempt;
     if(!exactAttempt&&!pendingRetryStop&&!duplicateRetryStop)return error('stale_stopped_receipt',409);
     if (lost && (!exactAttempt || (saga.native_id!==null && saga.native_id!==body.native_id))) return error('stale_lost_receipt',409);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale') {
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason))) {
       if (!await this.releaseLostCapacity(saga)) return error('session_cap_release_pending',503);
       return json({lost:true,duplicate:true,session_id:saga.session_id});
     }
@@ -886,6 +1426,26 @@ export class ProjectDO {
     const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',saga.intake_id);
     if(!intake||intake.session_id!==saga.session_id||intake.assigned_machine_id!==saga.machine_id)return error('stopped_intake_binding_mismatch',409);
     const now=Date.now(),eventKey=`stopped:${saga.attempt_operation_id}:${saga.epoch}`;
+    if (launchRefused && body.failure_reason === 'disk_below_floor') {
+      const nextAttempt = saga.attempt + 1;
+      const retryAt = now + 30_000;
+      const backpressured = this.transaction(() => {
+        const current = this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?', saga.operation_id);
+        if (!current || current.state !== saga.state || current.attempt_operation_id !== saga.attempt_operation_id || current.epoch !== saga.epoch) return false;
+        if (!['offered', 'claimed', 'admitted'].includes(current.state)) return false;
+        this.db.run(
+          "UPDATE dispatch_sagas SET state='pending_machine', attempt=?, attempt_operation_id=?, next_action_at=?, last_reason='disk_below_floor', updated_at=? WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=?",
+          nextAttempt, `${saga.operation_id}:${nextAttempt}`, retryAt, now, saga.operation_id, saga.state, saga.attempt_operation_id, saga.epoch,
+        );
+        this.db.run("UPDATE intakes SET status='queued', updated_at=? WHERE id=? AND session_id=?", now, intake.id, saga.session_id);
+        this.appendEvent(intake.id, `backpressure:${saga.attempt_operation_id}:${saga.epoch}`, `machine:${saga.machine_id}`, 'session_launch_backpressure',
+          { session_id: saga.session_id, machine_id: saga.machine_id, epoch: saga.epoch, reason: 'disk_below_floor', retry_at: retryAt }, now);
+        return true;
+      });
+      if (!backpressured) return error('stale_stopped_receipt', 409);
+      await this.scheduleNext();
+      return json({ queued: true, backpressure: true, reason: 'disk_below_floor', session_id: saga.session_id, retry_at: retryAt });
+    }
     const applied=this.transaction(()=>{
       const current=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
       if(!current||current.state!==saga.state||current.attempt_operation_id!==saga.attempt_operation_id||current.epoch!==saga.epoch)return false;
@@ -903,10 +1463,10 @@ export class ProjectDO {
           !launchFailed&&!lost&&['dead','idle'].includes(String(body.reason)),true,now);
       }
       this.db.run("UPDATE intakes SET status=?,final_evidence_json=?,updated_at=? WHERE id=?",status,
-        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped,
+        JSON.stringify({...(launchFailed?{launch_failed:true,native_id_absent:true}:lost?{lost:true,inventory_observed_at:body.inventory_observed_at,...(nativeAbsent?{native_outcome:'unconfirmed',native_inventory_absence:body.native_inventory_absence}:{})}:{stopped:true}),...(launchRefused?{failure_reason:body.failure_reason}:{}),reaped:nativeAbsent?false:reaped,
           operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,
           session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,
-          native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{})}),now,intake.id);
+          native_id:body.native_id??null,observed_at:body.observed_at,...(completion?{completion}:{...(status==='failed'?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})})}),now,intake.id);
       this.appendEvent(intake.id,eventKey,`machine:${saga.machine_id}`,launchFailed?'session_launch_failed':lost?'session_lost':reaped?'session_reaped':'session_stopped',
         {session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,reason:body.reason,native_id:body.native_id??null,
           ...(launchRefused?{failure_reason:body.failure_reason}:{})},now);
@@ -984,11 +1544,13 @@ export class ProjectDO {
       return await fail('managed_credential_auth_failed');
     if(saga.attempt>=1)return await fail('model_attempts_exhausted');
     if(!route||route.override_reason!==null)return await fail('explicit_route_auth_failed');
+    const modelConstraints=this.modelConstraintSnapshot(intake.id);
     let next:PickedRoute;
     let diagnostics:PickDiagnostics;
     try{
       const launch=this.parse(saga.launch_spec_json) as JsonRecord;
       const picked=await pickCommittedModelRoute(this.env,{interactive:launch.interactive===true,
+        ...(modelConstraints.length?{model_constraints:modelConstraints.map(row=>row.constraint)}:{}),
         ...(typeof launch.workspace==='string'?{workspace:launch.workspace}:{}),
         purpose: sessionPurpose(launch.purpose),
         with_goal:launch.with_goal===true,required_capabilities:route.required_capabilities,exclude_policy_ids:tried},
@@ -1003,12 +1565,13 @@ export class ProjectDO {
     const launchSpec:JsonRecord={...launch,engine:next.engine,model:next.model,...(next.effort?{effort:next.effort}:{})};
     if(!next.effort)delete launchSpec.effort;
     const picker=buildStartPickerEvidence(next,diagnostics,1,route.picker);
-    const routeState={...next,attempted_policy_ids:[...tried,next.policy_id],picker,
+    const routeState={...next,...(modelConstraints.length?{model_constraint_sources:modelConstraints}:{}),attempted_policy_ids:[...tried,next.policy_id],picker,
       initial_picker:normalizeStartPickerEvidence(route.initial_picker)??normalizeStartPickerEvidence(route.picker),
       ...((route as JsonRecord).completion_contract===true?{completion_contract:true}:{}),
       ...((route as JsonRecord).completion_contract_omitted==='launch_budget'?{completion_contract_omitted:'launch_budget'}:{})};
     const applied=this.transaction(()=>{
       if(!this.fallbackCurrent(saga,intake))return false;
+      if(JSON.stringify(this.modelConstraintSnapshot(intake.id))!==JSON.stringify(modelConstraints))return false;
       this.db.run(`UPDATE dispatch_sagas SET state='pending_machine',attempt=?,attempt_operation_id=?,machine_id=?,account_id=?,
         launch_spec_json=?,routing_json=?,next_action_at=?,last_reason='provider_auth_fallback',updated_at=?
         WHERE operation_id=? AND state=? AND attempt_operation_id=? AND epoch=? AND native_id IS NULL`,
@@ -1079,7 +1642,7 @@ export class ProjectDO {
     if (!saga || saga.session_id !== body.session_id || saga.machine_id !== body.machine_id
       || saga.attempt_operation_id !== body.attempt_operation_id || saga.epoch !== body.epoch) return error('stale_started_receipt', 409);
     const binding=this.workspaceBinding(saga,body.workspace_binding);
-    if (saga.state==='complete' && saga.last_reason==='host_inventory_stale' && saga.native_id===body.native_id) {
+    if (saga.state==='complete' && ['host_inventory_stale','native_inventory_absent'].includes(String(saga.last_reason)) && saga.native_id===body.native_id) {
       return json({started:false,lost:true,duplicate:true});
     }
     if (!/^[0-9a-f-]{36}$/i.test(body.native_id)) return error('invalid_started_receipt',400);
@@ -1155,7 +1718,15 @@ export class ProjectDO {
     const now = Date.now();
     const nativeDeadline = evidence.native_deadline as JsonRecord | undefined;
     const deadlineExceeded = nativeDeadline?.exceeded === true;
+    // Typed native cause first: a deadline or memcg-OOM exit is never relabelled
+    // as a launch/host failure, whatever else the host's journal recorded.
+    const oomKilled=(evidence.native_exit as JsonRecord|undefined)?.oom_killed===true;
+    const typedExit:string|undefined=stopRequested?undefined:deadlineExceeded?DEADLINE_REASON:oomKilled?OOM_REASON:undefined;
     const finishedStatus = body.exit_code === 0 && !launchFailed && !deadlineExceeded ? 'completed-awaiting-review' : 'failed';
+    // The host names an engine that refused to start on its auth/preflight
+    // check; recovery must repick instead of retrying that engine (intake 62ccfa1e).
+    const preflight = typeof body.failure_reason === 'string' && ENGINE_PREFLIGHT_FAILURES.has(body.failure_reason)
+      ? body.failure_reason : undefined;
     const duplicate=this.transaction(() => {
       this.pinWorkspaceBinding(saga,binding);
       const currentSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE operation_id=?',saga.operation_id);
@@ -1186,14 +1757,30 @@ export class ProjectDO {
         this.db.run('UPDATE dispatch_sagas SET routing_json=? WHERE operation_id=?',currentSaga.routing_json,saga.operation_id);
       }
       let status:string=finishedStatus,completion:CompletionRecord|undefined;
-      if(this.completionControlled(currentSaga)){
-        const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
-        status=claim?'completed-awaiting-review':'failed';
-        completion=this.completionOutcome(current,saga,claim,launchFailed?'launch_failed':stopRequested?'stop_requested':deadlineExceeded?'deadline_exceeded'
-          :body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code),!launchFailed&&!stopRequested,true,now);
+      if(currentSaga&&this.completionControlled(currentSaga)){
+        const route=(this.parse(currentSaga.routing_json) as JsonRecord|null)??{};
+        if(route.acceptance_verification===true){
+          const verdict=launchFailed?undefined:this.findVerificationVerdict(current,saga);
+          completion=this.verificationOutcome(current,currentSaga,verdict,typedExit??(launchFailed?'launch_failed':stopRequested?'stop_requested'
+            :'verifier_exit_'+String(body.exit_code)),now);
+          // Hub's own gate decided: independent verification passed and, for
+          // code work, the merge gate holds. The intake is accepted.
+          status=completion.outcome==='claimed'?'accepted':'failed';
+        }else{
+          const claim=launchFailed?undefined:this.findCompletionClaim(current,saga);
+          status=claim?'completed-awaiting-review':'failed';
+          completion=this.completionOutcome(current,saga,claim,typedExit??(launchFailed?'launch_failed':stopRequested?'stop_requested'
+            :preflight??(body.exit_code===0?'exit_without_completion_claim':'native_exit_'+String(body.exit_code))),(!launchFailed||typedExit!==undefined)&&!stopRequested,true,now);
+        }
       }
+      // An uncontrolled failed exit is Hub's own retry candidate: schedule its
+      // first (or next, after a Hub retry) bounded attempt with backoff.
+      const retryable=status==='failed'&&!completion;
       this.db.run('UPDATE intakes SET status=?, final_evidence_json=?, updated_at=? WHERE id=?', status, JSON.stringify({ ...stripCompletion(evidence), native_id: body.native_id, exit_code: body.exit_code,native_exit_confirmed:true,
-        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(completion?{completion}:{}) }), now, intake.id);
+        stop_requested:stopRequested,...(launchFailed?{launch_failed:true}:{}),...(preflight?{failure_reason:preflight}:{}),...(completion?{completion}:{...(retryable?{auto_retry:this.failedRetryMarker(intake.id,now)}:{})}) }), now, intake.id);
+      if(preflight)this.engineUnhealthyAlert(intake.id,saga,preflight,now);
+      else if(!launchFailed&&!stopRequested&&!deadlineExceeded&&isFastStartRefusal(body.exit_code,saga.created_at,now))
+        this.engineUnhealthyAlert(intake.id,saga,'native_exit_'+String(body.exit_code),now);
       this.db.run("UPDATE dispatch_sagas SET state='complete', native_id=?, next_action_at=NULL, last_reason=NULL, updated_at=? WHERE operation_id=?", body.native_id, now, saga.operation_id);
       this.appendEvent(intake.id, `finish:${saga.operation_id}`, 'hub2-host', 'finish_evidence_received', { session_id: saga.session_id, native_id: body.native_id, exit_code: body.exit_code, evidence,completion_digest:completionDigest,...(launchFailed?{launch_failed:true}:{}) }, now);
       return false;
@@ -1234,10 +1821,120 @@ export class ProjectDO {
     return undefined;
   }
 
+  /** The verifier has its own session-bound event and can never reuse the
+   * implementation's completion claim as its verdict. */
+  private findVerificationVerdict(intake:IntakeRow,saga:SagaRow):VerificationVerdict|undefined{
+    const criteria=this.parse(intake.acceptance_criteria_json),count=Array.isArray(criteria)?criteria.length:0;
+    const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
+    if(started===undefined)return undefined;
+    for(const row of this.db.all<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)){
+      const verdict=verificationVerdict((this.parse(row.body_json) as JsonRecord|null)?.evidence,saga.session_id,count);
+      if(verdict)return verdict;
+    }
+    return undefined;
+  }
+
+  /** Turn a verifier exit into one durable result: pass, explicit gaps to send
+   * back to the worker, a bounded verifier retry, or a loud escalation. */
+  private verificationOutcome(intake:IntakeRow,saga:SagaRow,verdict:VerificationVerdict|undefined,exitReason:string,now:number):CompletionRecord{
+    const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+    const attempt=Number(route.verification_attempt),origin=String(route.verification_origin_session_id??'');
+    const picker=(route.picker as JsonRecord|undefined)??{};
+    const excluded=Array.isArray(route.exclude_policy_ids)?route.exclude_policy_ids.filter((v):v is string=>typeof v==='string'):[];
+    if(typeof picker.policy_id==='string'&&!excluded.includes(picker.policy_id))excluded.push(picker.policy_id);
+    const previous=String(route.verification_of_session_id??'');
+    const priorVerifier=previous&&previous!==origin?previous:undefined;
+    const gaps=[...(verdict?.gaps??[])];
+    let mergeBlocked=false,passed=verdict?.verdict==='pass';
+    if(passed&&codeTask(this.parse(intake.source_json))){
+      const gate=this.intakeMergeGate(intake);
+      if(!gate.ok){
+        passed=false;mergeBlocked=true;
+        gaps.push(...mergeGaps(gate));
+      }
+    }
+    // A pass exists only inside an explicit verdict record: the gate reads the
+    // verdict, never the process exit, so a verifier exit without a verdict is
+    // retried, then escalated — it can never accept the intake. The journaled
+    // reason names its basis (intake 95ded88d: the raw exit label was recorded
+    // even on verdict-backed passes, so 'task_acceptance_verified' carried
+    // reason 'verifier_exit_without_verdict' and verified work looked
+    // auto-accepted). A no-verdict exit 0 keeps that canonical name; the exit
+    // label itself is journaled separately as exit_reason.
+    const reason=verdict?'verifier_verdict_'+verdict.verdict+(mergeBlocked?'_merge_gate_blocked':'')
+      :exitReason==='verifier_exit_0'?'verifier_exit_without_verdict':exitReason;
+    const explicit=verdict!==undefined;
+    const round=typeof route.verification_round==='string'?route.verification_round:undefined;
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const missing=explicit?undefined:`${reason}: ${verifierNoVerdictCause(this.appendsSinceStart(intake,saga),saga.session_id,Array.isArray(criteria)?criteria.length:0)}`;
+    const depth=this.continuationDepth(intake.id);
+    const retry=!explicit&&attempt<MAX_VERIFICATION_ATTEMPTS;
+    const escalated=!explicit&&!retry;
+    const state:VerificationAction['state']=passed?'passed':explicit?'failed':retry?'pending':'escalated';
+    const verification:VerificationAction={state,key:'verify:'+origin+(round?':'+round:'')+':'+String(attempt),...(round?{round}:{}),attempts:Number.isSafeInteger(attempt)?attempt:0,
+      tries:0,next_action_at:retry?now:null,original_session_id:origin,
+      ...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),
+      ...(gaps.length?{gaps}:{}),...(priorVerifier?{previous_verifier_session_id:priorVerifier}:{}),
+      ...(mergeBlocked&&!(verdict?.gaps??[]).length?{merge_gate_only:true}:{}),
+      excluded_policy_ids:excluded,...(!explicit?{last_reason:reason}:{})};
+    const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:passed?'claimed':'unfinished',
+      reason:passed?'acceptance_verified':explicit?'acceptance_verification_failed':escalated?'verification_exhausted':'verification_incomplete',
+      depth,...(typeof route.verification_summary==='string'&&route.verification_summary?{summary:route.verification_summary}:{}),verification,
+      ...(!passed&&gaps.length?{cause:'Acceptance gaps: '+gaps.join(' | ')}:missing?{cause:missing}:{})};
+    if(passed){
+      record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    }else if(explicit&&depth<MAX_AUTO_CONTINUATIONS){
+      record.continuation={state:'pending',key:'fix:'+saga.operation_id,tries:0,next_action_at:now};
+    }else if(!retry){
+      record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+      this.raiseDeveloperAlert(intake.id,saga.session_id,mergeBlocked?'merge_gate_blocked':'verification_exhausted',record.reason,depth,
+        now,{cause:record.cause??reason});
+    }
+    if(mergeBlocked&&record.continuation){
+      const detail=record.cause??'the PR merge gate is not satisfied';
+      this.raiseDeveloperAlert(intake.id,saga.session_id,'merge_gate_blocked',detail,depth,now,{cause:detail});
+    }
+    this.appendEvent(intake.id,'verification-result:'+saga.operation_id,VERIFICATION_ACTOR,
+      passed?'task_acceptance_verified':explicit?'task_acceptance_verification_failed':'task_verifier_unfinished',
+      {session_id:saga.session_id,original_session_id:origin,attempt,verdict:passed?'pass':explicit?'fail':'missing',reason,exit_reason:exitReason,
+        ...(missing?{cause:missing}:{}),...(gaps.length?{gaps}:{}),...(mergeBlocked?{merge_gate_blocked:true}:{})},now);
+    return record;
+  }
+
+  /** Worker appends written after this attempt's start, newest first. */
+  private appendRowsSinceStart(intake:IntakeRow,saga:SagaRow):Array<{seq:number;at:number;body:JsonRecord}>{
+    const started=this.db.one<{seq:number}>('SELECT seq FROM intake_events WHERE task_id=? AND event_key=?',intake.id,`start:${saga.operation_id}:requested`)?.seq;
+    if(started===undefined)return [];
+    return this.db.all<{seq:number;at:number;body_json:string}>(
+      "SELECT seq,at,body_json FROM intake_events WHERE task_id=? AND kind='worker_append' AND seq>? ORDER BY seq DESC LIMIT 200",intake.id,started)
+      .map(row=>({seq:row.seq,at:row.at,body:(this.parse(row.body_json) as JsonRecord|null)??{}}));
+  }
+
+  private appendsSinceStart(intake:IntakeRow,saga:SagaRow):JsonRecord[]{
+    return this.appendRowsSinceStart(intake,saga).map(row=>row.body);
+  }
+
+  /** Why this attempt ended unfinished: a current blocker record (not superseded
+   * by later progress notes or evidence), else the newest note. */
+  private unfinishedCause(intake:IntakeRow,saga:SagaRow,reason:string):{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}}{
+    const rows=this.appendRowsSinceStart(intake,saga);
+    let blocker:TaskBlocker|undefined,blockerEvent:{seq:number;at:number}|undefined;
+    for(const row of rows){
+      const current=taskBlocker(row.body.evidence,saga.session_id);
+      if(current){blocker=current;blockerEvent={seq:row.seq,at:row.at};break;}
+      const hasNote=typeof row.body.note==='string'&&row.body.note.trim().length>0;
+      const ev=row.body.evidence;
+      const hasProgressEvidence=!!ev&&typeof ev==='object'&&!Array.isArray(ev)&&(ev as JsonRecord).kind!=='task_blocked';
+      if(hasNote||hasProgressEvidence)break;
+    }
+    const note=rows.find(row=>typeof row.body.note==='string'&&row.body.note.trim())?.body.note as string|undefined;
+    return {cause:exitCause(reason,blocker,note),...(blocker?{blocker}:{}),...(blockerEvent?{blockerEvent}:{})};
+  }
+
   /** Consecutive Hub-started continuations since the last requester start. */
   private continuationDepth(intakeId:string):number{
     let depth=0;
-    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_AUTO_CONTINUATIONS+1)){
+    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_DEADLINE_CONTINUATIONS+1)){
       if(row.actor_id!==COMPLETION_ACTOR)break;
       depth++;
     }
@@ -1249,28 +1946,49 @@ export class ProjectDO {
   private completionOutcome(intake:IntakeRow,saga:SagaRow,claim:CompletionClaim|undefined,reason:string,continuable:boolean,deliver:boolean,now:number):CompletionRecord{
     const depth=this.continuationDepth(intake.id);
     const contractOmitted=(this.parse(saga.routing_json) as JsonRecord|null)?.completion_contract_omitted==='launch_budget';
+    const unfinished=claim?undefined:this.unfinishedCause(intake,saga,reason);
+    // Only a session that ended on its own is judged by its blocker; an operator
+    // stop, a lost host or a failed launch keeps its own reason and alert policy.
+    const blocker=unfinished?.blocker,hard=continuable&&!!blocker&&HARD_BLOCKERS.includes(blocker.cause);
     const record:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:claim?'claimed':'unfinished',
-      reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':reason,depth,...(claim?.summary?{summary:claim.summary}:{})};
-    if(!claim&&continuable&&!contractOmitted&&depth<MAX_AUTO_CONTINUATIONS)record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now};
+      reason:claim?'completion_claimed':contractOmitted?'completion_contract_omitted_launch_budget':hard?'blocked_'+blocker!.cause:reason,depth,
+      ...(claim?.summary?{summary:claim.summary}:{}),...(claim?{verification:{state:'pending',key:'verify:'+saga.operation_id,attempts:0,tries:0,
+        next_action_at:now,original_session_id:saga.session_id,summary:claim.summary,excluded_policy_ids:[]}}:{}),
+      ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{})};
+    // A fresh session cannot clear a permission, credential or external blocker:
+    // never spend the bounded continuations on one. A running job gets time first.
+    if(!claim&&continuable&&!contractOmitted&&!hard&&depth<continuationLimit(reason))
+      record.continuation={state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now};
     else if(deliver)record.delivery={state:'pending',key:'terminal:'+saga.operation_id,tries:0,next_action_at:now};
+    // Fail loudly (intake 42b42c9b): a session that ended on its own with no completion
+    // claim and nothing appended (no note, evidence or blocker) produced no visible work.
+    // Typed alert to the developer even when a continuation follows; owner is not changed.
+    const silent=!claim&&(reason==='exit_without_completion_claim'||reason.startsWith('native_exit_')||reason.startsWith('session_')&&reason!=='session_stop_confirmed')&&this.appendsSinceStart(intake,saga).length===0;
+    if(silent&&record.continuation){
+      const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'session_ended_no_output',reason,session_id:saga.session_id,machine_id:saga.machine_id,
+        detail:'Session ended with containment empty, no completion claim and no appended output.'};
+      this.appendEvent(intake.id,'developer-alert:session_ended_no_output:'+saga.session_id,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+      console.error('[hub2] SESSION_ENDED_NO_OUTPUT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intake.id,...alert}));
+    }
     // Every unclaimed end Hub does not recover itself (bound spent, lost host,
     // failed launch) gets a developer owner; only an operator stop is exempt.
     if(!claim&&!record.continuation&&!['stop_requested','session_stop_confirmed'].includes(record.reason))
-      this.raiseDeveloperAlert(intake.id,saga.session_id,continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now);
+      this.raiseDeveloperAlert(intake.id,saga.session_id,silent&&!hard?'session_ended_no_output':hard?'blocked':continuable&&!contractOmitted?'recovery_exhausted':'not_recoverable',record.reason,depth,now,unfinished);
     this.appendEvent(intake.id,'completion:'+saga.operation_id,COMPLETION_ACTOR,claim?'task_completion_claimed':'task_unfinished',
       {session_id:saga.session_id,reason:record.reason,depth,next:record.continuation?'continue':record.delivery?'deliver':'none',
+        ...(unfinished?{cause:unfinished.cause}:{}),...(blocker?{blocker}:{}),
         ...(claim?{criteria_met:claim.met,...(claim.summary?{summary:claim.summary}:{})}:{})},now);
     return record;
   }
 
   private completionDue(now:number):IntakeRow[]{
     return this.db.all<IntakeRow>(`SELECT i.* FROM intakes i WHERE ${COMPLETION_ELIGIBLE}
-      AND (${COMPLETION_DUE})<=? ORDER BY i.updated_at,i.id LIMIT 8`,now);
+      AND (${COMPLETION_DUE})<=? ORDER BY i.updated_at,i.id LIMIT 8`,now-ACCEPTED_COMPLETION_WINDOW_MS,now);
   }
 
   private completionNextDeadline():number|undefined{
     return this.db.one<{due:number|null}>(`SELECT MIN(${COMPLETION_DUE}) AS due
-      FROM intakes i WHERE ${COMPLETION_ELIGIBLE}`)?.due??undefined;
+      FROM intakes i WHERE ${COMPLETION_ELIGIBLE}`,Date.now()-ACCEPTED_COMPLETION_WINDOW_MS)?.due??undefined;
   }
 
   /** CAS-update the completion record of the attempt that is still current. */
@@ -1302,12 +2020,23 @@ export class ProjectDO {
         ({intake,record}=fixed);
       }
       try{
-        if(record.continuation?.state==='pending')await this.continueTask(intake,record);
+        if(record.verification?.state==='pending')await this.startVerification(intake,record);
+        else if(record.continuation?.state==='pending')await this.continueTask(intake,record);
         else if(record.delivery?.state==='pending')await this.deliverOutcome(intake,record);
       }catch(caught){
         // Never let one record spin the alarm: back off, then give up bounded.
         console.error('[hub2] completion action failed:',caught);
         this.saveCompletion(intake,next=>{
+          if(next.verification?.state==='pending'){
+            const verification=next.verification;
+            verification.tries++;verification.last_reason='internal_error';
+            if(verification.tries>=MAX_VERIFICATION_START_TRIES){
+              verification.state='escalated';verification.next_action_at=null;
+              next.delivery={state:'pending',key:'terminal:'+verification.original_session_id,tries:0,next_action_at:Date.now()};
+              this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed','internal_error',record.depth,Date.now());
+            }else verification.next_action_at=Date.now()+retryDelay(verification.tries);
+            return;
+          }
           const action=next.continuation?.state==='pending'?next.continuation:next.delivery;
           if(!action)return;
           action.tries++;action.last_reason='internal_error';
@@ -1318,7 +2047,8 @@ export class ProjectDO {
             if(continuing){
               const saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
               next.delivery={state:'pending',key:'terminal:'+(saga?.operation_id??record.session_id),tries:0,next_action_at:Date.now()};
-              this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_failed','internal_error',record.depth,Date.now());
+              this.raiseDeveloperAlert(intake.id,record.session_id,'recovery_start_failed','internal_error',record.depth,Date.now(),
+                record.cause?{cause:record.cause,...(record.blocker?{blocker:record.blocker}:{})}:undefined);
             }
           }else action.next_action_at=Date.now()+retryDelay(action.tries);
         });
@@ -1326,16 +2056,132 @@ export class ProjectDO {
     }
   }
 
+  /** Start a read-only verifier as a normal durable Hub session. The stable
+   * idempotency key means a crash after dispatch cannot start a duplicate. */
+  private async startVerification(intake:IntakeRow,record:CompletionRecord):Promise<void>{
+    const action=record.verification!,origin=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',action.original_session_id,intake.id);
+    const previous=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',record.session_id,intake.id);
+    if(!origin||!previous||intake.session_id!==record.session_id){
+      this.saveCompletion(intake,next=>{
+        if(!next.verification)return;
+        next.verification.state='escalated';next.verification.next_action_at=null;next.verification.last_reason='verification_origin_missing';
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed','verification_origin_missing',record.depth,Date.now());
+      });
+      return;
+    }
+    const attempt=action.attempts+1;
+    if(attempt>MAX_VERIFICATION_ATTEMPTS){
+      this.saveCompletion(intake,next=>{
+        if(!next.verification)return;
+        next.verification.state='escalated';next.verification.next_action_at=null;next.verification.last_reason='verification_attempt_limit';
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_exhausted','verification_attempt_limit',record.depth,Date.now());
+      });
+      return;
+    }
+    const excluded=new Set(action.excluded_policy_ids);
+    for(const saga of [origin,previous]){
+      const route=(this.parse(saga.routing_json) as JsonRecord|null)??{},picker=route.picker as JsonRecord|undefined;
+      if(typeof picker?.policy_id==='string')excluded.add(picker.policy_id);
+    }
+    const key='verify:'+action.original_session_id+(action.round?':'+action.round:'')+':'+attempt;
+    const hash=await sha256Hex(JSON.stringify(['hub2-start-session-v1',intake.project,intake.id,key]));
+    const verifierSessionId=`${hash.slice(0,8)}-${hash.slice(8,12)}-5${hash.slice(13,16)}-a${hash.slice(17,20)}-${hash.slice(20,32)}`;
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const prompt=verificationPrompt(intake.id,verifierSessionId,action.original_session_id,attempt,
+      action.summary??record.summary??'',Array.isArray(criteria)?criteria.map(String):[]);
+    const originalLaunch=this.parse(origin.launch_spec_json) as JsonRecord;
+    const body:JsonRecord={key,workspace:checkoutWorkspace(originalLaunch,this.workspaceBinding(origin)),prompt,purpose:'review',
+      timeout_seconds:1800,verification_of_session_id:record.session_id,verification_origin_session_id:action.original_session_id,
+      verification_attempt:attempt,verification_summary:action.summary??record.summary??'',exclude_policy_ids:[...excluded],
+      ...(action.round?{verification_round:action.round}:{})};
+    body.machine_id=origin.machine_id;
+    const actor:Actor={id:VERIFICATION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
+    let outcome:{state:'started'|'retry'|'refused';reason?:string;session_id?:string};
+    try{
+      const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{
+        method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(body)}),intake.id);
+      const result=await response.json().catch(()=>({})) as JsonRecord;
+      if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??verifierSessionId)};
+      else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
+    }catch(caught){outcome=caught instanceof HttpError
+      ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+      :{state:'retry',reason:'verification_start_uncertain'};}
+    if(outcome.state==='started'){
+      this.transaction(()=>this.appendEvent(intake.id,key,VERIFICATION_ACTOR,'task_verification_started',
+        {original_session_id:action.original_session_id,previous_session_id:record.session_id,session_id:outcome.session_id??verifierSessionId,
+          attempt,excluded_policy_ids:[...excluded]},Date.now()));
+      return;
+    }
+    const tries=action.tries+1,exhausted=outcome.state==='refused'||tries>=MAX_VERIFICATION_START_TRIES;
+    this.saveCompletion(intake,next=>{
+      const verification=next.verification;if(!verification)return;
+      verification.tries=tries;verification.last_reason=outcome.reason??'verification_start_failed';
+      if(exhausted){
+        verification.state='escalated';verification.next_action_at=null;
+        next.delivery={state:'pending',key:'terminal:'+record.session_id,tries:0,next_action_at:Date.now()};
+        this.raiseDeveloperAlert(intake.id,record.session_id,'verification_start_failed',verification.last_reason,record.depth,Date.now());
+      }else verification.next_action_at=Date.now()+retryDelay(tries);
+    },exhausted?{key:key+':refused',kind:'task_verification_start_refused',body:{session_id:record.session_id,attempt,reason:outcome.reason??null,tries}}:undefined);
+  }
+
   /** Loud, durable alert to the Hub developer (never the requester's channels)
    * when Hub cannot recover an unfinished intake itself. Runs inside the
    * caller's transaction: records the alert in the intake journal and makes the
    * developer the intake's active owner, so it never sits ownerless. */
-  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number):void{
-    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:MAX_AUTO_CONTINUATIONS};
-    this.appendEvent(intakeId,'developer-alert:'+kind+':'+sessionId,COMPLETION_ACTOR,'developer_alert_raised',alert,now);
-    this.appendEvent(intakeId,'developer-owner:'+kind+':'+sessionId,COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
+  private async sessionWakeInternal(request:Request):Promise<Response>{
+    const b=await bodyObject(request,4096);
+    if(typeof b.wake_id!=='string'||!/^[0-9a-f]{64}$/.test(b.wake_id)||typeof b.session_id!=='string'||typeof b.attempt_operation_id!=='string'||!Number.isSafeInteger(b.epoch)||!['pending','queued','delivered','acked','missed'].includes(String(b.state)))return error('invalid_wake',400);
+    const saga=this.sagaByAttempt(b.attempt_operation_id),intake=typeof b.intake_id==='string'?this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',b.intake_id):undefined;
+    if(!saga||!intake||saga.session_id!==b.session_id||saga.intake_id!==intake.id||saga.epoch!==b.epoch)return error('stale_wake',409);
+    this.transaction(()=>{
+      const now=Date.now(),missed=b.state!=='acked'&&Number.isSafeInteger(b.missed_at),key='session-wake:'+b.wake_id+':'+(missed?'missed':String(b.state));
+      const prior=this.db.one('SELECT 1 FROM intake_events WHERE task_id=? AND event_key=?',intake.id,key);if(prior)return;
+      if(b.state==='pending'&&this.db.one("SELECT 1 FROM intake_events WHERE task_id=? AND kind IN ('session_wake_updated','session_wake_missed') AND json_extract(body_json,'$.wake_id')=? AND json_extract(body_json,'$.wake_state') IN ('missed','acked') LIMIT 1",intake.id,b.wake_id))return;
+      this.appendEvent(intake.id,key,'hub:service:wake',missed?'session_wake_missed':'session_wake_updated',{
+        session_id:b.session_id,wake_id:b.wake_id,wake_state:b.state,wake_at_ms:b.wake_at_ms,
+        reason:missed?'missed_wake':null,authority:'untrusted_task_data',
+        ...(missed?{note:'Scheduled wake was not verified within its deadline. Handed to idle-with-open-AC recovery.'}:{})},now);
+      if(missed){
+        // A wake that was pending when the session died at its hard deadline (or OOM) is a
+        // consequence of that exit, not a delivery fault: name the real cause.
+        const ended=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+        const cause=(ended.native_deadline as JsonRecord|undefined)?.exceeded===true?DEADLINE_REASON
+          :((ended.native_exit as JsonRecord|undefined)?.oom_killed===true?OOM_REASON:undefined);
+        this.raiseDeveloperAlert(intake.id,b.session_id as string,cause??'missed_wake',cause??'missed_wake',0,now,cause?{cause:exitCause(cause)}:undefined,b.wake_id as string);
+      }
+    });return json({recorded:true});
+  }
+
+  /** Fail loudly (t1801u): an engine refused to start on its auth/preflight
+   * check. Its machine marked it unhealthy; the recovery start repicks. */
+  private engineUnhealthyAlert(intakeId:string,saga:SagaRow,reason:string,now:number):void{
+    const launch=(this.parse(saga.launch_spec_json) as JsonRecord|null)??{},route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind:'engine_unhealthy',reason,session_id:saga.session_id,machine_id:saga.machine_id,
+      engine:launch.engine??null,model:launch.model??null,policy_id:route.policy_id??null};
+    this.appendEvent(intakeId,'engine-unhealthy:'+saga.operation_id,COMPLETION_ACTOR,'engine_preflight_failed',alert,now);
+    console.error('[hub2] ENGINE_PREFLIGHT_FAILED alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
+  }
+
+  private formatBlockerAge(ms:number):string{
+    const secs=Math.max(0,Math.floor(ms/1000));
+    if(secs<60)return `${secs}s`;
+    const mins=Math.floor(secs/60),remSecs=secs%60;
+    if(mins<60)return remSecs?`${mins}m${remSecs}s`:`${mins}m`;
+    const hours=Math.floor(mins/60),remMins=mins%60;
+    return remMins?`${hours}h${remMins}m`:`${hours}h`;
+  }
+
+  private raiseDeveloperAlert(intakeId:string,sessionId:string,kind:string,reason:string,depth:number,now:number,why?:{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}},receiptKey?:string):void{
+    const blockerEvent=why?.blocker&&why?.blockerEvent?{seq:why.blockerEvent.seq,at:why.blockerEvent.at,age_ms:Math.max(0,now-why.blockerEvent.at)}:undefined;
+    const alert={recipient:DEVELOPER_ALERT_RECIPIENT,kind,reason,session_id:sessionId,depth,max_continuations:continuationLimit(reason),
+      ...(why?{cause:why.cause}:{}),...(why?.blocker?{blocker:why.blocker}:{}),...(blockerEvent?{blocker_event:blockerEvent}:{})};
+    this.appendEvent(intakeId,'developer-alert:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'developer_alert_raised',alert,now);
+    const blockerRef=blockerEvent?` Blocker event: seq ${blockerEvent.seq}, age ${this.formatBlockerAge(blockerEvent.age_ms)}.`:'';
+    this.appendEvent(intakeId,'developer-owner:'+kind+':'+(receiptKey??sessionId),COMPLETION_ACTOR,'intake_context_updated',{...this.intakeContext(intakeId),
       owner:DEVELOPER_ALERT_RECIPIENT,
-      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${MAX_AUTO_CONTINUATIONS} recovery sessions used).`,
+      current_state:`Hub could not finish this intake automatically (${kind}: ${reason}; session ${sessionId}; ${depth} of ${continuationLimit(reason)} recovery sessions used).${why?` Cause: ${why.cause}`:''}${blockerRef}`,
       next_step:'Developer: inspect the intake notes, fix the blocker and restart the intake (hub intake start).'},now);
     console.error('[hub2] INTAKE_RECOVERY_ALERT alert='+DEVELOPER_ALERT_RECIPIENT,JSON.stringify({intake_id:intakeId,...alert}));
   }
@@ -1362,6 +2208,17 @@ export class ProjectDO {
    * is append-only, so the same point always renders the same snapshot; newer
    * events stay available through `hub intake context`. */
   private continuationSnapshot(intake:IntakeRow,through:number):ContinuationSnapshot{
+    // Finish evidence survives reassignment in the append-only intake journal.
+    // Read the exact previous attempt, independently of the recent-note limit.
+    const finish=this.db.one<{body_json:string}>(`SELECT body_json FROM intake_events WHERE task_id=? AND seq<=?
+      AND kind IN ('finish_evidence_received','session_finish_after_stop')
+      AND json_extract(body_json,'$.session_id')=? ORDER BY seq DESC LIMIT 1`,intake.id,through,intake.session_id);
+    const receipt=finish?this.parse(finish.body_json) as JsonRecord|null:null;
+    const saved=(receipt?.evidence as JsonRecord|undefined)?.git_salvage as JsonRecord|undefined;
+    const preserved=saved&&['pushed','already_present'].includes(String(saved.status))
+      &&typeof saved.branch==='string'&&typeof saved.repo==='string'&&typeof saved.remote==='string'
+      &&typeof saved.head_sha==='string'&&/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(saved.head_sha)
+      ?`Branch ${saved.branch}; head ${saved.head_sha}; repository ${saved.repo}; remote ${saved.remote} (${saved.status}). Reuse this branch and inspect its existing PR before opening another.`:undefined;
     const context=this.db.one<{body_json:string}>("SELECT body_json FROM intake_events WHERE task_id=? AND kind='intake_context_updated' AND seq<=? ORDER BY seq DESC LIMIT 1",intake.id,through);
     const rows=this.db.all<IntakeEventRow>(`SELECT seq,actor_id,kind,body_json,at FROM intake_events WHERE task_id=? AND seq<=?
       AND kind IN ('created','worker_append','intake_updated','intake_context_updated') ORDER BY seq DESC LIMIT 51`,intake.id,through);
@@ -1378,30 +2235,45 @@ export class ProjectDO {
     };
     const contextBody=context?this.parse(context.body_json) as JsonRecord|null:null;
     return {through_seq:through,status:intake.status,
-      context:Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,contextBody?.[field]??null])),
+      context:{...(preserved?{preserved_work:preserved}:{}),...Object.fromEntries(INTAKE_CONTEXT_FIELDS.map(field=>[field,contextBody?.[field]??null]))},
       updates:rows.slice(0,50).reverse().map(row=>({seq:row.seq,kind:row.kind,actor:row.actor_id,text:text(row)})),more:rows.length>50};
   }
 
   private async continueTask(intake:IntakeRow,record:CompletionRecord):Promise<void>{
-    const action=record.continuation!,saga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
+    const action=record.continuation!,previousSaga=this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=?',record.session_id);
+    const fixingVerification=record.verification?.state==='failed';
+    const saga=fixingVerification?this.db.one<SagaRow>('SELECT * FROM dispatch_sagas WHERE session_id=? AND intake_id=?',record.verification!.original_session_id,intake.id):previousSaga;
     const launch=saga?this.parse(saga.launch_spec_json) as JsonRecord:undefined;
     let outcome:{state:'started'|'superseded'|'retry'|'refused';reason?:string;session_id?:string};
-    if(!saga||!launch||intake.session_id!==record.session_id)outcome={state:'superseded',reason:'attempt_replaced'};
+    if(!previousSaga||!saga||!launch||intake.session_id!==record.session_id)outcome={state:'superseded',reason:'attempt_replaced'};
     else{
       const route=this.parse(saga.routing_json) as JsonRecord|null;
       const timeout=Number(launch.timeout_seconds)||1800,depth=record.depth+1;
-      const body:JsonRecord={key:action.key,workspace:boundWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,engine:launch.engine,model:launch.model,
-        ...(typeof launch.effort==='string'?{effort:launch.effort}:{}),interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+      // Repick immediately for an engine start fault, or after a repeated
+      // unclaimed native crash. Preserve the checkout and the bounded budget,
+      // and carry exclusions so a later crash cannot select a broken route again.
+      const exitCode=record.reason==='native_exit_75'?75:record.reason==='native_exit_127'?127:undefined;
+      const span=exitCode!==undefined?this.db.one<{created_at:number;updated_at:number}>(
+        'SELECT created_at,updated_at FROM dispatch_sagas WHERE operation_id=?',previousSaga.operation_id):undefined;
+      const startRefused=!!span&&isFastStartRefusal(exitCode,span.created_at,span.updated_at);
+      const repeatedCrash=record.depth>0&&/^native_exit_-?[1-9][0-9]*$/.test(record.reason);
+      const repick=(ENGINE_PREFLIGHT_FAILURES.has(record.reason)||startRefused||repeatedCrash)&&launch.managed_credential_label===undefined&&typeof route?.policy_id==='string';
+      const excluded=Array.isArray(route?.exclude_policy_ids)?route.exclude_policy_ids.filter((id):id is string=>typeof id==='string'):[];
+      if(repick&&!excluded.includes(String(route!.policy_id)))excluded.push(String(route!.policy_id));
+      const body:JsonRecord={key:action.key,workspace:checkoutWorkspace(launch,this.workspaceBinding(saga)),machine_id:saga.machine_id,
+        ...(repick?{exclude_policy_ids:excluded}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+        interactive:launch.interactive===true,with_goal:launch.with_goal===true,
         purpose:launch.purpose??'implement',override_reason:'hub_completion_continuation',continuation_of:record.session_id,
         ...(launch.managed_credential_label!==undefined?{managed_credential_label:launch.managed_credential_label}:{}),
         ...(Array.isArray(route?.required_capabilities)?{required_capabilities:route!.required_capabilities}:{}),
         // A session killed at its deadline gets more time, within the start limit.
-        timeout_seconds:record.reason==='deadline_exceeded'?Math.min(7200,timeout*2):timeout};
+        timeout_seconds:record.reason===DEADLINE_REASON?Math.min(7200,timeout*2):timeout};
       // Budget the whole continuation launch (same fields the start builds) in
       // escaped-JSON bytes so the complete contract still fits the Machine limit.
       const criteria=this.parse(intake.acceptance_criteria_json),next={...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''};
       const budget=continuationBudget(next,intake.id,Array.isArray(criteria)?criteria.map(String):[]);
-      body.prompt=continuationPrompt(intake.id,depth,record.session_id,record.reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,action.snapshot_seq??this.latestSeq(intake.id)),budget);
+      const reason=fixingVerification?`${record.reason}: ${record.cause??record.verification?.gaps?.join(' | ')??'acceptance criteria were not met'}`:record.reason;
+      body.prompt=continuationPrompt(intake.id,depth,record.session_id,reason,basePrompt(String(launch.prompt??''))||intake.text,this.continuationSnapshot(intake,action.snapshot_seq??this.latestSeq(intake.id)),budget);
       const actor:Actor={id:COMPLETION_ACTOR,kind:'agent',resource_id:intake.project,scopes:['session:start','intake:read','project:'+intake.project]};
       try{
         const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(intake.id)+'/start',{method:'POST',
@@ -1410,7 +2282,9 @@ export class ProjectDO {
         if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
         else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
         else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
-      }catch{outcome={state:'retry',reason:'continuation_start_uncertain'};}
+      }catch(caught){outcome=caught instanceof HttpError
+        ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+        :{state:'retry',reason:'continuation_start_uncertain'};}
     }
     if(outcome.state==='started'){
       // The start transaction replaced the intake's terminal record; the event keeps it.
@@ -1440,7 +2314,8 @@ export class ProjectDO {
     else{
       const sender='intake:'+intake.id,actor:Actor={id:sender,kind:'agent',resource_id:intake.project,scopes:['message:send']};
       const text=deliveryBody({intake_id:intake.id,title:intake.title,outcome:record.outcome,reason:record.reason,session_id:record.session_id,
-        ...(record.summary?{summary:record.summary}:{}),...(record.continuation?{continuation:record.continuation}:{}),depth:record.depth});
+        ...(record.summary?{summary:record.summary}:{}),...(record.continuation?{continuation:record.continuation}:{}),depth:record.depth,
+        ...(record.cause?{cause:record.cause}:{}),...(record.blocker?{blocker:record.blocker}:{})});
       try{
         const response=await this.env.MAILBOXES.get(this.env.MAILBOXES.idFromName('global')).fetch('https://mailbox.internal/api/messages',{method:'POST',
           headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor),'x-hub2-mailbox':sender},body:JSON.stringify({key:action.key,recipient,body:text})});
@@ -1508,7 +2383,8 @@ export class ProjectDO {
         const evidence=(this.parse(intake.final_evidence_json) as JsonRecord|null)??{};
         const deadlineExceeded=(evidence.native_deadline as JsonRecord|undefined)?.exceeded===true;
         const exitCode=typeof evidence.exit_code==='number'?evidence.exit_code:null;
-        const reason=deadlineExceeded?'deadline_exceeded':exitCode===0?'exit_without_completion_claim':'native_exit_'+String(exitCode??'unknown');
+        const oomKilled=((evidence.native_exit as JsonRecord|undefined)?.oom_killed)===true;
+        const reason=deadlineExceeded?DEADLINE_REASON:oomKilled?OOM_REASON:exitCode===0?'exit_without_completion_claim':'native_exit_'+String(exitCode??'unknown');
         const route=(this.parse(saga.routing_json) as JsonRecord|null)??{};
         if(route.completion_contract!==true){
           this.db.run('UPDATE dispatch_sagas SET routing_json=?,updated_at=? WHERE operation_id=?',
@@ -1518,13 +2394,163 @@ export class ProjectDO {
         // A reopened intake is never left open without an owner: Hub schedules a
         // bounded recovery continuation, or alerts the developer when the bound is spent.
         const depth=this.continuationDepth(intake.id);
-        const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason,depth,
-          ...(depth<MAX_AUTO_CONTINUATIONS?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:now}}:{})};
+        const why=this.unfinishedCause(intake,saga,reason),hard=!!why.blocker&&HARD_BLOCKERS.includes(why.blocker.cause);
+        const completion:CompletionRecord={controlled:true,session_id:saga.session_id,outcome:'unfinished',reason:hard?'blocked_'+why.blocker!.cause:reason,depth,cause:why.cause,
+          ...(why.blocker?{blocker:why.blocker}:{}),
+          ...(depth<continuationLimit(reason)&&!hard?{continuation:{state:'pending',key:'continue:'+saga.operation_id,tries:0,next_action_at:why.blocker?.cause==='waiting'?now+BLOCKED_WAIT_MS:now}}:{})};
         this.db.run("UPDATE intakes SET status='open',final_evidence_json=?,updated_at=? WHERE id=?",
           JSON.stringify({...evidence,reopened_unfinished:reopened,completion}),now,intake.id);
         this.appendEvent(intake.id,'reopen-unverified:'+saga.operation_id,COMPLETION_ACTOR,'intake_reopened_unfinished',
           {...reopened,next:completion.continuation?'continue':'developer_alert'},now);
-        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,'recovery_exhausted',reason,depth,now);
+        if(!completion.continuation)this.raiseDeveloperAlert(intake.id,saga.session_id,hard?'blocked':'recovery_exhausted',completion.reason,depth,now,why);
+      }
+    });
+  }
+  private failedRetryDueRows():FailedRetryRow[]{
+    return this.db.all<FailedRetryRow>(FAILED_RETRY_DUE);
+  }
+  /** Backoff marker for a fresh uncontrolled failure: the retry pass starts
+   * the next attempt no earlier than one retryDelay step per prior retry. */
+  private failedRetryMarker(intakeId:string,now:number):JsonRecord{
+    return {next_action_at:now+retryDelay(this.retryDepth(intakeId)+1)};
+  }
+  private failedRetryNextDeadline():number|undefined{
+    return this.db.one<{due:number|null}>(`SELECT MIN(retry_due) AS due FROM (${FAILED_RETRY_CANDIDATES})`)?.due??undefined;
+  }
+  /** Consecutive Hub retries of this intake since the last non-retry start. */
+  private retryDepth(intakeId:string):number{
+    let depth=0;
+    for(const row of this.db.all<{actor_id:string}>("SELECT actor_id FROM intake_events WHERE task_id=? AND kind='session_start_requested' ORDER BY seq DESC LIMIT ?",intakeId,MAX_AUTO_RETRIES+1)){
+      if(row.actor_id!==RETRY_ACTOR)break;depth++;
+    }
+    return depth;
+  }
+  /** Terminal retry state, written CAS-style so the scan stops selecting the
+   * intake; `alert` escalates to the developer exactly once per intake. All
+   * writes, including the alert's journal events, live in one transaction. */
+  private markRetryTerminal(row:FailedRetryRow,state:string,now:number,why:{cause:string;blocker?:TaskBlocker;blockerEvent?:{seq:number;at:number}},alert?:string):void{
+    this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==row.session_id)return;
+      const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+      const marker=evidence.auto_retry as JsonRecord|undefined;
+      if(marker?.state==='terminal')return;
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify({state:'terminal',reason:state,...(marker?.tries!==undefined?{tries:marker.tries}:{}),...(why.blocker?{blocker_cause:why.blocker.cause}:{})}),now,row.id);
+      this.appendEvent(row.id,'retry-terminal:'+row.session_id,RETRY_ACTOR,'task_retry_terminal',
+        {session_id:row.session_id,state,...(why.cause?{cause:why.cause}:{}),...(why.blocker?{blocker:why.blocker}:{})},now);
+      if(alert)this.raiseDeveloperAlert(row.id,row.session_id,alert,state,this.retryDepth(row.id),now,why,row.id);
+    });
+  }
+  /** Bounded, durable retry of failed intakes Hub owns itself, driven by the
+   * project alarm: backoff from the failure, route/machine fallback on repeat
+   * failures, escalation only when the bound is spent or a human is blocking. */
+  private async runFailedIntakeRetries(now:number):Promise<void>{
+    for(const row of this.failedRetryDueRows()){
+      const evidence=(this.parse(row.final_evidence_json??'{}') as JsonRecord|null)??{};
+      // Operator stops (receipt reason or stop_requested finish) are human
+      // decisions; a dead/idle/lost/launch-failed row is Hub's to retry.
+      if((evidence.completion as JsonRecord|undefined)?.controlled===true
+        ||evidence.stop_requested===true||evidence.reason==='stop_confirmed')continue;
+      const reason=String(evidence.reason??(evidence.launch_failed===true?'launch_failed':'failed'));
+      const why=this.unfinishedCause({id:row.id,session_id:row.session_id} as IntakeRow,
+        {session_id:row.session_id,operation_id:row.saga_operation_id} as SagaRow,reason);
+      const hard=!!why.blocker&&HARD_BLOCKERS.includes(why.blocker.cause);
+      const depth=this.retryDepth(row.id);
+      if(hard){this.markRetryTerminal(row,'blocked_'+why.blocker!.cause,now,why,'blocked');continue;}
+      if(depth>=MAX_AUTO_RETRIES){this.markRetryTerminal(row,'retry_exhausted',now,why,'retry_exhausted');continue;}
+      if(row.retry_due>now)continue;
+      await this.startFailedIntakeRetry(row,depth,reason,now);
+    }
+  }
+  /** One durable retry start. The snapshot point and exclusion inputs are
+   * fixed before the first attempt so every resend of the same depth is
+   * byte-identical and the start idempotency key collapses duplicates. */
+  private async startFailedIntakeRetry(row:FailedRetryRow,depth:number,reason:string,now:number):Promise<void>{
+    const attempt=depth+1,sagaSession=row.session_id;
+    const intake=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+    if(!intake||intake.status!=='failed'||intake.session_id!==sagaSession)return;
+    const launch=this.parse(row.launch_spec_json) as JsonRecord;
+    const route=(this.parse(row.routing_json) as JsonRecord|null)??{};
+    const shell=String(launch.engine??'').toLowerCase()==='shell';
+    const timeout=Number(launch.timeout_seconds)||1800;
+    const fixed=this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return undefined;
+      const evidence=this.parse(current.final_evidence_json??'{}') as JsonRecord;
+      const marker=(evidence.auto_retry as JsonRecord|undefined)??{};
+      if(marker.attempt===attempt&&marker.snapshot_seq!==undefined)return marker;
+      const next={...marker,attempt,snapshot_seq:this.latestSeq(row.id)};
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify(next),now,row.id);
+      return next;
+    });
+    if(!fixed)return;
+    // The first retry keeps the failed attempt's route (the picker may still
+    // move machines); a second retry falls back to another routing policy,
+    // which cannot also pin that policy's engine and model. An engine that never
+    // started work (typed preflight failure, launch refusal, or launcher exit 75
+    // within FAST_START_FAILURE_MS such as the Codex quota gate refusing a dead
+    // credential) is never re-pinned: fail over on the first retry instead.
+    const evidence=(this.parse(intake.final_evidence_json??'{}') as JsonRecord|null)??{};
+    const preflight=ENGINE_PREFLIGHT_FAILURES.has(String(evidence.failure_reason));
+    // Only engine start faults: a workspace/request refusal keeps the pinned route.
+    const fastFailure=reason!==DEADLINE_REASON&&(evidence.launch_failed===true&&evidence.failure_reason==='host_operation_failed'
+      ||isFastStartRefusal(evidence.exit_code,row.saga_created_at,row.saga_updated_at));
+    const routeFallback=(depth>0||preflight||fastFailure)&&typeof route.policy_id==='string';
+    const body:JsonRecord={key:`retry:${row.saga_operation_id}:${attempt}`,workspace:checkoutWorkspace(launch,mergeWorkspaceBinding(launch.workspace,(route as JsonRecord|undefined)?.workspace_binding)),
+      ...(shell?{engine:'shell'}:routeFallback?{}:{engine:launch.engine,model:launch.model,...(typeof launch.effort==='string'?{effort:launch.effort}:{})}),
+      interactive:launch.interactive===true,with_goal:launch.with_goal===true,
+      purpose:launch.purpose??'implement',override_reason:'hub_failed_intake_retry',
+      ...(Array.isArray(route.required_capabilities)?{required_capabilities:route.required_capabilities}:{}),
+      ...(routeFallback?{exclude_policy_ids:[String(route.policy_id)]}:{}),
+      ...(shell?{exclude_machine_ids:[row.saga_machine_id]}:{}),
+      // A session killed at its deadline gets more time, within the start limit.
+      timeout_seconds:reason===DEADLINE_REASON?Math.min(7200,timeout*2):timeout};
+    const criteria=this.parse(intake.acceptance_criteria_json);
+    const budget=continuationBudget({...launch,workspace:body.workspace,timeout_seconds:body.timeout_seconds,prompt:''} as JsonRecord,row.id,Array.isArray(criteria)?criteria.map(String):[]);
+    body.prompt=retryPrompt(row.id,attempt,MAX_AUTO_RETRIES,sagaSession,reason,basePrompt(String(launch.prompt??''))||intake.text,
+      this.continuationSnapshot(intake,Number(fixed.snapshot_seq)),budget);
+    const actor:Actor={id:RETRY_ACTOR,kind:'agent',resource_id:row.project,
+      scopes:['session:start','intake:read','project:'+row.project,...(shell||launch.managed_credential_label!==undefined?['operator:admin']:[])]};
+    let outcome:{state:'started'|'superseded'|'retry'|'refused';reason?:string;session_id?:string};
+    try{
+      const response=await this.startIntake(new Request('https://project.internal/api/intakes/'+encodeURIComponent(row.id)+'/start',{
+        method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(body)}),row.id);
+      const result=await response.json().catch(()=>({})) as JsonRecord;
+      if(response.ok)outcome={state:'started',session_id:String((result.session as JsonRecord|undefined)?.id??'')};
+      else if(result.error==='intake_already_assigned')outcome={state:'superseded',reason:'intake_already_assigned'};
+      else outcome={state:response.status>=500||response.status===429?'retry':'refused',reason:String(result.error??response.status)};
+    }catch(caught){outcome=caught instanceof HttpError
+      ?{state:caught.status>=500||caught.status===429?'retry':'refused',reason:caught.code}
+      :{state:'retry',reason:'retry_start_uncertain'};}
+    if(outcome.state==='started'){
+      this.transaction(()=>this.appendEvent(row.id,`retry:${row.saga_operation_id}:${attempt}`,RETRY_ACTOR,'task_retry_started',
+        {previous_session_id:sagaSession,session_id:outcome.session_id??null,attempt,reason,route_fallback:routeFallback,
+          ...(fastFailure?{fast_failure:true,failed_policy_id:typeof route.policy_id==='string'?route.policy_id:null,
+            failed_machine_id:row.saga_machine_id}:{})},Date.now()));
+      if(fastFailure)console.error('[hub2] INTAKE_ROUTE_FAILOVER',JSON.stringify({intake_id:row.id,previous_session_id:sagaSession,
+        session_id:outcome.session_id??null,failed_policy_id:route.policy_id??null,failed_machine_id:row.saga_machine_id,
+        exit_code:Number.isInteger(evidence.exit_code)?evidence.exit_code:null,reason}));
+      return;
+    }
+    if(outcome.state==='superseded'){
+      this.markRetryTerminal(row,'superseded',Date.now(),{cause:outcome.reason??'attempt_replaced'});
+      return;
+    }
+    const tries=Number((fixed as JsonRecord).tries??0)+1,terminal=outcome.state==='refused'||tries>=MAX_RETRY_START_TRIES;
+    const terminalReason=outcome.state==='refused'?'retry_start_refused':'retry_start_failed';
+    this.transaction(()=>{
+      const current=this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?',row.id);
+      if(!current||current.status!=='failed'||current.session_id!==sagaSession)return;
+      const next={...fixed,tries,...(terminal?{state:'terminal',reason:terminalReason}:{next_action_at:Date.now()+retryDelay(tries),last_reason:(outcome.reason??'retry_start_uncertain').slice(0,100)})};
+      this.db.run("UPDATE intakes SET final_evidence_json=json_set(COALESCE(final_evidence_json,'{}'),'$.auto_retry',json(?)),updated_at=? WHERE id=?",
+        JSON.stringify(next),Date.now(),row.id);
+      if(terminal){
+        this.appendEvent(row.id,'retry-terminal:'+sagaSession,RETRY_ACTOR,'task_retry_terminal',
+          {session_id:sagaSession,state:'terminal',reason:terminalReason,last_reason:outcome.reason??null,tries},Date.now());
+        this.raiseDeveloperAlert(row.id,sagaSession,outcome.state==='refused'?'retry_start_refused':'retry_start_failed',
+          outcome.reason??terminalReason,this.retryDepth(row.id),Date.now(),{cause:outcome.reason??terminalReason},row.id);
       }
     });
   }
@@ -1565,6 +2591,7 @@ export class ProjectDO {
       this.db.one<{ due: number }>('SELECT route_next_action_at AS due FROM intakes WHERE route_registered=0 ORDER BY route_next_action_at,id LIMIT 1')?.due,
       this.work.nextDeadline() ?? undefined,
       this.completionNextDeadline(),
+      this.failedRetryNextDeadline(),
     ].filter((value): value is number => typeof value === 'number' && Number.isSafeInteger(value));
     const due = deadlines.length ? Math.min(...deadlines) : null;
     this.db.alarmOperation();
@@ -1626,7 +2653,7 @@ export class ProjectDO {
       assigned_machine_id: row.assigned_machine_id, session_id: row.session_id,
       linked_sessions: this.sessionLinks.links(row.id),
       dispatch: saga ? this.sagaView(saga, row.status) : undefined,
-      priority:row.priority??2,original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
+      priority:row.priority??2,promoted_at:this.promotedAt(row),original_ask:{title:row.original_title??row.title,text:row.original_text??row.text},provenance:this.parse(row.source_json),parent_intake_id:row.parent_intake_id??null,schedule_id:row.schedule_id??null,occurrence_id:row.occurrence_id??null,final_evidence: this.parse(row.final_evidence_json), created_at: row.created_at, updated_at: row.updated_at,
     };
   }
 
@@ -1682,12 +2709,146 @@ export class ProjectDO {
     return hasScope(actor, scope) && (actor.resource_id === project || hasScope(actor, `project:${project}`));
   }
 
+  private canCreateIntake(actor: ReturnType<typeof actorFrom>, project: string): boolean {
+    if (this.canProject(actor, project, 'intake:write')) return true;
+    return !!actor && actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id
+      && hasScope(actor, 'intake:create') && hasScope(actor, `worker_project:${project}`);
+  }
+
+  private canStartIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
+    if (this.canProject(actor, intake.project, 'session:start')) return true;
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !hasScope(actor, 'session:start')) return false;
+    if (!hasScope(actor, `worker_project:${intake.project}`)) return false;
+    if (actor.resource_id === intake.id) return false;
+    return intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id);
+  }
+
+  /**
+   * A worker session started for a child intake may read and append to that child's parent intake
+   * (fix-on-failure children report back to the work that spawned them). Nothing broader: no list,
+   * no siblings, no grandparents.
+   */
+  private isWorkerParent(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
+    if (!actor || actor.kind !== 'agent' || !actor.id.startsWith('session:') || !actor.resource_id || actor.resource_id === intake.id) return false;
+    const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
+    return !!own?.parent_intake_id && own.parent_intake_id === intake.id;
+  }
+
+  /** Resolve short intake refs: bound worker sessions only see their own parent; operators/project callers resolve any unique prefix in this project. */
+  private resolveIntakeRef(actor: ReturnType<typeof actorFrom>, ref: string): string {
+    if (ref.length < 6 || this.db.one('SELECT id FROM intakes WHERE id=?', ref)) return ref;
+    if (actor?.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id) {
+      const own = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', actor.resource_id);
+      return own?.parent_intake_id?.startsWith(ref) ? own.parent_intake_id : ref;
+    }
+    const rows = this.db.all<{ id: string }>('SELECT id FROM intakes WHERE id>=? AND id<? ORDER BY id LIMIT 2', ref, ref + '\uffff');
+    if (rows.length > 1) throw new HttpError('ambiguous_prefix', 409, `intake id prefix ${ref} matches several intakes; pass the full id`);
+    return rows.length === 1 ? rows[0].id : ref;
+  }
+
+  /** Resolve and validate parent_intake_id within this project, rejecting missing, ambiguous, self, or cyclic links. */
+  private resolveParentIntakeId(childId: string, raw: string | null): string | null | Response {
+    if (raw === null) return null;
+    const ref = raw.trim();
+    const exact = this.db.one<{ id: string }>('SELECT id FROM intakes WHERE id=?', ref);
+    let parentId: string;
+    if (exact) {
+      parentId = exact.id;
+    } else {
+      const rows = this.db.all<{ id: string }>('SELECT id FROM intakes WHERE id>=? AND id<? ORDER BY id LIMIT 2', ref, ref + '\uffff');
+      if (rows.length > 1) return error('ambiguous_prefix', 409, `parent_intake_id prefix ${ref} matches several intakes; pass the full id`);
+      if (!rows.length) return error('parent_intake_not_found', 404, `parent intake ${ref} was not found in this project`);
+      parentId = rows[0].id;
+    }
+    if (parentId === childId) return error('parent_intake_self', 409, 'an intake cannot be its own parent');
+    const seen = new Set<string>([childId]);
+    let cur: string | null = parentId;
+    for (let depth = 0; cur && depth < 64; depth++) {
+      if (seen.has(cur)) return error('parent_intake_cycle', 409, `${parentId} is already a descendant of ${childId}`);
+      seen.add(cur);
+      cur = this.db.one<{ parent_intake_id: string | null }>('SELECT parent_intake_id FROM intakes WHERE id=?', cur)?.parent_intake_id ?? null;
+    }
+    return parentId;
+  }
+
+  private intakeReadDenied(intake: IntakeRow): Response {
+    return forbiddenScope('intake:read', `read of intake ${intake.id} needs intake:read with project:${intake.project}, the intake's own or child-intake worker session, or operator:admin`);
+  }
+
+  /**
+   * Edge-only check (worker.ts) for a bound worker session reading a session or intake that is not
+   * its own. Granted only when the worker's own intake was authored by a requester (not a worker
+   * session) and its original title/text names the target by full id or 8+ hex prefix. Read-only:
+   * the edge forwards exactly one GET with an actor scoped to that one object. Each first grant per
+   * target is audited on the reader's intake; refusals are typed and name the operator command.
+   */
+  private async evidenceRead(request: Request): Promise<Response> {
+    const b = await bodyObject(request, 4096);
+    const kind = b.kind, target = b.target_id, actorId = b.actor_id, own = b.intake_id;
+    if (!['intake','session'].includes(String(kind)) || typeof target !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(target)
+      || typeof actorId !== 'string' || !/^session:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(actorId) || typeof own !== 'string' || !boundedString(own, 180))
+      return error('invalid_evidence_read', 400);
+    // A refusal echoes only the caller's own reference: an uncited target's full id is never disclosed.
+    const shown = typeof b.ref === 'string' && /^[0-9a-f-]{6,36}$/.test(b.ref) && target.startsWith(b.ref) ? b.ref : target.slice(0, 8);
+    const command = `hub ${kind === 'session' ? 'sessions' : 'intake'} show ${shown}`;
+    const refuse = (reason: string, why: string) => json({
+      error: 'evidence_not_referenced', reason, missing_scope: 'intake:read', operator_command: command,
+      detail: `${kind} ${shown} is outside this worker's intake (missing scope intake:read): ${why}; ask an operator to run \`${command}\` and append the facts to your intake`,
+    }, 403);
+    const row = this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', own);
+    if (!row) return refuse('own_intake_not_in_project', 'evidence reads are limited to the worker\'s own project');
+    // The text's author decides, not the row owner: a schedule occurrence copies its parent's text,
+    // so the parent's author must also be a requester.
+    const parent = row.schedule_id && row.parent_intake_id ? this.db.one<IntakeRow>('SELECT * FROM intakes WHERE id=?', row.parent_intake_id) : undefined;
+    const authors = [row.owner_actor_id, ...(row.schedule_id ? [parent?.owner_actor_id] : [])];
+    if (authors.some(a => !a || a.startsWith('session:')))
+      return refuse('intake_authored_by_worker', 'only a requester-authored intake grants evidence reads');
+    const reference = evidenceReferences(`${row.original_title ?? row.title}\n${row.original_text ?? row.text}`).find(ref => target.startsWith(ref));
+    if (!reference) return refuse('not_referenced', 'the intake text does not name it');
+    this.transaction(() => this.appendEvent(row.id, `intake:${row.id}:evidence_read:${kind}:${target}`, actorId, 'evidence_read',
+      { kind: kind as string, target_id: target, reference, read_only: true }, Date.now()));
+    return json({ granted: true, kind, target_id: target, reference });
+  }
+
   private canReadIntake(actor: ReturnType<typeof actorFrom>, intake: IntakeRow): boolean {
     if (this.canProject(actor, intake.project, 'intake:read')) return true;
-    return !!actor && actor.resource_id === intake.id && hasScope(actor, 'intake:read');
+    if (!actor || !hasScope(actor, 'intake:read')) return false;
+    if (actor.resource_id === intake.id) return true;
+    return actor.kind === 'agent' && actor.id.startsWith('session:')
+      && (intake.owner_actor_id === actor.id || (!!actor.resource_id && intake.parent_intake_id === actor.resource_id));
   }
 
 
+}
+
+/** Per-criterion bound: long verbatim requester wording must fit as AC1; the whole request body stays bounded at 16 KiB. */
+export const ACCEPTANCE_CRITERION_MAX_CHARS = 6000;
+export const ACCEPTANCE_CRITERIA_MAX_COUNT = 32;
+
+/** Validate criteria and name the exact failing check instead of a generic "required". */
+function criteriaError(value: unknown): Response | null {
+  if (!Array.isArray(value) || value.length < 1) return error('acceptance_criteria_required', 400, 'at least one acceptance criterion is required');
+  if (value.length > ACCEPTANCE_CRITERIA_MAX_COUNT) return error('acceptance_criteria_too_many', 400, `${value.length} criteria; max ${ACCEPTANCE_CRITERIA_MAX_COUNT}`);
+  for (let index = 0; index < value.length; index++) {
+    const item = value[index];
+    if (typeof item !== 'string' || !item.trim()) return error('acceptance_criterion_empty', 400, `criterion ${index + 1} must be non-empty text`);
+    if (item.length > ACCEPTANCE_CRITERION_MAX_CHARS) return error('acceptance_criterion_too_long', 400, `criterion ${index + 1} is ${item.length} characters; max ${ACCEPTANCE_CRITERION_MAX_CHARS} per criterion (16 KiB per request)`);
+    if (index > 0 && !T_ID_CITATION.test(item)) return error('acceptance_criterion_missing_t_id', 400, `criterion ${index + 1} (AC${index + 1}) cites no requester t-id (a token like t3416u); only AC1 is exempt: ${item.trim().slice(0, 160)}`);
+  }
+  return null;
+}
+
+/** A t-id citation is a token like t3416u: t + digits + optional letter, not embedded in a longer word. */
+const T_ID_CITATION = /(?<![A-Za-z0-9])t\d+[a-z]?(?![A-Za-z0-9])/i;
+
+/** Session/intake ids an intake's text names as evidence: full ids or 8-hex short ids (bounded). */
+export function evidenceReferences(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.toLowerCase().matchAll(/(?<![0-9a-z])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{8})(?![0-9a-z])/g)) {
+    found.add(m[1]);
+    if (found.size >= 64) break;
+  }
+  return [...found];
 }
 
 /** CLI/MCP clients send criteria as one text block; store one criterion per non-empty line. */

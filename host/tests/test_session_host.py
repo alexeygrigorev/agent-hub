@@ -329,3 +329,30 @@ class SessionHostTests(unittest.TestCase):
                 self.assertEqual(instance.settings, v2)
                 self.assertEqual(load_settings.call_count, 2)
 
+    def test_idle_cycles_gate_background_observer_threads(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(session_host.config, 'load_config', return_value={'machine_id': 'test-machine', 'access_token': 'synthetic'}), \
+             patch.object(session_host.fleet, 'load_settings', return_value={}), \
+             patch.object(session_host, 'qualify_sender_binding', return_value=SimpleNamespace(session_id='test-native', workspace=str(pathlib.Path.cwd()))), \
+             patch.object(session_host.fleet, 'Dispatcher'), \
+             patch.object(session_host.session_control, 'execute'), \
+             patch.object(session_host.session_messages, 'provision_credentials', return_value=[]), \
+             patch.object(session_host.session_messages, 'provision_intake_credentials', return_value=[]), \
+             patch.object(session_host, 'offers_loop', lambda *a, **k: None), \
+             patch.object(session_host, 'bindings_loop', lambda *a, **k: None), \
+             patch.object(session_host.replica_watcher, 'loop', lambda *a, **k: None), \
+             patch.object(session_host.self_update, 'loop', lambda *a, **k: None), \
+             patch.object(session_host, 'maybe_start_status_thread', return_value=None) as status_start, \
+             patch.object(session_host, 'maybe_start_metrics_thread', return_value=None) as metrics_start, \
+             patch.object(session_host, 'maybe_start_disk_thread', return_value=None) as disk_start, \
+             patch.object(session_host, 'maybe_start_host_health_thread', return_value=None) as health_start, \
+             patch.object(session_host, 'maybe_start_role_consumer_thread', return_value=None) as role_start, \
+             patch.object(session_host, 'maybe_start_token_thread', return_value=None) as token_start:
+            session_host.run('synthetic-settings', directory, interval=1, cycles=3)
+            self.assertEqual(status_start.call_count, 1)
+            self.assertEqual(metrics_start.call_count, 1)
+            self.assertEqual(disk_start.call_count, 1)
+            self.assertEqual(health_start.call_count, 1)
+            self.assertEqual(token_start.call_count, 1)
+            self.assertEqual(role_start.call_count, 0)
+

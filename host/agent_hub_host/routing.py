@@ -8,6 +8,52 @@ from pathlib import Path
 from urllib.parse import quote
 from . import bus
 
+# Matches the Hub2 server bound (hub2/src/intake-relations.ts ARTIFACT_MAX_BYTES): 6 MiB keeps the
+# base64 download under the CLI's 10 MiB response cap; full-page screenshots fit.
+ARTIFACT_MAX_BYTES = 6 * 1024 * 1024
+ARTIFACT_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
+PNG_SIGNATURE = b'\x89PNG\r\n\x1a\n'
+
+
+class ArtifactCheckError(ValueError):
+    """A local PNG check failed; the message names the check and never echoes file contents."""
+    def __init__(self, check, detail):
+        self.check = check
+        super().__init__(f'PNG rejected ({check} check): {detail}')
+
+
+def read_png(path):
+    """Read a local PNG for upload, naming the exact failed check."""
+    import stat
+    source = Path(path)
+    try:
+        info = os.lstat(source)
+    except FileNotFoundError:
+        raise ArtifactCheckError('exists', 'file not found') from None
+    except OSError:
+        raise ArtifactCheckError('readable', 'file metadata is unreadable') from None
+    if stat.S_ISLNK(info.st_mode):
+        raise ArtifactCheckError('symlink', 'path is a symbolic link; pass the real file')
+    if not stat.S_ISREG(info.st_mode):
+        raise ArtifactCheckError('regular-file', 'path is not a regular file')
+    if info.st_size == 0:
+        raise ArtifactCheckError('size', 'file is empty')
+    if info.st_size > ARTIFACT_MAX_BYTES:
+        raise ArtifactCheckError('size', f'{info.st_size} bytes exceeds the {ARTIFACT_MAX_BYTES}-byte (6 MiB) limit')
+    try:
+        fd = os.open(source, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            data = stream.read(ARTIFACT_MAX_BYTES + 1)
+    except PermissionError:
+        raise ArtifactCheckError('readable', 'permission denied') from None
+    except OSError:
+        raise ArtifactCheckError('readable', 'file is unreadable') from None
+    if len(data) > ARTIFACT_MAX_BYTES:
+        raise ArtifactCheckError('size', f'file grew past the {ARTIFACT_MAX_BYTES}-byte (6 MiB) limit while reading')
+    if not data.startswith(PNG_SIGNATURE) or data[12:16] != b'IHDR':
+        raise ArtifactCheckError('type', 'not a PNG (missing PNG signature/IHDR header)')
+    return data
+
 
 def add_commands(sub):
     submit = sub.add_parser('submit', help='Submit one approved action or a batch to the task queue')
@@ -49,12 +95,12 @@ def add_commands(sub):
     sub.add_parser('jobs', help='List this client’s most recent 100 jobs')
     job = sub.add_parser('job', help='Get a job’s status, redacted report and artifacts')
     job.add_argument('id')
-    upload = sub.add_parser('task-artifact', help='Assigned host only: upload a reviewed, sanitized PNG')
+    upload = sub.add_parser('task-artifact', help='Attach a reviewed, sanitized PNG (max 6 MiB) to an intake')
     upload.add_argument('id')
     upload.add_argument('--name', required=True)
     upload.add_argument('--file', required=True)
     upload.add_argument('--sanitized', action='store_true', required=True, help='Confirm pixels and metadata contain no secrets')
-    download = sub.add_parser('artifact', help='Download a task PNG to a new private file')
+    download = sub.add_parser('artifact', help='Download an intake PNG to a new private file')
     download.add_argument('id')
     download.add_argument('name')
     download.add_argument('--output', required=True)
@@ -119,7 +165,9 @@ def execute(args):
         return bus._do_request('GET', '/api/device/pending')
     if args.cmd in ('routing-machines', 'model-policy'):
         return bus._do_request('GET', '/api/fleet/routing/' + ('machines' if args.cmd == 'routing-machines' else 'policy'))
-    if args.cmd in ('host-release', 'launcher-release'):
+    if args.cmd == 'host-release':
+        return host_release(args)
+    if args.cmd == 'launcher-release':
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
             raise ValueError('Invalid machine id')
         if args.sha is not None and not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
@@ -128,28 +176,116 @@ def execute(args):
                                {'sha': None if args.clear else args.sha.lower()})
     if args.cmd == 'jobs':
         return bus._do_request('GET', '/api/fleet/tasks')
+    if args.cmd in ('task-artifact', 'artifact'):
+        return intake_artifact(args)
     if not re.fullmatch(r'[a-f0-9-]{36}', args.id):
         raise ValueError('Invalid job id')
     path = '/api/fleet/tasks/' + quote(args.id, safe='')
-    if args.cmd == 'task-artifact':
-        source = Path(args.file)
-        if source.is_symlink() or source.stat().st_size > 196608:
-            raise ValueError('PNG must be a bounded regular private file')
-        data = source.read_bytes()
-        if not data.startswith(b'\x89PNG\r\n\x1a\n'):
-            raise ValueError('PNG required')
-        return bus._do_request('POST', path + '/artifacts', {'name': args.name, 'media_type': 'image/png', 'data_base64': base64.b64encode(data).decode('ascii'), 'sanitized': args.sanitized})
-    if args.cmd == 'artifact':
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', args.name): raise ValueError('Invalid artifact name')
-        result = bus._do_request('GET', path + '/artifacts/' + quote(args.name, safe=''))
-        data = base64.b64decode(result['data_base64'], validate=True)
-        if len(data) > 196608 or not data.startswith(b'\x89PNG\r\n\x1a\n'): raise ValueError('Invalid artifact')
-        fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, 'wb') as stream: stream.write(data)
-        return {'saved': True, 'media_type': 'image/png'}
     if args.cmd == 'job':
         return bus._do_request('GET', path)
     payload = {'status': args.status, 'report': read_text(args.report_file),
                'artifacts': json.loads(read_text(args.artifacts_file)) if args.artifacts_file else [],
                'confirmed_exit': args.confirmed_exit}
     return bus._do_request('POST', path + '/result', payload)
+
+
+HOST_RELEASE_DEPLOY_PATH = (
+    "the 'Hub 2 production' workflow (.github/workflows/deploy.yml) publishes it automatically after "
+    "green CI on a main push and triggers the Hetzner host updater; to roll out now: "
+    "gh workflow run deploy.yml --ref main -f dry_run=false")
+
+
+def _hub_base_url():
+    from . import config
+    base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or config.load_config().get('base_url')
+    if not base:
+        raise ValueError('Not logged in. Base URL not configured.')
+    return base.rstrip('/')
+
+
+def host_release(args):
+    """Hub2 has no per-machine host pin (the Hub1 PUT route answers 404).
+
+    Hub2 hosts follow the published /cli/host-release.json. Report where the
+    requested commit stands in that rollout, or name exactly why it is not live.
+    """
+    from .api import check_url, safe_http_json
+    from .session_control import SessionInputError, diagnostic
+    import urllib.request
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', args.machine):
+        raise ValueError('Invalid machine id')
+    base = _hub_base_url()
+    check_url(base)
+    manifest_url = base + '/cli/host-release.json'
+    if args.clear:
+        raise SessionInputError(
+            'not_supported_on_hub2; Hub2 has no per-machine host-release pin to clear: '
+            f'{args.machine} follows {manifest_url}')
+    if not re.fullmatch(r'[0-9a-fA-F]{40}', args.sha):
+        raise ValueError('A full 40-hex commit is required')
+    sha = args.sha.lower()
+    try:
+        manifest = safe_http_json(urllib.request.Request(manifest_url, method='GET'))
+    except Exception as exc:
+        raise SessionInputError(
+            f'host_release_manifest_unavailable; could not read {manifest_url}: {diagnostic(exc)}') from None
+    published = manifest.get('host_version') if isinstance(manifest, dict) else None
+    if not isinstance(published, str) or not re.fullmatch(r'[0-9a-f]{40}', published):
+        raise SessionInputError(f'host_release_manifest_invalid; {manifest_url} has no 40-hex host_version')
+    if published != sha:
+        raise SessionInputError(
+            f'host_release_not_published; Hub2 has no per-machine pin (the Hub1 route is gone, hence 404): '
+            f'{args.machine} follows {manifest_url}, which publishes {published} not {sha} '
+            f'(no action if {published[:12]} already contains {sha[:12]}); {HOST_RELEASE_DEPLOY_PATH}')
+    result = {'machine': args.machine, 'requested_sha': sha, 'published_host_version': published,
+              'machine_host_version': None, 'connected': None}
+    try:
+        machines = bus._do_request('GET', '/api/fleet/routing/machines').get('machines') or []
+        entry = next((m for m in machines if isinstance(m, dict)
+                      and (m.get('machine_id') == args.machine or m.get('id') == args.machine)), None)
+    except Exception as exc:
+        entry, result['machine_view_error'] = None, diagnostic(exc)
+    if entry is not None:
+        result['machine_host_version'] = entry.get('host_version')
+        result['connected'] = entry.get('connected')
+    elif 'machine_view_error' not in result:
+        result['machine_view_error'] = 'machine_not_listed'
+    if result['machine_host_version'] == sha:
+        result['state'] = 'current'
+    elif result['machine_host_version'] is None:
+        result['state'] = 'published'
+    else:
+        result['state'] = 'published_pending_host_update'
+        result['next_step'] = ('the host updater timer adopts it within its batching window; '
+                               'run systemctl --user start agent-hub2-host-update.service on the host to adopt now')
+    return result
+
+
+def intake_artifact(args):
+    """Intake PNG artifacts (Hub2 /api/intake/tasks/<id>/artifacts)."""
+    from . import intake
+    task_id = intake.safe_id(args.id)
+    if not ARTIFACT_NAME.fullmatch(args.name):
+        raise ArtifactCheckError('name', 'use 1-64 of A-Z a-z 0-9 _ . - starting with a letter or digit')
+    path = intake.BASE + '/tasks/' + quote(task_id, safe='') + '/artifacts'
+    if args.cmd == 'task-artifact':
+        data = read_png(args.file)
+        payload = {'key': 'artifact-' + args.name, 'name': args.name, 'media_type': 'image/png',
+                   'data_base64': base64.b64encode(data).decode('ascii'), 'sanitized': args.sanitized}
+        return intake.request('POST', path, payload, max_request=len(payload['data_base64']) + 4096)
+    result = intake.request('GET', path + '/' + quote(args.name, safe=''))
+    try:
+        data = base64.b64decode(result['data_base64'], validate=True)
+    except (KeyError, TypeError, ValueError):
+        raise ArtifactCheckError('type', 'Hub response carried no valid base64 PNG') from None
+    if len(data) > ARTIFACT_MAX_BYTES:
+        raise ArtifactCheckError('size', f'downloaded artifact exceeds {ARTIFACT_MAX_BYTES} bytes')
+    if not data.startswith(PNG_SIGNATURE):
+        raise ArtifactCheckError('type', 'downloaded artifact is not a PNG')
+    try:
+        fd = os.open(args.output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ArtifactCheckError('output', 'output file already exists; choose a new path') from None
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+    return {'saved': True, 'media_type': 'image/png', 'bytes': len(data), 'sha256': result.get('sha256')}

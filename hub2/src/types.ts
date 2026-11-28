@@ -32,11 +32,29 @@ export function isDeploymentActor(value: unknown): value is Actor {
     && DEPLOYMENT_POLICY_SCOPES.every(scope => (actor.scopes as unknown[]).includes(scope));
 }
 
+/** Fixed diagnostic slugs only; unknown runtime inputs still become invalidated. */
+export type EvidenceInvalidationReason = 'invalidated' | 'persist_failed' | 'capacity_or_counter_limit'
+  | 'finish_identity_invalid' | 'snapshot_source_verification_failed' | 'snapshot_store_verification_failed' | 'closed'
+  | 'picker_snapshot_failed' | 'picker_pool_failed' | 'picker_decision_incomplete'
+  | 'picker_snapshot_no_host' | 'picker_pool_no_host' | 'picker_snapshot_data_unavailable'
+  | 'picker_snapshot_policy_unavailable' | 'picker_pool_policy_unavailable'
+  | 'picker_begin_failed' | 'picker_finish_failed'
+  | 'snapshot_route_timeout' | 'snapshot_route_rejected'
+  | 'dry_run_begin_failed' | 'dry_run_finish_timeout' | 'dry_run_finish_failed';
+
+/** Closed unavailable-only persistence metadata. Never an OS code or error text. */
+export type EvidencePersistStage = 'artifacts' | 'store_identity' | 'store_sentinel'
+  | 'snapshot_create' | 'snapshot_write' | 'snapshot_sync' | 'snapshot_close' | 'ancestor_sync'
+  | 'checkpoint_verify' | 'checkpoint_create' | 'checkpoint_write' | 'checkpoint_sync'
+  | 'checkpoint_close' | 'checkpoint_publish' | 'unspecified';
+export type EvidencePersistError = 'deadline' | 'permission' | 'missing' | 'collision'
+  | 'capacity' | 'readonly' | 'io' | 'fd_limit' | 'error' | 'opaque';
+
 /** Optional Node ingress authority; failures never authorize or refuse primary work. */
 export interface CredentialMonitorEvidence {
   begin(): unknown;
   finish(identity: unknown, decision: 'alert' | 'observation' | null): Promise<void>;
-  invalidate(): void;
+  invalidate(reason?: EvidenceInvalidationReason): void;
   snapshot(nonce: string): Promise<JsonRecord>;
 }
 

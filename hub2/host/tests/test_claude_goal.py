@@ -22,6 +22,26 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+class ExternalIncludesApprovalTest(unittest.TestCase):
+    def test_approves_workspace_and_keeps_other_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.claude.json'
+            path.write_text(json.dumps({'x': 1, 'projects': {'/w': {'hasTrustDialogAccepted': True}}}))
+            self.assertTrue(cg.approve_external_includes(directory, '/w'))
+            self.assertTrue(cg.approve_external_includes(directory, '/v'))
+            data = json.loads(path.read_text())
+            self.assertEqual(data['x'], 1)
+            self.assertEqual(data['projects']['/w'], {'hasTrustDialogAccepted': True, 'hasClaudeMdExternalIncludesApproved': True})
+            self.assertTrue(data['projects']['/v']['hasClaudeMdExternalIncludesApproved'])
+
+    def test_malformed_config_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / '.claude.json'
+            path.write_text('[1]')
+            self.assertFalse(cg.approve_external_includes(directory, '/w'))
+            self.assertEqual(path.read_text(), '[1]')
+
+
 class ClaudeGoalStoreTest(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[3] / '.local/tmp'
@@ -189,7 +209,8 @@ class ClaudeGoalLaunchTest(unittest.TestCase):
 
     def test_available_claude_advertises_goal_without_losing_codex_or_zai(self):
         adapter = nl.NativeLauncher({})
-        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'):
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value={'ok': 1}):
             capabilities = adapter.capabilities()
         for provider in ['claude', 'codex', 'zai']:
             self.assertEqual(capabilities[provider], {'headless', 'interactive', 'goal', 'effort'})

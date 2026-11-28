@@ -18,7 +18,7 @@ class MCPCLIParity(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("hub_mcp_inventory", ROOT / "scripts/mcp-cli-inventory.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        source = (ROOT / "src/mcp-curation.ts").read_text()
+        source = (ROOT / "hub2/compat/mcp-contract/mcp-curation.ts").read_text()
         match = re.search(r"const PHASE2_CLI_EXCLUSIONS: Record<string, string> = \{(.*?)\n\};", source, re.S)
         self.assertIsNotNone(match)
         keys = {

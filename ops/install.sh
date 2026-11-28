@@ -2,11 +2,30 @@
 # Install ops scripts + systemd user units. Safe to re-run after every change on main.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"; dest="$HOME/.local/share/agent-hub-ops"
+# send.sh resolves its controller beside the installed ~/bin wrappers.
+# Refuse an unknown pre-existing companion before ANY installation writes;
+# allow exact current bytes or an owned matching installed pair on upgrades.
+companion="$HOME/bin/session-ctl.sh"
+owned_regular() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] && [ "$(stat -c %h "$1")" = 1 ]
+}
+if [ -e "$companion" ] || [ -L "$companion" ]; then
+  if ! owned_regular "$companion" || ! { cmp -s "$companion" "$here/lib/session-ctl.sh" ||
+      { owned_regular "$dest/session-ctl.sh" && cmp -s "$companion" "$dest/session-ctl.sh"; }; }; then
+    echo 'ops_controller_companion_conflict; existing files preserved' >&2
+    exit 1
+  fi
+fi
 mkdir -p "$dest" "$HOME/bin" "$HOME/.config/systemd/user"
 install -m755 "$here/lib/session-ctl.sh" "$here/lib/watchdog.sh" "$dest/"
+install -m755 "$here/lib/session-ctl.sh" "$companion"
 # Mails dev@ for intakes Hub could not recover itself (developer_alert_raised).
 install -m755 "$here/../scripts/hub-intake-recovery-alerts.py" "$dest/"
+install -m755 "$here/../hub2/host/agent_hub_host/disk_hygiene.py" "$dest/disk_hygiene.py"
+install -m755 "$here/../hub2/host/agent_hub_host/disk_alert.py" "$dest/disk_alert.py"
 install -m644 "$here"/systemd/hub-intake-recovery-alerts.service "$here"/systemd/hub-intake-recovery-alerts.timer "$HOME/.config/systemd/user/"
+install -m644 "$here"/systemd/hub-disk-hygiene.service "$here"/systemd/hub-disk-hygiene.timer "$HOME/.config/systemd/user/"
+install -m644 "$here"/systemd/hub-disk-alert.service "$here"/systemd/hub-disk-alert.timer "$HOME/.config/systemd/user/"
 install -m755 "$here/lib/send.sh" "$HOME/bin/orch-send"
 install -m755 "$here/lib/send.sh" "$HOME/bin/oncall-send"
 install -m644 "$here"/systemd/ops-watchdog.service "$here"/systemd/ops-watchdog.timer "$HOME/.config/systemd/user/"
@@ -26,4 +45,6 @@ systemctl --user set-environment PATH="$dest/guard-bin:$(systemctl --user show-e
 systemctl --user daemon-reload
 systemctl --user enable --now ops-watchdog.timer
 systemctl --user enable --now hub-intake-recovery-alerts.timer
-echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer, hub-intake-recovery-alerts.timer"
+systemctl --user enable --now hub-disk-hygiene.timer
+systemctl --user enable --now hub-disk-alert.timer
+echo "installed: $dest, ~/bin/orch-send, ~/bin/oncall-send, ops-watchdog.timer, hub-intake-recovery-alerts.timer, hub-disk-hygiene.timer, hub-disk-alert.timer"

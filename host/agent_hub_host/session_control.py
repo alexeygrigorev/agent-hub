@@ -47,8 +47,40 @@ TERMINAL_COMMAND = ('acked', 'refused', 'uncertain', 'failed')
 TERMINAL_SESSION = ('running', 'stopped', 'lost', 'failed', 'refused', 'uncertain', 'cancelled')
 
 SAFE_ERROR = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+HOST_START_DETAIL_LIMIT = 240
+_UNSAFE_DETAIL_CONTROL = re.compile(r'[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]')
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r'\b(?:[A-Za-z0-9_-]*(?:authorization|proxy-authorization|www-authenticate|cookie|token|api[ _-]?key|private[ _-]?key|'
+    r'password|passwd|secret|credential)[A-Za-z0-9_-]*)\b["\'`]?\s*[:=]', re.IGNORECASE)
+_QUOTED_ASSIGNMENT = re.compile(r"[\"'`][^\"'`\r\n]*[\"'`]\s*[:=]")
+_INLINE_CREDENTIAL = re.compile(r'\b(?:Bearer|Basic)\s+\S', re.IGNORECASE)
+_URL_CREDENTIAL = re.compile(r'https?://[^\s/@]+@', re.IGNORECASE)
+_TOKEN_CREDENTIAL = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})\b')
 # Error bodies are small; refuse unexpectedly large responses before parsing.
 MAX_ERROR_RESPONSE = 64 * 1024
+
+
+def sanitize_start_detail(value):
+    """Return bounded human detail, rejecting controls and credential-shaped content."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    detail = value[:2048]
+    # Reject before normalizing: stripping a NUL from a broken-up credential
+    # header can expose the value that followed it.
+    if (_UNSAFE_DETAIL_CONTROL.search(detail)
+            or _CREDENTIAL_ASSIGNMENT.search(detail)
+            or _QUOTED_ASSIGNMENT.search(detail)
+            or _INLINE_CREDENTIAL.search(detail)
+            or _URL_CREDENTIAL.search(detail)
+            or _TOKEN_CREDENTIAL.search(detail)):
+        return None
+    if (re.search(r'\b(?:traceback|stack trace|raw stderr|stderr|stdout|request body|response body|environment dump)\b',
+                  detail, re.IGNORECASE)
+            or re.search(r'[{}\[\]]', detail)
+            or re.search(r'\b[A-Za-z_][A-Za-z0-9_]{1,}\s*=\s*\S', detail)):
+        return None
+    detail = ' '.join(detail.split())[:HOST_START_DETAIL_LIMIT].strip()
+    return detail or None
 
 # Hub1-only route families the Hub2 worker never serves (verified against
 # hub2/src/worker.ts routing). Requests fail here with a typed slug instead of
@@ -62,11 +94,14 @@ HUB2_UNSUPPORTED_PREFIXES = (
     '/api/fleet/reservations', '/api/fleet/accounts', '/api/fleet/limits',
     '/api/fleet/resources', '/api/fleet/routing/host-goal',
     '/api/fleet/routing/policy/grok', '/api/fleet/machines/',
+    '/api/fleet/routing/host-release', '/api/fleet/routing/launcher-release',
 )
 HUB2_UNSUPPORTED_HINTS = {
-    '/api/bus/': 'messaging moved to native mailboxes; `hub sessions send` covers bound sessions',
+    '/api/bus/': 'messaging moved to the Hub2 mailbox /api/messages; use `hub msg send --to human:me|session:<id>|agent:<name>` (web Inbox) or `hub sessions send <id>` to type into a bound session',
     '/api/webhooks': 'webhooks retired with Hub1',
     '/api/prompts': 'prompt library retired with Hub1',
+    '/api/fleet/routing/host-release': 'Hub2 hosts follow the published /cli/host-release.json; use `hub host-release --machine <id> --sha <sha>` to see its rollout',
+    '/api/fleet/routing/launcher-release': 'launcher pins were Hub1-only; Hub2 launchers ship inside the published host release',
 }
 
 
@@ -205,6 +240,11 @@ def http_error(exc, key=None):
                        and isinstance(row.get('id'), str) and re.fullmatch(r'[a-fA-F0-9-]{36}', row['id'])]
                 if ids:
                     name += ' matches: ' + ', '.join(ids[:100])
+            if err in ('route_not_found', 'session_not_found') and exc.code == 404:
+                provider_guidance = ('; cause: Hub has no session with this id visible to this credential. '
+                                     'It is either not Hub-managed (an aplexer-native session: reach it with '
+                                     '`aplexer show <id|tag>` / `a message` on its host) or outside this '
+                                     "credential's intake scope (retry with an operator credential)")
             if err == 'provider_disabled':
                 provider_guidance = ' requested engine/model is disabled by policy; choose an allowed model or ask the policy owner to change the model pool'
         if isinstance(data, dict):
@@ -283,8 +323,10 @@ def request(method, path, payload=None):
 
     def send(access):
         validate_v2_request(cfg)
-        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method,
-                                     headers={'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'})
+        headers = {'Authorization': 'Bearer ' + access, 'Content-Type': 'application/json'}
+        if isinstance(payload_key, str) and payload_key:
+            headers['Idempotency-Key'] = payload_key
+        req = urllib.request.Request(base.rstrip('/') + path, data=data, method=method, headers=headers)
         try:
             deadline = _request_deadline.get()
             if deadline is not None:
@@ -758,6 +800,12 @@ def add_commands(sub):
     protect = commands.add_parser('protect', help='Permanently protect an owned session from automated cleanup; never stops it')
     protect.add_argument('id')
     protect.add_argument('--key', required=True, help='Stable protection key; this operation has no unprotect counterpart')
+    finish = commands.add_parser('finish', help='Record this session completion claim; does not report native exit or accept the intake')
+    finish.add_argument('id', help='Exact Hub session UUID whose claim is in --file')
+    finish.add_argument('--intake-task-id', required=True, help='Exact currently assigned intake UUID')
+    finish.add_argument('--key', required=True, help='Stable claim key; reuse exactly after a lost response')
+    finish.add_argument('--file', required=True, help='Bounded UTF-8 session_finished JSON claim file, or - for stdin')
+    finish.add_argument('--json', action='store_true')
     show = commands.add_parser('show', help='Show one session with its binding state')
     show.add_argument('id')
     show.add_argument('--threshold')
@@ -881,17 +929,31 @@ def match_session_state(entry: dict, wanted: str) -> bool:
     return entry_state == wanted
 
 
-def wait_until_bound(session_id, interval, timeout=BIND_WAIT_TIMEOUT):
+TRANSIENT_BIND_STATES = ('queued', 'offered', 'claimed', 'starting', 'uncertain')
+# Hub2 session views name a start held behind the host launch cap (t4016u).
+HOST_QUEUED_START_STATES = ('queued_on_host', 'launching_after_host_queue')
+
+
+def _session_row(view):
+    """Unwrap Hub2 {session: {...}} envelopes while preserving Hub1 flat rows."""
+    if not isinstance(view, dict):
+        return None
+    session = view.get('session')
+    return session if isinstance(session, dict) else view
+
+
+def wait_until_bound(session_id, interval, timeout=None):
     """Poll a pending session until it is running (bound); False when the budget runs out."""
     from urllib.parse import quote
-    end = time.monotonic() + timeout
+    budget = BIND_WAIT_TIMEOUT if timeout is None else timeout
+    end = time.monotonic() + budget
     while True:
-        row = request('GET', '/api/sessions/' + quote(session_id, safe=''))
+        row = _session_row(request('GET', '/api/sessions/' + quote(session_id, safe='')))
         if isinstance(row, dict):
             state = row.get('state')
             if state == 'running':
                 return True
-            if state not in ('queued', 'offered', 'starting', 'uncertain'):
+            if state not in TRANSIENT_BIND_STATES:
                 return False  # terminal or unknown: no bind is coming
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -924,6 +986,45 @@ def _session_page(page):
     return rows, cursor
 
 
+def completion_claim_payload(args):
+    """Model-authored completion claim only; never host/native/verification evidence."""
+    import uuid
+    for value in (args.id, args.intake_task_id):
+        if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+            raise ValueError('Completion requires canonical session and intake UUIDs')
+    if not isinstance(args.key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}', args.key):
+        raise ValueError('Invalid completion key')
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Duplicate completion JSON key')
+            result[key] = value
+        return result
+    def invalid_number(_):
+        raise ValueError('Invalid completion JSON number')
+    try:
+        record = json.loads(read_file(args.file, limit=MAX_BODY, field='Completion claim'),
+                            object_pairs_hook=pairs, parse_constant=invalid_number, parse_float=invalid_number)
+    except (ValueError, RecursionError):
+        raise ValueError('Invalid completion claim JSON') from None
+    if (not isinstance(record, dict) or set(record) != {'kind','session_id','summary','acceptance'}
+            or record['kind'] != 'session_finished' or record['session_id'] != args.id
+            or not isinstance(record['summary'], str) or not record['summary'].strip()
+            or len(record['summary']) > 1000 or not isinstance(record['acceptance'], list)
+            or not record['acceptance']):
+        raise ValueError('File must contain a full session_finished claim for this session')
+    for entry in record['acceptance']:
+        if (not isinstance(entry, dict) or set(entry) != {'status','proof'}
+                or entry['status'] != 'met' or not isinstance(entry['proof'], str)
+                or not entry['proof'].strip()):
+            raise ValueError('Every completion entry requires status met and nonempty proof')
+    payload = {**record, 'key': args.key}
+    if len(json.dumps(payload, ensure_ascii=False).encode('utf-8')) > MAX_BODY:
+        raise ValueError('Completion claim exceeds capacity')
+    return payload
+
+
 def execute(args):
     # Capture's budget covers enqueue, every paginated HTTP request and sleep.
     # A context-local deadline cannot affect concurrent host receiver requests.
@@ -945,6 +1046,9 @@ def _execute(args):
         # Default grouped needs-action lifecycle projection (M15c). The
         # existing `list` spelling keeps the flat session intent listing.
         return request('GET', '/api/sessions?view=lifecycle')
+    if cmd == 'finish':
+        payload = completion_claim_payload(args)
+        return request('POST', '/api/intakes/' + args.intake_task_id + '/finished', payload)
     if cmd == 'link':
         from urllib.parse import quote
         return request('POST', '/api/sessions/' + quote(args.session, safe='') + '/link',
@@ -1223,7 +1327,11 @@ def _execute(args):
             payload['effort'] = args.effort
         if getattr(args, 'intake_worktree', None):
             if payload.get('cwd'):
-                raise ValueError('--intake-worktree successor keeps Hub in charge of the cwd; drop --cwd (a detached start never names one either)')
+                mode = args.intake_worktree
+                raise ValueError(f'--intake-worktree {mode} cannot be combined with --cwd: '
+                                 + ('Hub plans the successor worktree itself' if mode == 'successor'
+                                    else 'a detached start never resumes or creates a worktree, so it has no cwd to name')
+                                 + '; drop --cwd (to continue a failed intake in its own retained worktree, omit --intake-worktree)')
             payload['intake_worktree'] = args.intake_worktree
         needs = getattr(args, 'needs', None)
         if needs:
@@ -1285,7 +1393,19 @@ def _execute(args):
         created = dict(created, client_key=key)
         timeout, interval = check_wait_args(args)
         if timeout is not None:
-            binding = wait_for_session(created['id'], timeout, interval)
+            try:
+                binding = wait_for_session(created['id'], timeout, interval)
+            except ValueError:
+                # t4016u: a start held behind the host launch cap is queued
+                # (backpressure), not failed; report that instead of a timeout.
+                from urllib.parse import quote
+                queued = _session_row(request('GET', '/api/sessions/' + quote(created['id'], safe='')))
+                if not isinstance(queued, dict) or queued.get('start_state') not in HOST_QUEUED_START_STATES:
+                    raise
+                sys.stderr.write(f"Start queued on host {queued.get('machine_id') or ''}: waiting for a launch slot "
+                                 f"(state={queued.get('state')}); it launches when a slot frees\n")
+                created.update(queued)
+                return created
             created['binding_wait'] = binding
             bound = binding.get('session') if isinstance(binding, dict) else None
             bound = bound if isinstance(bound, dict) else binding
@@ -1294,9 +1414,17 @@ def _execute(args):
                 attention = bound.get('attention') if isinstance(bound, dict) else None
                 reason = attention.get('reason') if isinstance(attention, dict) else None
                 detail = f' ({reason})' if isinstance(reason, str) and SAFE_ERROR.fullmatch(reason) else ''
-                stage = bound.get('stage') if isinstance(bound, dict) else None
+                stage = attention.get('stage') if isinstance(attention, dict) else None
+                if not isinstance(stage, str) or not SAFE_ERROR.fullmatch(stage):
+                    stage = bound.get('stage') if isinstance(bound, dict) else None
                 if isinstance(stage, str) and SAFE_ERROR.fullmatch(stage):
                     detail += f' (stage={stage})'
+                raw_detail = attention.get('detail') if isinstance(attention, dict) else None
+                if raw_detail is None and isinstance(bound, dict):
+                    raw_detail = bound.get('detail')
+                safe_detail = sanitize_start_detail(raw_detail)
+                if safe_detail:
+                    detail += f'; detail: {safe_detail}'
                 raise SessionInputError(
                     f'session_start_failed; session {created["id"]} reached {state or "an unconfirmed state"}{detail}; '
                     f'reconcile with --key {key} via show/events'
@@ -1412,16 +1540,30 @@ def _execute(args):
                 try:
                     return request('POST', '/api/sessions/' + args.id + '/' + cmd, payload)
                 except SessionHTTPError as exc:
-                    if cmd != 'capture' or not exc.pending or timeout is None:
+                    bare_not_running = (not exc.pending and exc.status == 409 and exc.code == 'session_not_running')
+                    if cmd != 'capture' or timeout is None or (not exc.pending and not bare_not_running):
                         raise
-                    # Early capture: wait for the native binding instead of failing with
-                    # a bare 409, then give the acknowledgement its full budget.
-                    print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
-                          file=sys.stderr, flush=True)
+                    from urllib.parse import quote
                     outer = _request_deadline.get()
                     bind_token = _request_deadline.set(time.monotonic() + BIND_WAIT_TIMEOUT + 10)
                     try:
-                        bound = wait_until_bound(args.id, min(interval, 2.0))
+                        if bare_not_running:
+                            row = _session_row(request('GET', '/api/sessions/' + quote(args.id, safe='')))
+                            state = row.get('state') if isinstance(row, dict) else None
+                            if state == 'running':
+                                bound = True
+                            elif state in TRANSIENT_BIND_STATES:
+                                print(f'Session {args.id} is {state}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                                      file=sys.stderr, flush=True)
+                                bound = wait_until_bound(args.id, min(interval, 2.0), timeout=BIND_WAIT_TIMEOUT)
+                            else:
+                                raise exc
+                        else:
+                            # Early capture: wait for the native binding instead of failing with
+                            # a bare 409, then give the acknowledgement its full budget.
+                            print(f'Session {args.id} is {exc.state or "starting"}: waiting up to {BIND_WAIT_TIMEOUT:g}s for its native binding',
+                                  file=sys.stderr, flush=True)
+                            bound = wait_until_bound(args.id, min(interval, 2.0), timeout=BIND_WAIT_TIMEOUT)
                     finally:
                         _request_deadline.reset(bind_token)
                     if not bound:

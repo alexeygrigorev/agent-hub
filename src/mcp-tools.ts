@@ -7,7 +7,7 @@ function tool(name: string, method: Method, path: string, description: string, c
 }
 tool('repos_list', 'GET', '/api/repos', 'Private repository registry; query org, status (active/archived/duplicate), flagged=true.', ['repos list']);
 tool('repos_show', 'GET', '/api/repos/{name}', 'Repository metadata and canonical duplicate target.', ['repos show']);
-tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only human fields: payload label, aliases, purpose, stack, key_folders, urls. Refresh never overwrites these.', ['repos edit']);
+tool('repos_edit', 'PATCH', '/api/repos/{name}', 'Operator-only repository fields (create or update): payload canonical_url (required for create), purpose, status, duplicate_of, domains, aliases, metadata.', ['repos add', 'repos edit']);
 tool('status', 'GET', '/api/status', 'Authorized status; query accepts since, task, project, host, after, limit.', ['status']);
 tool('machines_available', 'GET', '/api/machines/available', 'List available machines.', ['machines available']);
 tool('fleet', 'GET', '/api/fleet', 'Fleet machines, native sessions, agents, accounts and launch lineage. Sessions paged (sessions_limit/cursor); sections= subsets.', ['fleet']);
@@ -124,9 +124,11 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'fleet-capacity-history': 'Admin-only account capacity observations are operator diagnostics, never agent MCP tools.',
   'intake merge-check': 'Host-local: runs git and gh in a checkout, then records merge evidence; deliberate CLI step. The close gate itself is enforced for MCP intake_update (intake 2e00e01f).',
   'intake merge-state': 'Read of the merge gate; shown on intake_show (merge_state) and GET /api/intake/merge-state.',
+  'intake reevaluate': 'Operator-only: restarts Hub acceptance verification and the merge gate for a failed intake (Hub2); deliberate CLI step, not an agent tool.',
   'intake queue': 'Read of the autonomous intake queue (GET /api/intake/queue); MCP callers inspect queue health via ops_status or intake_list.',
   'machines remove': 'Operator-only machine retirement; deliberate CLI step, not an agent tool.',
   'machines revoke': 'Admin-only hard hide of a machine with credential kill; deliberate CLI step, not an agent tool.',
+  'host': 'Host-daemon administration (enroll, serve, heartbeat, self-update) runs on the host machine with its machine credential; not a model tool.',
   'host-goal': 'Operator set/inspect of durable host bring-up state; deliberate CLI step, not an agent tool.',
   'limits disable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
   'limits enable': 'Operator-only reversible account routing switch; deliberate CLI step, not an agent tool.',
@@ -136,7 +138,8 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'msg agent-delegate': 'Operator grant of named-agent delegation to an MCP client; deliberate CLI step.',
   'agents create': 'Operator-only named-agent credential minting writes a private host profile; deliberate CLI step, not an MCP tool.',
   'agents show': 'Operator-only named-agent configuration inspection; deliberate CLI step, not an MCP tool.',
-  'agents delegate': 'Operator-only credential-family delegation management; deliberate CLI step, not an MCP tool.',
+  'agents sticky': 'Operator-only sticky machine pins and forward-claim family grants; deliberate CLI step, not an MCP tool.',
+  'agents claim': 'The sticky session claims its own forward target with its worker credential; deliberate session-side CLI step, not an MCP tool.',
   'agents forward': 'Operator-only named-agent session forwarding management; deliberate CLI step, not an MCP tool.',
   'msg readdress': 'Operator re-address of an undelivered session message; deliberate CLI step.',
   'msg whoami': 'Reports the local CLI identity source; MCP callers are identified by their own login.',
@@ -149,6 +152,15 @@ export const CLI_EXCLUSIONS: Record<string, string> = {
   'sessions first-attempt-report': 'First-attempt outcome ledger is a client-side aggregation over the sessions listing; MCP callers use sessions_list and compute the same normalized outcomes.',
   'engines add': 'Operator credential import reads private native files; never expose provider credentials through model tools.',
   'engines import-native': 'Host-local operator action reads private native Claude credentials; never expose credential collection through model tools.',
+  'engines default-claude enroll': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); binds the local native login and reads it, never a model tool.',
+  'engines default-claude status': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); local read-only enrollment state; deliberate CLI step, not an agent tool.',
+  'engines default-claude check': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); dry-run verdict against the central generation; deliberate CLI step, not an agent tool.',
+  'engines default-claude disable': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); removes the enrollment; deliberate CLI step, not an agent tool.',
+  'engines default-claude enable-writes': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); turns native writes on only after a separately verified legacy-writer handoff; never an agent tool.',
+  'engines default-claude observe': 'Operator-only control of the opt-in one-way default Claude credential consumer on this host (a native credential writer); returns it to observe-only; deliberate CLI step, not an agent tool.',
+  'engines registry list': 'Operator-only inspection of the per-engine update-command registry (the commands hosts run on update); deliberate CLI step, not a model tool.',
+  'engines registry remove': 'Operator-only mutation of the per-engine update-command registry (the commands hosts run on update); never exposed to model tools.',
+  'engines registry set': 'Operator-only mutation of the per-engine update-command registry (the commands hosts run on update); never exposed to model tools.',
   'engines login': 'Hub-central provider login needs a human browser consent and a pasted one-time code; never through model tools.',
   'engines maintain': 'Operator trigger for Hub credential refresh and direct provider quota; the cron already runs it.',
   'engines list': 'Operator credential-management inventory is inspected through the CLI or dedicated account UI.',

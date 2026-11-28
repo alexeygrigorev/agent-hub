@@ -30,7 +30,7 @@ if ! git cat-file -e "${ADMISSION_BASE}^{commit}" 2>/dev/null || \
   echo "HOLD: this worktree predates the fixed heavy-test admission in d8740aac; rebase it onto current origin/main, then rerun this gate." >&2
   exit 2
 fi
-unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE
+unset APLEXER_TAG APLEXER_WORKSPACE HUB_WORKER_CONFIG_FILE HUB_CONFIG_FILE HUB2_CONFIG
 
 PLAN="$(python3 scripts/ci/affected_tests.py "${BASE}")" || exit 1
 field() { printf '%s' "${PLAN}" | python3 -c "import json,sys;d=json.load(sys.stdin);v=d['$1'];print(' '.join(v) if isinstance(v,list) else int(v))"; }
@@ -71,7 +71,7 @@ PY_ENV=(env)
 while IFS= read -r name; do
   case "$name" in
     AGENT_HUB_HEAVY_TEST_HELD|AFFECTED_*) ;;
-    APLEXER_*|HUB_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR) PY_ENV+=(-u "$name") ;;
+    APLEXER_*|HUB_*|HUB2_*|AGENT_HUB_*|XDG_CONFIG_HOME|XDG_DATA_HOME|XDG_STATE_HOME|XDG_RUNTIME_DIR|GH_CONFIG_DIR) PY_ENV+=(-u "$name") ;;
   esac
 done < <(compgen -e)
 export AFFECTED_PYENV="${PY_ENV[*]}"

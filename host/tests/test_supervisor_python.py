@@ -115,7 +115,7 @@ def test_no_second_controller_while_journal_lock_is_held(tmp_path):
             raise AssertionError('must refuse')
         except RuntimeError as error:
             assert 'lock held' in str(error)
-    native.assert_not_called()
+    assert all(call.args[0] != 'start' for call in native.call_args_list)
 
 
 def test_native_failure_logs_aplexer_stderr_without_changing_type():

@@ -60,10 +60,21 @@
       "enabled": true
     },
     {
-      "id": "zai-glm-flash",
-      "engine": "zai",
-      "model": "glm-5.3-flash",
-      "account_id": "zai-central",
+      "id": "claude-opus-high",
+      "engine": "claude",
+      "model": "opus",
+      "effort": "high",
+      "account_id": "claude",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-hydrogen-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-hydrogen-medium",
+      "effort": "medium",
+      "account_id": "gemini",
       "weight": 1,
       "capabilities": [],
       "enabled": true
@@ -74,6 +85,76 @@
       "model": "gemini-4-argon-medium",
       "effort": "medium",
       "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-carbon-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-carbon-medium",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": ["think-only"],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-low",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-low",
+      "effort": "low",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-medium",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-medium",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-high",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-high",
+      "effort": "high",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-neon-xhigh",
+      "engine": "antigravity",
+      "model": "gemini-4-neon-xhigh",
+      "effort": "max",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "antigravity-orchestrator-neon",
+      "engine": "antigravity",
+      "model": "gemini-pro-orchestrator-neon",
+      "effort": "medium",
+      "account_id": "gemini",
+      "weight": 1,
+      "capabilities": [],
+      "enabled": true
+    },
+    {
+      "id": "glm-flash-zcodex",
+      "engine": "zcodex",
+      "model": "glm-5.4",
+      "effort": "medium",
+      "account_id": "zai-central",
       "weight": 1,
       "capabilities": [],
       "enabled": true

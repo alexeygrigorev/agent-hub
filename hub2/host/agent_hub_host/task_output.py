@@ -26,6 +26,39 @@ def output_parts(task_id, operation_id, epoch):
     return ('.local', 'hub2-output', token)
 
 
+def _dirfd_supported():
+    return os.open in os.supports_dir_fd and hasattr(os, 'O_NOFOLLOW')
+
+
+def _is_link(info):
+    # Symlinks and Windows reparse points (junctions, mount points) are never followed.
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0) & 0x400)
+
+
+def portable_path_beneath(workspace, parts, create=False):
+    """Windows/no-dir_fd variant of open_beneath: lstat every component, refuse links.
+
+    Windows has no O_NOFOLLOW/dir_fd; ownership and mode bits are not meaningful
+    there, so only the link/escape checks apply (a per-user profile ACL bounds access).
+    """
+    if not parts or any(not isinstance(p, str) or p in ('', '.', '..') or '/' in p or '\\' in p for p in parts):
+        raise RuntimeError('task_output_path_invalid')
+    root = Path(workspace).resolve(strict=True)
+    current = root
+    for index, part in enumerate(parts):
+        current = current / part
+        directory = create or index < len(parts) - 1
+        if create:
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        info = os.lstat(current)
+        if _is_link(info) or (directory and not stat.S_ISDIR(info.st_mode)):
+            raise RuntimeError('task_output_private_path_required')
+    return current
+
+
 def open_beneath(workspace, parts, create=False, private=False):
     """Open fixed relative components without following file/directory symlinks."""
     if not parts or any(not isinstance(p, str) or p in ('', '.', '..') or '/' in p or '\\' in p for p in parts):
@@ -66,6 +99,18 @@ def open_beneath(workspace, parts, create=False, private=False):
 
 
 def read_beneath(workspace, parts, limit, tail=False, private=False):
+    if not _dirfd_supported():
+        path = portable_path_beneath(workspace, parts)
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 and private:
+            raise RuntimeError('task_output_file_invalid')
+        if not tail and info.st_size > limit:
+            raise RuntimeError('task_output_record_too_large')
+        with open(path, 'rb') as handle:
+            if tail:
+                handle.seek(max(0, info.st_size - limit - 3))
+                return capture_tail(handle.read(limit + 3).decode('utf8', errors='replace'), limit)
+            return handle.read(limit).decode('utf8', errors='replace')
     fd = open_beneath(workspace, parts, private=private)
     try:
         info = os.fstat(fd)
@@ -85,15 +130,21 @@ def read_beneath(workspace, parts, limit, tail=False, private=False):
 
 
 def prepare_output(task_id, specification, profile, engine, prompt):
-    if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
-        return None  # Keep the existing launch path on platforms without safe descriptor traversal.
     parts = output_parts(task_id, specification.get('operation_id'), specification.get('epoch'))
-    fd = open_beneath(specification['workspace'], parts, create=True)
+    if not _dirfd_supported():
+        # Windows (intake 42b42c9b): without retained output a headless session
+        # had no capture at all (empty pane while running, task_output_unavailable after exit).
+        if os.listdir(portable_path_beneath(specification['workspace'], parts, create=True)):
+            raise RuntimeError('task_output_attempt_exists')
+        fd = None
+    else:
+        fd = open_beneath(specification['workspace'], parts, create=True)
     try:
-        if os.listdir(fd):
+        if fd is not None and os.listdir(fd):
             raise RuntimeError('task_output_attempt_exists')
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
     return {'parts': list(parts), 'profile': profile, 'engine': engine,
             'operation_id': specification.get('operation_id'), 'epoch': specification.get('epoch'),
             'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest()}
@@ -108,10 +159,6 @@ def same_path(value, expected):
 
 def capture_task_output(task_id, expected, native_id, limit=CAPTURE_OUTPUT_BYTES, *, retained_only=False):
     """None selects legacy/interactive PTY capture; empty means task not ready yet."""
-    if os.open not in os.supports_dir_fd or not hasattr(os, 'O_NOFOLLOW'):
-        if retained_only:
-            raise RuntimeError('task_output_unavailable')
-        return None
     workspace = expected['workspace']
     def unique(pairs):
         value = {}

@@ -1,6 +1,6 @@
 """Synthetic fixtures for M14c explicit-argv probes.
 
-Fake runners for gh/wrangler parsing; the only live subprocesses run git
+Fake runners for gh parsing; the only live subprocesses run git
 against disposable synthetic fixture repos inside the owned private TMPDIR.
 No network, no deploys, no operator configuration.
 """
@@ -47,7 +47,7 @@ class TestProbeArgv(unittest.TestCase):
                      ['gh', 'api', 'repos/x', 'POST'],
                      ['gh', 'run', 'cancel', '1'],
                      ['gh', 'run', 'rerun', '1'],
-                     ['wrangler', 'deployments', 'delete']):
+                     ['wrangler', 'deployments', 'list']):
             clean, reason = status_probe.check_argv(argv)
             self.assertIsNone(clean, argv)
             self.assertIsInstance(reason, str)
@@ -57,8 +57,7 @@ class TestProbeArgv(unittest.TestCase):
         self.assertIsNotNone(argv)
         self.assertIsNone(reason)
         for argv_ok in (['gh', 'api', 'repos/o/r/actions/runs'],
-                        ['gh', 'run', 'list', '--limit', '5'],
-                        ['wrangler', 'deployments', 'list']):
+                        ['gh', 'run', 'list', '--limit', '5']):
             clean, reason = status_probe.check_argv(argv_ok)
             self.assertIsNotNone(clean, argv_ok)
             self.assertIsNone(reason, argv_ok)
@@ -261,14 +260,14 @@ class TestCollectProbes(unittest.TestCase):
     def test_ci_deploy_payloads_carry_sha_and_require_it(self):
         runner = fake_runner({
             ('gh', 'run', 'list'): (0, json.dumps([{'head_sha': SHA_A, 'conclusion': 'success', 'id': 3}])),
-            ('wrangler', 'deployments', 'list'): (0, json.dumps(
+            ('gh', 'api', 'repos/o/r/deployments'): (0, json.dumps(
                 [{'id': 'd1', 'environment': 'production', 'state': 'active', 'sha': SHA_A}])),
         })
         result = status_probe.collect_probes(self.spec([
             {'id': 'c1', 'kind': 'ci', 'cwd': self.root, 'for_native_id': 'n1',
              'sha': SHA_A, 'argv': ['gh', 'run', 'list']},
             {'id': 'd1', 'kind': 'deployment', 'cwd': self.root, 'for_native_id': 'n1',
-             'sha': SHA_A, 'argv': ['wrangler', 'deployments', 'list']},
+             'sha': SHA_A, 'argv': ['gh', 'api', 'repos/o/r/deployments']},
             {'id': 'noci', 'kind': 'ci', 'cwd': self.root, 'for_native_id': 'n1',
              'argv': ['gh', 'run', 'list']},
         ]), runner)

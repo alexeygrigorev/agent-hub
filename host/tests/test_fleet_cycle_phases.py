@@ -243,6 +243,8 @@ def test_role_jobs_cache_hit_and_file_revision_invalidation():
 def test_bus_body_detail_extracts_error_slugs_only():
     assert bus._sanitized_body_detail(b'{"error":"invalid_subscription","reason":"unmapped"}') == \
         ': invalid_subscription:unmapped'
+    assert bus._sanitized_body_detail(b'{"error":"forbidden","missing_scope":"routing:read","detail":"missing scope routing:read"}') == \
+        ': forbidden:routing:read'
     assert bus._sanitized_body_detail(b'{"error":"already_claimed"}') == ': already_claimed'
     assert bus._sanitized_body_detail(b'not json') == ''
     assert bus._sanitized_body_detail(b'{"error":"ok","token":"SECRET-shape with spaces"}') == ': ok'

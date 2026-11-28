@@ -149,7 +149,10 @@ def cmd_update(args):
             if resp.status != 200:
                 print(f"Failed to fetch CLI manifest from {manifest_url} (HTTP {resp.status})", file=sys.stderr)
                 sys.exit(1)
-            manifest = json.loads(resp.read().decode("utf-8"))
+            raw_manifest = resp.read(131073)
+            if len(raw_manifest) > 131072:
+                raise ValueError('CLI manifest exceeds the size bound')
+            manifest = json.loads(raw_manifest.decode("utf-8"))
     except Exception as exc:
         print(f"Failed to check for updates from {manifest_url}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -186,11 +189,14 @@ def cmd_update(args):
             if resp.status != 200:
                 print(f"Download failed: {pyz_url} returned HTTP {resp.status}", file=sys.stderr)
                 sys.exit(1)
-            data = resp.read()
+            data = resp.read(32 * 1024 * 1024 + 1)
     except Exception as exc:
         print(f"Download failed from {pyz_url}: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    if len(data) > 32 * 1024 * 1024:
+        print('Downloaded CLI exceeds the size bound', file=sys.stderr)
+        sys.exit(1)
     if not data:
         print("Downloaded file is empty", file=sys.stderr)
         sys.exit(1)
@@ -212,6 +218,35 @@ def cmd_update(args):
         else:
             install_dir = Path.home() / ".local" / "bin"
             target_path = install_dir / "hub"
+
+    # Established regular installations share the host updater's writer guard.
+    # Unknown existing targets retain the historical EXPLICIT manual-update path;
+    # the background updater never enrolls or publishes them. Fresh ownership
+    # is established by the normal public installer, not inferred by cmd_update.
+    if sys.platform == 'linux':
+        from . import regular_cli
+        owned_root = Path.home() / '.local/share/agent-hub2'
+        invoked = Path(sys.argv[0]).absolute()
+        if not install_dir_arg and invoked.name == 'hub' and regular_cli.selected(owned_root, invoked):
+            target_path = invoked  # Do not resolve away a replaced owned pathname.
+        if regular_cli.selected(owned_root, target_path):
+            with urllib.request.urlopen(urllib.request.Request(
+                    f"{clean_base}/cli/host-release.json", headers={"User-Agent":"hub-cli"}), timeout=10) as response:
+                release_bytes = response.read(131073)
+            if len(release_bytes) > 131072:
+                raise regular_cli.Refused('regular_cli_manifest_bound')
+            release = json.loads(release_bytes)
+            if release.get('host_version') != server_commit:
+                raise regular_cli.Refused('regular_cli_generation')
+            budget = regular_cli.Budget()
+            if getattr(args,'force',False) and regular_cli.strict_exists(regular_cli.state_path(owned_root,target_path) / regular_cli.PENDING):
+                regular_cli.reconcile(target_path,owned_root,_budget=budget)
+            result = regular_cli.publish(data, release, target_path, owned_root,
+                                         create=not regular_cli.strict_exists(target_path),_budget=budget)
+            if result['status'] not in ('published','current'):
+                raise regular_cli.Refused('regular_cli_unmanaged')
+            print(f"Updated owned regular hub at {target_path} to {server_version} ({server_commit[:12]})")
+            return
 
     install_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.parent / f".hub.tmp.{os.getpid()}"
@@ -478,10 +513,14 @@ def main():
         from . import intake
         intake.summary_main()
         return
+    if sys.argv[1:2] == ['host']:
+        from . import host_command
+        raise SystemExit(host_command.main(sys.argv[2:]))
     parser = argparse.ArgumentParser(description="Agent Hub CLI")
     parser.add_argument("--version", action="version", version=f"%(prog)s {format_version()}")
     parser.add_argument("--profile", default=None, help="Named agent profile for messaging commands (e.g. developer; see hub msg --help)")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("host", help="Host daemon administration: enroll, serve, heartbeat, configure-host, self-update, credential-mode, version, request (see hub host --help)")
     p_update = sub.add_parser("update", help="Update hub CLI to the latest deployed version or check staleness")
     p_update.add_argument("--url", default=None, help="Release URL (default: HUB_URL/HUB_BASE_URL or https://hub.dtcdev.click; ignores stored profile URL)")
     p_update.add_argument("--check", action="store_true", help="Check for updates without installing")
@@ -618,7 +657,7 @@ def main():
 
     p_run = sub.add_parser("run", help="Run the host agent in the foreground")
 
-    p_send = sub.add_parser("send", help="Send a message (session:<id>, tag@machine, agent:<name>, human:<sub> or a bus address)")
+    p_send = sub.add_parser("send", help="Post a Hub2 mailbox message (human:me = your Hub web Inbox, human:<sub>, session:<id>, agent:<name>)")
     p_send.add_argument("--from", dest="from_actor", required=False, default=None)
     p_send.add_argument("--to", dest="to_actor", required=True)
     p_send.add_argument("--kind", default="note")
@@ -732,8 +771,13 @@ def main():
             result = provisioning.command(args)
             if getattr(args, 'engines_cmd', None) == 'recommend' and not getattr(args, 'json', False) and isinstance(result, dict):
                 print(provisioning.render_recommend(result))
+            elif getattr(args, 'engines_cmd', None) == 'update' and not getattr(args, 'json', False) and isinstance(result, dict) and 'results' in result:
+                print(provisioning.render_engine_update(result))
             else:
                 print(json.dumps(result))
+            if getattr(args, 'engines_cmd', None) == 'update' and isinstance(result, dict) and result.get('ok') is False:
+                print('ERROR: one or more engine updates failed', file=sys.stderr)
+                sys.exit(1)
         except Exception as exc:
             print(provisioning.engine_error_message(exc, getattr(args, 'engines_cmd', None)), file=sys.stderr)
             sys.exit(1)
@@ -876,6 +920,12 @@ def main():
             print(json.dumps(routing.execute(args), indent=2))
         except Exception as exc:
             from . import session_control
+            if args.cmd in ('task-artifact', 'artifact'):
+                # Name the failed check (local PNG check or the Hub's error slug + detail), nothing generic.
+                from . import intake
+                reason = str(exc) if isinstance(exc, routing.ArtifactCheckError) else intake.diagnostic(exc)
+                print('Hub task operation failed (%s): %s' % (args.cmd, reason), file=sys.stderr)
+                sys.exit(1)
             print('Hub task operation failed (%s): %s; check inputs, authentication and host admission.'
                   % (args.cmd, session_control.diagnostic(exc)), file=sys.stderr)
             sys.exit(1)

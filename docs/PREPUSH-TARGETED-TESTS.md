@@ -7,18 +7,21 @@ commit reached main in 40 minutes.
 
 ## Rule
 
-Hub workers and the orchestrator-main release-slot owner push Agent Hub main
-with `scripts/push-main.sh` after committing the finished change and obtaining
-the release slot. Run it from the checkout being released; it accepts no skip,
-remote, or ref arguments. Use this helper instead of a raw `git push`.
+Follow [AGENTS.md](../AGENTS.md): work in an isolated task workspace, run
+`scripts/test-affected-local.sh` before pushing the finished PR branch, obtain
+independent review of the exact final head and green required CI, then enable
+`gh pr merge --auto --rebase --match-head-commit <reviewed-sha>`. Do not push
+main directly. A selector result of BROAD (exit 4) sends the broad/full suite to
+CI; never run `scripts/test-full-local.sh` or a broad suite on Hetzner.
 
-The helper fetches origin/main, installs the managed Git pre-push hook and
-pushes only the committed HEAD. The hook is the single verifier for both the
-helper and plain `git push origin HEAD:main` (including `worker:main` refspecs).
-It receives Git's advertised remote main SHA and runs
-`scripts/capped-test-retry.sh -- scripts/test-affected-local.sh --base <sha>`
-with final priority. BROAD (exit 4) runs the full local gate. Tests run once per
-push, with no cached pass, environment skip flag or helper-only exception.
+## Retained main-push hook (legacy mechanism)
+
+`scripts/push-main.sh` and the managed pre-push hook remain in source for legacy
+callers. They are not the current PR shipping procedure and do not authorize a
+direct main push. The helper fetches origin/main and installs the hook; the hook
+uses Git's advertised main SHA to run the affected lane. Its implemented BROAD
+fallback still invokes the full local gate. That retained behavior is not
+permission to use it on Hetzner; use the PR/CI flow above instead.
 
 Hub installs the hooks from `host/agent_hub_host/prepush.py` in
 `worktree_guard.protect_bound_worktree` before launching/adopting an Agent Hub
@@ -57,8 +60,8 @@ acquiring it, including the BROAD fallback; the runners retain their heavy-test
 admission. The hook releases this short lock before returning to its parent Git.
 Git's remote ref transaction locks and compares the advertised old SHA atomically
 when updating main, so a concurrent remote push is refused even after the hook.
-Integrate and rerun after main advances. The orchestrator release slot covers
-verification through push; this helper does not grant it.
+A stale main update must be reconciled before retrying. The helper does not
+grant integration or deployment authority.
 
 The runner requires the `capped-test-retry.sh` direct routing for self-admitting
 lanes (introduced in d8740aac); older checkouts must update before using it.
@@ -73,28 +76,32 @@ helper and plain pushes, a failing commit leaving origin/main unchanged, a
 repaired commit pushing, automatic Scope trailers on normal and merge commits,
 gray trailer preservation, the primary checkout's Scope-only hook, and linked
 worker pre-push protection, other-project exclusion, inherited-hook preservation,
-missing lanes, refspecs, source mutation and BROAD failures. Fix-forward and
-revert commits use the same gate: test the repaired/reverted tree and push when
-green.
+missing lanes, refspecs, source mutation and BROAD failures. These tests describe
+the retained mechanism. Fix-forward and revert work follow the current PR, review and CI procedure above.
 
-- Before a push: `scripts/test-affected-local.sh` (optionally `--base REF`,
+## Current affected lane and CI
+
+- Before a PR-branch push: `scripts/test-affected-local.sh` (optionally `--base REF`,
   `--dry-run` to print the selection). It runs scope guard, workflow validation
   if `.github/workflows` or `scripts/ci` changed, then inside ONE slot: typecheck
   (if TS changed), Vitest on the affected files, pytest on the affected files
   with a disposable HOME and scrubbed session env, and the Worker dry-run build
   (if `src/` or wrangler changed).
-- The full suite runs once per push in `.github/workflows/deploy.yml` (unfiltered
-  Vitest, critical Python, browser checks, build). Deploy only follows a green
-  run. A red full run is fixed forward by the pusher.
+- Required CI is split across `.github/workflows/deploy.yml`, `hub2.yml`
+  (including integrated start-path e2e), and `python-tests.yml` (host/CLI and
+  release tooling), with their configured triggers and reusable jobs. Deploy
+  follows the required green gates. Fix new CI failures forward on the PR; do
+  not exclude them or treat a local targeted pass as a full-suite pass.
 - Selection (`scripts/ci/affected_tests.py`): changed test files; tests whose name
   starts with the changed module's stem; tests that mention the changed path or
   import the module (`agent_hub_host.X`, `from agent_hub_host import X`,
   `import X`, `X.py/.ts/.js/.html`). Docs-only changes select nothing.
 - BROAD (exit 4): `package.json`, lockfiles, `vitest.config.ts`, `wrangler.jsonc`,
   `tsconfig*`, `pyproject.toml`, `uv.lock`, `host/tests/conftest.py`, the heavy-test
-  gate/scripts. Run `scripts/test-full-local.sh --priority final` for those.
-- The cap is unchanged: same six slots, same `AGENT_HUB_HEAVY_TEST_DIR`, FIFO.
-  Only the work per push shrank. A targeted run holds a slot ~40 s instead of 10+ min.
+  gate/scripts. Run those broad/full checks in CI, not locally on Hetzner.
+- Use the shared `AGENT_HUB_HEAVY_TEST_DIR`; its live `slots` file controls
+  admission under the maintained cap. Never change it or unlink live locks to
+  admit a run. A targeted run holds a slot ~40 s instead of 10+ min.
 
 ## Measurement (Hetzner, 2026-10-31, load average 13-18)
 
@@ -105,7 +112,7 @@ typecheck, build): 38 s wall.
 admission (seconds): 2.6, 3.1, 40, 42, 79, 82, 115, 118, 151, 153. **Median 80 s,
 max 153 s** (target < 180 s median). Before: the live queue at 17:51 held 13 tickets
 with median wait 509 s so far, max 1323 s, each admitted run taking 10+ min.
-This test used a private lock dir with 2 slots (two extra concurrent runs for
-~3 min); the shared dir keeps its 2-slot cap.
+This historical measurement used a private lock dir with 2 slots (two extra
+concurrent runs for ~3 min). It does not specify the current shared slot count.
 
 Option 2 (offload to DESKTOP-FP4OP26) was not needed and is not implemented.

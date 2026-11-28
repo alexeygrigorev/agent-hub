@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import unicodedata
 import zipfile
 
 from . import bus, config, engine_versions, hook_command, hook_trust, private_fs, state_hook_commands
@@ -812,11 +813,37 @@ def _engine_config(path, parse, default):
         return raw, default
 
 
-def _write_engine_config(path, raw, current):
+ENGINE_TOML_MAX_BYTES = 1048576  # Codex/ZAI config.toml only; same finite bound for read and write.
+
+
+class EngineTomlConfigError(ValueError):
+    """Fixed, content-free refusal for an unusable Codex/ZAI config.toml."""
+
+
+def _engine_toml_config(path):
+    """Current Codex/ZAI config.toml as (raw_bytes_or_None, text).
+
+    Only an absent file starts empty. A present file that is oversized (beyond
+    ENGINE_TOML_MAX_BYTES) or not valid UTF-8 is refused instead of being
+    replaced by empty defaults, so no settings are lost.
+    """
+    try:
+        raw = read_engine_file(path, ENGINE_TOML_MAX_BYTES)
+    except ValueError:
+        raise EngineTomlConfigError('engine config.toml exceeds the byte bound; refusing to replace it') from None
+    if raw is None:
+        return None, ''
+    try:
+        return raw, raw.decode('utf-8')
+    except UnicodeDecodeError:
+        raise EngineTomlConfigError('engine config.toml is not valid UTF-8; refusing to replace it') from None
+
+
+def _write_engine_config(path, raw, current, limit=131072):
     """Write only real changes, so an engine refresh never triggers a rewrite loop."""
     if raw == current:
         return
-    private_fs.atomic_write(path, raw, 131072, engine_owned=True)
+    private_fs.atomic_write(path, raw, limit, engine_owned=True)
     if os.name != 'nt':
         try:
             os.chmod(path, 0o600)
@@ -913,7 +940,7 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             codex_dir = home / '.codex'
             config_toml = codex_dir / 'config.toml'
             hooks_file = codex_dir / 'hooks.json'
-            current, content = _engine_config(config_toml, str, '')
+            current, content = _engine_toml_config(config_toml)
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
@@ -921,13 +948,16 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, hooks_file)
-            _write_engine_config(config_toml, updated.encode('utf-8'), current)
+            generated = updated.encode('utf-8')
+            if len(generated) > ENGINE_TOML_MAX_BYTES:
+                raise EngineTomlConfigError('generated engine config.toml exceeds the byte bound; not published')
+            _write_engine_config(config_toml, generated, current, ENGINE_TOML_MAX_BYTES)
 
         if provider in ('zai', None):
             zcodex_dir = home / '.zcodex'
             zconfig_toml = zcodex_dir / 'config.toml'
             zhooks_file = zcodex_dir / 'hooks.json'
-            current, content = _engine_config(zconfig_toml, str, '')
+            current, content = _engine_toml_config(zconfig_toml)
             updated = set_toml_top_level_keys(content, {
                 'approval_policy': 'never',
                 'sandbox_mode': 'danger-full-access',
@@ -935,7 +965,10 @@ def install_managed_engine_permissions(bundle=None, home=None, trusted_paths=Non
             })
             updated = ensure_toml_trusted_projects(updated, paths_to_trust)
             updated = ensure_toml_trusted_hooks(updated, zhooks_file)
-            _write_engine_config(zconfig_toml, updated.encode('utf-8'), current)
+            generated = updated.encode('utf-8')
+            if len(generated) > ENGINE_TOML_MAX_BYTES:
+                raise EngineTomlConfigError('generated engine config.toml exceeds the byte bound; not published')
+            _write_engine_config(zconfig_toml, generated, current, ENGINE_TOML_MAX_BYTES)
 
     # Claude Code
     if provider in ('claude', None):
@@ -1865,17 +1898,112 @@ def executable_path(bundle, dest, is_windows=None):
     return modules / '.bin' / binary
 
 
+CODEX_WRAPPER_PROTOCOL = 'hub2-codex-wrapper-exec-v1'
+CODEX_WRAPPER_DEFAULT = ('git', 'cloudflare-agent-git', 'scripts', 'launch-codex.sh')
+CODEX_WRAPPER_UNAVAILABLE = 'codex_launch_wrapper_unavailable'
+
+
+def _valid_codex_wrapper_body(text):
+    """Return True only for the exact canonical maintained Codex quota wrapper template."""
+    if not isinstance(text, str):
+        return False
+    # Reject control characters (except LF/HT) and non-ASCII whitespace/separators
+    # so Python line/whitespace parsing cannot diverge from Bash.
+    for ch in text:
+        if ch in (' ', '\t', '\n'):
+            continue
+        if (ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f or ch.isspace()
+                or unicodedata.category(ch) in ('Cc', 'Cf', 'Zl', 'Zp', 'Zs')):
+            return False
+    raw_lines = text.split('\n')
+    if not raw_lines or raw_lines[0] not in ('#!/usr/bin/env bash', '#!/bin/bash'):
+        return False
+    stmts = []
+    for line in raw_lines[1:]:
+        stripped = line.strip(' \t')
+        if stripped and not stripped.startswith('#'):
+            stmts.append(stripped)
+    if len(stmts) not in (3, 4) or stmts[0] != 'set -euo pipefail':
+        return False
+    if len(stmts) == 4:
+        repo_match = re.fullmatch(r'repo=(/[A-Za-z0-9._/@+-]+)', stmts[1])
+        if not repo_match or '..' in Path(repo_match.group(1)).parts:
+            return False
+        if stmts[2] != 'python3 "$repo/scripts/quota-gate.py"':
+            return False
+    else:
+        # Direct form: python3 /abs/.../quota-gate.py (unquoted or double-quoted)
+        gate_match = re.fullmatch(r'python3 (?:"(/[A-Za-z0-9._/@+-]+/quota-gate\.py)"|(/[A-Za-z0-9._/@+-]+/quota-gate\.py))', stmts[1])
+        if not gate_match:
+            return False
+        gate_path = gate_match.group(1) or gate_match.group(2)
+        if '..' in Path(gate_path).parts:
+            return False
+    exec_match = re.fullmatch(r'exec (/[A-Za-z0-9._/@+-]+/codex) "\$@"', stmts[-1])
+    if not exec_match or '..' in Path(exec_match.group(1)).parts:
+        return False
+    return True
+
+
+def codex_launch_wrapper(environ=None, home=None):
+    """Return the verified maintained Codex quota wrapper (a resolved Linux path).
+
+    Only operator configuration is trusted: CODEX_LAUNCH_WRAPPER of this host
+    process, else the fixed maintained script under the account's passwd home.
+    A configured value is never replaced by the default. Windows has no
+    supported wrapper, and a missing, unsafe or incompatible script refuses
+    Codex; there is no raw SDK fallback. The wrapper itself runs the fresh
+    quota gate exactly once, so nothing here probes quota or runs it."""
+    environ = os.environ if environ is None else environ
+    if os.name == 'nt' or sys.platform != 'linux':
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    configured = environ.get('CODEX_LAUNCH_WRAPPER')
+    try:
+        if configured is not None:
+            # Present-but-empty is an operator decision to disable Codex, not unset.
+            candidate = configured
+        else:
+            if home is None:
+                import pwd
+                home = pwd.getpwuid(os.geteuid()).pw_dir
+            candidate = str(Path(home).joinpath(*CODEX_WRAPPER_DEFAULT))
+        if not isinstance(candidate, str) or '\0' in candidate or not os.path.isabs(candidate):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        real = os.path.realpath(candidate, strict=True)
+        owners = {0, os.geteuid()}
+        chain = [real] + [str(parent) for parent in Path(real).parents]
+        for item in chain:
+            info = os.lstat(item)
+            if info.st_uid not in owners:
+                raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+            if info.st_mode & 0o002 and not (stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX):
+                raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        info = os.lstat(real)
+        if (not stat.S_ISREG(info.st_mode) or info.st_size > 4096 or not info.st_mode & 0o100
+                or info.st_mode & 0o020 and info.st_gid != os.getegid() or not os.access(real, os.X_OK)):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        with open(real, 'rb') as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        text = raw.decode('utf8')
+        if not _valid_codex_wrapper_body(text):
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        return Path(real)
+    except (OSError, ValueError, UnicodeDecodeError, RuntimeError):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE) from None
+
+
 def engine_argv(bundle, dest, is_windows=None):
     if is_windows is None:
         is_windows = (os.name == 'nt')
-    # A host may require its protected quota wrapper for every Codex start.
-    # This is operator environment, never a bundle/request supplied command.
-    wrapper = os.environ.get('CODEX_LAUNCH_WRAPPER') if bundle['provider'] == 'codex' else None
-    if wrapper:
-        path = Path(wrapper)
-        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
-            raise ValueError('Configured Codex launch wrapper unavailable')
-        return [str(path)]
+    if bundle['provider'] == 'codex':
+        # Every Codex start goes through the maintained fail-closed quota
+        # wrapper; the SDK executable is never run directly and the bundle,
+        # request or worker controls cannot choose the wrapper.
+        if is_windows:
+            raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+        return [str(codex_launch_wrapper())]
     executable = executable_path(bundle, dest, is_windows=is_windows)
     if is_windows and bundle['provider'] in ('codex', 'gemini'):
         node = shutil.which('node')
@@ -2568,19 +2696,57 @@ def managed_subscriptions():
     return subs
 
 
+def operator_config_dir(name):
+    """The host operator's own ~/.config/<name> (real HOME, not a session HOME)."""
+    root = os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')
+    return Path(root) / name
+
+
 def shared_dataops_dir():
-    """Hub-owned DataOps credential directory shared by every managed session.
+    """DataOps credential directory every managed session reads.
 
     Managed engines run with a private HOME, so the operator's own
-    ~/.config/dataops is invisible to them (intake 3bae55cf). An operator
-    provisions this directory once per host with
-    `DATAOPS_CONFIG_DIR=<dir> dataops login --label "<agent>@<host>"`; it lives
-    outside every repository and its contents are never printed.
+    ~/.config/dataops is invisible to them (intake 3bae55cf). DataOps refresh
+    tokens are single-use and rotate inside one family; a second, Hub-private
+    login (the old `shared/dataops` copy) is revoked whenever the operator
+    re-logs in and cannot be repaired by the operator (intake fc36c32b: sessions
+    failed with "Refresh token family revoked"). So when the operator login
+    exists, sessions use that very directory: one family, rotated under the CLI's
+    credentials lock, always as fresh as the host login. The Hub-owned
+    `shared/dataops` directory remains only as the fallback for hosts with no
+    operator login. Contents are never printed.
     """
+    operator = operator_config_dir('dataops')
+    if (operator / 'credentials.json').is_file():
+        return operator
     try:
         return Path(config.get_config_path()).parent / 'shared' / 'dataops'
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def link_operator_dapier_session(home):
+    """Expose the operator's dapier session (XDG_CONFIG_HOME/dapier) in a session HOME.
+
+    dapier reads $XDG_CONFIG_HOME/dapier/session.json and managed sessions get a
+    private XDG_CONFIG_HOME, so they reported "Not signed in" while the host
+    user was signed in (intake fc36c32b). A symlink keeps a single session file.
+    """
+    source = operator_config_dir('dapier')
+    if not (source / 'session.json').is_file():
+        return
+    target = Path(home) / '.config' / 'dapier'
+    try:
+        if target.is_symlink():
+            if Path(os.readlink(target)) == source:
+                return
+            target.unlink()
+        elif target.exists():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source, target_is_directory=True)
+    except OSError:
+        pass
 
 
 def engine_environment(bundle, home, dest=None):
@@ -2624,6 +2790,7 @@ def engine_environment(bundle, home, dest=None):
     shared = shared_dataops_dir()
     if shared is not None and 'DATAOPS_CONFIG_DIR' not in env and (shared / 'credentials.json').is_file():
         env['DATAOPS_CONFIG_DIR'] = str(shared)
+    link_operator_dapier_session(home)
     if bundle.get('provider') == 'go':
         from .fleet import load_settings
         from .opencode_auth import environment, prepare
@@ -2699,7 +2866,7 @@ def quotas():
     from Gemini CLI's native Google Code Assist API. Hub itself also reads
     these accounts centrally; this is the backend fallback path.
     """
-    from .fleet import quota_metadata
+    from .quota_metadata import quota_metadata
     from . import credentials
     accounts = []
     with lock():
@@ -2960,6 +3127,34 @@ def managed_exec_readiness(archive):
     return {'protocol': MANAGED_CLAUDE_PROTOCOL, 'label': 'hub-claude', 'profile': 'hub-hub-claude'}
 
 
+def codex_exec_readiness(archive):
+    """Read-only proof that this archive's Codex profile executes through the wrapper.
+
+    The profile must be the maintained `hub-shared-codex` entry whose command
+    matches this archive's exact generated `execute` invocation (interpreter,
+    effective archive precedence, managed root, handler and account label);
+    no quota probe, install or sync."""
+    archive = Path(archive).resolve(strict=True)
+    if not archive.is_file() or not zipfile.is_zipfile(archive):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    wrapper = codex_launch_wrapper()
+    document = tomllib.loads(private_fs.read_bytes(profile_path(), 262144).decode('utf8'))
+    profiles = document.get('profiles')
+    profile = profiles.get('hub-shared-codex') if isinstance(profiles, dict) else None
+    previous = sys.argv[0]
+    try:
+        sys.argv[0] = str(archive)
+        expected = module_command('execute', 'shared-codex')
+    finally:
+        sys.argv[0] = previous
+    if (not isinstance(profile, dict) or set(profile) != {'engine', 'command'}
+            or profile['engine'] != 'codex' or profile['command'] != expected
+            or str(archive) not in expected[expected.index('-c') + 1]):
+        raise ValueError(CODEX_WRAPPER_UNAVAILABLE)
+    return {'protocol': CODEX_WRAPPER_PROTOCOL, 'label': 'shared-codex', 'profile': 'hub-shared-codex',
+            'wrapper': str(wrapper)}
+
+
 def managed_claude_context(extra_argv):
     """Consume one private attempt record; this is never a general argv escape."""
     markers = [v for v in extra_argv if v.startswith(MANAGED_CONTEXT_FLAG)]
@@ -2998,6 +3193,13 @@ def managed_claude_context(extra_argv):
 
 
 MANAGED_CLAUDE_SYSTEM_SETTINGS = ('/etc/claude-code/managed-settings.json', '/etc/claude-code/managed-settings.d')
+# Claude Code itself rewrites the generated .claude.json metadata (project trust,
+# history, caches) and it legitimately grows past 64 KiB. Only those two
+# metadata files get this documented finite 1 MiB read cap; settings.json and
+# settings.local.json stay at 64 KiB. Both are read whole by the private reader
+# (no prefix scan or truncation) and fully parsed and validated.
+MANAGED_CLAUDE_SETTINGS_LIMIT = 65536
+MANAGED_CLAUDE_METADATA_LIMIT = 1048576
 
 
 def managed_claude_settings(home, *, system_settings=None):
@@ -3013,11 +3215,13 @@ def managed_claude_settings(home, *, system_settings=None):
         raise ValueError('managed_settings_unverified')
     auth_keys = {'apiKeyHelper', 'primaryApiKey', 'awsAuthRefresh', 'awsCredentialExport',
                  'forceLoginMethod', 'forceLoginOrgUUID'}
-    for parts in (('.claude', 'settings.json'), ('.claude', 'settings.local.json'),
-                  ('.claude', '.claude.json'), ('.claude.json',)):
+    for parts, limit in ((('.claude', 'settings.json'), MANAGED_CLAUDE_SETTINGS_LIMIT),
+                         (('.claude', 'settings.local.json'), MANAGED_CLAUDE_SETTINGS_LIMIT),
+                         (('.claude', '.claude.json'), MANAGED_CLAUDE_METADATA_LIMIT),
+                         (('.claude.json',), MANAGED_CLAUDE_METADATA_LIMIT)):
         path = Path(home).joinpath(*parts)
         try:
-            settings = json.loads(private_fs.read_bytes(path, 65536))
+            settings = json.loads(private_fs.read_bytes(path, limit))
         except FileNotFoundError:
             continue
         except (OSError, ValueError):
@@ -3475,6 +3679,8 @@ def add_commands(sub):
     native.add_argument('--resume-generation',type=int,help='Sync this already saved generation; no native credential read or upload')
     list_cmd.add_argument('--view', choices=['worker'], default=None, help='Sanitized read-only verification view (worker sessions): engine, account, host, health, quota state')
     commands.add_parser('quota', help='Sanitized managed account observations for the server collector')
+    from . import default_claude_consumer
+    default_claude_consumer.add_commands(commands)
     remove = commands.add_parser('remove')
     remove.add_argument('label')
     commands.add_parser('sync', help='Reconcile this enrolled machine now')
@@ -3485,14 +3691,26 @@ def add_commands(sub):
     login.add_argument('--adopt', action='store_true', help='Attach to an existing unmanaged quota pool with this label')
     commands.add_parser('status', help='Operator: per-host sync state of every managed account')
     commands.add_parser('maintain', help='Operator: run central refresh + direct provider quota now')
-    update = commands.add_parser('update', help='Hub-owned engine version rollout (intake 8cc9e31a): canary + smoke, never interrupts live sessions')
-    update.add_argument('--engine', choices=['codex', 'claude', 'opencode', 'agy', 'zcodex'], default=None, help='Only this engine (default: all supported)')
-    update.add_argument('--machine', default=None, help='Only this registered host (default: this host; use with Hub routing for fleet rollout)')
+    update = commands.add_parser('update', help='Update engines using their declared Hub registry update commands')
+    update.add_argument('--engine', default=None, help='Only this engine from the Hub registry (default: all registered)')
+    update.add_argument('--machine', default=None, help='Only this registered host (default: this host; use with Hub routing for remote host)')
+    update.add_argument('--all-machines', action='store_true', default=False, help='Run on all registered hosts via Hub')
     update.add_argument('--canary', default=None, help='Canary host for fleet rollout (default: RMTHZ)')
     update.add_argument('--check-only', action='store_true', help='Report installed/desired/latest without installing or smoking')
     update.add_argument('--smoke', action='store_true', default=None, help='Run the real-prompt smoke after install (default: on unless --check-only)')
     update.add_argument('--no-smoke', dest='smoke', action='store_false', help='Skip the real-prompt smoke')
+    update.add_argument('--json', action='store_true', default=False, help='Machine-readable JSON output')
     update.set_defaults(smoke=True)
+    registry = commands.add_parser('registry', help='Inspect or edit per-engine update commands in Hub')
+    reg_sub = registry.add_subparsers(dest='registry_cmd', required=True)
+    reg_sub.add_parser('list', help='List registered engines and their update commands')
+    reg_set = reg_sub.add_parser('set', help='Add or update an engine update command in Hub')
+    reg_set.add_argument('engine', help='Engine name (e.g. claude, codex, opencode, gemini, antigravity)')
+    reg_set.add_argument('--binary', required=True, help='Executable name')
+    reg_set.add_argument('--version-command', required=True, help='Command to read installed version')
+    reg_set.add_argument('--update-command', required=True, help='Command to update the engine')
+    reg_rm = reg_sub.add_parser('remove', help='Remove an engine from the Hub registry')
+    reg_rm.add_argument('engine', help='Engine name')
     cancel = commands.add_parser('cancel', help='Admin: cancel a pending rollout and restore its prior engine version')
     cancel.add_argument('rollout_id', help='Full rollout UUID')
     cancel.add_argument('--reason', default='operator_cancelled', help='Short nonsecret audit reason')
@@ -3613,31 +3831,145 @@ def sync_status(listing):
     return {'hosts': hosts}
 
 
-def engine_update_command(args):
-    """On-demand engine rollout (AC1-3): disable self-updates, sync, smoke, report.
+def _probe_engine_version(version_command, timeout=30):
+    from . import engine_rollout
+    if not version_command:
+        return None
+    try:
+        proc = subprocess.run(
+            version_command, shell=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout,
+        )
+        out = ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
+        parsed = engine_rollout.parse_version(out)
+        if parsed:
+            return parsed
+        return out.splitlines()[0][:80] if proc.returncode == 0 and out else None
+    except Exception:
+        return None
 
-    Fleet targeting (``--machine`` for another host) is routed through Hub
-    (``POST /api/engines/update``); this host never SSHes anywhere. The local
-    path converges via the normal managed ``sync`` (side-by-side installs,
-    previous revision kept while live sessions use it) and runs one real
-    smoke session per engine.
-    """
+
+def _run_registry_update_local(entries, machine_name):
+    results = []
+    for entry in entries:
+        engine = entry['engine']
+        version_cmd = entry['version_command']
+        update_cmd = entry['update_command']
+        old_version = _probe_engine_version(version_cmd)
+        ok = False
+        exit_code = None
+        err_text = None
+        output = None
+        try:
+            proc = subprocess.run(
+                update_cmd, shell=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+            )
+            exit_code = proc.returncode
+            combined = ((proc.stderr or '') + '\n' + (proc.stdout or '')).strip()
+            output = combined[-1500:] if combined else None
+            if proc.returncode == 0:
+                ok = True
+            else:
+                tail = combined.splitlines()[-1][:200] if combined else ''
+                err_text = 'exit_code_%d%s' % (proc.returncode, ': ' + tail if tail else '')
+        except subprocess.TimeoutExpired:
+            err_text = 'update_command_timeout'
+        except Exception as exc:
+            err_text = '%s: %s' % (type(exc).__name__, exc)
+        new_version = _probe_engine_version(version_cmd)
+        status = 'failed' if not ok else ('updated' if new_version != old_version else 'unchanged')
+        results.append({
+            'machine_id': machine_name,
+            'engine': engine,
+            'old_version': old_version,
+            'new_version': new_version,
+            'status': status,
+            'ok': ok,
+            'exit_code': exit_code,
+            'update_command': update_cmd,
+            'error': err_text,
+            'output': output,
+        })
+    return {'ok': all(r['ok'] for r in results), 'machine': machine_name, 'results': results}
+
+
+def render_engine_update(result):
+    rows = result.get('results') or []
+    lines = []
+    if not rows:
+        lines.append('No engines matched.')
+        return '\n'.join(lines)
+    lines.append('%-18s %-12s %-14s %-14s %s' % ('MACHINE', 'ENGINE', 'OLD_VERSION', 'NEW_VERSION', 'STATUS'))
+    for row in rows:
+        machine = str(row.get('machine_id') or result.get('machine') or '-')
+        engine = str(row.get('engine') or '-')
+        old_v = str(row.get('old_version') or '-')
+        new_v = str(row.get('new_version') or '-')
+        status = str(row.get('status') or ('completed' if row.get('ok') else 'failed'))
+        lines.append('%-18s %-12s %-14s %-14s %s' % (machine, engine, old_v, new_v, status))
+        if not row.get('ok'):
+            err = row.get('error') or 'update_failed'
+            lines.append('ERROR [%s/%s]: %s' % (machine, engine, err))
+    return '\n'.join(lines)
+
+
+def engine_update_command(args):
+    """Run per-engine update commands from the Hub engine registry (or canary/check-only)."""
     from . import engine_rollout
     only = getattr(args, 'engine', None)
-    engines = [only] if only else list(engine_rollout.ENGINE_ORDER)
     machine = getattr(args, 'machine', None)
+    all_machines = getattr(args, 'all_machines', False)
     try:
         import socket
         local_names = {socket.gethostname()}
+        local_machine = socket.gethostname()
     except Exception:
         local_names = set()
+        local_machine = 'local'
     try:
         from . import config as _config
         local_id = (_config.load_host_config() or {}).get('machine_id')
         if local_id:
             local_names.add(str(local_id))
+            local_machine = str(local_id)
     except Exception:
         pass
+
+    if not getattr(args, 'canary', None) and not getattr(args, 'check_only', False):
+        if all_machines or (machine and machine.casefold() not in {name.casefold() for name in local_names}):
+            body = {}
+            if only:
+                body['engine'] = only
+            if machine and not all_machines:
+                body['machine'] = machine
+            started = bus._do_request('POST', '/api/engines/update-runs', body)
+            run_id = started['run_id']
+            deadline = time.monotonic() + 300
+            latest = {'run_id': run_id, 'done': False, 'ok': False, 'results': []}
+            while time.monotonic() < deadline:
+                latest = bus._do_request('GET', '/api/engines/update-runs/' + run_id)
+                if latest.get('done'):
+                    return {'ok': bool(latest.get('ok')), 'run_id': run_id, 'results': latest.get('results', [])}
+                time.sleep(1.0)
+            return {'ok': False, 'run_id': run_id, 'error': 'engine_update_run_timeout',
+                    'results': latest.get('results', [])}
+
+        reg = bus._do_request('GET', '/api/engines/registry')
+        entries = reg.get('engines') if isinstance(reg, dict) else None
+        if not isinstance(entries, list) or not entries:
+            raise ValueError('Hub engine registry is empty')
+        if only:
+            want = only.strip().lower()
+            matched = [e for e in entries if e.get('engine') == want]
+            if not matched and want == 'agy':
+                matched = [e for e in entries if e.get('engine') == 'antigravity']
+            if not matched:
+                raise ValueError('Unknown engine in Hub registry: %s' % only)
+            entries = matched
+        return _run_registry_update_local(entries, local_machine)
+
+    engines = [only] if only else list(engine_rollout.ENGINE_ORDER)
     if machine:
         if machine.casefold() not in {name.casefold() for name in local_names}:
             body: dict = {}
@@ -3784,6 +4116,9 @@ def command(args):
     if args.engines_cmd == 'import-native':
         from . import native_claude_import
         return native_claude_import.command(args)
+    if args.engines_cmd == 'default-claude':
+        from . import default_claude_consumer
+        return default_claude_consumer.command(args)
     if args.engines_cmd == 'recommend':
         import urllib.parse
         if getattr(args, 'engine', None) and not (getattr(args, 'reason', None) and str(args.reason).strip()):
@@ -3826,6 +4161,18 @@ def command(args):
     if args.engines_cmd == 'update':
         from . import engine_rollout
         return engine_update_command(args)
+    if args.engines_cmd == 'registry':
+        import urllib.parse
+        if args.registry_cmd == 'list':
+            return bus._do_request('GET', '/api/engines/registry')
+        if args.registry_cmd == 'set':
+            return bus._do_request('PUT', '/api/engines/registry/' + urllib.parse.quote(args.engine, safe=''), {
+                'binary': args.binary,
+                'version_command': args.version_command,
+                'update_command': args.update_command,
+            })
+        if args.registry_cmd == 'remove':
+            return bus._do_request('DELETE', '/api/engines/registry/' + urllib.parse.quote(args.engine, safe=''))
     if args.engines_cmd == 'list':
         if getattr(args, 'view', None) == 'worker':
             return bus._do_request('GET', '/api/engines?view=worker')

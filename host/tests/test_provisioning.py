@@ -33,13 +33,13 @@ def installer(argv, **kwargs):
 def test_codex_operator_wrapper_is_required_when_configured(tmp_path, monkeypatch):
     wrapper = tmp_path / 'launch-codex.sh'
     monkeypatch.setenv('CODEX_LAUNCH_WRAPPER', str(wrapper))
-    with pytest.raises(ValueError, match='wrapper unavailable'):
+    with pytest.raises(ValueError, match='wrapper_unavailable'):
         p.engine_argv(bundle(), tmp_path)
-    wrapper.write_text('#!/bin/sh\nexit 0\n')
+    wrapper.write_text('#!/usr/bin/env bash\nset -euo pipefail\npython3 /x/quota-gate.py\nexec /x/codex "$@"\n')
     wrapper.chmod(0o700)
-    assert p.engine_argv(bundle(), tmp_path) == [str(wrapper)]
+    assert p.engine_argv(bundle(), tmp_path) == [str(wrapper.resolve())]
     monkeypatch.setenv('CODEX_LAUNCH_WRAPPER', 'relative-wrapper')
-    with pytest.raises(ValueError, match='wrapper unavailable'):
+    with pytest.raises(ValueError, match='wrapper_unavailable'):
         p.engine_argv(bundle(), tmp_path)
 
 
@@ -137,6 +137,7 @@ def test_credentials_go_to_child_only_not_native_profile_or_argv():
     with patch.object(p.subprocess, 'run', side_effect=installer):
         p.sync(lambda *a: {'engines': [b]})
     with patch.object(p.sys, 'argv', ['wrapper', 'test-account', '--version']), \
+         patch.object(p, 'codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
          patch.object(p, 'hub_launch_gate', return_value=(True, 'ok')), \
          patch.object(p.os, 'execve') as execute:
         p.execute()
@@ -639,6 +640,7 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     monkeypatch.setenv('AGENT_HUB_MANAGED_DIR', str(active_m_dir))
     monkeypatch.setenv('HUB_CONFIG_FILE', str(default_m_dir.parent / 'host.json'))
     monkeypatch.setenv('HUB_TOKEN', 'secret-host-token')
+    monkeypatch.setattr(p, 'codex_launch_wrapper', lambda *a, **k: Path('/synthetic/launch-codex.sh'))
 
     # Case 1: Guard rejects invocation (below the configured reserve)
     calls_execve = []
@@ -693,7 +695,7 @@ def test_codex_protected_guard_behavioral_regression(tmp_path, monkeypatch):
     p.execute()
     assert len(calls_execve) == 1
     cmd, argv, env = calls_execve[0]
-    assert cmd == str(dest / 'engine/node_modules/.bin/codex')
+    assert cmd == '/synthetic/launch-codex.sh'
     assert 'task-prompt' in argv
     # Check strict env isolation: host secrets removed
     assert 'HUB_CONFIG_FILE' not in env
@@ -1119,7 +1121,7 @@ def test_execute_bypasses_permissions_for_goal_and_interactive(tmp_path, monkeyp
     root_dir = tmp_path / 'managed'
     root_dir.mkdir(mode=0o700)
     monkeypatch.setattr(p, 'root', lambda: root_dir)
-    monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
+    monkeypatch.setattr(p, 'codex_launch_wrapper', lambda *a, **k: Path('/synthetic/launch-codex.sh'))
 
     b = bundle()
     b['provider'] = 'codex'
@@ -1605,7 +1607,7 @@ def test_managed_native_effort_4af7f1d6(tmp_path, monkeypatch, label, model, exp
     managed = tmp_path / 'managed'
     managed.mkdir(mode=0o700)
     monkeypatch.setattr(p, 'root', lambda: managed)
-    monkeypatch.delenv('CODEX_LAUNCH_WRAPPER', raising=False)
+    monkeypatch.setattr(p, 'codex_launch_wrapper', lambda *a, **k: Path('/synthetic/launch-codex.sh'))
     b = bundle()
     b.update(provider='codex', label=label, args=['-c', 'model_reasoning_effort="high"'])
     b['files']['.codex/config.toml'] = 'model_reasoning_effort = "xhigh"\n'

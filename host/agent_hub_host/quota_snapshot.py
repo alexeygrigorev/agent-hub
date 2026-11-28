@@ -26,9 +26,6 @@ SCHEMA_VERSION = "1.1"
 COLLECTOR_VERSION = "quota_snapshot/1.1"
 ALLOWED_PROVIDERS = (
     "codex",
-    # Orin's second Codex account (own CODEX_HOME, own ChatGPT token);
-    # reported by the same host collector (quse) as a separate route.
-    "codex-orin",
     "claude",
     "gemini",
     "grok",

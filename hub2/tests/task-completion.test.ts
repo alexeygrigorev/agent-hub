@@ -8,11 +8,16 @@ import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage.ts';
 import {ProjectDO} from '../src/project-do';
 import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
-import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,basePrompt,completionClaim,completionContract,continuationPrompt} from '../src/task-completion';
+import {CONTRACT_MARKER,CONTINUATION_MARKER,MAX_AUTO_CONTINUATIONS,MAX_DEADLINE_CONTINUATIONS,MAX_VERIFICATION_ATTEMPTS,basePrompt,completionClaim,completionContract,continuationPrompt,taskBlocker,verificationPrompt} from '../src/task-completion';
 
 const admin={id:'human:completion-owner',kind:'operator',scopes:['operator:admin']};
-const candidates=[{id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true}];
-const AC=['Feature works for the requester','PR merged with green CI'];
+const candidates=[
+  {id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
+  {id:'terra-route',engine:'codex',model:'gpt-6.1-terra',effort:'medium',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
+  {id:'luna-route',engine:'codex',model:'gpt-6.1-luna',effort:'max',account_id:'codex-private',weight:1,capabilities:[],enabled:true},
+  {id:'sonnet-route',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude-private',weight:1,capabilities:[],enabled:true},
+];
+const AC=['Feature works for the requester','PR merged with green CI (t1a)'];
 
 function fixture(routes=candidates){
   const parent=resolve('.local/tmp');mkdirSync(parent,{recursive:true});
@@ -21,6 +26,7 @@ function fixture(routes=candidates){
   let control:ControlDO,sql:NodeSqlStorage,project:ProjectDO;
   const reservations:any[]=[],mail:any[]=[];
   let capDenials=0,mailFailures=0;
+  const unhealthyEngines:string[]=[];
   const namespace=(handle:(id:string,request:Request)=>Promise<Response>)=>({idFromName:(id:string)=>id,
     get:(id:string)=>({fetch:(input:string|Request,init?:RequestInit)=>handle(id,input instanceof Request?input:new Request(input,init))})});
   const env:any={
@@ -33,14 +39,15 @@ function fixture(routes=candidates){
     }),
     MACHINES:namespace(async(id,r)=>{
       const path=new URL(r.url).pathname;
-      if(path==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex'],capabilities:['headless','interactive']});
+      if(path==='/_internal/routing')return Response.json({machine_id:id,connected:true,engines:['codex','claude','go'],capabilities:['headless','interactive'],
+        unhealthy_engines:unhealthyEngines.map(engine=>({engine,reason:'native_exit_127',until:Date.now()+1800000}))});
       const body=await r.json() as any;
       if(path==='/_internal/reserve'){
         assert(new TextEncoder().encode(JSON.stringify(body.launch)).length<=12_000,'Machine launch limit');
         reservations.push(body);return Response.json({state:'staged',epoch:body.attempt+1});}
       return Response.json({state:'offered'});
     }),
-    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80},hosts:['h1']})),
+    ACCOUNTS:namespace(async()=>Response.json({account:{enabled:true,min_remaining:0},credential_usable:true,credential_status:'ready',quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['h1']})),
     MAILBOXES:namespace(async(_id,r)=>{
       if(mailFailures>0){mailFailures--;return Response.json({error:'unavailable'},{status:503});}
       const body=await r.json() as any,actor=JSON.parse(r.headers.get('x-hub2-actor')!);
@@ -57,37 +64,64 @@ function fixture(routes=candidates){
   const db=()=>(project as any).db;
   return {call,reservations,mail,db,get project(){return project;},
     denyCapacity(n:number){capDenials=n;},failMail(n:number){mailFailures=n;},
+    failEngine(engine:string){unhealthyEngines.push(engine);},
     reopen(){sql.close();open();},close(){sql.close();controlSql.close();rmSync(directory,{recursive:true});}};
 }
 type F=ReturnType<typeof fixture>;
 const json=async(r:Response)=>await r.json() as any;
 
-async function createIntake(f:F,key:string){
-  const r=await f.call('/api/intakes?project=org/completion','POST',{key,title:'Ship the requested feature',text:'Implement the requested feature end to end.',acceptance_criteria:AC});
+async function createIntake(f:F,key:string,codeTask=false){
+  const r=await f.call('/api/intakes?project=org/completion','POST',{key,title:'Ship the requested feature',text:'Implement the requested feature end to end.',acceptance_criteria:AC,code_task:codeTask});
   assert.equal(r.status,201);return (await json(r)).intake.id as string;
 }
 const intakeRow=(f:F,id:string)=>f.db().one('SELECT * FROM intakes WHERE id=?',id);
 const sagas=(f:F,id:string)=>f.db().all('SELECT * FROM dispatch_sagas WHERE intake_id=? ORDER BY created_at,operation_id',id) as any[];
+const activeSaga=(f:F,id:string)=>f.db().one('SELECT * FROM dispatch_sagas WHERE intake_id=? AND session_id=?',id,intakeRow(f,id)?.session_id);
 const events=(f:F,id:string)=>(f.db().all('SELECT * FROM intake_events WHERE task_id=? ORDER BY seq',id) as any[]).map(e=>({...e,body:JSON.parse(e.body_json)}));
 const completion=(f:F,id:string)=>JSON.parse(intakeRow(f,id).final_evidence_json??'{}').completion;
 
 /** Drive the newest saga of an intake to running, like an admitted host launch. */
 async function run(f:F,id:string){
-  const saga=sagas(f,id).at(-1),native=crypto.randomUUID();
+  const saga=activeSaga(f,id)??sagas(f,id).at(-1);
+  const native=crypto.randomUUID();
   f.db().run("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?",saga.operation_id);
   const binding={operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:native};
-  assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
+  const started=await f.call('/_internal/started','POST',binding);
+  assert.equal(started.status,201,JSON.stringify({response:await started.clone().json(),saga_state:saga.state,intake_status:intakeRow(f,id)?.status,
+    session_id:saga.session_id,active_session_id:intakeRow(f,id)?.session_id}));
   return binding;
 }
 async function finish(f:F,binding:any,exit:number,deadline=false){
   const r=await f.call('/_internal/finish','POST',{...binding,exit_code:exit,native_exit_confirmed:true,evidence:{result:'exit',native_deadline:{exceeded:deadline}}});
   assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
 }
-async function claim(f:F,id:string,sessionId:string,acceptance=AC.map(()=>({status:'met',proof:'commit abc123, CI run 42 green, live check ok'})),key='claim-'+sessionId){
+async function claim(f:F,id:string,sessionId:string,acceptance=AC.map(()=>({status:'met',proof:'commit abc123, CI run 42 green, live check ok'})),key='claim-'+sessionId,status=201){
   const r=await f.call('/api/intakes/'+id+'/events','POST',{key,event:{kind:'task_complete',session_id:sessionId,summary:'Feature shipped and verified live.',acceptance}});
-  assert.equal(r.status,201);
+  assert.equal(r.status,status,JSON.stringify(await r.clone().json()));
 }
-const start=(f:F,id:string,key:string,extra:object={})=>f.call('/api/intakes/'+id+'/start','POST',{key,workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.',...extra});
+const mergeProof={kind:'merge_gate',repository:'org/completion',pr_url:'https://github.com/org/completion/pull/1',base_ref:'main',
+  merged_at:'2026-11-13T10:00:00.000Z',head_sha:'a'.repeat(40),checks_head_sha:'a'.repeat(40),checks_state:'success',checks_total:2,
+  checks_successful:2,checks_pending:0,checks_failed:0,merge_commit_sha:'b'.repeat(40),main_head_sha:'c'.repeat(40),merge_commit_in_main:true,
+  checked_at:'2026-11-13T10:01:00.000Z'};
+async function addMergeProof(f:F,id:string,key='merge-proof'){
+  const r=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key,evidence:mergeProof});
+  assert.equal(r.status,201,JSON.stringify(await r.clone().json()));
+}
+async function verify(f:F,id:string,sessionId:string,verdict:'pass'|'fail',gap='A criterion is not met'){
+  const acceptance=verdict==='pass'?AC.map(()=>({status:'met',proof:'independent code and behavior review'})):
+    [{status:'unmet',gap},{status:'met',proof:'independent review'}];
+  const actor={id:'session:'+sessionId,kind:'agent',resource_id:id,scopes:['intake:append']};
+  const r=await f.call('/api/intakes/'+id+'/events','POST',{key:'verdict-'+sessionId,event:{kind:'acceptance_verification',session_id:sessionId,
+    verdict,summary:verdict==='pass'?'All criteria verified independently':'Returned with a concrete gap',acceptance}},actor);
+  assert.equal(r.status,201,JSON.stringify(await r.clone().json()));
+}
+async function finishClaimed(f:F,id:string,binding:any,exit=0){
+  await finish(f,binding,exit);
+  await f.project.alarm();
+  const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+  return verifier;
+}
+const start=(f:F,id:string,key:string,extra:object={})=>f.call('/api/intakes/'+id+'/start','POST',{key,workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.',timeout_seconds:1800,...extra});
 
 test('task sessions receive the completion contract with intake, session and criteria within the launch limit',async()=>{
   const f=fixture();
@@ -96,7 +130,7 @@ test('task sessions receive the completion contract with intake, session and cri
     assert.equal((await start(f,id,'first')).status,201);
     const saga=sagas(f,id)[0],launch=f.reservations.at(-1).launch;
     assert(launch.prompt.startsWith('Implement the requested feature end to end.'+CONTRACT_MARKER));
-    for(const text of [id,saga.session_id,'1. '+AC[0],'2. '+AC[1],'"kind":"task_complete"','hub intake append '+id])assert(launch.prompt.includes(text),text);
+    for(const text of [id,saga.session_id,'1. '+AC[0],'2. '+AC[1],'"kind":"session_finished"','hub sessions finish '+saga.session_id])assert(launch.prompt.includes(text),text);
     assert.equal(JSON.parse(saga.routing_json).completion_contract,true);
     assert.equal(basePrompt(launch.prompt),'Implement the requested feature end to end.');
     assert(new TextEncoder().encode(JSON.stringify(launch)).length<=12_000);
@@ -114,7 +148,7 @@ test('false completion: exit 0 without a completion claim keeps the task unfinis
     const first=await run(f,id);
     // A NOT-DONE note is not a claim; neither is a claim for another session or a partial claim.
     await f.call('/api/intakes/'+id+'/events','POST',{key:'handoff',note:'HANDOFF: NOT DONE, PR still open'});
-    await claim(f,id,'00000000-0000-4000-8000-000000000000',undefined,'foreign');
+    await claim(f,id,'00000000-0000-4000-8000-000000000000',undefined,'foreign',409);
     await claim(f,id,first.session_id,[{status:'met',proof:'only one'}],'partial');
     await finish(f,first,0);
     let row=intakeRow(f,id);
@@ -142,18 +176,30 @@ test('false completion: exit 0 without a completion claim keeps the task unfinis
   }finally{f.close();}
 });
 
-test('a claimed task is finished even when its process times out, and the outcome is delivered once to the owner',async()=>{
+test('a claim starts an independent verifier and is delivered only after verification passes',async()=>{
   const f=fixture();
   try{
-    const id=await createIntake(f,'claimed-timeout');
+    const id=await createIntake(f,'claimed-timeout',true);
     assert.equal((await start(f,id,'first')).status,201);
     const first=await run(f,id);
+    await addMergeProof(f,id);
     await claim(f,id,first.session_id);
     await finish(f,first,124,true);
     assert.equal(intakeRow(f,id).status,'completed-awaiting-review','completion claim, not exit code, decides');
-    assert.equal(completion(f,id).outcome,'claimed');
+    assert.equal(completion(f,id).outcome,'claimed');assert.equal(completion(f,id).verification.state,'pending');
+    const earlyAccept=await f.call('/api/intakes/'+id,'PATCH',{key:'early-accept',status:'accepted'});
+    assert.equal(earlyAccept.status,409);assert.equal((await json(earlyAccept)).error,'acceptance_verification_required');
     assert(events(f,id).some(e=>e.kind==='task_completion_claimed'&&e.body.criteria_met===2));
     f.failMail(1);
+    await f.project.alarm();
+    assert.equal(f.mail.length,0);
+    const verifier=activeSaga(f,id),route=JSON.parse(verifier.routing_json),originalRoute=JSON.parse(sagas(f,id)[0].routing_json);
+    assert.equal(route.acceptance_verification,true);assert.notEqual(route.picker.policy_id,originalRoute.picker.policy_id);
+    assert(!/astra|haiku/i.test(`${route.picker.policy_id} ${route.picker.model??''}`));
+    assert.match(JSON.parse(verifier.launch_spec_json).prompt,/Hub post-DONE acceptance verifier/);
+    assert(!JSON.parse(verifier.launch_spec_json).prompt.includes(CONTRACT_MARKER),'verifier gets its verdict contract, not the worker contract');
+    const verifierRun=await run(f,id);await verify(f,id,verifierRun.session_id,'pass');await finish(f,verifierRun,0);
+    assert.equal(intakeRow(f,id).status,'accepted','Hub accepts verified, merged code work itself');assert.equal(completion(f,id).verification.state,'passed');
     await f.project.alarm();
     assert.equal(f.mail.length,0);assert.equal(completion(f,id).delivery.state,'pending');assert.equal(completion(f,id).delivery.tries,1);
     assert(completion(f,id).delivery.next_action_at>Date.now(),'transient delivery failure backs off');
@@ -161,13 +207,88 @@ test('a claimed task is finished even when its process times out, and the outcom
     await f.project.alarm();
     assert.equal(f.mail.length,1);
     const message=f.mail[0];
-    assert.equal(message.recipient,admin.id);assert.equal(message.sender,'intake:'+id);assert.equal(message.key,'terminal:'+first.operation_id);
-    assert.match(message.body,/Task finished, awaiting review/);assert(message.body.includes(id)&&message.body.includes('Feature shipped and verified live.'));
+    assert.equal(message.recipient,admin.id);assert.equal(message.sender,'intake:'+id);assert.equal(message.key,'terminal:'+activeSaga(f,id).operation_id);
+    assert.match(message.body,/Task accepted by Hub/);assert(message.body.includes(id)&&message.body.includes('Feature shipped and verified live.'));
     assert.equal(completion(f,id).delivery.state,'delivered');
     assert(events(f,id).some(e=>e.kind==='task_outcome_delivered'&&e.body.message_id==='message-1'));
+    assert.equal(intakeRow(f,id).status,'accepted');
     f.reopen();await f.project.alarm();
     assert.equal(f.mail.length,1,'delivery is durable and never repeated');
-    assert.equal(sagas(f,id).length,1,'a finished task is never continued');
+    assert.equal(sagas(f,id).length,2,'a verified task is never continued');
+  }finally{f.close();}
+});
+
+test('an unmet criterion is sent back to the original worker with the verifier gap',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verification-failure',false);
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'fail','The requested export is missing.');await finish(f,verifier,0);
+    const rejected=completion(f,id);
+    assert.equal(intakeRow(f,id).status,'failed');assert.equal(rejected.verification.state,'failed');
+    assert.deepEqual(rejected.verification.gaps,['The requested export is missing.']);
+    assert.equal(rejected.verification.merge_gate_only,undefined,'a verifier gap is never released by an operator done');
+    assert.equal(rejected.continuation.state,'pending');
+    await f.project.alarm();
+    const continuation=activeSaga(f,id),prompt=JSON.parse(continuation.launch_spec_json).prompt;
+    assert.equal(JSON.parse(continuation.routing_json).purpose,undefined);
+    assert.equal(JSON.parse(continuation.launch_spec_json).engine,JSON.parse(sagas(f,id)[0].launch_spec_json).engine);
+    assert.equal(JSON.parse(continuation.launch_spec_json).model,JSON.parse(sagas(f,id)[0].launch_spec_json).model);
+    assert(prompt.includes('The requested export is missing.'));
+    assert(prompt.includes(first.session_id),'the verification failure keeps the original work session context');
+    assert.equal(intakeRow(f,id).assigned_actor_id,admin.id,'verification never replaces the requester');
+    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===verifier.session_id));
+  }finally{f.close();}
+});
+
+test('missing or cross-repository merge proof blocks acceptance, fails verification, alerts loudly and sends code work back',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'merge-required',true);
+    assert.equal((await start(f,id,'first')).status,201);
+    const wrongRepo=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'wrong-repo',evidence:{...mergeProof,repository:'org/another-project'}});
+    assert.equal(wrongRepo.status,201);
+    const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    const accept=await f.call('/api/intakes/'+id,'PATCH',{key:'early-accept',status:'accepted'});
+    assert.equal(accept.status,409);assert.equal((await json(accept)).error,'merge_gate');
+    assert.equal(intakeRow(f,id).status,'completed-awaiting-review');
+    await f.project.alarm();
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'failed','a model pass cannot bypass the programmatic merge check');
+    assert.equal(completion(f,id).verification.state,'failed');
+    assert(completion(f,id).verification.gaps.some((gap:string)=>gap.includes('is not in org/another-project')));
+    assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='merge_gate_blocked'));
+    await f.project.alarm();
+    const continuation=activeSaga(f,id),prompt=JSON.parse(continuation.launch_spec_json).prompt;
+    assert(prompt.includes('Merge gate:'));assert.equal(intakeRow(f,id).assigned_actor_id,admin.id);
+  }finally{f.close();}
+});
+
+test('an incomplete verifier retries once with a different model, survives restart, then escalates',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verifier-retry',false);
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifierOne=await run(f,id),routeOne=JSON.parse(activeSaga(f,id).routing_json);
+    await finish(f,verifierOne,124,true);
+    assert.equal(completion(f,id).verification.state,'pending');assert.equal(completion(f,id).verification.attempts,1);
+    f.reopen();await f.project.alarm();
+    assert.equal(sagas(f,id).length,3,'the bounded retry is a new durable verifier session');
+    const verifierTwo=await run(f,id),routeTwo=JSON.parse(activeSaga(f,id).routing_json);
+    assert.equal(routeTwo.verification_attempt,MAX_VERIFICATION_ATTEMPTS);
+    assert.notEqual(routeTwo.picker.policy_id,routeOne.picker.policy_id);
+    assert.notEqual(routeTwo.picker.policy_id,JSON.parse(sagas(f,id)[0].routing_json).picker.policy_id);
+    assert(sagas(f,id).every(saga=>JSON.parse(saga.routing_json).picker.policy_id!=='luna-route'),'automatic implementation and both verifiers exclude Luna');
+    await finish(f,verifierTwo,1);
+    assert.equal(completion(f,id).verification.state,'escalated');
+    assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='verification_exhausted'));
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,3,'verification retries stop at the configured limit');
+    assert.match(f.mail.at(-1).body,/Task NOT finished/);
   }finally{f.close();}
 });
 
@@ -176,18 +297,18 @@ test('continuations are bounded per requester start; deadline exits get more tim
   try{
     const id=await createIntake(f,'bounded');
     assert.equal((await start(f,id,'first')).status,201);
-    for(let attempt=0;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
+    for(let attempt=0;attempt<=MAX_DEADLINE_CONTINUATIONS;attempt++){
       const binding=await run(f,id);
       await finish(f,binding,124,true);
       await f.project.alarm();
     }
     const all=sagas(f,id);
-    assert.equal(all.length,1+MAX_AUTO_CONTINUATIONS);
-    assert.deepEqual(all.map(s=>JSON.parse(s.launch_spec_json).timeout_seconds),[1800,3600,7200]);
+    assert.equal(all.length,1+MAX_DEADLINE_CONTINUATIONS);
+    assert.deepEqual(all.map(s=>JSON.parse(s.launch_spec_json).timeout_seconds),[1800,3600,7200,7200,7200]);
     assert.equal(intakeRow(f,id).status,'failed');
-    assert.equal(completion(f,id).continuation,undefined);assert.equal(completion(f,id).depth,MAX_AUTO_CONTINUATIONS);
-    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Task NOT finished/);assert.match(f.mail[0].body,/continued it 2 times/);
-    await f.project.alarm();assert.equal(sagas(f,id).length,3,'no unbounded restart loop');
+    assert.equal(completion(f,id).continuation,undefined);assert.equal(completion(f,id).depth,MAX_DEADLINE_CONTINUATIONS);
+    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Task NOT finished/);assert.match(f.mail[0].body,/continued it 4 times/);
+    await f.project.alarm();assert.equal(sagas(f,id).length,5,'no unbounded restart loop');
     // Exhaustion raises a loud developer alert (dev@, not the requester) and the developer owns the intake.
     const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
     assert.equal(alerts.length,1);assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');assert.equal(alerts[0].body.kind,'recovery_exhausted');
@@ -197,7 +318,7 @@ test('continuations are bounded per requester start; deadline exits get more tim
     assert.equal((await start(f,id,'human-restart')).status,201);
     await finish(f,await run(f,id),0);
     await f.project.alarm();
-    assert.equal(sagas(f,id).length,5);
+    assert.equal(sagas(f,id).length,7);
   }finally{f.close();}
 });
 
@@ -361,11 +482,26 @@ test('pending continuation and delivery survive an outage longer than 25 hours',
   const f=fixture();
   try{
     const unclaimed=await createIntake(f,'outage-continue');await start(f,unclaimed,'first');await finish(f,await run(f,unclaimed),0);
-    const done=await createIntake(f,'outage-deliver');await start(f,done,'first');const binding=await run(f,done);await claim(f,done,binding.session_id);await finish(f,binding,0);
+    const done=await createIntake(f,'outage-deliver');await start(f,done,'first');const binding=await run(f,done);await claim(f,done,binding.session_id);await finishClaimed(f,done,binding);
     f.db().run('UPDATE intakes SET updated_at=?',Date.now()-25*3600000);
     f.reopen();await f.project.alarm();
     assert.equal(sagas(f,unclaimed).length,2,'old unfinished attempt is continued');
     assert.equal(f.mail.length,1,'old terminal outcome is delivered');assert.equal(completion(f,done).delivery.state,'delivered');
+  }finally{f.close();}
+});
+
+test('accepted intakes enter the completion scan only inside the bounded recent window',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'accepted-window');await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);
+    const evidence=JSON.parse(intakeRow(f,id).final_evidence_json),due=Date.now()-100;
+    evidence.completion.delivery={state:'pending',key:'accepted-delivery',tries:0,next_action_at:due};
+    f.db().run("UPDATE intakes SET status='accepted',final_evidence_json=?,updated_at=? WHERE id=?",JSON.stringify(evidence),Date.now()-60_000,id);
+    assert.equal((f.project as any).completionNextDeadline(),due,'a recent accepted intake still gets its pending delivery');
+    f.db().run('UPDATE intakes SET updated_at=? WHERE id=?',Date.now()-8*24*3600000,id);
+    assert.equal((f.project as any).completionNextDeadline(),undefined,'old accepted intakes are outside the host-polled scan');
+    const plan=(f.db().all(`EXPLAIN QUERY PLAN SELECT 1 FROM intakes i WHERE i.status='accepted' AND i.updated_at>=?`,0) as any[]).map(r=>r.detail).join(' ');
+    assert.match(plan,/intakes_status_updated/,'the accepted window is an index range');
   }finally{f.close();}
 });
 
@@ -374,14 +510,14 @@ test('eligible current actions are filtered before LIMIT and alarm MIN; terminal
   try{
     const old=Date.now()-26*3600000;
     for(let n=0;n<9;n++){
-      const id=await createIntake(f,'ineligible-'+n);await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finish(f,b,0);
+      const id=await createIntake(f,'ineligible-'+n);await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);
       const evidence=JSON.parse(intakeRow(f,id).final_evidence_json);evidence.completion.delivery.next_action_at=0;
       if(n%3===0)evidence.completion.controlled=false;
       else if(n%3===1)evidence.completion.session_id='replaced-session';
       else f.db().run("UPDATE dispatch_sagas SET routing_json=json_remove(routing_json,'$.completion_contract') WHERE intake_id=?",id);
       f.db().run('UPDATE intakes SET final_evidence_json=?,updated_at=? WHERE id=?',JSON.stringify(evidence),old+n,id);
     }
-    const id=await createIntake(f,'eligible');await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finish(f,b,0);
+    const id=await createIntake(f,'eligible');await start(f,id,'first');const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);
     const evidence=JSON.parse(intakeRow(f,id).final_evidence_json),due=Date.now()-100;
     evidence.completion.delivery.next_action_at=due;
     evidence.completion.continuation={state:'refused',key:'old-continuation',tries:3,next_action_at:Date.now()+3600000};
@@ -413,7 +549,7 @@ for(const failure of ['retry','refused','superseded','throw','outer-catch']){
         replaced=true;
         const response=await original(new Request('https://project.internal/api/intakes/'+id+'/start',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},
           body:JSON.stringify({key:'manual-successor',workspace:'/srv/work/feature',prompt:'new requester attempt'})}),id);
-        assert(response.ok,await response.text());const b=await run(f,id);await claim(f,id,b.session_id);await finish(f,b,0);snapshot=intakeRow(f,id);
+        assert(response.ok,await response.text());const b=await run(f,id);await claim(f,id,b.session_id);await finishClaimed(f,id,b);snapshot=intakeRow(f,id);
       };
       if(failure==='outer-catch')project.continueTask=async()=>{await replace();throw new Error('test late outer failure');};
       else project.startIntake=async(request:Request,intakeId:string)=>{
@@ -424,9 +560,9 @@ for(const failure of ['retry','refused','superseded','throw','outer-catch']){
       };
       await f.project.alarm();
       assert.equal(replaced,true);assert.equal(intakeRow(f,id).session_id,snapshot.session_id);
-      assert.equal(intakeRow(f,id).status,'completed-awaiting-review');assert.equal(intakeRow(f,id).final_evidence_json,snapshot.final_evidence_json);
+      assert.equal(intakeRow(f,id).status,'accepted');assert.equal(intakeRow(f,id).final_evidence_json,snapshot.final_evidence_json);
       assert.equal(intakeRow(f,id).updated_at,snapshot.updated_at);assert.equal(completion(f,id).outcome,'claimed');assert.equal(completion(f,id).continuation,undefined);
-      await f.project.alarm();assert.equal(f.mail.length,1,'new claimed result still delivers normally');assert.equal(sagas(f,id).length,2);
+      await f.project.alarm();assert.equal(f.mail.length,1,'new claimed result still delivers normally');assert.equal(sagas(f,id).length,3);
     }finally{f.close();}
   });
 }
@@ -439,8 +575,8 @@ test('valid quote-heavy prompt stays exact and outcome-controlled when the contr
     assert.equal(f.reservations.at(-1).launch.prompt,prompt);await finish(f,await run(f,id),0);
     assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).outcome,'unfinished');assert.equal(completion(f,id).continuation,undefined);
     await f.project.alarm();assert.equal(sagas(f,id).length,1);assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/NOT finished/);
-    const done=await createIntake(f,'omitted-claim');await start(f,done,'first',{prompt});const b=await run(f,done);await claim(f,done,b.session_id);await finish(f,b,0);
-    assert.equal(intakeRow(f,done).status,'completed-awaiting-review');assert.equal(completion(f,done).outcome,'claimed','a valid explicit claim still counts');
+    const done=await createIntake(f,'omitted-claim');await start(f,done,'first',{prompt});const b=await run(f,done);await claim(f,done,b.session_id);await finishClaimed(f,done,b);
+    assert.equal(intakeRow(f,done).status,'accepted');assert.equal(completion(f,done).outcome,'claimed','a valid explicit claim still counts');
   }finally{f.close();}
 });
 
@@ -606,12 +742,12 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
     const finished=await m.call('/api/sessions/'+binding.session_id+'/finish',timeoutBody);
     assert.equal(finished.status,201);
     const attention=m.db().one('SELECT reason,observed_at FROM attention WHERE session_id=?',binding.session_id);
-    assert.equal(attention?.reason,'deadline_exceeded','timeout retirement raises a visible session alert');
+    assert.equal(attention?.reason,'native_deadline_exceeded','timeout retirement raises a visible session alert');
     const shownBefore=await json(await f.call('/api/intakes/'+id));
     assert.equal(shownBefore.intake.status,'failed');
     assert.notEqual(shownBefore.intake.dispatch.state,'complete','failed/timed-out dispatch view must not report complete');
     assert.equal(completion(f,id).outcome,'unfinished');
-    assert.equal(completion(f,id).reason,'deadline_exceeded');
+    assert.equal(completion(f,id).reason,'native_deadline_exceeded');
     assert.equal(completion(f,id).continuation.state,'pending');
     // Closing as done/closed or archiving without an explicit cancellation/supersede reason is refused.
     assert.equal((await f.call('/api/intakes/'+id,'POST',{key:'bad-close',status:'done'})).status,409);
@@ -620,7 +756,7 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
     const shownAfter=await json(await f.call('/api/intakes/'+id));
     assert(['queued','running'].includes(shownAfter.intake.status),'recovery continuation started');
     assert.equal(sagas(f,id).length,2);
-    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===binding.session_id&&e.body.reason==='deadline_exceeded'));
+    assert(events(f,id).some(e=>e.kind==='task_continuation_started'&&e.body.previous_session_id===binding.session_id&&e.body.reason==='native_deadline_exceeded'));
 
     // Historical d3e6c4b0-class intakes closed/left unrecovered by aplexer_retirement in the last 14 days reopen on startup.
     const retiredTimeout=await createIntake(f,'d3e6c4b0-timeout');await start(f,retiredTimeout,'first');const b1=await run(f,retiredTimeout);
@@ -633,7 +769,7 @@ test('aplexer_retirement timeout (exit 124) never marks intake or dispatch compl
       JSON.stringify({source:'aplexer_retirement',exit_code:0,native_exit_confirmed:true,native_deadline:{deadline_ms:now+1000,exceeded:false}}),now-86400_000,retiredZero);
     f.reopen();
     for(const [reopenedId,expectedReason,prevStatus,sessionId] of [
-      [retiredTimeout,'deadline_exceeded','archived',b1.session_id],
+      [retiredTimeout,'native_deadline_exceeded','archived',b1.session_id],
       [retiredZero,'exit_without_completion_claim','completed-awaiting-review',b2.session_id],
     ] as const){
       const view=(await json(await f.call('/api/intakes/'+reopenedId))).intake;
@@ -682,7 +818,7 @@ test('a continuation carries the current same-intake state beyond the first 100 
     const latest=events(f,id).find(e=>e.event_key==='append:'+id+':latest').seq;assert(preamble.includes('#'+latest+' worker_append by '+admin.id+': LATEST'));
     assert(!prompt.includes('OTHER-INTAKE-PRIVATE'),'no other intake data');assert(!preamble.includes('Q01 verification pending'),'bounded to the newest updates');
     assert.equal(basePrompt(prompt),'Implement the requested feature end to end.','original task preserved');
-    assert(prompt.includes('1. '+AC[0])&&prompt.includes('2. '+AC[1])&&prompt.includes('"kind":"task_complete"'),'criteria and completion controls kept');
+    assert(prompt.includes('1. '+AC[0])&&prompt.includes('2. '+AC[1])&&prompt.includes('"kind":"session_finished"'),'criteria and completion controls kept');
     assert(new TextEncoder().encode(basePrompt(prompt)).length<=8192);assert(new TextEncoder().encode(JSON.stringify(launch)).length<=12_000);
   }finally{f.close();}
 });
@@ -771,7 +907,7 @@ test('quote-heavy valid originals with quote-heavy notes keep the full contract 
       const launch=latestLaunch(f,id),size=new TextEncoder().encode(JSON.stringify(launch)).length;
       assert(size<=12_000,'escaped launch '+size+' within the Machine limit');
       assert.equal(JSON.parse(sagas(f,id).at(-1).routing_json).completion_contract_omitted,undefined,'contract kept');
-      assert(launch.prompt.includes(CONTRACT_MARKER)&&launch.prompt.includes('1. '+AC[0])&&launch.prompt.includes('2. '+AC[1])&&launch.prompt.includes('"kind":"task_complete"'));
+      assert(launch.prompt.includes(CONTRACT_MARKER)&&launch.prompt.includes('1. '+AC[0])&&launch.prompt.includes('2. '+AC[1])&&launch.prompt.includes('"kind":"session_finished"'));
       assert(launch.prompt.includes('NEWEST "state" \\ Q10 accepted')&&launch.prompt.includes('hub intake context '+id),'current context kept');
       const task=basePrompt(launch.prompt);
       assert(task.startsWith('"'.repeat(100))&&task.endsWith('[truncated by Hub; full task: hub intake show '+id+']'),'original clipped with a pointer to the full task');
@@ -821,4 +957,794 @@ test('archived or manually restarted intakes are never resurrected by a pending 
       assert(!events(f,id).some(e=>e.actor_id==='hub2-completion'&&e.kind.startsWith('task_continuation')));
     }finally{f.close();}
   }
+});
+
+// 12 Nov 2026: four intakes burnt both continuations in 1-3 minutes each because
+// every session hit the same outside blocker (worker 403, revoked token, a deploy
+// another session owned) and the alert said only recovery_exhausted.
+async function blocked(f:F,id:string,sessionId:string,cause:string,detail:string,key='blocked-'+sessionId){
+  const r=await f.call('/api/intakes/'+id+'/events','POST',{key,event:{kind:'task_blocked',session_id:sessionId,cause,detail,next_step:'Root applies the policy'}});
+  assert.equal(r.status,201,JSON.stringify(await r.clone().json()));
+}
+
+test('the completion contract tells sessions how to record a blocker with its cause',async()=>{
+  const text=completionContract('i-1','s-1',AC,6000);
+  for(const part of ['"kind":"task_blocked"','"session_id":"s-1"','--key blocked-s-1','permission','credential','external','waiting'])assert(text.includes(part),part);
+  assert.deepEqual(taskBlocker({kind:'task_blocked',session_id:'s-1',cause:'Permission',detail:'HTTP 403\nforbidden'},'s-1'),{cause:'permission',detail:'HTTP 403 forbidden'});
+  assert.equal(taskBlocker({kind:'task_blocked',session_id:'s-2',cause:'permission',detail:'x'},'s-1'),undefined,'another session\'s blocker does not count');
+  assert.equal(taskBlocker({kind:'task_blocked',session_id:'s-1',cause:'bogus'},'s-1')!.cause,'other');
+});
+
+test('a permission blocker is not continued: Hub alerts the developer at once and the alert names the cause',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-permission');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'state',note:'AC4 blocked: hub model-policy returns 403'});
+    await blocked(f,id,first.session_id,'permission','hub model-policy returns HTTP 403 for this worker');
+    await finish(f,first,0);
+    const record=completion(f,id);
+    assert.equal(record.reason,'blocked_permission');assert.equal(record.continuation,undefined,'no continuation into the same blocker');
+    assert.equal(record.blocker.cause,'permission');assert.match(record.cause,/^blocked \(permission\): hub model-policy returns HTTP 403 for this worker Next: Root applies the policy/);
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'blocked');assert.equal(alerts[0].body.reason,'blocked_permission');
+    assert.match(alerts[0].body.cause,/HTTP 403/);assert.equal(alerts[0].body.depth,0);
+    const blockerRow=events(f,id).find(e=>e.kind==='worker_append'&&e.body.evidence?.kind==='task_blocked');
+    assert.equal(alerts[0].body.blocker_event?.seq,blockerRow?.seq);
+    assert.equal(typeof alerts[0].body.blocker_event?.age_ms,'number');
+    const task=(await json(await f.call('/api/intakes/'+id))).task;
+    assert.equal(task.owner,'dev@dtcdev.click');assert.match(task.current_state,/Cause: blocked \(permission\): hub model-policy returns HTTP 403/);
+    assert.match(task.current_state,new RegExp(`Blocker event: seq ${blockerRow?.seq}, age `));
+    assert(events(f,id).some(e=>e.kind==='task_unfinished'&&e.body.next==='deliver'&&/HTTP 403/.test(e.body.cause)));
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'no continuation was started');
+    assert.equal(f.mail.length,1);assert.match(f.mail[0].body,/Cause: blocked \(permission\)/);assert.match(f.mail[0].body,/does not restart a session into a permission blocker/);
+  }finally{f.close();}
+});
+
+test('42b42c9b regression: a crash after progress supersedes an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'stale-blocker-42b42c9b');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read on sessions 4027e3ec/5e0a9c29');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'progress-1',note:'worked around 403 and delivered PR 742; re-review approved'});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined,'stale blocker superseded by later progress must not block recovery');
+    assert.equal(record.continuation?.state,'pending');
+    assert.match(record.cause,/worked around 403 and delivered PR 742/);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started within budget');
+  }finally{f.close();}
+});
+
+test('a crash after non-blocker evidence clears an earlier permission blocker recovers automatically',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'cleared-blocker');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','403 missing scope intake:read');
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'cleared-1',event:{kind:'blocker_cleared',session_id:first.session_id}});
+    await finish(f,first,129);
+    const record=completion(f,id);
+    assert.equal(record.reason,'native_exit_129');
+    assert.equal(record.blocker,undefined);
+    assert.equal(record.continuation?.state,'pending');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,2,'recovery session started after blocker cleared');
+  }finally{f.close();}
+});
+
+test('a waiting blocker is continued after a delay, not immediately',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-waiting');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'waiting','CI run 42 still running on the PR head');
+    const before=Date.now();
+    await finish(f,first,0);
+    const record=completion(f,id);
+    assert.equal(record.reason,'exit_without_completion_claim');assert.equal(record.continuation.state,'pending');
+    assert(record.continuation.next_action_at>=before+15*60_000,'waits before continuing');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1,'not started yet');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,0);
+  }finally{f.close();}
+});
+
+test('recovery_exhausted alert names the cause from the last session note when no blocker record exists',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'exhausted-cause');
+    assert.equal((await start(f,id,'first')).status,201);
+    for(let attempt=0;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
+      const binding=await run(f,id);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+': portal refresh token family revoked'});
+      await finish(f,binding,0);
+      await f.project.alarm();
+    }
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal(alerts[0].body.cause,'the session exited on its own without a completion record; its last note: attempt 2: portal refresh token family revoked');
+    assert.match((await json(await f.call('/api/intakes/'+id))).task.current_state,/Cause: .*attempt 2: portal refresh token family revoked/);
+  }finally{f.close();}
+});
+
+test('an operator stop keeps its reason and raises no developer alert even after a hard blocker record',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'blocked-then-stopped');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await blocked(f,id,first.session_id,'permission','HTTP 403');
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:143,native_exit_confirmed:true,stop_requested:true,evidence:{result:'exit',stop_requested:true}});
+    assert.equal(r.status,200);
+    assert.equal(completion(f,id).reason,'stop_requested');assert.equal(completion(f,id).continuation,undefined);
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='blocked').length,0);
+  }finally{f.close();}
+});
+
+// P4: committed work remains discoverable after the previous attempt ends.
+test('salvage finish evidence persists on the intake and names the same branch in a continuation',async()=>{
+  for(const status of ['pushed','already_present']){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'salvage-'+status);
+      assert.equal((await start(f,id,'first')).status,201);
+      const first=await run(f,id);
+      const saved={repo:'/srv/work/feature',remote:'origin',branch:'fix/preserved-work',head_sha:'a'.repeat(40),status};
+      const response=await f.call('/_internal/finish','POST',{...first,exit_code:137,native_exit_confirmed:true,
+        evidence:{result:'killed',git_salvage:saved}});
+      assert.equal(response.status,200);
+      assert.deepEqual(JSON.parse(intakeRow(f,id).final_evidence_json).git_salvage,saved);
+      assert.deepEqual(events(f,id).find(e=>e.kind==='finish_evidence_received').body.evidence.git_salvage,saved);
+      // Progress chatter must not bury the branch outside the newest 50 notes.
+      for(let n=0;n<55;n++)await note(f,id,'post-exit-'+n,'verification progress '+n);
+      f.reopen();
+      await f.project.alarm();
+      const launch=latestLaunch(f,id);
+      assert.equal(launch.workspace,'/srv/work/feature','continuation keeps the bound worktree');
+      for(const text of [saved.branch,saved.head_sha,saved.repo,'Reuse this branch','existing PR'])
+        assert(launch.prompt.includes(text),'continuation includes '+text);
+      assert.equal(sagas(f,id).length,2,'exactly one continuation');
+      assert(events(f,id).some(e=>e.kind==='finish_evidence_received'&&e.body.evidence.git_salvage.branch===saved.branch),
+        'receipt survives clearing final evidence on reassignment');
+    }finally{f.close();}
+  }
+});
+
+test('continuation salvage ignores failed or malformed push evidence and other attempts',async()=>{
+  for(const saved of [
+    {repo:'/srv/work/feature',remote:'origin',branch:'DO-NOT-REUSE-FAILED',head_sha:'a'.repeat(40),status:'failed'},
+    {repo:'/srv/work/feature',remote:'origin',branch:'DO-NOT-REUSE-BAD-SHA',head_sha:'invalid',status:'pushed'},
+  ]){
+    const f=fixture();
+    try{
+      const id=await createIntake(f,'salvage-invalid');
+      assert.equal((await start(f,id,'first')).status,201);
+      const first=await run(f,id);
+      assert.equal((await f.call('/_internal/finish','POST',{...first,exit_code:1,native_exit_confirmed:true,
+        evidence:{git_salvage:saved}})).status,200);
+      (f.project as any).transaction(()=>(f.project as any).appendEvent(id,'foreign-finish','hub2-host','finish_evidence_received',
+        {session_id:'foreign-attempt',evidence:{git_salvage:{...saved,status:'pushed',branch:'FOREIGN-BRANCH',head_sha:'b'.repeat(40)}}},Date.now()));
+      await f.project.alarm();
+      const prompt=latestLaunch(f,id).prompt;
+      assert(!prompt.includes('DO-NOT-REUSE')&&!prompt.includes('FOREIGN-BRANCH'));
+    }finally{f.close();}
+  }
+});
+
+test('continuation snapshot can read qualified late-stop salvage without altering stop recovery',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'late-stop-salvage');
+    assert.equal((await start(f,id,'first')).status,201);
+    const first=await run(f,id);
+    await finish(f,first,1);
+    (f.project as any).transaction(()=>(f.project as any).appendEvent(id,'late-stop-finish','hub2-host','session_finish_after_stop',
+      {session_id:first.session_id,evidence:{git_salvage:{repo:'/srv/work/feature',remote:'origin',branch:'fix/late-stop',head_sha:'c'.repeat(40),status:'pushed'}}},Date.now()));
+    await f.project.alarm();
+    assert(latestLaunch(f,id).prompt.includes('fix/late-stop'));
+    assert(latestLaunch(f,id).prompt.includes('c'.repeat(40)));
+  }finally{f.close();}
+});
+
+// Live probe a3fa3196 (13 Nov 2026): verifiers wrote {"evidence":{...}} as the
+// prompt said, the CLI wrapped it again, and Hub saw no verdict twice.
+test('a doubly wrapped verdict is read as written and an absent verdict fails loudly with its cause',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'wrapped-verdict',true);
+    await start(f,id,'first');const first=await run(f,id);await addMergeProof(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id),actor={id:'session:'+verifier.session_id,kind:'agent',resource_id:id,scopes:['intake:append']};
+    const record={kind:'acceptance_verification',session_id:verifier.session_id,verdict:'pass',summary:'All criteria verified',
+      acceptance:AC.map(()=>({status:'met',proof:'checked'}))};
+    const r=await f.call('/api/intakes/'+id+'/events','POST',{key:'wrapped',event:{evidence:record}},actor);
+    assert.equal(r.status,201,await r.clone().text());
+    assert.deepEqual(events(f,id).filter(e=>e.kind==='worker_append').at(-1).body.evidence,record,'stored unwrapped');
+    await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'accepted');assert.equal(completion(f,id).verification.state,'passed');
+
+    const silent=await createIntake(f,'silent-verifier',false);
+    await start(f,silent,'first');const work=await run(f,silent);await claim(f,silent,work.session_id);await finish(f,work,0);
+    await f.project.alarm();
+    const quiet=await run(f,silent),quietActor={id:'session:'+quiet.session_id,kind:'agent',resource_id:silent,scopes:['intake:append']};
+    const malformed=await f.call('/api/intakes/'+silent+'/events','POST',{key:'short',event:{evidence:{evidence:{...record,session_id:quiet.session_id,acceptance:[{status:'met',proof:'x'}]}}}},quietActor);
+    assert.equal(malformed.status,400,'a malformed verdict is refused at append, even when wrapped');
+    await f.call('/api/intakes/'+silent+'/events','POST',{key:'note',note:'could not reach the deployment'},quietActor);
+    await finish(f,quiet,0);
+    const unfinished=events(f,silent).find(e=>e.kind==='task_verifier_unfinished');
+    assert.match(unfinished.body.cause,/^verifier_exit_without_verdict: the verifier appended no verdict; its last note: could not reach the deployment/);
+    assert.equal(completion(f,silent).cause,unfinished.body.cause);
+  }finally{f.close();}
+});
+
+// Intake 95ded88d (20 Nov 2026): the journal recorded task_acceptance_verified
+// with reason verifier_exit_without_verdict, so a verdict-backed pass was
+// indistinguishable from an auto-accept. A verifier exit without a verdict must
+// stay unfinished (retry, then escalate) and a verdict-backed pass must be
+// journaled by its verdict, never by its exit code.
+test('a verifier that exits without a verdict never passes: Hub retries, then escalates, and nothing closes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verifier-no-verdict',true);
+    await start(f,id,'first');const first=await run(f,id);await addMergeProof(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    // First verifier attempt: exits 0 having appended no verdict record.
+    const firstVerifier=await run(f,id);
+    await finish(f,firstVerifier,0);
+    const attempt1=events(f,id).find(e=>e.kind==='task_verifier_unfinished');
+    assert(attempt1,'the no-verdict exit is journaled as unfinished');
+    assert.equal(attempt1.body.verdict,'missing');
+    assert.equal(attempt1.body.reason,'verifier_exit_without_verdict');
+    assert.equal(attempt1.body.exit_reason,'verifier_exit_0');
+    assert(!events(f,id).some(e=>e.kind==='task_acceptance_verified'),'no pass without a verdict record');
+    assert.equal(intakeRow(f,id).status,'failed','the intake is not closed on a no-verdict exit');
+    assert.equal(completion(f,id).outcome,'unfinished');
+    assert.equal(completion(f,id).verification.state,'pending','Hub retries verification itself');
+    assert.match(completion(f,id).cause,/^verifier_exit_without_verdict: /);
+    // An operator cannot accept over the missing verification.
+    const acceptEarly=await f.call('/api/intakes/'+id,'PATCH',{key:'accept-early',status:'accepted'});
+    assert.equal(acceptEarly.status,409,JSON.stringify(await acceptEarly.clone().json()));
+    // Last verifier attempt also appends nothing: loud escalation, still no pass.
+    await f.project.alarm();
+    const lastVerifier=await run(f,id);
+    await finish(f,lastVerifier,0);
+    const attempt2=events(f,id).filter(e=>e.kind==='task_verifier_unfinished').at(-1);
+    assert.equal(attempt2.body.attempt,MAX_VERIFICATION_ATTEMPTS);
+    assert(!events(f,id).some(e=>e.kind==='task_acceptance_verified'),'still no pass');
+    assert.equal(intakeRow(f,id).status,'failed');
+    assert.equal(completion(f,id).verification.state,'escalated');
+    assert(events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.kind==='verification_exhausted'),'the developer is alerted');
+    const acceptLate=await f.call('/api/intakes/'+id,'PATCH',{key:'accept-late',status:'accepted'});
+    assert.equal(acceptLate.status,409);
+  }finally{f.close();}
+});
+
+test('a verdict-backed pass is journaled by its verdict and a fail by its gap, never as an exit label',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'verifier-verdict-reasons',true);
+    await start(f,id,'first');const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    // An explicit fail verdict: journaled by its verdict, not its exit code.
+    const verifier=await run(f,id);
+    await verify(f,id,verifier.session_id,'fail','A criterion is not met');await finish(f,verifier,0);
+    const failed=events(f,id).find(e=>e.kind==='task_acceptance_verification_failed');
+    assert.equal(failed.body.verdict,'fail');
+    assert.equal(failed.body.reason,'verifier_verdict_fail');
+    assert.equal(failed.body.exit_reason,'verifier_exit_0');
+    assert.equal(intakeRow(f,id).status,'failed');
+    // The gap goes back to a worker; after its fix, a passing verdict accepts.
+    await f.project.alarm();
+    const fixed=await run(f,id);
+    await claim(f,id,fixed.session_id);await addMergeProof(f,id);await finish(f,fixed,0);
+    await f.project.alarm();
+    const retryVerifier=await run(f,id);
+    await verify(f,id,retryVerifier.session_id,'pass');await finish(f,retryVerifier,0);
+    const accepted=events(f,id).find(e=>e.kind==='task_acceptance_verified');
+    assert.equal(accepted.body.verdict,'pass');
+    assert.equal(accepted.body.reason,'verifier_verdict_pass');
+    assert.equal(accepted.body.exit_reason,'verifier_exit_0','the raw exit label stays separate from the verdict basis');
+    assert.equal(intakeRow(f,id).status,'accepted');
+    assert.equal(completion(f,id).verification.state,'passed');
+
+    // A pass held back only by the merge gate is a named failure, not a pass.
+    const unmerged=await createIntake(f,'verifier-pass-unmerged',true);
+    await start(f,unmerged,'first');const worker=await run(f,unmerged);await claim(f,unmerged,worker.session_id);await finish(f,worker,0);
+    await f.project.alarm();
+    const gateVerifier=await run(f,unmerged);
+    await verify(f,unmerged,gateVerifier.session_id,'pass');await finish(f,gateVerifier,0);
+    const held=events(f,unmerged).find(e=>e.kind==='task_acceptance_verification_failed');
+    assert.equal(held.body.verdict,'fail');
+    assert.equal(held.body.reason,'verifier_verdict_pass_merge_gate_blocked');
+    assert.equal(held.body.merge_gate_blocked,true);
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    assert(!events(f,unmerged).some(e=>e.kind==='task_acceptance_verified'));
+  }finally{f.close();}
+});
+
+test('merge-state is readable by operators and the intake worker only, and names the gate problems',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'merge-state',true);
+    await start(f,id,'first');const first=await run(f,id);
+    const worker={id:'session:'+first.session_id,kind:'agent',resource_id:id,scopes:['intake:read','intake:append']};
+    let state=await json(await f.call('/api/intakes/'+id+'/merge-state','GET',undefined,worker));
+    assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,false);assert.match(state.merge_gate.problems[0],/JSON object/);
+    assert.match(state.next_step,/hub intake merge-check/);
+    const posted=await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'worker-proof',evidence:mergeProof},worker);
+    assert.equal(posted.status,201,await posted.clone().text());
+    state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true);assert.deepEqual(state.merge_gate.problems,[]);
+    const other=await createIntake(f,'other-intake',true);
+    const foreign=await f.call('/api/intakes/'+other+'/merge-state','GET',undefined,worker);
+    assert.equal(foreign.status,403);
+    const noCi={...mergeProof,checks_state:'none',checks_total:0,checks_successful:0};
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'no-ci',evidence:noCi});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true,'a merged PR in a repository without CI is not blocked');
+    const masterNoCi={...noCi,base_ref:'master'};
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'master-no-ci',evidence:masterNoCi});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,true,'a merged PR targeting master without CI is not blocked');
+    await f.call('/api/intakes/'+other+'/merge-evidence','POST',{key:'red',evidence:{...mergeProof,checks_state:'failure',checks_successful:1,checks_failed:1}});
+    state=await json(await f.call('/api/intakes/'+other+'/merge-state'));
+    assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('green')));
+  }finally{f.close();}
+});
+
+test('operator re-evaluation of a failed intake accepts merged work and sends unmerged work back with named gaps',async()=>{
+  const f=fixture();
+  try{
+    // Merged work whose session ended blocked (a0af4b9b/d40c7989 on 13 Nov).
+    const merged=await createIntake(f,'reeval-merged',true);
+    await start(f,merged,'first');const first=await run(f,merged);
+    const blocker={kind:'task_blocked',session_id:first.session_id,cause:'permission',detail:'merge-state 404'};
+    await f.call('/api/intakes/'+merged+'/events','POST',{key:'blocked',event:blocker},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    await finish(f,first,0);
+    assert.equal(intakeRow(f,merged).status,'failed');
+    await f.project.alarm();
+    const before=sagas(f,merged).length;
+    const workerTry=await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1'},{id:'session:'+first.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    assert.equal(workerTry.status,403);
+    const requested=await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1',reason:'PR merged; merge-state was 404'});
+    assert.equal(requested.status,202,await requested.clone().text());
+    assert.equal((await f.call('/api/intakes/'+merged+'/reevaluate','POST',{key:'r1',reason:'PR merged; merge-state was 404'})).status,200,'idempotent');
+    await f.project.alarm();
+    assert.equal(sagas(f,merged).length,before+1,'one independent verifier');
+    const verifier=activeSaga(f,merged),route=JSON.parse(verifier.routing_json);
+    assert.equal(route.acceptance_verification,true);assert.match(route.verification_round,/^re[0-9a-f]{12}$/);
+    assert.notEqual(route.picker.policy_id,JSON.parse(sagas(f,merged)[0].routing_json).picker.policy_id);
+    assert.match(JSON.parse(verifier.launch_spec_json).prompt,/hub intake merge-check/);
+    const vrun=await run(f,merged);
+    await f.call('/api/intakes/'+merged+'/merge-evidence','POST',{key:'verifier-proof',evidence:mergeProof},{id:'session:'+vrun.session_id,kind:'agent',resource_id:merged,scopes:['intake:append']});
+    await verify(f,merged,vrun.session_id,'pass');await finish(f,vrun,0);
+    assert.equal(intakeRow(f,merged).status,'accepted');
+    assert(events(f,merged).some(e=>e.kind==='task_reevaluation_requested'));
+    assert(events(f,merged).some(e=>e.kind==='task_acceptance_verified'));
+
+    // Work that never reached main: a model pass cannot bypass the gate.
+    const unmerged=await createIntake(f,'reeval-unmerged',true);
+    await start(f,unmerged,'first');const second=await run(f,unmerged);await finish(f,second,0);
+    await f.project.alarm();await f.project.alarm();
+    while(['queued','running'].includes(intakeRow(f,unmerged).status)){await finish(f,await run(f,unmerged),0);await f.project.alarm();}
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    assert.equal((await f.call('/api/intakes/'+unmerged+'/reevaluate','POST',{key:'r2'})).status,202);
+    await f.project.alarm();
+    const check=await run(f,unmerged);
+    await f.call('/api/intakes/'+unmerged+'/merge-evidence','POST',{key:'open-pr',evidence:{...mergeProof,merged_at:null,merge_commit_in_main:false}});
+    await verify(f,unmerged,check.session_id,'pass');await finish(f,check,0);
+    assert.equal(intakeRow(f,unmerged).status,'failed');
+    const gaps=completion(f,unmerged).verification.gaps as string[];
+    assert(gaps.some(g=>g.includes('the pull request is not merged')),JSON.stringify(gaps));
+    assert.equal(completion(f,unmerged).continuation.state,'pending','sent back to the worker');
+    await f.project.alarm();
+    assert(JSON.parse(activeSaga(f,unmerged).launch_spec_json).prompt.includes('the pull request is not merged'));
+    assert.equal((await f.call('/api/intakes/'+unmerged+'/reevaluate','POST',{key:'r3'})).status,409,'not while a session runs');
+  }finally{f.close();}
+});
+
+// a3fa3196 shape: the intake failed after its verifiers escalated, so its last
+// session is a verifier. Re-evaluation must review the implementation session.
+test('re-evaluation after verifier escalation reviews the implementation session and sends gaps to a worker, not a reviewer',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'reeval-after-verifier',true);
+    await start(f,id,'first');const work=await run(f,id);await claim(f,id,work.session_id);await finish(f,work,0);
+    for(let attempt=1;attempt<=MAX_VERIFICATION_ATTEMPTS;attempt++){await f.project.alarm();await finish(f,await run(f,id),0);}
+    assert.equal(intakeRow(f,id).status,'failed');assert.equal(completion(f,id).verification.state,'escalated');
+    const lastVerifier=intakeRow(f,id).session_id;assert.notEqual(lastVerifier,work.session_id);
+    assert(sagas(f,id).every(saga=>JSON.parse(saga.routing_json).picker.policy_id!=='luna-route'),'automatic implementation and both verifiers exclude Luna');
+    const requested=await json(await f.call('/api/intakes/'+id+'/reevaluate','POST',{key:'after-escalation'}));
+    assert.equal(requested.original_session_id,work.session_id);assert.equal(requested.session_id,lastVerifier);
+    await f.project.alarm();
+    const verifier=activeSaga(f,id),route=JSON.parse(verifier.routing_json);
+    assert.equal(route.verification_origin_session_id,work.session_id);assert.equal(route.verification_of_session_id,lastVerifier);
+    assert(JSON.parse(verifier.launch_spec_json).prompt.includes('implementation session '+work.session_id));
+    const vrun=await run(f,id);await verify(f,id,vrun.session_id,'fail','Export is missing.');await finish(f,vrun,0);
+    assert.equal(completion(f,id).continuation.state,'pending');
+    await f.project.alarm();
+    const fix=activeSaga(f,id),launch=JSON.parse(fix.launch_spec_json);
+    assert.equal(JSON.parse(fix.routing_json).purpose,undefined,'the fix session implements');
+    assert(!launch.prompt.includes('Hub post-DONE acceptance verifier'),'the fix session is not given the verifier role');
+    assert(launch.prompt.includes('Implement the requested feature end to end.'));assert(launch.prompt.includes('Export is missing.'));
+  }finally{f.close();}
+});
+
+test('merge evidence for a PR of another repository never satisfies the gate',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'foreign-pr',true);
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'foreign',evidence:{...mergeProof,pr_url:'https://github.com/org/other/pull/9'}});
+    const state=await json(await f.call('/api/intakes/'+id+'/merge-state'));
+    assert.equal(state.merge_gate.ok,false);assert(state.merge_gate.problems.some((p:string)=>p.includes('is not in org/completion')));
+  }finally{f.close();}
+});
+
+test('work merged in other repositories satisfies the gate when the newest proof of each repository passes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'multi-repo',true);
+    const proofOf=(repo:string,n:number,extra:object={})=>({...mergeProof,repository:repo,pr_url:`https://github.com/${repo}/pull/${n}`,...extra});
+    const post=async(key:string,evidence:object)=>assert.equal((await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key,evidence})).status,201);
+    const state=async()=>(await json(await f.call('/api/intakes/'+id+'/merge-state'))).merge_gate;
+    // A first merge-check against the intake project found no PR there: superseded once any PR is identified.
+    await post('none',{kind:'merge_gate',repository:'org/completion',checked_at:mergeProof.checked_at,observation_error:'no pull request of org/completion is cited in the intake'});
+    assert.equal((await state()).ok,false);
+    await post('content',proofOf('org/content',6));
+    await post('site-red',proofOf('org/site',1,{checks_state:'failure',checks_successful:1,checks_failed:1}));
+    const red=await state();
+    assert.equal(red.ok,false);assert(red.problems.includes('org/site: checks are not green for the exact head SHA'),JSON.stringify(red.problems));
+    await post('site',proofOf('org/site',1));
+    const uncited=await state();
+    assert.equal(uncited.ok,false,'a PR outside the intake project must be tied to the intake');
+    assert(uncited.problems.some((p:string)=>p.includes('https://github.com/org/content/pull/6 is outside org/completion and not cited')));
+    const note=async(key:string,text:string)=>assert.equal((await f.call('/api/intakes/'+id+'/events','POST',{key,note:text})).status,201);
+    await note('cite-12','Also see https://github.com/org/content/pull/61 and https://github.com/org/site/pull/12');
+    assert.equal((await state()).ok,false,'a longer PR number is not a citation');
+    await note('cite','Merged https://github.com/org/content/pull/6 and https://github.com/org/site/pull/1');
+    const green=await state();assert.equal(green.ok,true,JSON.stringify(green.problems));
+    // A newer observation that found no PR blocks again (rework without a PR).
+    await post('rework',{kind:'merge_gate',repository:'org/completion',checked_at:mergeProof.checked_at,observation_error:'no pull request of org/completion is cited in the intake'});
+    assert.equal((await state()).ok,false);
+    await post('site-again',proofOf('org/site',1));
+    assert.equal((await state()).ok,true);
+    await start(f,id,'first');
+    const first=await run(f,id);await claim(f,id,first.session_id);
+    await finishClaimed(f,id,first);
+    assert.equal(intakeRow(f,id).status,'accepted','closes done without an operator');
+  }finally{f.close();}
+});
+
+test('an operator done accepts a verified intake that only the merge gate held back, once the gate passes',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'merge-released',true);
+    await start(f,id,'first');
+    const first=await run(f,id);await claim(f,id,first.session_id);await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id);await verify(f,id,verifier.session_id,'pass');await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'failed');
+    assert(completion(f,id).verification.gaps.every((g:string)=>g.startsWith('Merge gate: ')));
+    assert.equal(completion(f,id).verification.merge_gate_only,true);
+    const close=async(key:string)=>{const shown=await json(await f.call('/api/intakes/'+id));
+      return f.call('/api/intakes/'+id,'POST',{key,expected_version:shown.task.control.version,status:'done',note:'Developer live check passed'});};
+    const refused=await close('done-1');
+    assert.equal(refused.status,409);assert.equal((await json(refused)).error,'merge_gate');
+    // An uncited foreign PR: Hub's refusal quotes the URL, which must never count as a citation.
+    const foreign={...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'};
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site-uncited',evidence:foreign});
+    for(const key of ['done-u1','done-u2']){
+      const again=await close(key);
+      assert.equal(again.status,409);assert.equal((await json(again)).error,'merge_gate');
+    }
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'cite',note:'Work merged in https://github.com/org/site/pull/1'});
+    await f.call('/api/intakes/'+id+'/merge-evidence','POST',{key:'site',evidence:{...mergeProof,repository:'org/site',pr_url:'https://github.com/org/site/pull/1'}});
+    assert.equal(completion(f,id).verification.merge_gate_only,true);
+    const done=await close('done-2');
+    assert.equal(done.status,200,JSON.stringify(await done.clone().json()));
+    assert.equal(intakeRow(f,id).status,'accepted');
+  }finally{f.close();}
+});
+
+test('continuations and verifiers unwrap cleaned-up intake worktrees to their parent checkout',async()=>{
+  const f=fixture();
+  try{
+    const digest='d'.repeat(64),checkout='/srv/work/cmp-banner',worktree=`${checkout}/.local/hub-worktrees/${digest}`;
+    const id=await createIntake(f,'unwrap-worktree',false);
+    await start(f,id,'first',{workspace:'cmp-banner'});
+    const first=await run(f,id);
+    assert((await f.call('/_internal/started','POST',{...first,workspace_binding:{version:1,requested_workspace:'cmp-banner',resolved_workspace:worktree}})).ok);
+    await finish(f,first,0);
+    await f.project.alarm();
+    const cont=activeSaga(f,id);
+    assert.equal(JSON.parse(cont.launch_spec_json).workspace,checkout);
+    const second=await run(f,id);
+    await claim(f,id,second.session_id);
+    await finish(f,second,0);
+    await f.project.alarm();
+    const verifier=activeSaga(f,id);
+    assert.equal(JSON.parse(verifier.launch_spec_json).workspace,checkout);
+  }finally{f.close();}
+});
+
+test('hub intake close succeeds on an already-accepted verified intake while unverified intakes still fail closed',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'close-accepted',true);
+    await start(f,id,'first');
+    const first=await run(f,id);
+    await addMergeProof(f,id);
+    await claim(f,id,first.session_id);
+    await finish(f,first,0);
+    await f.project.alarm();
+    const verifier=await run(f,id);
+    await verify(f,id,verifier.session_id,'pass');
+    await finish(f,verifier,0);
+    assert.equal(intakeRow(f,id).status,'accepted');
+
+    const shown=await json(await f.call('/api/intakes/'+id));
+    const closed=await f.call('/api/intakes/'+id,'POST',{
+      key:'close-accepted-1',
+      expected_version:shown.task.control.version,
+      status:'done',
+    });
+    assert.equal(closed.status,200);
+    assert.equal((await json(closed)).intake.status,'accepted');
+
+    // Unverified controlled intakes still fail closed with 409 acceptance_verification_required.
+    const unverified=await createIntake(f,'close-unverified',true);
+    await start(f,unverified,'first');
+    const uRun=await run(f,unverified);
+    await addMergeProof(f,unverified);
+    await finish(f,uRun,1);
+    assert.equal(intakeRow(f,unverified).status,'failed');
+    const uShown=await json(await f.call('/api/intakes/'+unverified));
+    const badClose=await f.call('/api/intakes/'+unverified,'POST',{
+      key:'close-unverified-1',
+      expected_version:uShown.task.control.version,
+      status:'done',
+    });
+    assert.equal(badClose.status,409);
+    assert.equal((await json(badClose)).error,'acceptance_verification_required');
+
+    // Non-controlled failed intakes still fail closed with 409 review_required.
+    f.db().run("UPDATE intakes SET final_evidence_json='{}' WHERE id=?",unverified);
+    const badLegacyClose=await f.call('/api/intakes/'+unverified,'POST',{
+      key:'close-unverified-2',
+      expected_version:uShown.task.control.version,
+      status:'done',
+    });
+    assert.equal(badLegacyClose.status,409);
+    assert.equal((await json(badLegacyClose)).error,'review_required');
+  }finally{f.close();}
+});
+
+test('read-only briefs are not code tasks, and an operator can reclassify and reevaluate',async()=>{
+  const f=fixture();
+  try{
+    const make=async(key:string,title:string,text:string,ac:string[],extra:object={})=>{
+      const r=await f.call('/api/intakes?project=org/completion','POST',{key,title,text,acceptance_criteria:ac,...extra});
+      assert.equal(r.status,201);return (await json(r)).intake.id as string;};
+    const report=await make('ro1','DTC migration status','Read-only report, no code.',['Report states migration status']);
+    assert.equal(JSON.parse(intakeRow(f,report).source_json).code_task,false,'report-only brief is classified non-code');
+    const draft=await make('ro2','Draft email','Draft-only email task.',['Draft is written']);
+    assert.equal(JSON.parse(intakeRow(f,draft).source_json).code_task,false);
+    const code=await make('ro3','Fix bug','Implement fix and open a PR; read-only follow-up later.',['PR merged']);
+    assert.equal(JSON.parse(intakeRow(f,code).source_json).code_task,true,'delivery wording keeps the gate');
+    const forced=await make('ro4','Status','Read-only report.',['Report'],{code_task:true});
+    assert.equal(JSON.parse(intakeRow(f,forced).source_json).code_task,true,'explicit value wins');
+
+    const worker={id:'session:x',kind:'agent',resource_id:forced,scopes:['intake:append']};
+    assert.notEqual((await f.call('/api/intakes/'+forced,'PATCH',{key:'w1',code_task:false},worker)).status,200,'workers cannot reclassify');
+    assert.equal((await f.call('/api/intakes/'+forced,'PATCH',{key:'c0',code_task:'no'})).status,400);
+    const res=await f.call('/api/intakes/'+forced,'PATCH',{key:'c1',code_task:false,note:'read-only report'});
+    assert.equal(res.status,200,await res.clone().text());
+    assert.equal(JSON.parse(intakeRow(f,forced).source_json).code_task,false);
+    assert.ok(events(f,forced).some(e=>e.kind==='intake_reclassified'&&e.body.was===true&&e.body.code_task===false));
+    const state=await json(await f.call('/api/intakes/'+forced+'/merge-state'));
+    assert.equal(state.merge_gate.required,false);assert.equal(state.merge_gate.ok,true);
+  }finally{f.close();}
+});
+
+test('implementation sessions default to a 2h deadline, review keeps 30 min',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'timeout-default');
+    const r=await f.call('/api/intakes/'+id+'/start','POST',{key:'dflt',workspace:'/srv/work/feature',prompt:'Implement the requested feature end to end.'});
+    assert.equal(r.status,201);
+    assert.equal(JSON.parse(sagas(f,id)[0].launch_spec_json).timeout_seconds,7200);
+  }finally{f.close?.();}
+});
+
+test('intake 62ccfa1e: an engine auth/preflight failure alerts and the continuation repicks another engine on that machine',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'preflight-fallback');
+    assert.equal((await start(f,id,'first',{engine:'claude',override_reason:'requester pinned the broken engine'})).status,201);
+    const first=await run(f,id),firstSaga=activeSaga(f,id);
+    assert.equal(JSON.parse(firstSaga.launch_spec_json).engine,'claude');
+    const r=await f.call('/_internal/finish','POST',{...first,exit_code:1,native_exit_confirmed:true,failure_reason:'engine_auth_check_unavailable',
+      detail:'Engine authentication check failed before the session started.',evidence:{result:'exit',native_deadline:{exceeded:false}}});
+    assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+    assert.equal(completion(f,id).reason,'engine_auth_check_unavailable');
+    assert.equal(JSON.parse(intakeRow(f,id).final_evidence_json).failure_reason,'engine_auth_check_unavailable');
+    const alert=events(f,id).find(e=>e.kind==='engine_preflight_failed');
+    assert.deepEqual({kind:alert?.body.kind,reason:alert?.body.reason,engine:alert?.body.engine,policy:alert?.body.policy_id,machine:alert?.body.machine_id},
+      {kind:'engine_unhealthy',reason:'engine_auth_check_unavailable',engine:'claude',policy:'sonnet-route',machine:firstSaga.machine_id});
+    await f.project.alarm();
+    const next=sagas(f,id).at(-1),launch=JSON.parse(next.launch_spec_json),route=JSON.parse(next.routing_json);
+    assert.notEqual(next.session_id,first.session_id);
+    assert.equal(launch.engine,'codex','the retry picks a different engine instead of the broken one');
+    assert.notEqual(route.policy_id,'sonnet-route');
+    assert.equal(next.machine_id,firstSaga.machine_id,'the machine holding the workspace is kept');
+  }finally{f.close();}
+});
+
+test('Muse exit 127 restarts on a healthy route; further crashes exhaust the budget with a visible developer alert',async()=>{
+  const muse={id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',effort:null,account_id:'shared-go',weight:1,capabilities:[],enabled:true};
+  const f=fixture([muse,candidates[0],candidates[3]]);
+  try{
+    const id=await createIntake(f,'muse-127-recovery');
+    assert.equal((await start(f,id,'first',{engine:'go',override_reason:'canary Muse failure'})).status,201);
+    const first=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-0',note:'attempt 0 progress'});
+    const response=await f.call('/_internal/finish','POST',{...first,exit_code:127,native_exit_confirmed:true,evidence:{
+      source:'aplexer_retirement',containment_empty:true,native_identity:{id:first.native_id,tag:'task-hub2-'+first.session_id,workspace:'/srv/work/feature'},
+      native_exit:{code:127,exited_at_ms:Date.now()}}});
+    assert.equal(response.status,200);
+    f.failEngine('go'); // Machine's existing fast-start health gate excludes Muse.
+    f.reopen(); // The recovery decision must survive a server restart.
+    await f.project.alarm();
+    const next=activeSaga(f,id);
+    assert.notEqual(next.session_id,first.session_id);
+    assert.notEqual(JSON.parse(next.launch_spec_json).engine,'go');
+    assert.notEqual(JSON.parse(next.routing_json).policy_id,'go-muse');
+    assert.deepEqual(JSON.parse(next.routing_json).exclude_policy_ids,['go-muse']);
+    assert.match(JSON.parse(next.launch_spec_json).prompt,/native_exit_127/);
+    for(let attempt=1;attempt<=MAX_AUTO_CONTINUATIONS;attempt++){
+      const binding=await run(f,id);
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
+      await finish(f,binding,1);
+      await f.project.alarm();
+    }
+    assert.equal(sagas(f,id).length,1+MAX_AUTO_CONTINUATIONS);
+    assert.equal(new Set(sagas(f,id).map(s=>JSON.parse(s.routing_json).policy_id)).size,3,'failed routes are never selected again');
+    const view=await json(await f.call('/api/intakes/'+id));
+    assert.equal(view.intake.status,'failed');
+    assert.equal(view.task.owner,'dev@dtcdev.click');
+    assert.match(view.task.current_state,/recovery_exhausted: native_exit_1/);
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);
+    assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');
+    assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal(alerts[0].body.reason,'native_exit_1');
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,1+MAX_AUTO_CONTINUATIONS,'exhaustion never loops');
+    assert.equal(events(f,id).filter(e=>e.kind==='developer_alert_raised').length,1);
+  }finally{f.close();}
+});
+
+test('21a07a26 path: repeated Muse exit 1 changes route before exhausting controlled recovery',async()=>{
+  const muse={id:'go-muse',engine:'go',model:'opencode-go/muse-spark-1.3-contributor',effort:null,account_id:'shared-go',weight:1,capabilities:[],enabled:true};
+  const f=fixture([muse,candidates[0]]);
+  try{
+    const id=await createIntake(f,'21a07a26-repeated-crash');
+    assert.equal((await start(f,id,'first',{engine:'go',override_reason:'reproduce native failure'})).status,201);
+    for(let attempt=0;attempt<2;attempt++){
+      const binding=await run(f,id);
+      assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'go');
+      await f.call('/api/intakes/'+id+'/events','POST',{key:'note-'+attempt,note:'attempt '+attempt+' progress'});
+      assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:1,native_exit_confirmed:true,evidence:{
+        source:'aplexer_retirement',containment_empty:true,native_identity:{id:binding.native_id,tag:'task-hub2-'+binding.session_id,workspace:'/srv/work/feature'},
+        native_exit:{code:1,exited_at_ms:Date.now()}}})).status,200);
+      f.reopen();
+      await f.project.alarm();
+    }
+    assert.equal(JSON.parse(activeSaga(f,id).launch_spec_json).engine,'codex');
+    assert.equal(sagas(f,id).length,3,'the second recovery uses the last available attempt on a different route');
+    const final=await run(f,id);
+    await f.call('/api/intakes/'+id+'/events','POST',{key:'note-final',note:'final attempt progress'});
+    await finish(f,final,1);
+    await f.project.alarm();
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised');
+    assert.equal(alerts.length,1);
+    assert.equal(alerts[0].body.kind,'recovery_exhausted');
+    assert.equal(alerts[0].body.reason,'native_exit_1');
+    assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');
+    const view=await json(await f.call('/api/intakes/'+id));
+    assert.equal(view.intake.status,'failed');
+    assert.equal(view.task.owner,'dev@dtcdev.click');
+    assert.match(view.task.current_state,/native_exit_1/);
+    await f.project.alarm();
+    assert.equal(sagas(f,id).length,3);
+  }finally{f.close();}
+});
+
+test('a plain nonzero exit keeps the first continuation on the same engine',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'plain-exit');
+    assert.equal((await start(f,id,'first',{engine:'claude',override_reason:'pinned'})).status,201);
+    const first=await run(f,id);
+    await finish(f,first,1);
+    await f.project.alarm();
+    assert.equal(JSON.parse(sagas(f,id).at(-1).launch_spec_json).engine,'claude');
+    assert.equal(events(f,id).some(e=>e.kind==='engine_preflight_failed'),false);
+  }finally{f.close();}
+});
+
+test('a session that ends on its own with no claim and no appended output raises a typed session_ended_no_output developer alert',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'silent-exit');
+    assert.equal((await start(f,id,'first')).status,201);
+    const binding=await run(f,id);
+    await finish(f,binding,0);await f.project.alarm();
+    const alerts=events(f,id).filter(e=>e.kind==='developer_alert_raised'&&e.body.kind==='session_ended_no_output');
+    assert.equal(alerts.length,1);
+    assert.equal(alerts[0].body.recipient,'dev@dtcdev.click');
+    assert.equal(alerts[0].body.session_id,binding.session_id);
+    // A session that left a note is not silent.
+    const id2=await createIntake(f,'noisy-exit');
+    assert.equal((await start(f,id2,'first')).status,201);
+    const second=await run(f,id2);
+    await f.call('/api/intakes/'+id2+'/events','POST',{key:'note-1',note:'worked on it'});
+    await finish(f,second,0);await f.project.alarm();
+    assert.equal(events(f,id2).filter(e=>e.body?.kind==='session_ended_no_output').length,0);
+  }finally{f.close();}
+});
+
+// Intake 92e496e1: an interactive fix session killed at its hard runtime deadline
+// (8246f41e shape: native exit 129 SIGHUP, lifetime exactly timeout_seconds) is
+// typed native_deadline_exceeded, recovered automatically beyond the ordinary
+// budget, and named in the alert; a memcg OOM is typed oom.
+const hupFinish=async(f:F,binding:any,native_exit:object,extra:object={})=>{
+  const r=await f.call('/_internal/finish','POST',{...binding,exit_code:129,native_exit_confirmed:true,...extra,
+    evidence:{source:'aplexer_status',containment_empty:true,native_exit,native_deadline:{deadline_ms:Date.now()-5,exceeded:true}}});
+  assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+};
+test('a SIGHUP exit at the 2 h deadline is native_deadline_exceeded, not host_operation_failed, and recovers past the ordinary budget',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'deadline-hup');await start(f,id,'first',{interactive:true,purpose:'fix',timeout_seconds:7200});
+    let current=await run(f,id);
+    for(let n=0;n<4;n++){
+      // 8246f41e: host also journalled the aborting kill as a host operation failure.
+      await hupFinish(f,current,{code:129,exited_at_ms:Date.now(),oom_killed:false,signal:null},{failure_reason:'host_operation_failed'});
+      assert.equal(completion(f,id).reason,'native_deadline_exceeded');
+      assert.match(completion(f,id).cause,/hard runtime deadline/);
+      assert.equal(completion(f,id).continuation?.state,'pending',`renewal ${n+1} is automatic`);
+      await f.project.alarm();
+      assert.equal(sagas(f,id).length,n+2);
+      const launch=JSON.parse(sagas(f,id).at(-1).launch_spec_json);
+      assert.equal(launch.timeout_seconds,7200);assert.equal(launch.interactive,true);
+      current=await run(f,id);
+    }
+    await hupFinish(f,current,{code:129,exited_at_ms:Date.now(),oom_killed:false,signal:null});
+    assert.equal(completion(f,id).continuation,undefined,'deadline renewals are bounded');
+    const alert=events(f,id).find(e=>e.kind==='developer_alert_raised'&&e.body.kind==='recovery_exhausted');
+    assert.equal(alert?.body.reason,'native_deadline_exceeded');assert.match(alert?.body.cause,/hard runtime deadline/);
+    assert(!events(f,id).some(e=>e.kind==='developer_alert_raised'&&e.body.reason==='host_operation_failed'));
+  }finally{f.close();}
+});
+test('a workload memcg OOM exit is typed oom and continued',async()=>{
+  const f=fixture();
+  try{
+    const id=await createIntake(f,'oom-exit');await start(f,id,'first');const current=await run(f,id);
+    const r=await f.call('/_internal/finish','POST',{...current,exit_code:137,native_exit_confirmed:true,
+      evidence:{source:'aplexer_status',containment_empty:true,native_exit:{code:137,exited_at_ms:Date.now(),oom_killed:true,signal:null},native_deadline:{exceeded:false}}});
+    assert.equal(r.status,200,JSON.stringify(await r.clone().json()));
+    assert.equal(completion(f,id).reason,'oom');assert.match(completion(f,id).cause,/memory cap/);
+    assert.equal(completion(f,id).continuation?.state,'pending');
+  }finally{f.close();}
 });

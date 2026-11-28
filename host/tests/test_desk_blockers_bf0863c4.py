@@ -130,6 +130,15 @@ def test_operator_launcher_is_never_replaced(install_root, tmp_path, monkeypatch
     assert settings.read_text() == before
 
 
+def materialize_synthetic_claude_login(dest):
+    # provisioning.profile_logged_in reads only the materialized home credential
+    # for Claude (3160d5df); a synthetic, non-secret file satisfies that contract.
+    cred = dest / 'home' / '.claude' / '.credentials.json'
+    cred.parent.mkdir(parents=True, mode=0o700)
+    cred.write_text('{"synthetic": true}', encoding='utf-8')
+    os.chmod(cred, 0o600)
+
+
 def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
     os.chmod(tmp_path, 0o700)
     m_dir = tmp_path / 'managed-engines'
@@ -140,6 +149,7 @@ def test_admission_stamps_hub_verdict_after_local_lock(tmp_path, monkeypatch):
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
@@ -180,6 +190,7 @@ def test_admission_repairs_missing_profile_before_hub_stamp(tmp_path, monkeypatc
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     events = []
@@ -220,6 +231,7 @@ def test_admission_missing_profile_still_refuses_after_failed_repair(tmp_path, m
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
     monkeypatch.setattr(p, 'lock', lambda timeout=None: contextlib.nullcontext())
@@ -258,12 +270,28 @@ def test_admission_refusal_carries_fixed_gate_reason():
     assert 'gate_reason' not in d.classify(ValueError('Fresh admission refused'))
 
 
-def test_typescript_gate_reasons_match_host():
+def test_maintained_public_host_diagnostics_use_fixed_catalog_and_hide_input():
+    # Root Fleet's GATE_REASONS set was the obsolete Hub1 projection. Current
+    # MachineDO publishes a fixed catalog, not arbitrary host gate/detail text.
     from agent_hub_host import dispatch_diagnostics as d
     import re
-    ts = (REPO / 'src/fleet.ts').read_text()
-    block = ts.split('const GATE_REASONS = new Set([', 1)[1].split('])', 1)[0]
-    assert set(re.findall(r"'([a-z_]+)'", block)) == d.GATE_REASONS
+    ts = (REPO / 'hub2/src/machine-do.ts').read_text()
+    match = re.search(r'const HOST_FAILURE_DETAILS:Readonly<Record<string,string>> = (\{.*?\n\});', ts, re.S)
+    assert match is not None
+    catalog = json.loads(match.group(1))
+    assert catalog['workspace_unavailable'] == 'path does not exist; Hub will not create it'
+    assert catalog['native_dispatch_not_started'] == 'Native launch did not start.'
+    hostile = 'token=synthetic-secret\x1b]0;private-path\x07'
+    classified = d.classify(ValueError(hostile), workspace_available=False)
+    assert classified['reason'] == 'workspace_unavailable'
+    assert classified['reason'] in catalog
+    assert hostile not in json.dumps(classified)
+    projection = ts.split('  private hostStartDiagnostic(', 1)[1].split('\n  /**', 1)[0]
+    assert 'fixedHostDetail(reason)' in projection
+    assert "return {stage:'host_launch',...(detail?{detail}:{})}" in projection
+    assert '...diagnostic' not in projection
+    # Actual MachineDO projection, stale identity and hostile fields are also
+    # executed by the required accounts-mail Node tests, not a copied projector.
 
 
 def test_admission_lock_failure_is_named(tmp_path, monkeypatch):
@@ -295,6 +323,7 @@ def test_admission_reads_atomic_state_when_lock_unavailable(tmp_path, monkeypatc
              revision='11111111-1111-4111-8111-111111111111')
     dest = m_dir / (b['label'] + '-' + b['revision'])
     dest.mkdir(mode=0o700)
+    materialize_synthetic_claude_login(dest)
     p.write_json(dest / 'bundle.json', b)
     p.write_json(m_dir / 'state.json', [{'label': b['label'], 'revision': b['revision'], 'provider': 'claude'}])
 

@@ -1,10 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {buildRoutingPool, type RoutingSnapshot} from '../src/routing-pool.ts';
+import {normalizeRepositoryOrigin, qualifiedRepositoryWorkspace} from '../src/repository-identity.ts';
 
 function fixture(): RoutingSnapshot {
   const now = Date.now();
-  const candidate = (engine: string) => ({id: engine, engine, model: engine === 'codex' ? 'gpt-6.1-sol' : 'gemini-4-argon-medium',
+  const candidate = (engine: string) => ({id: engine, engine, model: engine === 'codex' ? 'gpt-6.1-sol' : 'gemini-4-hydrogen-medium',
     effort: 'medium', account_id: engine, weight: 1, capabilities: [], enabled: true});
   return {observed_at: now, policy: {version: 1, candidates: [candidate('codex'), candidate('antigravity')]},
     accounts: new Map(['codex', 'antigravity'].map(id => [id, {account: {enabled: true}, credential_usable: true,
@@ -47,4 +48,40 @@ test('absolute paths do not require a workspace label tag', () => {
   const result = buildRoutingPool(fixture(), {...request, workspace: 'C:\\Users\\Alexey'});
   assert.ok(result.options.every(row => row.value.machine_id === 'desktop'));
   assert.ok(!result.diagnostics.advisories?.some(row => row.reason === 'capability_not_advertised'));
+});
+
+test('repository identity normalizes registry HTTPS and checkout SSH to one stable bounded token', async () => {
+  const registry = 'https://github.com/AI-Shipping-Labs/Website.git';
+  const checkout = 'git@github.com:ai-shipping-labs/website.git';
+  assert.equal(normalizeRepositoryOrigin(registry), 'github.com/ai-shipping-labs/website');
+  assert.equal(normalizeRepositoryOrigin(checkout), normalizeRepositoryOrigin(registry));
+  assert.equal(await qualifiedRepositoryWorkspace(registry), 'repo-948832775e82e294b99d190121d47ac86ec4986811a36b2c505e3a6f802');
+  assert.equal((await qualifiedRepositoryWorkspace(registry))?.length, 64);
+  assert.equal(normalizeRepositoryOrigin('https://user:secret@github.com/owner/repo.git'), 'github.com/owner/repo');
+  assert.equal(normalizeRepositoryOrigin('https://github.com/owner/repo?token=secret'), undefined);
+});
+
+test('qualified repository requirement rejects old hosts that forge its token through a label', () => {
+  const token = 'repo-948832775e82e294b99d190121d47ac86ec4986811a36b2c505e3a6f802';
+  const snapshot = fixture();
+  snapshot.machines.set('qualified', {...snapshot.machines.get('linux')!,
+    capabilities: ['headless', 'effort:codex', 'effort:antigravity', 'repo-identity:v1', `workspace:${token}`]});
+  snapshot.machines.set('old-host', {...snapshot.machines.get('desktop')!,
+    // An old host can forge the token through a same-named directory/alias,
+    // but supported old configuration cannot emit the new protocol marker.
+    capabilities: ['headless', 'effort:antigravity', `workspace:${token}`]});
+  const qualified = buildRoutingPool(snapshot, {interactive: false, workspace: token});
+  assert.ok(qualified.options.length > 0);
+  assert.ok(qualified.options.every(row => row.value.machine_id === 'qualified'));
+  assert.ok(qualified.options.every(row => row.value.required_capabilities.includes('repo-identity:v1')));
+
+  snapshot.machines.delete('qualified');
+  assert.throws(() => buildRoutingPool(snapshot, {interactive: false, workspace: token}),
+    (err: any) => err?.code === 'repository_workspace_unavailable' && err?.status === 503);
+
+  snapshot.machines.set('qualified-no-checkout', {...snapshot.machines.get('linux')!,
+    capabilities: ['headless', 'effort:codex', 'effort:antigravity', 'repo-identity:v1']});
+  assert.throws(() => buildRoutingPool(snapshot, {interactive: false, workspace: token}),
+    (err: any) => err?.code === 'repository_checkout_missing' && err?.status === 400
+      && err?.detail === 'no checkout under enrolled roots; pass --cwd after creating it');
 });

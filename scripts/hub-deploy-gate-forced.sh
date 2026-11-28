@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Forced-command SSH wrapper for the Hub pre-commit live shell start canary.
+# Forced-command SSH wrapper for the Hub pre-commit live full (model-less, candidate-bound) start canary.
 # Invoked via authorized_keys:
 #   restrict,command="/usr/local/sbin/hub-start-canary/hub-deploy-gate-forced.sh" ssh-ed25519 ...
 # Purges the caller environment, validates SSH_ORIGINAL_COMMAND against a single
@@ -12,7 +12,7 @@ HERE="$(/usr/bin/dirname -- "$(/usr/bin/readlink -f -- "${BASH_SOURCE[0]}")")"
 emit_reject() {
   local stage="$1" reason="$2" code="$3"
   local payload
-  payload="$(/usr/bin/printf '{"cleanup": "not_needed", "deploy_gate": true, "mode": "shell", "ok": false, "reason": "%s", "session_id": null, "stage": "%s"}\n' "$reason" "$stage")"
+  payload="$(/usr/bin/printf '{"cleanup": "not_needed", "deploy_gate": true, "mode": "full", "ok": false, "reason": "%s", "session_id": null, "stage": "%s"}\n' "$reason" "$stage")"
   /usr/bin/printf '%s\n' "$payload"
   /usr/bin/printf '%s\n' "$payload" >&2
   exit "$code"
@@ -23,13 +23,14 @@ if (($# != 0)); then
 fi
 
 ORIG_CMD="${SSH_ORIGINAL_COMMAND:-}"
-if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --candidate-cli-sha256\ ([0-9a-f]{64})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
+if [[ ! "$ORIG_CMD" =~ ^hub-deploy-gate\ --candidate-sha\ ([0-9a-f]{40})\ --candidate-cli-sha256\ ([0-9a-f]{64})\ --candidate-updater-sha256\ ([0-9a-f]{64})\ --run-token\ ([0-9a-f]{32,64})\ --helper-sha256\ ([0-9a-f]{64})$ ]]; then
   emit_reject "forced_command" "invalid_forced_command" 2
 fi
 CANDIDATE_SHA="${BASH_REMATCH[1]}"
 CANDIDATE_CLI_SHA256="${BASH_REMATCH[2]}"
-RUN_TOKEN="${BASH_REMATCH[3]}"
-HELPER_SHA256="${BASH_REMATCH[4]}"
+CANDIDATE_UPDATER_SHA256="${BASH_REMATCH[3]}"
+RUN_TOKEN="${BASH_REMATCH[4]}"
+HELPER_SHA256="${BASH_REMATCH[5]}"
 
 USER_UID="$(/usr/bin/id -u)"
 USER_NAME="$(/usr/bin/id -un)"
@@ -42,8 +43,8 @@ A_BIN="$USER_HOME/.local/bin/a"
 HOST_RELEASE_ROOT="$USER_HOME/.local/share/agent-hub2"
 WORKSPACE_DIR="$USER_HOME/work/hub-canary"
 STATE_DIR="$USER_HOME/.local/state/agent-hub-canary"
-DEPLOY_GATE_TIMEOUT_S=360
-DEPLOY_GATE_LOCK_WAIT_S=5
+DEPLOY_GATE_TIMEOUT_S=480
+DEPLOY_GATE_LOCK_WAIT_S=60
 EXTRA_ENV=()
 
 if [[ "$HERE" != "$PROD_LIB" && ! -L "$HERE/.test-harness.env" && -f "$HERE/.test-harness.env" ]]; then
@@ -68,9 +69,10 @@ exec /usr/bin/timeout --kill-after=10s "${DEPLOY_GATE_TIMEOUT_S}s" \
   HUB_CANARY_LOCK_WAIT_S="$DEPLOY_GATE_LOCK_WAIT_S" \
   "${EXTRA_ENV[@]}" \
   /usr/bin/python3 -I -S "$HERE/hub_start_canary.py" \
-  --mode shell \
+  --mode full \
   --deploy-gate \
   --candidate-sha "$CANDIDATE_SHA" \
   --candidate-cli-sha256 "$CANDIDATE_CLI_SHA256" \
+  --candidate-updater-sha256 "$CANDIDATE_UPDATER_SHA256" \
   --run-token "$RUN_TOKEN" \
   --helper-sha256 "$HELPER_SHA256"

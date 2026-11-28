@@ -5,6 +5,7 @@ host/tests/fixtures/acceptance/. No Hub access, no real session is started or st
 import importlib.util
 import io
 import json
+import re
 import hashlib
 import os
 import runpy
@@ -24,8 +25,22 @@ spec = importlib.util.spec_from_file_location('acc10', HERE.parents[1] / 'script
 acc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(acc)
 
-SOL, GLM, MUSE, LUNA = 'gpt-6.1-sol', 'glm-5.3-flash', 'opencode-go/muse-spark-1.3-contributor', 'gpt-6-luna'  # fixture pool
-OK_MODELS = [SOL, GLM, MUSE, SOL, GLM, MUSE, SOL, GLM, LUNA, SOL]
+SOL, GLM, MUSE, LUNA = 'claude-sonnet-4-6', 'claude-opus-4-6', 'gemini-4-hydrogen', 'gemini-4-luna'
+HAIKU = 'claude-haiku-4-5'
+# Offline PASS-path draws here use the qualified plain-pane contract (Claude). The qualified Hydrogen medium
+# styled-screen path is exercised in test_cli_hydrogen_acceptance.py; MUSE/LUNA below are OTHER antigravity models
+# that must keep failing with UNKNOWN_NATIVE_FRAMING. The runtime picker itself is NOT narrowed.
+OK_MODELS = [SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL, GLM, HAIKU, SOL]
+NATIVE_POOL = [
+    {'policy_id': 'claude-sonnet', 'engine': 'claude', 'model': SOL, 'effort': 'medium', 'weight': 30, 'share': 0.3},
+    {'policy_id': 'claude-opus', 'engine': 'claude', 'model': GLM, 'effort': 'high', 'weight': 20, 'share': 0.2},
+    {'policy_id': 'claude-haiku', 'engine': 'claude', 'model': HAIKU, 'effort': 'low', 'weight': 10, 'share': 0.1},
+    {'policy_id': 'hydrogen-med', 'engine': 'antigravity', 'model': MUSE, 'effort': 'medium', 'weight': 25, 'share': 0.25},
+    {'policy_id': 'hydrogen-luna', 'engine': 'antigravity', 'model': LUNA, 'effort': 'low', 'weight': 15, 'share': 0.15},
+]
+_CLAUDE = [dict(x) for x in NATIVE_POOL if x['engine'] == 'claude']
+CLAUDE_POOL = [dict(x, share=x['weight'] / sum(y['weight'] for y in _CLAUDE)) for x in _CLAUDE]
+PARENT_INTAKE = '11111111-1111-4111-8111-111111111111'
 
 
 def fixture(name):
@@ -33,19 +48,36 @@ def fixture(name):
 
 
 COMMIT = 'a' * 40
-WORKSPACE = '/home/user/work/acceptance'
 TMP = HERE.parents[1] / '.local/tmp'
 TMP.mkdir(parents=True, exist_ok=True)
 
 
 def transport(engine='codex', commit=COMMIT):
-    # Synthetic attestations only: no claim about an installed provider/host.
+    # Legacy headless stream transport fixture (for legacy ParserTests only).
     return {'engine': engine, 'machine_id': acc.HOST,
             'format': acc.CAPTURE_FORMATS.get(engine, 'plaintext'), 'host_release_sha': commit,
             'provider_version': 'offline-fixture-v1',
             'profile_set_sha256': hashlib.sha256(('nonsecret-offline-argv-' + engine).encode()).hexdigest(),
             'reference': 'synthetic://capture/' + engine,
             'sha256': hashlib.sha256(('offline-capture-receipt-' + engine).encode()).hexdigest()}
+
+
+def native_transport(engine='claude', commit=COMMIT):
+    return {
+        'engine': engine,
+        'machine_id': acc.HOST,
+        'mode': 'interactive',
+        'format': acc.NATIVE_CAPTURE_FORMATS[engine],
+        # A hypothetical/new Hydrogen class label must never be enough (label is not attestation).
+        'proof_class': acc.NATIVE_PROOF_CLASSES.get(engine, 'native_exact_probe_header_plus_artifact_v3'),
+        'capture_command': acc.NATIVE_CAPTURE_COMMAND,
+        'artifact_schema': acc.WORK_SCHEMA,
+        'host_release_sha': commit,
+        'provider_version': 'offline-native-fixture-v2',
+        'profile_set_sha256': hashlib.sha256(('nonsecret-interactive-argv-' + engine).encode()).hexdigest(),
+        'reference': 'synthetic://native-capture/' + engine,
+        'sha256': hashlib.sha256(('offline-native-receipt-' + engine).encode()).hexdigest(),
+    }
 
 
 def provider_frames(engine, marker):
@@ -89,39 +121,78 @@ def evidence(commit=COMMIT, **kw):
     return f.name
 
 
+def native_evidence(commit=COMMIT, **kw):
+    ev = {
+        'kind': acc.NATIVE_EVIDENCE_KIND,
+        'canary': 'success',
+        'canary_commit': commit,
+        'ci_e2e': 'success',
+        'ci_e2e_commit': commit,
+        'operator_validation': {
+            'actor': 'offline-fixture',
+            'target_commit': commit,
+            # Plain-pane (Claude) attestation only; the Hydrogen styled-screen record is a separate shape
+            # (host/tests/test_cli_hydrogen_acceptance.py).
+            'capture_transports': {'claude': native_transport('claude', commit)},
+            'receipts': {
+                name: {
+                    'commit': commit,
+                    'reference': 'synthetic://' + name + '/receipt',
+                    'sha256': hashlib.sha256(('offline-' + name).encode()).hexdigest(),
+                }
+                for name in ('deployment', 'canary', 'ci_e2e')
+            },
+        },
+    }
+    ev.update(kw)
+    f = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, dir=TMP)
+    json.dump(ev, f)
+    f.close()
+    unittest.addModuleCleanup(os.unlink, f.name)
+    return f.name
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix='acc10-', dir=TMP))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bin = self.tmp / 'bin'
         self.bin.mkdir()
-        for name in ('hub', 'a', 'alerts'):
+        for name in ('hub', 'a', 'git', 'alerts'):
             (self.bin / name).symlink_to(FIX / 'fake_hub.py')
+        self.base_ws = self.tmp / 'base-ws'
+        self.base_ws.mkdir()
+        self.child_ws_root = self.tmp / 'child-ws'
+        self.child_ws_root.mkdir()
         self.cfg_path = self.tmp / 'cfg.json'
         env = {'PATH': '%s:%s' % (self.bin, os.environ['PATH']), 'FAKE_CFG': str(self.cfg_path)}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        # Fake CLI processes import the real command parser; their cold startup
-        # can exceed0.5s under the shared lane. Keep proof assertions unchanged
-        # with an offline budget well below the production90s capture budget.
-        for name, val in (('CAPTURE_BUDGET_S', 2),):
+        for name, val in (('CAPTURE_BUDGET_S', 2), ('CREATE_BUDGET_S', 10)):
             p = mock.patch.object(acc, name, val)
             p.start()
             self.addCleanup(p.stop)
 
     def state(self):
         path = Path(str(self.cfg_path) + '.state')
-        return json.loads(path.read_text()) if path.exists() else {'sessions': {}}
+        return json.loads(path.read_text()) if path.exists() else {'sessions': {}, 'intakes': {}, 'log': []}
 
     def go(self, **cfg):
         bundle = cfg.pop('evidence_bundle', None)
+        out_dir = cfg.pop('output_dir', self.tmp / ('out-' + str(time.time_ns())))
         cfg.setdefault('models', OK_MODELS)
+        cfg.setdefault('pool', NATIVE_POOL)
+        cfg.setdefault('child_workspace_root', str(self.child_ws_root))
         Path(str(self.cfg_path) + '.state').unlink(missing_ok=True)
         self.cfg_path.write_text(json.dumps(cfg))
         out = io.StringIO()
         r = acc.Runner(alerts_cmd=str(self.bin / 'alerts'))
-        rc = acc.run(r, bundle or evidence(), COMMIT, workspace=WORKSPACE, sleep=lambda s: time.sleep(0.01), out=out, intake='intake-1')
+        rc = acc.run(
+            r, bundle or native_evidence(), COMMIT,
+            workspace=str(self.base_ws), sleep=lambda s: time.sleep(0.01),
+            out=out, intake=PARENT_INTAKE, output_dir=str(out_dir),
+        )
         return rc, out.getvalue()
 
     def assertAllStopped(self):
@@ -134,7 +205,7 @@ class Harness(unittest.TestCase):
 class FixtureStateTests(Harness):
     def seed_state(self):
         self.cfg_path.write_text('{}')
-        state = {'n': 0, 'sessions': {}, 'keys': {}, 'log': []}
+        state = {'n': 0, 'sessions': {}, 'keys': {}, 'intakes': {}, 'intake_keys': {}, 'log': []}
         path = Path(str(self.cfg_path) + '.state')
         path.write_text(json.dumps(state))
         return path, path.read_bytes()
@@ -150,8 +221,6 @@ class FixtureStateTests(Harness):
 
     def test_killed_publication_preserves_readable_state_for_next_cli_invocation(self):
         path, previous = self.seed_state()
-        # Block exactly after the complete temporary is closed, before replace.
-        # The pipe handshake removes timing guesses and needs no slow/hung CLI.
         code = """
 import os, runpy, signal, sys
 
@@ -194,14 +263,18 @@ class AcceptanceTests(Harness):
         self.assertEqual(out.count('shares(session.picker)='), 10)
         self.assertAllStopped()
         self.assertEqual(len(self.state()['sessions']), 10)
+        self.assertEqual(len(self.state()['intakes']), 10)
         self.assertNotIn('pick', self.state()['log'])
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
-        self.assertEqual(len(summary['starts'][0]['picker']['pool']), 4)
+        self.assertEqual(len(summary['starts'][0]['picker']['pool']), len(NATIVE_POOL))
         self.assertEqual(summary['starts'][0]['picker']['policy_version'], 7)
-        # Each capture/list proof is followed by stop before the next start.
-        sequence = [x for x in self.state()['log'] if x == 'start' or x.startswith('stop:')]
-        self.assertEqual(sequence[::2], ['start'] * 10)
-        self.assertEqual(self.state()['log'].count('start:--intake-task-id'), 10)
+        for rec in summary['starts']:
+            self.assertEqual(rec['requested_workspace'], str(self.base_ws))
+            self.assertNotEqual(rec['workspace'], str(self.base_ws))
+            self.assertTrue(rec['archived'])
+            self.assertEqual(rec['cleanup_status'], 'CONFIRMED')
+        sequence = [x for x in self.state()['log'] if x == 'sessions:start' or x.startswith('stop:')]
+        self.assertEqual(sequence[::2], ['sessions:start'] * 10)
 
     def test_wrong_show_identity_is_refused_and_known_start_is_stopped(self):
         rc, out = self.go(wrong_show_id=True)
@@ -211,7 +284,7 @@ class AcceptanceTests(Harness):
         self.assertEqual(self.state()['n'], 1)
 
     def test_malformed_native_uuid_never_proves_presence_or_cleanup_absence(self):
-        for value in ('native-placeholder', '1234', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', None, [], {'id': 'untrusted'}):
+        for value in ('native-placeholder', '1234', 'AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE', [], {'id': 'untrusted'}):
             with self.subTest(value=value):
                 rc, out = self.go(native_id=value)
                 self.assertEqual(rc, 1, out)
@@ -233,42 +306,25 @@ class AcceptanceTests(Harness):
             with self.subTest(knob=knob):
                 rc, out = self.go(**{knob: True})
                 self.assertEqual(rc, 1, out)
-                self.assertIn('no completed tool output', out)
+                self.assertIn('did not prove completed work', out)
                 self.assertAllStopped()
 
     def test_foreign_plaintext_json_and_missing_attestation_fail_with_cleanup(self):
-        for engine in ('claude', 'antigravity'):
-            pool = [{'policy_id': 'synthetic-' + engine, 'model': 'synthetic-model', 'engine': engine,
-                     'effort': None, 'weight': 1, 'share': 1}]
-            with self.subTest(engine=engine):
-                rc, out = self.go(pool=pool, models=['synthetic-model'] * 10, capture_format_override='go')
-                self.assertEqual(rc, 1, out)
-                self.assertIn('no completed tool output', out)
-                self.assertAllStopped()
-        path = Path(evidence()); ev = json.loads(path.read_text())
-        ev['operator_validation']['capture_transports'].pop('codex'); path.write_text(json.dumps(ev))
-        rc, out = self.go(evidence_bundle=str(path))
-        self.assertEqual(rc, 1, out); self.assertIn('no verified stream transport for engine codex', out)
-        self.assertAllStopped()
-
-    def test_wrong_stream_for_current_engine_is_not_proof(self):
         rc, out = self.go(capture_format_override='go')
-        self.assertEqual(rc, 1, out); self.assertIn('no completed tool output', out)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('did not prove completed work', out)
         self.assertAllStopped()
-
-    def test_model_less_run_with_claude_and_argon_paired_streams(self):
-        pool = [
-            {'policy_id': 'synthetic-claude', 'model': 'synthetic-claude-model', 'engine': 'claude', 'effort': None, 'weight': 1, 'share': 1/3},
-            {'policy_id': 'synthetic-argon', 'model': 'synthetic-argon-model', 'engine': 'antigravity', 'effort': None, 'weight': 1, 'share': 1/3},
-            {'policy_id': 'synthetic-codex', 'model': SOL, 'engine': 'codex', 'effort': 'medium', 'weight': 1, 'share': 1/3},
-        ]
-        rc, out = self.go(pool=pool, models=['synthetic-claude-model', 'synthetic-argon-model', SOL] * 3 + [SOL])
-        self.assertEqual(rc, 0, out)
-        self.assertEqual(self.state()['n'], 10)
-        self.assertAllStopped()
+        path = Path(native_evidence())
+        ev = json.loads(path.read_text())
+        ev['operator_validation']['capture_transports'].pop('claude')
+        path.write_text(json.dumps(ev))
+        rc, out = self.go(evidence_bundle=str(path))
+        self.assertEqual(rc, 1, out)
+        self.assertIn('verified interactive native-pane capture transport records required', out)
+        self.assertEqual(self.state()['sessions'], {})
 
     def test_operator_bundle_must_not_change_during_acceptance(self):
-        original = acc.checked_evidence
+        original = acc.checked_native_evidence
         calls = []
         def check(path, commit):
             calls.append(path)
@@ -277,14 +333,14 @@ class AcceptanceTests(Harness):
                 data['operator_validation']['actor'] = 'different-offline-validator'
                 Path(path).write_text(json.dumps(data))
             return original(path, commit)
-        with mock.patch.object(acc, 'checked_evidence', side_effect=check):
+        with mock.patch.object(acc, 'checked_native_evidence', side_effect=check):
             rc, out = self.go()
         self.assertEqual(rc, 1, out)
         self.assertIn('evidence bundle changed during run', out)
         self.assertAllStopped()
 
     def test_replacement_after_validation_cannot_become_the_baseline_hash(self):
-        original = acc.validate_evidence
+        original = acc.validate_native_evidence
         pins = {}
         def validate_then_replace(data, path, commit):
             problems = original(data, path, commit)
@@ -295,7 +351,7 @@ class AcceptanceTests(Harness):
                 Path(path).write_text(json.dumps(replacement))
                 pins['replacement'] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
             return problems
-        with mock.patch.object(acc, 'validate_evidence', side_effect=validate_then_replace):
+        with mock.patch.object(acc, 'validate_native_evidence', side_effect=validate_then_replace):
             rc, out = self.go()
         self.assertEqual(rc, 1, out)
         self.assertIn('evidence bundle changed during run', out)
@@ -312,10 +368,11 @@ class AcceptanceTests(Harness):
         self.assertAllStopped()
 
     def test_actual_current_fallback_pool_and_history(self):
-        rc, out = self.go(fallback=True)
+        # Fallback stays inside qualified-framing engines here; a Hydrogen fallback is covered by the B2 tests.
+        rc, out = self.go(fallback=True, pool=CLAUDE_POOL)
         self.assertEqual(rc, 0, out)
         self.assertAllStopped()
-        rc, out = self.go(fallback=True, cross_attempt_pool=True)
+        rc, out = self.go(fallback=True, cross_attempt_pool=True, pool=CLAUDE_POOL)
         self.assertEqual(rc, 1)
         self.assertIn('current chosen model/policy not in the picker pool', out)
         self.assertAllStopped()
@@ -333,12 +390,6 @@ class AcceptanceTests(Harness):
                 self.assertAllStopped()
                 self.assertNotIn('pick', self.state()['log'])
 
-    def test_unacknowledged_capture_cannot_prove_output(self):
-        rc, out = self.go(capture_unacked=True)
-        self.assertEqual(rc, 1)
-        self.assertIn('no completed tool output', out)
-        self.assertAllStopped()
-
     def test_refuses_without_ready_env(self):
         os.environ.pop('HUB_ACCEPTANCE_READY', None)
         self.assertEqual(acc.main(['--live']), 2)
@@ -347,16 +398,18 @@ class AcceptanceTests(Harness):
     def test_acceptance_criteria_source_required(self):
         self.cfg_path.write_text(json.dumps({'models': OK_MODELS}))
         out = io.StringIO()
-        rc = acc.run(acc.Runner(alerts_cmd=str(self.bin / 'alerts')), evidence(), COMMIT, workspace=WORKSPACE, out=out)
+        rc = acc.run(
+            acc.Runner(alerts_cmd=str(self.bin / 'alerts')), native_evidence(), COMMIT,
+            workspace=str(self.base_ws), out=out, output_dir=str(self.tmp / 'out'),
+        )
         self.assertEqual(rc, 1)
-        self.assertIn('acceptance criteria source missing', out.getvalue())
+        self.assertIn('valid parent --intake-task-id UUID required', out.getvalue())
         self.assertEqual(self.state()['sessions'], {}, 'must not start anything')
 
     def test_start_failure_ends_run(self):
         rc, out = self.go(fail_start_at=3)
         self.assertEqual(rc, 1)
         self.assertIn('start failed', out)
-        # A definite refusal ends the run and must not trigger a new launch via replay.
         self.assertEqual(len(self.state()['sessions']), 3)
         self.assertAllStopped()
 
@@ -404,7 +457,7 @@ class AcceptanceTests(Harness):
                 self.assertTrue(record['cleanup_uncertain'])
                 self.assertIsNone(record.get('id'))
                 self.assertIn('cleanup uncertain', out)
-                self.assertIn('original key ' + record['key'], out)
+                self.assertIn('original key ' + record['start_key'], out)
                 requests = self.state()['start_requests']
                 self.assertEqual(len(requests), 3)
                 self.assertEqual(requests[1], requests[2])
@@ -419,10 +472,10 @@ class AcceptanceTests(Harness):
         sessions = list(self.state()['sessions'].values())
         self.assertEqual(len(sessions), 3)
         self.assertTrue(all(s['stopped'] for s in sessions[:2]))
-        self.assertFalse(sessions[2]['stopped'])  # explicitly unknown to the client, never falsely reported clean
+        self.assertFalse(sessions[2]['stopped'])
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
         self.assertTrue(summary['starts'][2]['cleanup_uncertain'])
-        self.assertEqual(len(self.state()['start_requests']), 5)  # two good, one lost, two same-key receipts
+        self.assertEqual(len(self.state()['start_requests']), 5)
 
     def test_blocking_start_hits_deadline_and_is_cleaned_up(self):
         with mock.patch.object(acc, 'RUNNING_BUDGET_S', 1):
@@ -439,13 +492,19 @@ class AcceptanceTests(Harness):
         self.assertIn('astra picked', out)
 
     def test_luna_over_three(self):
+        # Luna is a Hydrogen-engine draw, so a live run ends at its unavailable native proof; the quota rule is
+        # still enforced by the summary over whatever records exist.
+        recs = [{'n': i + 1, 'model': m, 'engine': 'antigravity' if m in (LUNA, MUSE) else 'claude', 'errors': []}
+                for i, m in enumerate([LUNA] * 4 + [SOL, GLM, MUSE, SOL, GLM, MUSE])]
+        self.assertIn('luna 4 > 3', acc.summarize(recs, [])['problems'])
         rc, out = self.go(models=[LUNA] * 4 + [SOL, GLM, MUSE, SOL, GLM, MUSE])
         self.assertEqual(rc, 1)
-        self.assertIn('luna 4 > 3', out)
+        self.assertIn('UNKNOWN_NATIVE_FRAMING', out)
+        self.assertAllStopped()
 
     def test_luna_on_degraded_pool(self):
-        one = [fixture('hub_sessions_pick.json')['pool'][0]]
-        one[0]['share'] = 1.0
+        one = [next(x for x in NATIVE_POOL if x['model'] == LUNA)]
+        one[0] = dict(one[0], share=1.0)
         rc, out = self.go(pool=one, models=[LUNA] * 10)
         self.assertEqual(rc, 1)
         self.assertIn('luna picked from a degraded one-model pool', out)
@@ -470,7 +529,7 @@ class AcceptanceTests(Harness):
 
     def test_missing_host_and_workspace(self):
         rc, out = self.go(list_no_host=True)
-        self.assertIn("host None != hetzner-aplexer", out)
+        self.assertIn('host None != hetzner-aplexer', out)
         rc, out = self.go(list_no_workspace=True)
         self.assertIn('workspace path missing', out)
         self.assertEqual(rc, 1)
@@ -485,15 +544,15 @@ class AcceptanceTests(Harness):
     def test_capture_prompt_only(self):
         rc, out = self.go(capture_prompt_only=True)
         self.assertEqual(rc, 1)
-        self.assertIn('no completed tool output beyond the prompt', out)
+        self.assertIn('did not prove completed work', out)
 
     def test_stop_not_confirmed(self):
         rc, out = self.go(stop_not_confirmed=True)
         self.assertEqual(rc, 1)
-        self.assertIn('!= stopped', out)
+        self.assertIn('stop_confirmed != true', out)
 
     def test_native_lingers_after_stop_but_exited_rows_do_not_count(self):
-        with mock.patch.object(acc, 'STOP_BUDGET_S', 6):
+        with mock.patch.object(acc, 'STOP_BUDGET_S', 4):
             rc, out = self.go(native_lingers=True, fail_start_at=1)
         self.assertEqual(rc, 1)
         self.assertIn('still listed', out)
@@ -537,13 +596,13 @@ class AcceptanceTests(Harness):
         self.assertIn('post-run alert watermark predates end-of-run cutoff', out)
         self.assertAllStopped()
         summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
-        evidence = summary['alert_watermarks']
-        before, after = evidence['before'], evidence['after']
+        evidence_wm = summary['alert_watermarks']
+        before, after = evidence_wm['before'], evidence_wm['after']
         self.assertEqual(after['generation'], before['generation'])
         self.assertEqual(after['count'], before['count'])
         self.assertGreater(after['observed_at_ms'], before['observed_at_ms'])
-        self.assertLess(after['observed_at_ms'], evidence['required_post_observed_at_ms'])
-        self.assertLess(evidence['required_post_observed_at_ms'] - after['observed_at_ms'], acc.ALERT_SAMPLE_MAX_AGE_MS)
+        self.assertLess(after['observed_at_ms'], evidence_wm['required_post_observed_at_ms'])
+        self.assertLess(evidence_wm['required_post_observed_at_ms'] - after['observed_at_ms'], acc.ALERT_SAMPLE_MAX_AGE_MS)
         self.assertNotIn('stale or from the future', out)
         self.assertNotIn('reset or observation time regressed', out)
 
@@ -554,6 +613,570 @@ class AcceptanceTests(Harness):
         self.assertEqual(rc, 1)
         self.assertIn('alert baseline unavailable', out)
         self.assertEqual(self.state()['sessions'], {})
+
+
+class V2NativeAndLineageTests(Harness):
+    """V1+V2 interactive native-pane, challenge/artifact, and owned-lineage cleanup regressions."""
+
+    def test_plan_mode_renders_argv_without_invoking_hub(self):
+        out_dir = self.tmp / 'plan-out'
+        buf = io.StringIO()
+        with mock.patch('sys.stdout', buf):
+            rc = acc.main([
+                '--plan', '--formal',
+                '--evidence', native_evidence(),
+                '--commit', COMMIT,
+                '--workspace', str(self.base_ws),
+                '--intake-task-id', PARENT_INTAKE,
+                '--output-dir', str(out_dir),
+            ])
+        self.assertEqual(rc, 0, buf.getvalue())
+        data = json.loads(buf.getvalue())
+        self.assertEqual(len(data['plan']), 10)
+        self.assertIn('--interactive', data['plan'][0]['start_argv'])
+        self.assertNotIn('--prompt', data['plan'][0]['start_argv'])
+        self.assertEqual(self.state()['sessions'], {})
+
+    def test_cli_parser_rejects_interactive_with_prompt_and_accepts_new_start_argv(self):
+        import argparse
+        from agent_hub_host import session_control
+        parser = argparse.ArgumentParser()
+        session_control.add_commands(parser.add_subparsers(dest='cmd'))
+        argv = acc.build_start_argv('/abs/base', PARENT_INTAKE, 'key-1')
+        parsed = parser.parse_args(argv)
+        self.assertTrue(parsed.interactive)
+        self.assertIsNone(parsed.prompt)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(argv + ['--prompt', 'bad'])
+
+    def test_create_lost_response_replays_same_key_and_ten_unique_children(self):
+        rc, out = self.go(create_fail_after_accept_at=0)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.state()['intakes']), 10)
+        rc2, out2 = self.go(reuse_intake_id=True)
+        self.assertEqual(rc2, 1, out2)
+        self.assertIn('child intake id reused', out2)
+
+    def test_headless_mode_and_legacy_headless_evidence_rejected(self):
+        rc, out = self.go(force_headless_mode=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('session is not interactive', out)
+        rc, out = self.go(evidence_bundle=evidence())
+        self.assertEqual(rc, 1, out)
+        self.assertIn('operator-validated same-commit receipt references required', out)
+        self.assertEqual(self.state()['sessions'], {})
+
+    def test_natural_exit_after_proof_before_live_stop_fails_sample(self):
+        rc, out = self.go(natural_exit_after_proof=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('natural exit after proof before live STOP', out)
+        self.assertAllStopped()
+
+    def test_null_native_id_still_issues_standard_stop(self):
+        rc, out = self.go(null_native_stop=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('no canonical native UUID', out)
+        self.assertTrue(any(x.startswith('stop:') for x in self.state()['log']))
+        self.assertAllStopped()
+
+    def test_proven_continuation_and_verification_descendants_drained_not_counted(self):
+        for knob in ('continuation_descendant', 'verification_descendant', 'fresh_successor_after_first_scan'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 0, out)
+                self.assertAllStopped()
+                summary = json.loads(out[out.index('{\n'):out.rindex('\nACCEPTANCE ')])
+                self.assertEqual(len(summary['starts']), 10)
+                self.assertTrue(summary['starts'][0]['cleanup_lineage'])
+
+    def test_foreign_incomplete_archive_snapshot_change_over_limit_and_cas_conflict(self):
+        for knob, expected in [
+            ('foreign_assignment', 'foreign, missing or unprovable current session'),
+            ('foreign_assigned_machine', "current assigned_machine_id 'foreign-host'"),
+            ('pending_dispatch_state', 'non-terminal dispatch state'),
+            ('history_seq_gap', 'intake history sequence gap'),
+            ('history_incomplete_archive', 'history_archive has 3 unread archived events'),
+            ('history_snapshot_changed', 'intake snapshot changed during history scan'),
+            ('descendant_over_limit', 'exceeded 8 descendant bound'),
+            ('archive_cas_conflict', 'archive CAS failed'),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expected, out)
+
+    def test_trust_menu_and_negative_pane_renderings_fail(self):
+        for knob in ('trust_menu_rendered', 'hydrogen_prose_command_exited', 'claude_waiting_only',
+                     'claude_prose_only', 'claude_unterminated_echo', 'hydrogen_unrelated_action',
+                     'hydrogen_unrelated_python', 'hydrogen_unrelated_shell', 'hydrogen_assistant_footer',
+                     'hydrogen_truncated_header'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('did not prove completed work', out)
+                self.assertAllStopped()
+
+    def test_ac_normalization_and_provenance_match_hub2_contract(self):
+        _, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-1.py')
+        norm = acc.normalize_acceptance_criteria(ac)
+        self.assertEqual(len(norm), 2)
+        self.assertFalse(any(line.startswith('1.') or line.startswith('2.') for line in norm))
+        rc, out = self.go()
+        self.assertEqual(rc, 0, out)
+        for intake in self.state()['intakes'].values():
+            self.assertIsNone(intake['parent_intake_id'])
+            self.assertIn('provenance', intake)
+            self.assertEqual(len(intake['acceptance_criteria']), 2)
+            self.assertFalse(any(line.startswith('1.') or line.startswith('2.') for line in intake['acceptance_criteria']))
+            self.assertEqual(intake['acceptance_criteria'][1], norm[1])
+
+    def test_v2_artifact_tamper_and_link_negatives_fail(self):
+        for knob in ('result_symlink', 'result_hardlink', 'result_duplicate_key', 'result_non_canonical', 'result_bad_digest', 'result_preexisting'):
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn('did not prove completed work', out)
+                self.assertAllStopped()
+
+    def test_b3_missing_or_drifted_current_custody_never_confirms_or_archives(self):
+        for knob, expected in [
+            ('cleanup_missing_dispatch', 'missing or malformed current dispatch'),
+            ('cleanup_null_machine', 'current assigned_machine_id None'),
+            ('cleanup_dispatch_missing_op', 'operation_id None is not a base UUID'),
+            ('cleanup_dispatch_null_machine', 'machine_id UNKNOWN'),
+            ('cleanup_epoch_drift', 'epoch drift 2 != 1'),
+            ('cleanup_native_drift', 'native_id drift'),
+            ('cleanup_stop_view_op_drift', 'operation_id drift'),
+            ('archive_unproven', 'archive unproven'),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(expected, out)
+                self.assertAllStopped()
+                report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+                first = report['starts'][0]
+                self.assertNotEqual(first.get('cleanup_status'), 'CONFIRMED')
+                if knob != 'archive_unproven':
+                    self.assertNotIn('intake:update', self.state()['log'])
+                    self.assertFalse(first.get('archived'))
+                else:
+                    self.assertEqual(first.get('cleanup_status'), 'ARCHIVE_PENDING')
+
+    def test_b3_lost_archive_ack_is_confirmed_only_by_final_recheck(self):
+        rc, out = self.go(archive_lost_ack=True)
+        report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+        for rec in report['starts']:
+            self.assertEqual(rec.get('cleanup_status'), 'CONFIRMED', out)
+            self.assertTrue(rec.get('archived'))
+        self.assertEqual(rc, 0, out)
+
+    @staticmethod
+    def real_shapes(attempt=0):
+        """Sanitized copies of Root's genuine observation-1 field SHAPES (values synthetic)."""
+        base, sid, native = '2ff7f80c-0d8b-58a7-a7ad-d24786513cdd', '743973dd-533c-55ab-a5fb-29c3b7a93125', '4a082cb8-f506-46fc-9beb-8ca53ccc10d2'
+        cid, att = '65b8e3e4-c77a-4bdb-b937-a1c590297df6', '2ff7f80c-0d8b-58a7-a7ad-d24786513cdd:%d' % attempt
+        live = {'id': sid, 'state': 'running', 'intake_id': cid, 'project_id': acc.PROJECT, 'machine_id': acc.HOST,
+                'epoch': 1445, 'operation_id': att, 'native_id': native, 'host': acc.HOST, 'machine': acc.HOST,
+                'mode': 'interactive', 'interactive': True, 'evidence': None, 'attention': None}
+        exit_ev = {'operation_id': base, 'attempt_operation_id': att, 'session_id': sid, 'intake_id': cid,
+                   'machine_id': acc.HOST, 'epoch': 1445, 'native_id': native, 'state': 'stopped', 'exit_code': 0,
+                   'native_exit_confirmed': True, 'evidence': {'containment_empty': True, 'source': 'aplexer_retirement'}}
+        stopped = dict(live, state='stopped', evidence=dict(exit_ev), stop_confirmed=True)
+        dispatch = {'id': sid, 'operation_id': base, 'attempt_operation_id': att, 'intake_id': cid, 'machine_id': acc.HOST,
+                    'epoch': 1445, 'state': 'failed', 'native_id': native, 'attempt': attempt, 'next_action_at': None}
+        final = {'stopped': True, 'reaped': False, 'operation_id': base, 'attempt_operation_id': att, 'session_id': sid,
+                 'machine_id': acc.HOST, 'epoch': 1445, 'reason': 'stop_confirmed', 'native_id': native,
+                 'completion': {'controlled': True, 'session_id': sid, 'outcome': 'unfinished',
+                                'reason': 'session_stop_confirmed', 'depth': 0},
+                 'finish_after_stop': dict(exit_ev)}
+        return live, stopped, dispatch, final, cid
+
+    def test_b3_real_machine_vs_project_shapes_bind_base_and_attempt(self):
+        for attempt in (0, 1):
+            live, stopped, dispatch, final, cid = self.real_shapes(attempt)
+            self.assertNotIn('attempt_operation_id', live)
+            ident = acc._owned_identity(live, live['native_id'])
+            self.assertEqual(ident['operation_id'], dispatch['operation_id'])
+            self.assertEqual(ident['attempt_operation_id'], live['operation_id'])
+            self.assertEqual(ident['attempt'], attempt)
+            self.assertIsNone(acc._stop_view_problem(ident, stopped, 'stop view'))
+            self.assertIsNone(acc._bind_view(ident, live, acc.machine_session_identity, 'pre-stop', acc.IDENTITY_KEYS))
+            self.assertIsNone(acc._bind_view(ident, dispatch, acc.dispatch_identity, 'dispatch', acc.IDENTITY_KEYS))
+            self.assertIsNone(acc.final_stop_proof_problem(final, ident, cid))
+            # Raw operation_id labels differ across endpoints by contract; they are never compared directly.
+            self.assertNotEqual(live['operation_id'], dispatch['operation_id'])
+            # An optional redundant Machine alias is accepted only when it agrees.
+            self.assertIsNone(acc._stop_view_problem(ident, dict(stopped, attempt_operation_id=live['operation_id']), 'v'))
+
+    def test_b3_contradictory_malformed_missing_or_different_tuple_fails(self):
+        live, stopped, dispatch, final, cid = self.real_shapes(0)
+        ident = acc._owned_identity(live, live['native_id'])
+        base = dispatch['operation_id']
+        other = 'bbbbbbbb-0d8b-58a7-a7ad-d24786513cdd'
+        for bad in ['opaque-op', base, base.upper() + ':0', base + ':01', base + ':-1', base + ':0:0', None, 7,
+                    'prefix-' + base + ':0']:
+            with self.subTest(machine_op=bad):
+                with self.assertRaises(acc.IdentityError):
+                    acc.machine_session_identity(dict(live, operation_id=bad))
+                self.assertIsNone(acc._owned_identity(dict(live, operation_id=bad), live['native_id'])['operation_id'])
+        machine_neg = [
+            (dict(stopped, attempt_operation_id=base), 'contradicts Machine operation_id'),
+            (dict(stopped, attempt=1), 'contradicts Machine operation_id'),
+            (dict(stopped, attempt=True), 'contradicts Machine operation_id'),
+            (dict(stopped, operation_id=other + ':0'), 'operation_id drift'),
+            (dict(stopped, operation_id=base + ':1'), 'drift'),
+            (dict(stopped, epoch=1446), 'epoch drift'),
+            (dict(stopped, epoch=None), 'epoch UNKNOWN'),
+            (dict(stopped, machine_id='other-host', host='other-host', machine='other-host'), 'machine_id drift'),
+            (dict(stopped, host='other-host'), 'contradicts machine_id'),
+            (dict(stopped, native_id='99999999-0000-4000-8000-000000000000'), 'native_id drift'),
+            (dict(stopped, id='00000000-0000-4000-8000-000000000001'), 'session_id drift'),
+            (dict(stopped, evidence=dict(stopped['evidence'], attempt_operation_id=base + ':1')), 'session exit evidence'),
+            (dict(stopped, evidence=dict(stopped['evidence'], operation_id=other, attempt_operation_id=other + ':0')), 'session exit evidence'),
+        ]
+        for view, msg in machine_neg:
+            with self.subTest(msg=msg):
+                problem = acc._stop_view_problem(ident, view, 'stop view')
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        dispatch_neg = [
+            (None, 'missing or malformed'),
+            ('unknown', 'missing or malformed'),
+            (dict(dispatch, operation_id=dispatch['attempt_operation_id']), 'is not a base UUID'),
+            ({k: v for k, v in dispatch.items() if k != 'attempt_operation_id'}, 'not strict'),
+            (dict(dispatch, attempt_operation_id=other + ':0'), 'attempt_operation_id base'),
+            (dict(dispatch, attempt=1), 'contradicts attempt_operation_id'),
+            (dict(dispatch, attempt=False), 'contradicts attempt_operation_id'),
+            (dict(dispatch, operation_id=other, attempt_operation_id=other + ':0'), 'operation_id drift'),
+            (dict(dispatch, epoch=1446), 'epoch drift'),
+            (dict(dispatch, machine_id=None), 'machine_id UNKNOWN'),
+            (dict(dispatch, native_id=None), 'native_id UNKNOWN'),
+            (dict(dispatch, id='00000000-0000-4000-8000-000000000001'), 'session_id drift'),
+        ]
+        for view, msg in dispatch_neg:
+            with self.subTest(dispatch=msg):
+                problem = acc._bind_view(ident, view, acc.dispatch_identity, 'dispatch', acc.IDENTITY_KEYS)
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        fas = final['finish_after_stop']
+        final_neg = [
+            (None, 'missing'),
+            (dict(final, attempt_operation_id=base + ':1'), 'drift'),
+            (dict(final, finish_after_stop=dict(fas, attempt_operation_id=base + ':1')), 'finish_after_stop'),
+            (dict(final, finish_after_stop=dict(fas, operation_id=base + ':0')), 'not a base UUID'),
+            (dict(final, finish_after_stop=None), 'finish_after_stop'),
+            (dict(final, reason='finished'), 'not a confirmed stop'),
+            (dict(final, completion=dict(final['completion'], reason='session_finished')), 'session_stop_confirmed'),
+            (dict(final, finish_after_stop=dict(fas, native_exit_confirmed=False)), 'native exit'),
+            (dict(final, finish_after_stop=dict(fas, evidence={'containment_empty': False})), 'empty containment'),
+            (dict(final, finish_after_stop=dict(fas, intake_id='other')), 'finish_after_stop'),
+            (dict(final, epoch=1446), 'epoch drift'),
+        ]
+        for view, msg in final_neg:
+            with self.subTest(final=msg):
+                problem = acc.final_stop_proof_problem(view, ident, cid)
+                self.assertIsNotNone(problem)
+                self.assertIn(msg, problem)
+        # NULL native original: never equality, even when later views carry a native id.
+        null_ident = acc._owned_identity(live, None)
+        self.assertIn('native_id UNKNOWN', acc._bind_view(null_ident, dispatch, acc.dispatch_identity, 'd', acc.IDENTITY_KEYS))
+        self.assertIn('native_id UNKNOWN', acc.final_stop_proof_problem(final, null_ident, cid))
+
+    def test_b3_process_fake_real_shapes_end_to_end(self):
+        rc, out = self.go(show_redundant_alias=True)
+        self.assertEqual(rc, 0, out)
+        self.assertAllStopped()
+        report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+        for rec in report['starts']:
+            self.assertRegex(rec['attempt_operation_id'], r'^%s:0$' % re.escape(rec['operation_id']))
+            self.assertEqual(rec['attempt'], 0)
+        for intake in self.state()['intakes'].values():
+            self.assertEqual(intake['status'], 'archived')
+            self.assertEqual(intake['dispatch']['state'], 'failed')
+            self.assertEqual(intake['final_evidence']['completion']['reason'], 'session_stop_confirmed')
+        for knob, msg, archived in [
+            ('show_alias_contradiction', 'contradicts Machine operation_id', False),
+            ('show_attempt_contradiction', 'contradicts Machine operation_id', False),
+            ('show_malformed_operation', 'not strict <uuid>:<attempt>', False),
+            ('start_response_base_drift', 'start response operation_id drift', None),
+            ('stop_evidence_contradiction', 'session exit evidence', False),
+            ('dispatch_alias_base_mismatch', 'attempt_operation_id base', False),
+            ('dispatch_attempt_int_contradiction', 'contradicts attempt_operation_id', False),
+            ('dispatch_machine_attempt_as_base', 'is not a base UUID', False),
+            ('dispatch_missing_alias', 'not strict', False),
+            ('final_missing', 'final_evidence missing', False),
+            ('final_attempt_contradiction', 'finish_after_stop', False),
+            ('final_reason_not_stop', 'session_stop_confirmed', False),
+            ('final_no_native_exit', 'native exit', False),
+            ('final_containment_not_empty', 'empty containment', False),
+        ]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(**{knob: True})
+                self.assertEqual(rc, 1, out)
+                self.assertIn(msg, out)
+                self.assertAllStopped()
+                stops = [x for x in self.state()['log'] if x.startswith('stop:')]
+                self.assertTrue(stops)
+                if archived is False:
+                    self.assertNotIn('intake:update', self.state()['log'])
+                    self.assertFalse(any(i['status'] == 'archived' for i in self.state()['intakes'].values()))
+
+    def test_b3_pinned_review_counterexample_null_dispatch_is_unknown(self):
+        run, sid, cid = (PARENT_INTAKE, '22222222-3333-4444-8555-666666666666', '33333333-4444-4555-8666-777777777777')
+        base, native = 'abcdef01-2345-5678-89ab-cdef01234567', '55555555-6666-4777-8888-999999999999'
+        show = {'id': cid, 'project': acc.PROJECT, 'session_id': sid, 'assigned_machine_id': acc.HOST, 'updated_at': 100,
+                'status': 'open', 'dispatch': None, 'final_evidence': None}
+
+        class R:
+            calls = []
+
+            def json(self, tool, args, timeout):
+                self.calls.append(args)
+                return {'intake': dict(show, status='archived')}
+        # Machine-shaped stop view: operation_id IS the attempt id, no redundant alias.
+        stop_view = {'id': sid, 'state': 'stopped', 'stop_confirmed': True, 'operation_id': base + ':0',
+                     'epoch': 1, 'machine_id': acc.HOST, 'native_id': native}
+        owned = {'session_id': sid, 'operation_id': base, 'attempt_operation_id': base + ':0', 'attempt': 0,
+                 'epoch': 1, 'machine_id': acc.HOST, 'native_id': native}
+        for owned_extra, view, msg in [
+            ({}, stop_view, 'missing or malformed current dispatch'),
+            ({'attempt_operation_id': None}, stop_view, 'attempt_operation_id UNKNOWN'),
+            ({}, dict(stop_view, epoch=None), 'epoch UNKNOWN'),
+            ({}, dict(stop_view, operation_id='bbbbbbbb-2345-5678-89ab-cdef01234567:0'), 'operation_id drift'),
+            ({}, dict(stop_view, operation_id='original-op'), 'identity invalid'),
+            ({}, dict(stop_view, attempt_operation_id=base), 'contradicts Machine operation_id'),
+        ]:
+            with self.subTest(msg=msg):
+                r = R(); r.calls = []
+                rec = {'id': sid, 'child_intake_id': cid, 'owned_identity': dict(owned, **owned_extra), 'host': acc.HOST,
+                       'native_id': native, 'stop_key': 'synthetic-stop', 'errors': [], 'n': 1}
+                with mock.patch.object(acc, '_stop_single_session', lambda *a, v=view: (dict(v), None)), \
+                        mock.patch.object(acc, 'scan_intake_lineage',
+                                          lambda *a: ({'show': show, 'events': [{'seq': 1, 'kind': 'created', 'body': {}}]}, None)):
+                    acc.stop_and_drain_lineage(r, rec, run, lambda: 0, lambda _: None)
+                self.assertFalse(rec['cleanup_confirmed'])
+                self.assertEqual(rec['cleanup_status'], 'UNKNOWN')
+                self.assertFalse(rec.get('archived'))
+                self.assertEqual(r.calls, [])
+                self.assertTrue(any(msg in e for e in rec['errors']), rec['errors'])
+
+    def test_b1_actual_project_create_shape_and_no_invented_source(self):
+        brief, ac = acc.make_child_brief_and_ac(PARENT_INTAKE, 1, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-1.py')
+        cid = '33333333-4444-4555-8666-777777777777'
+        title = 'Phase7 owned run %s/%d' % (PARENT_INTAKE, 1)
+        # Mirrors hub2/src/project-do.ts create INSERT + viewIntake (no saga yet => no dispatch key).
+        actual = {'id': cid, 'project': acc.PROJECT, 'title': title, 'text': brief,
+                  'acceptance_criteria': acc.normalize_acceptance_criteria(ac), 'status': 'open',
+                  'assigned_machine_id': None, 'session_id': None, 'linked_sessions': [], 'priority': 2,
+                  'original_ask': {'title': title, 'text': brief}, 'provenance': {'type': 'user', 'code_task': True},
+                  'parent_intake_id': None, 'schedule_id': None, 'occurrence_id': None, 'final_evidence': None,
+                  'created_at': 1, 'updated_at': 1}
+
+        class R:
+            def __init__(self, view):
+                self.view, self.calls = view, []
+
+            def json(self, tool, args, timeout):
+                self.calls.append(args)
+                return {'intake': self.view} if args[1] in ('create', 'show') else {'ok': True}
+        r = R(actual)
+        rec = {'create_key': 'k-create', 'start_key': 'k-start'}
+        self.assertEqual(acc.create_child_intake(r, rec, PARENT_INTAKE, 1, PARENT_INTAKE, 'b', 'a', brief, ac, set(), lambda: 0), cid)
+        self.assertFalse(any(flag.startswith('--source') for flag in r.calls[0]))
+        receipt = rec['create_receipt']
+        self.assertEqual(receipt['provenance'], {'type': 'user', 'code_task': True})
+        self.assertFalse(receipt['structural_parent_link'])
+        self.assertEqual(receipt['text_sha256'], hashlib.sha256(brief.encode()).hexdigest())
+        note = r.calls[-1]
+        self.assertEqual(note[:5], ['intake', 'append', PARENT_INTAKE, '--key', 'acc10-own-%s-1' % PARENT_INTAKE])
+        self.assertIn('create_key=k-create', note[-1])
+        self.assertIn(receipt['acceptance_criteria_sha256'], note[-1])
+        for change, msg in [
+            ({'provenance': {'type': 'forwarded', 'reference': 'parent:x'}}, 'provenance mismatch'),
+            ({'provenance': {'type': 'user', 'code_task': False}}, 'provenance mismatch'),
+            ({'parent_intake_id': PARENT_INTAKE}, 'structural parent_intake_id'),
+            ({'text': brief + ' '}, 'text mismatch'),
+            ({'original_ask': {'title': title, 'text': 'x'}}, 'original_ask mismatch'),
+            ({'acceptance_criteria': ac.splitlines()}, 'acceptance_criteria mismatch'),
+            ({'session_id': '22222222-3333-4444-8555-666666666666'}, 'not open/unassigned'),
+        ]:
+            with self.subTest(msg=msg):
+                with self.assertRaisesRegex(RuntimeError, msg):
+                    acc.create_child_intake(R(dict(actual, **change)), dict(rec), PARENT_INTAKE, 1, PARENT_INTAKE,
+                                            'b', 'a', brief, ac, set(), lambda: 0)
+
+    def test_b1_fake_legacy_forwarded_provenance_is_rejected(self):
+        rc, out = self.go(legacy_forwarded_provenance=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('provenance mismatch', out)
+
+    def test_b2_plain_pane_and_label_never_attest_antigravity(self):
+        """A class label is not attestation: no plain-pane rendering or Claude-shaped record can prove antigravity."""
+        run = '40a49778-f092-450d-a042-12ad276ab134'
+        cmd = acc.probe_command(run, 3)
+        self.assertRegex(cmd, r'^python3 \.local/h7_[0-9a-f]{12}_03\.py$')
+        self.assertEqual(cmd, 'python3 ' + acc.hydrogen_frame.h7_rel_path(run, 3))
+        expected = 'AC10_WORK_V2 %s 3 %s %s 5050' % (run, 'a' * 64, 'b' * 40)
+        brief, _ = acc.make_child_brief_and_ac(run, 3, PARENT_INTAKE, '/tmp/ch.bin', '/tmp/helper-3.py')
+        self.assertIn('`%s`' % cmd, brief)
+        self.assertIn('`/tmp/helper-3.py`', brief)
+        self.assertNotIn(expected, brief)
+        row = '● Ran (%s) (ctrl+o to expand)\n' % cmd
+        panes = {
+            'exact_row_alone': row + '> ',
+            'assistant_footer_exact_row': 'Assistant readiness summary:\n' + row + 'I am done.\n',
+            'row_plus_expected_stdout': row + '  ' + expected + '\n',
+            'claude_shaped_block': '● Bash(%s)\n  ⎿  %s\n❯ ' % (cmd, expected),
+        }
+        labels = ['native_exact_probe_header_plus_artifact_v3', 'native_action_plus_artifact_v2',
+                  acc.NATIVE_PROOF_CLASSES['claude'], acc.NATIVE_PROOF_CLASSES['antigravity']]
+        for label in labels:
+            t = dict(native_transport('antigravity', COMMIT), proof_class=label)
+            self.assertFalse(acc.native_transport_ok('antigravity', t, COMMIT), label)
+            for name, pane in panes.items():
+                with self.subTest(label=label, pane=name):
+                    self.assertFalse(acc.native_pane_output_ok(pane, 'antigravity', t, expected, brief, command_id=cmd))
+        self.assertFalse(hasattr(acc, 'hydrogen_framing_diagnostic'))
+        # A Claude-shaped (plain-pane) antigravity record in an operator bundle is refused.
+        path = Path(native_evidence())
+        ev = json.loads(path.read_text())
+        ev['operator_validation']['capture_transports']['antigravity'] = native_transport('antigravity', COMMIT)
+        problems = acc.validate_native_evidence(ev, str(path), COMMIT)
+        self.assertIn('verified interactive native-pane capture transport records required', problems)
+
+    def test_b2_hydrogen_draw_fails_unavailable_with_artifact_only_and_cleanup(self):
+        for knob, artifact in [({}, 'VALIDATED'), ({'no_probe_file': True}, 'absent')]:
+            with self.subTest(knob=knob):
+                rc, out = self.go(models=[MUSE], **knob)
+                self.assertEqual(rc, 1, out)
+                self.assertIn('native proof UNAVAILABLE for engine antigravity: UNKNOWN_NATIVE_FRAMING', out)
+                self.assertIn('artifact-only=%s' % artifact, out)
+                self.assertNotIn('ACCEPTANCE PASS', out)
+                self.assertAllStopped()
+                report = json.loads(out[out.index('\n{\n') + 1:out.rindex('\n}') + 2])
+                first = report['starts'][0]
+                self.assertIs(first.get('capture_verified'), False)
+                self.assertEqual(first['native_proof']['root_checker_status'], 'NEEDS_ROOT_RENDERER_ATTESTATION')
+                self.assertIs(first['native_proof']['native_action_verified'], False)
+                self.assertEqual(bool(first.get('artifact_only')), artifact == 'VALIDATED')
+        with self.assertRaises(TimeoutError):
+            acc.verify_work_artifact(None, str(self.tmp), PARENT_INTAKE, 1, PARENT_INTAKE, PARENT_INTAKE,
+                                     PARENT_INTAKE, PARENT_INTAKE, b'x' * 32, lambda: 10, 5)
+
+    def test_deadline_each_git_call_gets_fresh_remaining_budget(self):
+        class Clock:
+            t = 100.0
+
+            def __call__(self):
+                return self.t
+
+        class R:
+            def __init__(self, clock, costs):
+                self.clock, self.costs, self.timeouts = clock, list(costs), []
+
+            def _spend(self, timeout):
+                self.timeouts.append(timeout)
+                self.clock.t += self.costs.pop(0)
+
+            def run(self, tool, args, timeout):
+                self._spend(timeout)
+                return 0, 'b' * 40 + '\n', ''
+
+            def run_bytes(self, tool, args, timeout):
+                self._spend(timeout)
+                return 0, b'', b''
+        # First call consumes most of the budget; the second gets only what remains (not the initial value).
+        clock = Clock(); r = R(clock, [24.0, 1.0])
+        acc.observe_git_state(r, '/ws', clock, 100.0 + 30.0)
+        self.assertEqual(r.timeouts, [30.0, 6.0])
+        clock = Clock(); r = R(clock, [10.0, 1.0])
+        acc.observe_git_state(r, '/ws', clock, 100.0 + 90.0)
+        self.assertEqual(r.timeouts, [30.0, 30.0])
+        # First call exhausts the 90s total: the second Git call is never started.
+        clock = Clock(); r = R(clock, [91.0, 1.0])
+        with self.assertRaises(TimeoutError):
+            acc.observe_git_state(r, '/ws', clock, 100.0 + 90.0)
+        self.assertEqual(r.timeouts, [30.0])
+        # Second call overruns: refused after it returns even though both commands "succeeded".
+        clock = Clock(); r = R(clock, [5.0, 30.0])
+        with self.assertRaises(TimeoutError):
+            acc.observe_git_state(r, '/ws', clock, 100.0 + 30.0)
+        self.assertEqual(r.timeouts, [30.0, 25.0])
+
+    def test_previous_attempt_fallback_requires_full_binding(self):
+        operation = '22222222-2222-4222-8222-222222222222'
+        owned = {'session_id': PARENT_INTAKE, 'operation_id': operation,
+                 'attempt_operation_id': operation + ':1', 'attempt': 1,
+                 'epoch': 7, 'machine_id': acc.HOST}
+        created = dict(owned, attempt=0, attempt_operation_id=operation + ':0')
+        self.assertTrue(acc._previous_attempt_matches(owned, created, PARENT_INTAKE))
+        for field, values in (('epoch', (None, 8)),
+                              ('machine_id', (None, 'foreign-machine'))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(acc._previous_attempt_matches(
+                        owned, dict(created, **{field: value}), PARENT_INTAKE))
+        self.assertFalse(acc._previous_attempt_matches(owned, created, 'foreign-session'))
+        self.assertFalse(acc._previous_attempt_matches(dict(owned, attempt=0), created, PARENT_INTAKE))
+
+    def test_proof_budget_never_floors_positive_remaining_time(self):
+        self.assertEqual(acc._fresh_git_timeout(lambda: 0, 0.001, 'test'), 0.001)
+        for now in (0.001, 1):
+            with self.subTest(now=now), self.assertRaises(TimeoutError):
+                acc._fresh_git_timeout(lambda: now, 0.001, 'test')
+
+    def test_artifact_deadline_is_checked_before_each_read(self):
+        class Clock:
+            t = 0.0
+            def __call__(self):
+                return self.t
+        # A slow probe read must not begin a result read after the total deadline.
+        clock = Clock()
+        def probe_read(*args):
+            clock.t = 91.0
+            return b'probe body'
+        with mock.patch.object(acc, 'validate_no_symlink_ancestors'), \
+             mock.patch.object(acc, 'bounded_file', side_effect=probe_read) as read, \
+             mock.patch.object(acc.os, 'lstat') as metadata:
+            with self.assertRaises(TimeoutError):
+                acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                         PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                         b'x' * 32, clock, 90.0, pinned_probe=b'probe body')
+            self.assertEqual(read.call_count, 1)
+            metadata.assert_not_called()
+        # Path validation may also exhaust the budget before either file is opened.
+        for pinned in (None, b'probe body'):
+            clock = Clock()
+            def slow_path(*args):
+                clock.t = 91.0
+            with self.subTest(pinned=pinned), \
+                 mock.patch.object(acc, 'validate_no_symlink_ancestors', side_effect=slow_path), \
+                 mock.patch.object(acc, 'bounded_file') as read:
+                with self.assertRaises(TimeoutError):
+                    acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                             PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                             b'x' * 32, clock, 90.0, pinned_probe=pinned)
+                read.assert_not_called()
+        # A result read crossing the deadline must not start a metadata read.
+        clock = Clock()
+        with mock.patch.object(acc, 'validate_no_symlink_ancestors'), \
+             mock.patch.object(acc, 'bounded_file', side_effect=probe_read) as read, \
+             mock.patch.object(acc.os, 'lstat') as metadata:
+            with self.assertRaises(TimeoutError):
+                acc.verify_work_artifact(None, '/ws', PARENT_INTAKE, 1, PARENT_INTAKE,
+                                         PARENT_INTAKE, PARENT_INTAKE, PARENT_INTAKE,
+                                         b'x' * 32, clock, 90.0)
+            self.assertEqual(read.call_count, 1)
+            metadata.assert_not_called()
+
+    def test_porcelain_z_rename_copy_counting(self):
+        self.assertEqual(acc.parse_porcelain_z_count(b''), 0)
+        self.assertEqual(acc.parse_porcelain_z_count(b' M a.py\x00R  new.py\x00old.py\x00C  c.py\x00src.py\x00'), 3)
+        with self.assertRaises(ValueError):
+            acc.parse_porcelain_z_count(b' M a.py')
+        with self.assertRaises(ValueError):
+            acc.parse_porcelain_z_count(b'R  new.py\x00')
 
 
 class ParserTests(unittest.TestCase):

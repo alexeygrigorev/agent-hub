@@ -292,7 +292,7 @@ def _https_get_json(base, path, access):
     return json.loads(body.decode('utf-8'))
 
 
-def request(method, path, payload=None):
+def request(method, path, payload=None, max_request=None):
     if method == 'GET' and payload is None and path.startswith(BASE + '/summary') and 'api' not in globals():
         fast = _fast_summary_get(path)
         if fast is not None:
@@ -307,8 +307,9 @@ def request(method, path, payload=None):
     base = os.environ.get('HUB_URL') or os.environ.get('HUB_BASE_URL') or cfg.get('base_url')
     api.check_url(base)
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8') if payload is not None else None
-    if data is not None and len(data) > MAX_REQUEST:
-        raise IntakeInputError(f'Intake request exceeds {MAX_REQUEST} UTF-8 bytes (JSON envelope included)')
+    limit = max_request or MAX_REQUEST
+    if data is not None and len(data) > limit:
+        raise IntakeInputError(f'Intake request exceeds {limit} UTF-8 bytes (JSON envelope included)')
     env_token = os.environ.get('HUB_TOKEN') or os.environ.get('HUB_JOB_TOKEN')
     token = env_token or cfg.get('access_token') or auth.get_access_token()
     # GETs are safe to repeat. Task writes are safe only when the exact
@@ -397,7 +398,7 @@ def add_commands(sub):
     commands = root.add_subparsers(dest='intake_cmd', required=True)
     from . import intake_stats
     intake_stats.options(commands.add_parser('stats', help='Timing and attempts for one intake'), individual=True)
-    depend = commands.add_parser('depend', help='Add a prerequisite; original work waits until it is DONE')
+    depend = commands.add_parser('depend', help='Record a prerequisite intake (may be in another project); shown in `intake show`/`links`')
     depend.add_argument('id')
     depend.add_argument('--on', required=True)
     depend.add_argument('--remove', action='store_true')
@@ -439,6 +440,7 @@ def add_commands(sub):
                         help='Post-DONE verifier policy (default auto: Hub decides from the change)')
     create.add_argument('--priority', choices=['high', 'normal', 'low'], default=None,
                         help='Queue priority (default normal; autonomous queue takes high before normal before low)')
+    create.add_argument('--parent', default=None, help='Operator only: parent intake id (short or full)')
     create.add_argument('--key', required=True)
     listing = commands.add_parser('list', help='List one page, or all matching tasks with --all')
     listing.add_argument('--status', default=None)
@@ -484,6 +486,8 @@ def add_commands(sub):
     update.add_argument('--priority', choices=['high', 'normal', 'low'], help='Queue priority (high is taken before normal before low)')
     update.add_argument('--reason', help='Reason for close, cancellation or reopen')
     update.add_argument('--superseded-by', help='Replacement intake id; required for cancel unless dropped by Alexey')
+    update.add_argument('--code-task', choices=['true', 'false'], help='Operator only: reclassify the intake as a code task (merge gate applies) or not')
+    update.add_argument('--parent', help='Operator only: parent intake id (short or full; pass "none" to clear)')
     update.add_argument('--force', action='store_true', help='Override the worktree close gate when closing; requires --reason')
     update.add_argument('--note', help='Note recorded with this update (max 4000 characters); given alone it appends a plain note')
     close = commands.add_parser('close', help='CAS status done; refused while intake worktrees are present or unmerged unless --force --reason')
@@ -502,8 +506,13 @@ def add_commands(sub):
     merge_check.add_argument('--sha', action='append', default=[], help='Extra commit to verify (the DONE note commits and HEAD are always checked)')
     merge_check.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     merge_check.add_argument('--dry-run', action='store_true', help='Print the evidence without recording it')
-    merge_state = commands.add_parser('merge-state', help='Merge state of one intake, or the list of unmerged intakes')
+    merge_check.add_argument('--pr', default=None, help='Hub2: the PR (URL or number) that merged this work; a URL may be in any repository (run once per repository the work merged in); default: the newest PR of the intake project cited in the intake, else a PR of a branch the host pushed for it')
+    merge_state = commands.add_parser('merge-state', help="One intake's programmatic merge gate (Hub2), or the list of unmerged intakes (legacy Hub)")
     merge_state.add_argument('id', nargs='?')
+    reevaluate = commands.add_parser('reevaluate', help='Operator: re-run Hub acceptance verification and the merge gate on a failed intake; a pass accepts it, a fail sends it back with named gaps')
+    reevaluate.add_argument('id')
+    reevaluate.add_argument('--reason', default=None, help='Why the intake is re-evaluated (shown to the verifier)')
+    reevaluate.add_argument('--key', help='Stable retry key; generated automatically when omitted')
     event = commands.add_parser('append', help='Append a note in one command (--note TEXT or --note-file F; key and version are automatic), or an intake/note/session/report/commit/followup/blocker/decision/rule reference as JSON with --event-file; approval decisions require operator')
     event.add_argument('id')
     event.add_argument('--version', type=int, help='CAS version for --event-file appends; not needed for a plain note')
@@ -547,6 +556,57 @@ def add_commands(sub):
     handoff = sub.add_parser('handoff', help='Self-contained ALL authorized open work and operator rules; fails without a complete consistent snapshot')
     handoff.add_argument('--project')
     handoff.add_argument('--page-size', type=int, default=25)
+
+
+def current_version(shown):
+    """CAS version from `intake show`: Hub2 serves task.control.version, Hub1 task.version."""
+    task = shown.get('task') if isinstance(shown, dict) else None
+    if isinstance(task, dict):
+        control = task.get('control')
+        for value in ((control or {}).get('version') if isinstance(control, dict) else None, task.get('version')):
+            if type(value) is int:
+                return value
+    raise IntakeInputError('Intake show response has no task.control.version; pass --version from `hub intake show`')
+
+
+def _hub2_events(intake_id, pages=20):
+    events, after = [], 0
+    for _ in range(pages):
+        page = request('GET', BASE + '/tasks/' + intake_id + '/history?' + urlencode({'after': after, 'limit': 100}))
+        batch = page.get('events') if isinstance(page, dict) else None
+        if not isinstance(batch, list) or not batch:
+            break
+        events.extend(event for event in batch if isinstance(event, dict))
+        after = page.get('next')
+        if not isinstance(after, int):
+            break
+    return events
+
+
+def _hub2_merge_check(args, intake):
+    """Hub2: collect GitHub evidence for the intake's PR and record it (merge gate)."""
+    from . import hub2_merge_evidence
+    intake_id = safe_id(str(intake.get('id') or args.id))
+    repository = str(intake.get('project') or '')
+    pr = args.pr
+    if pr and not str(pr).startswith('https://') and not str(pr).isdigit():
+        raise IntakeInputError('--pr must be a PR URL or number')
+    # Work merged in another repository (content repo, site repo): the PR URL
+    # names that repository, and Hub gates on the newest observation of each.
+    cited = hub2_merge_evidence.PR_URL.match(str(pr)) if pr else None
+    if pr and str(pr).startswith('https://') and not cited:
+        raise IntakeInputError('--pr URL must be https://github.com/<owner>/<repo>/pull/<number>')
+    if cited:
+        repository = cited.group(1)
+    if not pr:
+        pr = hub2_merge_evidence.find_pr(repository, _hub2_events(intake_id))
+    evidence = hub2_merge_evidence.collect(repository, pr)
+    if args.dry_run:
+        return {'dry_run': True, 'intake_id': intake_id, 'evidence': evidence}
+    key = args.key or 'merge-check-' + _random_hex()
+    valid_key(key)
+    request('POST', BASE + '/tasks/' + intake_id + '/merge-evidence', {'key': key, 'evidence': evidence})
+    return request('GET', BASE + '/tasks/' + intake_id + '/merge-state')
 
 
 def safe_id(value):
@@ -729,6 +789,8 @@ def execute(args):
             body['verification'] = args.verification
         if getattr(args, 'priority', None) is not None:
             body['priority'] = args.priority
+        if getattr(args, 'parent', None) is not None:
+            body['parent_intake_id'] = None if args.parent.lower() in {'', 'none', 'null'} else args.parent
         return request('POST', BASE + '/tasks', body)
     if command == 'summary':
         params = {'project': args.project} if args.project is not None else {}
@@ -776,9 +838,18 @@ def execute(args):
         return request('GET', BASE + '/grantees?' + urlencode(params))
     if command == 'merge-state':
         return request('GET', BASE + ('/tasks/' + safe_id(args.id) + '/merge-state' if args.id else '/merge-state'))
+    if command == 'reevaluate':
+        key = args.key or 'reevaluate-' + _random_hex()
+        valid_key(key)
+        payload = {'key': key}
+        if args.reason:
+            payload['reason'] = args.reason
+        return request('POST', BASE + '/tasks/' + safe_id(args.id) + '/reevaluate', payload)
     if command == 'merge-check':
         from . import merge_evidence
         shown = request('GET', BASE + '/tasks/' + safe_id(args.id))
+        if isinstance(shown, dict) and isinstance(shown.get('intake'), dict):
+            return _hub2_merge_check(args, shown['intake'])
         history = ((shown.get('task') or {}).get('payload_data') or {}).get('history') or []
         task = shown.get('task') or {}
         text = '\n'.join(e.get('text', '') for e in history if isinstance(e, dict) and e.get('kind') == 'note' and str(e.get('text', '')).lstrip().startswith('DONE'))
@@ -813,7 +884,7 @@ def execute(args):
         valid_key(key)
         version = args.version
         if version is None:
-            version = request('GET', path)['task']['version']
+            version = current_version(request('GET', path))
         payload = {'key': key, 'expected_version': version}
         if command == 'depend':
             payload.update(on=safe_id(args.on), remove=args.remove)
@@ -931,6 +1002,10 @@ def execute(args):
             args.status = 'done'
         if getattr(args, 'note', None) is not None:
             payload['note'] = _note_text(args.note)
+        if getattr(args, 'code_task', None) is not None:
+            payload['code_task'] = args.code_task == 'true'
+        if getattr(args, 'parent', None) is not None:
+            payload['parent_intake_id'] = None if args.parent.lower() in {'', 'none', 'null'} else args.parent
         for field in ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by'):
             if getattr(args, field, None) is not None:
                 if field == 'acceptance_criteria' and len(args.acceptance_criteria.encode('utf-8')) > 8192:
@@ -944,7 +1019,7 @@ def execute(args):
     raise IntakeInputError('Unknown intake operation')
 
 
-UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by')
+UPDATE_FIELDS = ('project', 'status', 'title', 'current_state', 'next_step', 'owner', 'uncertainty', 'acceptance_criteria', 'priority', 'verification', 'reason', 'superseded_by', 'code_task', 'parent')
 
 
 def _usage_error(message):

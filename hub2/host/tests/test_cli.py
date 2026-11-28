@@ -106,6 +106,52 @@ class CliTests(unittest.TestCase):
         self.assertEqual(body["acceptance_criteria"], ["First requirement"])
         self.assertEqual(auth, "Bearer synthetic-token")
 
+    def test_intake_append_posts_merge_evidence_and_merge_check_collects_for_requested_pr(self):
+        from agent_hub_host import merge_evidence
+
+        proof = {"kind": "merge_gate", "repository": "org/repo", "checked_at": "2026-11-13T10:00:00Z"}
+        evidence = Path(self.temp.name) / "merge.json"
+        evidence.write_text(json.dumps({"evidence": proof}), encoding="utf-8")
+        code, _ = self.invoke("intake", "append", "task-1", "--project", "org/repo", "--key", "merge-1", "--file", str(evidence))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/append"))
+        self.assertEqual(body, {"evidence": proof, "key": "merge-1"})
+
+        verdict = {"kind": "acceptance_verification", "session_id": "v1", "verdict": "pass",
+                   "summary": "All met", "acceptance": [{"status": "met", "proof": "ok"}]}
+        evidence.write_text(json.dumps(verdict), encoding="utf-8")
+        code, _ = self.invoke("intake", "append", "task-1", "--project", "org/repo", "--key", "verify-1", "--file", str(evidence))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/append"))
+        self.assertEqual(body, {"evidence": verdict, "key": "verify-1"})
+
+        with patch.object(merge_evidence, "collect", return_value=proof) as collect:
+            code, _ = self.invoke("intake", "merge-check", "task-1", "--project", "org/repo", "--pr", "23", "--key", "merge-check-1")
+        self.assertEqual(code, 0)
+        collect.assert_called_once_with(None, "23")
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/merge-evidence"))
+        self.assertEqual(body, {"key": "merge-check-1", "evidence": proof})
+
+    def test_sessions_finish_requires_a_matching_record_and_posts_to_intake_finish_route(self):
+        event = Path(self.temp.name) / "finished.json"
+        event.write_text(json.dumps({"kind": "session_finished", "session_id": "session-1", "summary": "Done",
+                                     "acceptance": [{"status": "met", "proof": "PR 23"}]}), encoding="utf-8")
+        code, _ = self.invoke("sessions", "finish", "session-1", "--intake-task-id", "task-1", "--key", "finish-1", "--file", str(event))
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("POST", "/api/intakes/task-1/finished"))
+        self.assertEqual(body["kind"], "session_finished")
+        self.assertEqual(body["session_id"], "session-1")
+        self.assertEqual(body["key"], "finish-1")
+
+        event.write_text(json.dumps({"kind": "session_finished", "session_id": "somebody-else", "acceptance": []}), encoding="utf-8")
+        call_count = len(Handler.calls)
+        self.assertEqual(self.invoke("sessions", "finish", "session-1", "--intake-task-id", "task-1", "--file", str(event))[0], 1)
+        self.assertEqual(len(Handler.calls), call_count, "mismatched session evidence never reaches Hub")
+
     def test_session_capture_uses_fenced_command_surface(self):
         code, _ = self.invoke("sessions", "capture", "session-1", "--machine", "test-host", "--key", "capture-1")
         self.assertEqual(code, 0)
@@ -171,6 +217,7 @@ class CliTests(unittest.TestCase):
         })
         saved_config = self.config.read_bytes()
         with patch("agent_hub_host.cli.Journal") as journal, \
+             patch("agent_hub_host.agent.Bridge.strict_wake_supported", return_value=True), \
              patch("agent_hub_host.auth.refresh") as refresh, \
              patch("agent_hub_host.native_launch.shutil.which", return_value=None):
             code, result = self.invoke("heartbeat", "--label", "fleet-cycle", "--aplexer", os.sys.executable)
@@ -183,11 +230,57 @@ class CliTests(unittest.TestCase):
         self.assertEqual(auth, "Bearer synthetic-token")
         self.assertEqual(body["labels"], ["fleet-cycle"])
         self.assertEqual(body["engines"], ["shell"])
-        self.assertEqual(body["capabilities"], ["headless"])
+        expected_shell_modes = "modes:v1:shell:hi" if "interactive" in body["capabilities"][1] or body["capabilities"][1] == "modes:v1:shell:hi" else "modes:v1:shell:h"
+        self.assertIn(body["capabilities"][1], ("modes:v1:shell:hi", "modes:v1:shell:h"))
+        self.assertEqual(body["capabilities"], ["headless", expected_shell_modes, "repo-identity:v1", "workspace-preflight:v1", "session-wakes:strict-inbox:v1"])
         self.assertNotIn("native_sessions", body)
         journal.assert_not_called()
         refresh.assert_not_called()
         self.assertEqual(self.config.read_bytes(), saved_config)
+
+    def test_intake_update_parent(self):
+        code, _ = self.invoke("intake", "update", "0cfeba5e", "--project", "DataTalksClub/website", "--parent", "bf3a67fb", "--key", "p1")
+        self.assertEqual(code, 0)
+        method, path, body, _ = Handler.calls[-1]
+        self.assertEqual((method, urlsplit(path).path), ("PATCH", "/api/intakes/0cfeba5e"))
+        self.assertEqual(parse_qs(urlsplit(path).query)["project"], ["DataTalksClub/website"])
+        self.assertEqual(body, {"key": "p1", "parent_intake_id": "bf3a67fb"})
+
+        code, _ = self.invoke("intake", "update", "0cfeba5e", "--project", "DataTalksClub/website", "--parent", "none", "--key", "p2")
+        self.assertEqual(code, 0)
+        self.assertIsNone(Handler.calls[-1][2]["parent_intake_id"])
+
+    def test_serve_natural_startup_hook_runs_only_for_continuous_serve_and_never_gates(self):
+        save_config(self.config, {
+            "server": f"http://127.0.0.1:{self.server.server_port}",
+            "token": "synthetic-token",
+            "machine_id": "test-machine",
+            "roots": [self.temp.name],
+            "engines": ["shell"],
+        })
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host",
+                   side_effect=RuntimeError("no_helper")) as hook, \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--label", "l1")
+        self.assertEqual(code, 0)
+        hook.assert_called_once_with(["--config", str(self.config), "serve", "--label", "l1"])
+        bridge.return_value.serve.assert_called_once()
+
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host") as hook, \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--once")
+        self.assertEqual(code, 0)
+        hook.assert_not_called()
+        bridge.return_value.drain.assert_called_once()
+
+        with patch("agent_hub_host.quota_natural_exec.maybe_exec_natural_host") as hook, \
+             patch("agent_hub_host.quota_natural_startup.consume_natural_handoff",
+                   side_effect=RuntimeError("bad_fd")), \
+             patch("agent_hub_host.cli.Bridge") as bridge:
+            code, _ = self.invoke("serve", "--alert-handoff-fd", "9")
+        self.assertEqual(code, 0)
+        hook.assert_not_called()
+        bridge.return_value.serve.assert_called_once()
 
 
 if __name__ == "__main__":

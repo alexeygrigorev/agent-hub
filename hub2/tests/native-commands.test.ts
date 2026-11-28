@@ -81,7 +81,7 @@ test('capture result is bounded, sanitized and receipt replay persists across ev
  assert.equal((await f.ack(c,{output:'bounded output\n'})).status,200);
  const reopened=fixture('defer',f.db);const saved=await reopened.view(c.id);assert.equal(saved.ack.capture,'bounded output\n');
  const replay=await reopened.create('capture','cap',{mode:'screen'});assert.equal(replay.status,200);assert.equal((await replay.json() as any).command.id,c.id);
- assert.equal(f.db.prepare('SELECT version FROM hub2_schema').get()!.version,9);f.db.close();
+ assert.equal(f.db.prepare('SELECT version FROM hub2_schema').get()!.version,10);f.db.close();
 });
 test('persisted deadline expires pending independent commands without synthesizing stop; late ACK refused',async()=>{
  const f=await ready(),c=await receipt(f);assert.equal(f.alarm,c.deadline_ms);

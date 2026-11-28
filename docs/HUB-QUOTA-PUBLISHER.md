@@ -10,13 +10,22 @@ labels and a `skipped` mapping. It records an invocation timestamp only for
 published accounts. A skipped account keeps its previous timestamp. Failed,
 malformed or unknown-account receipts cannot refresh any account.
 
+Each successful `grok` publication also mirrors the same measured remaining
+percentage (0 on an explicit provider limit) to `PUT /api/quota/grokbot` with
+source `hub-quota-publish:grok` and ten minutes of validity (bounded by the
+window reset). Dapier reads that export through `GET /api/quota/grokbot`, so it
+stays `fresh=true` while the five-minute timer runs and goes stale, never
+`below_threshold`, within ten minutes of the publisher stopping. The receipt lists
+`grokbot` as published, or as `skipped: quota_report_failed` when only the mirror
+PUT failed; an unmeasured `grok` pool is not mirrored.
+
 These local receipts prove successful CLI publication, not continued Hub quota
 validity, provider credential health, or available quota. No quota percentages,
 provider errors, quse details or tokens enter the helper's output or alert text.
 
 ## Configuration and state
 
-The default expected set is `claude,codex,codex-orin,gemini,grok,copilot,shared-go,zai-central`.
+The default expected set is `claude,codex,gemini,grok,copilot,shared-go,zai-central`.
 Review this against the intended pools before installation. Use the same explicit
 `--accounts` list in both unit overrides if only a subset is expected. Gemini and
 ZAI use labels `gemini` and `zai-central`. Disabled pools are not enabled by this

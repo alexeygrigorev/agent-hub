@@ -197,6 +197,31 @@ class TestSessionControlCli(unittest.TestCase):
                     self.assertEqual(call.args[2]['intake_task_id'], 'task-fixture')
                     self.assertEqual(call.args[2].get('with_goal', False), bool(mode))
 
+    def test_start_sends_short_key_in_body_and_idempotency_header(self):
+        import os
+        captured = {}
+
+        def fake_http_json(req, **_kwargs):
+            captured['method'] = req.get_method()
+            captured['url'] = req.full_url
+            captured['body'] = json.loads(req.data.decode('utf-8'))
+            captured['header_key'] = req.get_header('Idempotency-key')
+            return {'id': 'session-gha-6', 'state': 'offered'}
+
+        with patch.object(session_control.config, 'load_config', return_value={'base_url': 'https://hub.test'}), \
+                patch.dict(os.environ, {'HUB_TOKEN': 'fixture-env-token'}), \
+                patch.object(session_control.api, 'safe_http_json', side_effect=fake_http_json):
+            result = session_control.execute(self.parse(
+                'start', '--repo', 'org/repo', '--machine', 'hetzner-aplexer',
+                '--purpose', 'fix', '--intake-task-id', '20ae035b-a3c9-4779-b7ef-b14c55e34fbf',
+                '--headless', '--key', 'gha-6', '--no-wait', '--prompt', 'fix it',
+            ))
+        self.assertEqual(captured['method'], 'POST')
+        self.assertTrue(captured['url'].endswith('/api/sessions'))
+        self.assertEqual(captured['body']['key'], 'gha-6')
+        self.assertEqual(captured['header_key'], 'gha-6')
+        self.assertEqual(result['client_key'], 'gha-6')
+
     def test_send_capture_stop_payloads(self):
         with patch.object(session_control, 'read_file', return_value='prompt'), \
                 patch.object(session_control, 'request', return_value={}) as transport:
@@ -307,6 +332,22 @@ class TestSessionControlCli(unittest.TestCase):
                 patch.object(session_control.time, 'sleep', return_value=None):
             with self.assertRaisesRegex(ValueError, 'workspace_label_unavailable'):
                 session_control.execute(args)
+
+    def test_start_wait_reports_host_queued_start_as_queued_not_failed(self):
+        # t4016u: a burst start held behind the host launch cap is backpressure.
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-queued', '--wait', '--timeout', '30', '--interval', '1')
+        queued = {'session': {'id': 's-q', 'state': 'offered', 'machine_id': 'h1', 'start_state': 'queued_on_host',
+                              'host_queue': {'state': 'queued'}, 'attention': {'reason': 'host_launch_queued'}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-q', 'state': 'offered'}, queued]), \
+                patch.object(session_control, 'wait_for_session', side_effect=ValueError('Session wait timed out; re-check status')):
+            result = session_control.execute(args)
+        self.assertEqual(result['start_state'], 'queued_on_host')
+        self.assertEqual(result['state'], 'offered')
+        # Without the queued marker a timeout still surfaces as a timeout.
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-x', 'state': 'offered'}, {'session': {'id': 's-x', 'state': 'offered'}}]), \
+                patch.object(session_control, 'wait_for_session', side_effect=ValueError('Session wait timed out; re-check status')):
+            with self.assertRaisesRegex(ValueError, 'timed out'):
+                session_control.execute(self.parse('start', '--workspace', 'demo', '--key', 'k-x', '--wait', '--timeout', '30', '--interval', '1'))
 
     def test_send_wait_ignores_transport_until_correlated_ack(self):
         args = self.parse('send', 's1', '--body-file', 'p.txt', '--key', 'k2', '--wait', '--timeout', '30', '--interval', '1')
@@ -814,7 +855,11 @@ class TestSessionControlCli(unittest.TestCase):
         self.assertEqual(transport.call_args.args[2]['intake_worktree'], 'detached')
         args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
                           '--intake-worktree', 'successor', '--cwd', 'sub/dir', '--key', 'k-bad')
-        with self.assertRaisesRegex(ValueError, 'drop --cwd'):
+        with self.assertRaisesRegex(ValueError, 'successor cannot be combined with --cwd.*Hub plans'):
+            session_control.execute(args)
+        args = self.parse('start', '--no-wait', '--workspace', 'demo', '--intake-task-id', 'task-1',
+                          '--intake-worktree', 'detached', '--cwd', 'sub/dir', '--key', 'k-bad2')
+        with self.assertRaisesRegex(ValueError, 'detached cannot be combined with --cwd.*never resumes'):
             session_control.execute(args)
 
     def test_commands_rendering_shows_waiting_in_inbox_and_reason(self):
@@ -924,6 +969,68 @@ class TestSessionControlCli(unittest.TestCase):
                 patch.object(session_control.time, 'sleep', return_value=None):
             with self.assertRaisesRegex(ValueError, 'stage=admission'):
                 session_control.execute(args)
+
+    def test_start_wait_surfaces_sanitized_host_attention_diagnostics(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-host-diag', '--timeout', '5', '--interval', '1')
+        failed = {'session': {'id': 's-host-diag', 'state': 'failed', 'attention': {
+            'reason': 'workspace_unavailable', 'stage': 'host_launch',
+            'detail': 'Workspace unavailable. Authorization: Bearer private-test-secret '
+                      '\x1b[31mUse the enrolled workspace\x1b[0m\n' + 'x' * 400}}}
+        with patch.object(session_control, 'request', side_effect=[{'id': 's-host-diag'}, failed]), \
+                patch.object(session_control.time, 'sleep', return_value=None):
+            with self.assertRaises(session_control.SessionInputError) as caught:
+                session_control.execute(args)
+        message = session_control.diagnostic(caught.exception)
+        self.assertIn('workspace_unavailable', message)
+        self.assertIn('stage=host_launch', message)
+        self.assertNotIn('detail:', message)
+        self.assertNotIn('Workspace unavailable.', message)
+        self.assertNotIn('Use the enrolled workspace', message)
+        self.assertNotIn('private-test-secret', message)
+        self.assertNotIn('\x1b', message)
+        self.assertLess(len(message), 600)
+
+    def test_start_wait_tolerates_missing_or_malformed_attention_fields(self):
+        args = self.parse('start', '--workspace', 'demo', '--key', 'k-old-host', '--timeout', '5', '--interval', '1')
+        for attention in (
+                {'reason': 'workspace_unavailable'},
+                {'reason': 'workspace_unavailable', 'stage': {'raw': 'credential'}, 'detail': ['secret']},
+                {'reason': 'workspace_unavailable', 'stage': 'bad stage', 'detail': '\x1b[31m'}):
+            failed = {'session': {'id': 's-old-host', 'state': 'failed', 'attention': attention}}
+            with self.subTest(attention=attention), \
+                    patch.object(session_control, 'request', side_effect=[{'id': 's-old-host'}, failed]), \
+                    patch.object(session_control.time, 'sleep', return_value=None):
+                with self.assertRaises(session_control.SessionInputError) as caught:
+                    session_control.execute(args)
+            message = session_control.diagnostic(caught.exception)
+            self.assertIn('workspace_unavailable', message)
+            self.assertNotIn('stage=', message)
+            self.assertNotIn('secret', message)
+
+    def test_start_detail_sanitizer_rejects_raw_dumps_and_bounds_human_text(self):
+        self.assertIsNone(session_control.sanitize_start_detail('raw stderr: private traceback'))
+        self.assertIsNone(session_control.sanitize_start_detail('config={"api_key":"private-test-secret"}'))
+        self.assertIsNone(session_control.sanitize_start_detail('Authorization: Bearer' + chr(0) + ' synthetic-private-token'))
+        self.assertIsNone(session_control.sanitize_start_detail('AWS_SECRET_ACCESS_KEY: synthetic-private-token'))
+        for detail in ('"access_token' + ' ' * 140 + '": "synthetic-private-token"',
+                       '"AWS_SECRET_ACCESS_KEY": "synthetic-private-token"',
+                       '"access_token": "synthetic-private-token"',
+                       "'access_token': 'synthetic-private-token'",
+                       '`access_token`: `synthetic-private-token`',
+                       '"private_key": "synthetic-private-token"',
+                       '"api key": "synthetic-private-token"',
+                       '"access_token ": "synthetic-private-token"',
+                       'https://synthetic-private-token@example.test/repo.git',
+                       'private_key: synthetic-private-token',
+                       'api key: synthetic-private-token'):
+            with self.subTest(detail=detail):
+                self.assertIsNone(session_control.sanitize_start_detail(detail))
+        self.assertIsNone(session_control.sanitize_start_detail('Workspace unavailable.' + chr(27) + '[31m Retry'))
+        safe = session_control.sanitize_start_detail('Workspace unavailable. Retry the enrolled workspace.')
+        self.assertIn('Workspace unavailable.', safe)
+        self.assertIn('Retry the enrolled workspace.', safe)
+        self.assertLessEqual(len(safe), session_control.HOST_START_DETAIL_LIMIT)
+        self.assertEqual(session_control.sanitize_start_detail('x' * 500), 'x' * session_control.HOST_START_DETAIL_LIMIT)
 
     def test_list_table_maps_hub2_session_view_fields(self):
         hub2_rows = [
@@ -1179,3 +1286,145 @@ class TestTargetedCaptureReceipt(unittest.TestCase):
         with patch.object(session_control,'request') as transport:
             with self.assertRaisesRegex(ValueError,'invalid_command_id'):session_control.execute(args)
         transport.assert_not_called()
+
+
+class TestEarlyCaptureBinding(unittest.TestCase):
+    def _parse(self, *argv):
+        return parser().parse_args(['sessions', *argv])
+
+    def _bare_409(self):
+        return session_control.SessionHTTPError(409, code='session_not_running',
+                                                message='Session HTTP request failed with status 409 (session_not_running)')
+
+    def test_bare_409_waits_for_wrapped_claimed_to_running_and_reuses_key(self):
+        views = iter([
+            {'session': {'id': 'sid', 'state': 'claimed'}},
+            {'session': {'id': 'sid', 'state': 'starting'}},
+            {'session': {'id': 'sid', 'state': 'running'}},
+        ])
+        posts = []
+
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                posts.append((path, dict(payload)))
+                if len(posts) == 1:
+                    raise self._bare_409()
+                return {'command_id': 'c1'}
+            self.assertEqual((method, path), ('GET', '/api/sessions/sid'))
+            return next(views)
+
+        ack = {'state': 'acked', 'ack': {'capture': 'ok'}}
+        with patch.object(session_control, 'request', side_effect=fake), \
+                patch.object(session_control.time, 'sleep'), \
+                patch.object(session_control, 'wait_for_command', return_value=ack), \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            result = session_control.execute(self._parse('capture', 'sid', '--key', 'stable-k'))
+        self.assertEqual(len(posts), 2)
+        self.assertEqual([p[0] for p in posts], ['/api/sessions/sid/capture', '/api/sessions/sid/capture'])
+        self.assertEqual([p[1]['key'] for p in posts], ['stable-k', 'stable-k'])
+        self.assertEqual(result['command_wait'], ack)
+        self.assertIn('Session sid is claimed: waiting up to', err.getvalue())
+
+    def test_bare_409_preserves_hub1_flat_envelope_and_pending_true(self):
+        for exc_factory, views in (
+            (self._bare_409, iter([{'state': 'offered'}, {'state': 'claimed'}, {'state': 'running'}])),
+            (lambda: session_control.SessionHTTPError(409, code='session_not_bound', pending=True, state='offered'),
+             iter([{'session': {'state': 'claimed'}}, {'session': {'state': 'running'}}])),
+        ):
+            posts = []
+
+            def fake(method, path, payload=None):
+                if method == 'POST':
+                    posts.append(payload['key'])
+                    if len(posts) == 1:
+                        raise exc_factory()
+                    return {'command_id': 'c2'}
+                return next(views)
+
+            ack = {'state': 'acked', 'ack': {'capture': 'tail'}}
+            with self.subTest(exc=exc_factory), \
+                    patch.object(session_control, 'request', side_effect=fake), \
+                    patch.object(session_control.time, 'sleep'), \
+                    patch.object(session_control, 'wait_for_command', return_value=ack), \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                result = session_control.execute(self._parse('capture', 'sid', '--key', 'k-once'))
+            self.assertEqual(posts, ['k-once', 'k-once'])
+            self.assertEqual(result['command_wait'], ack)
+
+    def test_bare_409_already_running_on_peek_retries_once_without_sleep(self):
+        posts = []
+
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                posts.append(payload['key'])
+                if len(posts) == 1:
+                    raise self._bare_409()
+                return {'command_id': 'c3'}
+            return {'session': {'id': 'sid', 'state': 'running'}}
+
+        ack = {'state': 'acked', 'ack': {'capture': 'live'}}
+        with patch.object(session_control, 'request', side_effect=fake), \
+                patch.object(session_control.time, 'sleep') as sleep, \
+                patch.object(session_control, 'wait_for_command', return_value=ack), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            result = session_control.execute(self._parse('capture', 'sid', '--key', 'k-fast'))
+        self.assertEqual(posts, ['k-fast', 'k-fast'])
+        self.assertEqual(result['command_wait'], ack)
+        sleep.assert_not_called()
+
+    def test_bare_409_preserves_terminal_and_foreign_errors_without_sleep(self):
+        for terminal in ('stopped', 'failed', 'lost', 'refused', 'cancelled'):
+            def fake(method, path, payload=None, st=terminal):
+                if method == 'POST':
+                    raise self._bare_409()
+                return {'session': {'id': 'sid', 'state': st}}
+
+            with self.subTest(terminal=terminal), \
+                    patch.object(session_control, 'request', side_effect=fake) as call, \
+                    patch.object(session_control.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, r'status 409 \(session_not_running\).*reconcile with --key k-term'):
+                    session_control.execute(self._parse('capture', 'sid', '--key', 'k-term'))
+            self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+            sleep.assert_not_called()
+
+        def fake_foreign(method, path, payload=None):
+            if method == 'POST':
+                raise self._bare_409()
+            raise session_control.SessionHTTPError(404, code='session_not_found')
+
+        with patch.object(session_control, 'request', side_effect=fake_foreign) as call, \
+                patch.object(session_control.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError, r'404.*session_not_found.*reconcile with --key k-404'):
+                session_control.execute(self._parse('capture', 'sid', '--key', 'k-404'))
+        self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+        sleep.assert_not_called()
+
+    def test_bare_409_deadline_exhaustion_fails_without_enqueue_or_new_session(self):
+        def fake(method, path, payload=None):
+            if method == 'POST':
+                raise self._bare_409()
+            return {'session': {'id': 'sid', 'state': 'claimed'}}
+
+        clock = [0.0]
+        with patch.object(session_control, 'request', side_effect=fake) as call, \
+                patch.object(session_control.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(session_control.time, 'sleep', side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                patch.object(session_control, 'BIND_WAIT_TIMEOUT', 4.0), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(ValueError, 'session_not_bound; session sid did not reach running'):
+                session_control.execute(self._parse('capture', 'sid', '--key', 'k-timeout'))
+        self.assertEqual(sum(c.args[0] == 'POST' for c in call.call_args_list), 1)
+        self.assertTrue(all('/api/sessions/sid' in c.args[1] for c in call.call_args_list))
+
+    def test_no_wait_and_send_do_not_poll_on_bare_409(self):
+        for argv in (
+            ('capture', 'sid', '--no-wait', '--key', 'k-nowait'),
+            ('send', 'sid', '--prompt', 'hello', '--wait', '--key', 'k-send'),
+        ):
+            with self.subTest(argv=argv), \
+                    patch.object(session_control, 'request', side_effect=self._bare_409()) as call, \
+                    patch.object(session_control.time, 'sleep') as sleep:
+                with self.assertRaisesRegex(ValueError, 'session_not_running'):
+                    session_control.execute(self._parse(*argv))
+            self.assertEqual(call.call_count, 1)
+            sleep.assert_not_called()

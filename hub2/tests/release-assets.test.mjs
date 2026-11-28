@@ -11,8 +11,10 @@ const env = {
   ASSETS: { fetch: async () => { assets++; return new Response('artifact'); } },
   CONTROL: { idFromName: () => 'global', get: () => ({ fetch: async () => Response.json({ error: 'unauthorized' }, { status: 401 }) }) },
 };
-const names = ['host-release.json', 'hub.pyz', 'hub.pyz.sha256', 'manifest.json',
-  'install.sh', 'install.ps1', 'host-install.sh', 'hub2-self-update.py', 'hub2-enroll.py',
+// These immutable matched-release payloads are fetched before a host has credentials.
+const naturalNames = ['agent-hub-quota-dispatcher.pyz', 'hub-quota-publish.py', 'natural-quota-prelude.py'];
+const names = [...naturalNames, 'host-release.json', 'hub.pyz', 'hub.pyz.sha256', 'manifest.json',
+  'install.sh', 'install.ps1', 'host-install.sh', 'host-install.ps1', 'hub2-self-update.py', 'hub2-enroll.py', 'hub_alert_client.py',
   'agent-hub2-host.service', 'agent-hub2-host-update.service', 'agent-hub2-host-update.timer',
   `agent_hub_host_v2-2.0.0+g${'a'.repeat(40)}-py3-none-any.whl`, 'websockets-16.0-py3-none-any.whl'];
 for (const name of names) {
@@ -27,10 +29,42 @@ for (const name of names) {
     assert.equal(assets, before + 2);
   }
 }
-for (const path of ['/cli/private.env', '/cli/%2e%2e/private.env', '/cli/other-1.0.whl', '/cli/agent_hub_host_v2-malformed.whl', '/api/sessions']) {
+// Legacy hosts' dead self-update route now serves the published Hub2 installers (intake 41ef7048).
+{
+  const seen = [];
+  const aliasEnv = { ...env, ASSETS: { fetch: async (request) => { seen.push(new URL(request.url).pathname); return new Response('installer'); } } };
+  for (const [alias, target] of [['/host/install.ps1', '/cli/host-install.ps1'], ['/host/install.sh', '/cli/host-install.sh']]) {
+    for (const method of ['GET', 'HEAD']) {
+      const response = await worker.fetch(new Request('https://hub.example' + alias + '?x=1', { method }), aliasEnv);
+      assert.equal(response.status, 200, method + ' ' + alias);
+      assert.equal(response.headers.get('X-Content-Type-Options'), 'nosniff');
+      assert.equal(seen.at(-1), target);
+    }
+    assert.notEqual((await worker.fetch(new Request('https://hub.example' + alias, { method: 'POST' }), aliasEnv)).status, 200);
+  }
+  for (const path of ['/host/__proto__', '/host/constructor', '/host/install.ps1.bak', '/host/']) {
+    const before = seen.length;
+    assert.notEqual((await worker.fetch(new Request('https://hub.example' + path), aliasEnv)).status, 200, path);
+    assert.equal(seen.length, before, path);
+  }
+}
+for (const path of ['/cli/agent-hub-quota-dispatcher-private.pyz', '/cli/agent-hub-quota-dispatcher.pyz.bak', '/cli/hub-quota-publish.py.bak', '/cli/natural-quota-prelude.py/extra', '/cli/hub_alert_client.py.bak', '/cli/hub_alert_client_private.py', '/cli/hub_alert_client.py/extra', '/cli/private.env', '/cli/%2e%2e/private.env', '/cli/other-1.0.whl', '/cli/agent_hub_host_v2-malformed.whl', '/api/sessions']) {
   const before = assets;
   assert.notEqual((await worker.fetch(new Request('https://hub.example' + path), env)).status, 200);
   assert.equal(assets, before, path);
+  assert.notEqual((await production.fetch(new Request('https://hub.example'+path),
+    {...env,HUB2_RELEASE_MODE:'bootstrap'})).status,200,'bootstrap '+path);
+  assert.equal(assets,before,path+' must not reach static source through bootstrap');
+}
+for (const name of ['hub_alert_client.py', ...naturalNames]) {
+  for (const method of ['POST','PUT','PATCH','DELETE']) {
+    const before = assets;
+    const url = 'https://hub.example/cli/' + name;
+    assert.notEqual((await worker.fetch(new Request(url, {method}), env)).status, 200, method + ' ' + name);
+    assert.equal((await production.fetch(new Request(url, {method}),
+      {...env,HUB2_RELEASE_MODE:'bootstrap'})).status, 503, 'bootstrap ' + method + ' ' + name);
+    assert.equal(assets,before,'release artifact writes never reach static assets');
+  }
 }
 const before = assets;
 assert.notEqual((await worker.fetch(new Request('https://hub.example/cli/host-release.json', { method: 'POST' }), env)).status, 200);
@@ -47,13 +81,19 @@ try {
   const releaseRoot = join(testDir, 'managed');
   const first = `releases/${'a'.repeat(40)}`;
   const second = `releases/${'b'.repeat(40)}`;
+  const missingClient = `releases/${'c'.repeat(40)}`;
   await mkdir(join(publicDir, 'cli'), { recursive: true });
   await writeFile(join(publicDir, 'index.html'), 'dashboard');
   await writeFile(join(publicDir, 'cli/manifest.json'), 'legacy');
   await writeFile(join(publicDir, 'cli/install.sh'), 'legacy installer');
+  await writeFile(join(publicDir, 'cli/hub_alert_client.py'), 'legacy client');
+  for (const name of naturalNames) await writeFile(join(publicDir, 'cli', name), 'legacy ' + name);
+  await mkdir(join(releaseRoot,missingClient),{recursive:true});
   for (const [target, content] of [[first, 'first'], [second, 'second release']]) {
     await mkdir(join(releaseRoot, target), { recursive: true });
     await writeFile(join(releaseRoot, target, 'manifest.json'), content);
+    await writeFile(join(releaseRoot, target, 'hub_alert_client.py'), content+' client');
+    for (const name of naturalNames) await writeFile(join(releaseRoot, target, name), content + ' ' + name);
   }
   const current = join(releaseRoot, 'current');
   const runtime = { ...env, ASSETS: assetFetcher(publicDir, releaseRoot), HUB2_RELEASE_MODE: 'active' };
@@ -64,16 +104,26 @@ try {
     await rename(next, current);
   };
   assert.equal(await (await get('/cli/manifest.json')).text(), 'legacy');
+  assert.equal(await (await get('/cli/hub_alert_client.py')).text(),'legacy client');
   await select(first);
   assert.equal(await (await get('/cli/manifest.json')).text(), 'first');
+  assert.equal(await (await get('/cli/hub_alert_client.py')).text(),'first client');
+  for (const name of naturalNames) assert.equal(await (await get('/cli/' + name)).text(), 'first ' + name);
   assert.equal((await get('/cli/install.sh')).status, 404, 'active release does not mix in legacy assets');
   assert.equal(await (await get('/')).text(), 'dashboard');
   await select(second);
   const asset = await get('/cli/manifest.json');
   assert.equal(await asset.text(), 'second release');
   assert.equal(asset.headers.get('Content-Length'), '14');
+  assert.equal(await (await get('/cli/hub_alert_client.py')).text(),'second release client');
+  for (const name of naturalNames) assert.equal(await (await get('/cli/' + name)).text(), 'second release ' + name);
+  await select(missingClient);
+  assert.equal((await get('/cli/hub_alert_client.py')).status,404,'selected release cannot mix in legacy or prior client');
+  for (const name of naturalNames) assert.equal((await get('/cli/' + name)).status, 404, 'missing current artifact must not fall back: ' + name);
   await select(first);
   assert.equal(await (await get('/cli/manifest.json')).text(), 'first');
+  assert.equal(await (await get('/cli/hub_alert_client.py')).text(),'first client');
+  for (const name of naturalNames) assert.equal(await (await get('/cli/' + name)).text(), 'first ' + name);
   await select('../public/cli');
   assert.equal((await get('/cli/manifest.json')).status, 404, 'unmanaged pointer fails closed');
   await unlink(current);

@@ -18,6 +18,7 @@ concurrency:
 jobs:
   release-tooling:
     name: release-tooling
+    # Kept on GitHub-hosted: the schema-installer tests need passwordless root (sudo -n).
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

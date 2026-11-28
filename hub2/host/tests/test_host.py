@@ -1,4 +1,5 @@
 import json
+import math
 import hashlib
 import io
 import os
@@ -9,20 +10,34 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_hub_host.agent import Bridge, Journal, offer_ack_frame, OfferAcknowledgement
+from agent_hub_host import resource_admission
 from agent_hub_host.client import ApiError, Client, save_config
 from agent_hub_host.cli import main as cli_main
+
+
+STRICT_SEND_HELP = '--strict --enter --expect-tag --expect-workspace --expect-created-at-ms --idempotency-key --deadline-ms'
 
 
 class FakeNative:
     def __init__(self):
         self.calls, self.process, self.fail_send = [], None, False
+        self.help_snapshots = []
 
     def __call__(self, args, **options):
         self.calls.append((args, options))
         command = args[1:]
+        if command == ['send', '--help']:
+            # Feature discovery has no target/text/input and never mutates a worker.
+            if options.get('input') is not None:
+                raise AssertionError('read-only help must not carry input')
+            before = json.loads(json.dumps(self.process))
+            result = subprocess.CompletedProcess(args, 0, STRICT_SEND_HELP, '')
+            self.help_snapshots.append((before, json.loads(json.dumps(self.process))))
+            return result
         if "start" in command[:1]:
             child = args[args.index("--") + 1:]
             tag = args[args.index("--tag") + 1]
@@ -108,8 +123,19 @@ class HostTests(unittest.TestCase):
         auth = patch('agent_hub_host.agent.local_claude_missing_contexts', return_value=[])
         self.auth_observer = auth.start()
         self.addCleanup(auth.stop)
+        # Lifecycle fixtures run against synthetic physical-RAM samples; dedicated
+        # admission tests narrow this holder to exact boundaries. Foreign fixtures
+        # reuse HostTests.setUp and inherit the same synthetic sampler.
+        self.sample_available = [64 * 1024**3]
+        self.bridge.resource_sample = lambda deadline: self.sample_available[0]
 
     def tearDown(self):
+        # This fixture owns the asynchronous census and its thread-local journal.
+        from agent_hub_host.launch_reaper import observation_thread
+        thread = observation_thread(self.bridge)
+        if thread is not None:
+            thread.join(10)
+            self.assertFalse(thread.is_alive(), 'fixture census did not settle before cleanup')
         self.journal.db.close()
         self.temp.cleanup()
 
@@ -152,12 +178,14 @@ class HostTests(unittest.TestCase):
         self.bridge.heartbeat([], include_native_sessions=False)
         self.assertEqual(captured[-1][1], ['claude'])
         flags = captured[-1][2]
-        self.assertIn('interactive:claude', flags)
+        self.assertIn('modes:v1:claude:hi', flags)
+        self.assertNotIn('interactive:claude', flags)  # superseded by the modes declaration
         self.assertIn(self.auth_observer.return_value[0], flags)
         self.assertIn('credentials:local:headless:claude:claude', flags)
         self.assertIn('credentials:local:interactive:claude:claude', flags)
         self.assertLessEqual(len(flags), 32)
         self.auth_observer.return_value *= 2
+        # Leave one auth-observation slot after the complete engine-mode declaration.
         self.bridge.launcher.capabilities = lambda: {'claude': {'headless','interactive', *('cap'+str(i) for i in range(27))}}
         self.bridge.heartbeat([], include_native_sessions=False)
         self.assertEqual(len(captured[-1][2]),32)
@@ -179,6 +207,66 @@ class HostTests(unittest.TestCase):
         self.auth_observer.assert_not_called()
         self.assertFalse(any(flag.startswith('credentials:') for flag in captured[-1][2]))
 
+    def test_full_engine_fleet_keeps_repository_identity_and_qualified_workspaces(self):
+        # Intake a59390a6: hetzner-aplexer with zai/zcodex filled all 32 legacy slots with
+        # engine hints, shed repo-identity:v1 and every workspace:repo-* token, and Hub
+        # refused repo-only starts with 503 repository_workspace_unavailable.
+        from agent_hub_host.native_launch import LOCAL_ROUTES
+        captured = []
+        self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
+        self.bridge.launcher.config = {'routes': {key: dict(value) for key, value in LOCAL_ROUTES.items()}}
+        self.bridge.launcher.managed_claude_readiness = lambda: True
+        self.auth_observer.return_value = []
+        engines = ['antigravity', 'claude', 'codex', 'go', 'shell', 'zai', 'zcodex']
+        full = {'headless', 'interactive', 'effort', 'goal'}
+        self.bridge.engines = set(engines)
+        self.bridge.launcher.capabilities = lambda: {'antigravity': {'headless', 'interactive', 'effort'},
+            'claude': set(full), 'codex': set(full), 'go': {'headless', 'interactive'}, 'shell': {'headless'},
+            'zai': set(full), 'zcodex': set(full)}
+        qualified = 'workspace:repo-' + 'a' * 59
+        class Advertisement:
+            def tags(self):
+                return ['workspace:relay', qualified]
+        self.bridge.advertisement = Advertisement()
+        self.bridge.heartbeat([], include_native_sessions=False)
+        flags = captured[-1][2]
+        legacy = [flag for flag in flags if not flag.startswith('workspace:')]
+        self.assertLessEqual(len(legacy), 32)
+        for marker in ('repo-identity:v1', 'workspace-preflight:v1', 'managed:hub-claude:opus:medium:v1',
+                       'credentials:local:interactive:claude:claude', 'goal:zcodex', 'effort:zai'):
+            self.assertIn(marker, flags)
+        self.assertIn(qualified, flags)
+        self.assertNotIn('workspace:inventory-overflow', flags)
+        for engine in engines:
+            self.assertNotIn('interactive:' + engine, flags)
+        self.assertIn('modes:v1:zcodex:hi', flags)
+        self.assertIn('modes:v1:shell:h', flags)
+
+    def test_optional_wake_negotiation_uses_only_spare_legacy_slots_and_preserves_workspaces(self):
+        probes = []
+        self.bridge.strict_wake_supported = lambda: probes.append(True) or True
+        captured = []
+        self.client.heartbeat = lambda *args, **kwargs: captured.append(args)
+        self.bridge.engines = {'shell'}
+        self.bridge.launcher.capabilities = lambda: {'shell': {'headless'}}
+        workspace = 'workspace:ordinary-existing-root'
+        for count in (27, 28):
+            with self.subTest(resource_tags=count):
+                tags = ['resource-fixture:' + str(i) for i in range(count)]
+                class Advertisement:
+                    def tags(self):
+                        return tags + [workspace]
+                self.bridge.advertisement = Advertisement()
+                before = len(probes)
+                self.bridge.heartbeat([], include_native_sessions=False)
+                self.assertEqual(len(probes)-before, 1 if count == 27 else 0)
+                flags = captured[-1][2]
+                legacy = tags + ['headless', 'modes:v1:shell:h', 'repo-identity:v1', 'workspace-preflight:v1']
+                self.assertEqual(flags, legacy + (['session-wakes:strict-inbox:v1'] if count == 27 else []) + [workspace])
+                self.assertEqual(len([flag for flag in flags if not flag.startswith('workspace:')]), 32)
+                self.assertEqual(captured[-1][1], ['shell'])
+                self.auth_observer.assert_not_called()
+
     def test_known_missing_observation_does_not_gate_explicit_launch_validation(self):
         self.bridge.engines.add('claude')
         self.bridge.launcher.capabilities = lambda: {'claude': {'headless'}}
@@ -197,7 +285,9 @@ class HostTests(unittest.TestCase):
                 offer['session_id'] += '-interactive' if interactive else '-headless'
                 offer['operation_id'] += '-interactive' if interactive else '-headless'
                 offer['launch']['interactive'] = interactive
-                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')):
+                with patch('agent_hub_host.providers.provision', side_effect=AssertionError('central home must not be provisioned')), \
+                     patch('agent_hub_host.native_launch.codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
+                     patch('agent_hub_host.native_launch.NativeLauncher.codex_exec_readiness', return_value={'wrapper': '/synthetic/launch-codex.sh'}):
                     self.bridge.offer(offer)
                 argv, options = next((args, kw) for args, kw in reversed(self.native.calls) if args[1] == 'start')
                 child = argv[argv.index('--') + 1:]
@@ -205,11 +295,15 @@ class HostTests(unittest.TestCase):
                 self.assertNotIn('CLAUDE_CONFIG_DIR=', ' '.join(argv))
                 self.assertNotIn('HUB2_LAUNCH_CONTEXT', options['env'])
                 if interactive:
-                    self.assertEqual(child[0], 'codex')
+                    self.assertEqual(child[0], '/synthetic/launch-codex.sh')
                     self.assertNotIn('exec', child)
                 else:
-                    self.assertIn('task', child); self.assertIn('run', child)
-                    self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+                    # Local headless Codex uses the native login through the wrapper,
+                    # never the legacy managed profile home (exit-75 regression).
+                    self.assertEqual(child[0], '/synthetic/launch-codex.sh')
+                    self.assertIn('exec', child)
+                    self.assertNotIn('--profile', child)
+                    self.assertNotIn('hub-shared-codex', ' '.join(argv))
 
     def test_existing_journal_schema_adds_persistent_runtime_deadline(self):
         path=self.root/'legacy-journal.sqlite'
@@ -325,7 +419,8 @@ class HostTests(unittest.TestCase):
         state = self.root / 'origin-native-state'
         retired = state / 'retired-sessions' / row['native_id']
         retired.mkdir(parents=True, mode=0o700, exist_ok=True)
-        now = int(time.time()*1000)
+        # Model a terminal instant not earlier than the fractional host manifest.
+        now = max(int(time.time()*1000), math.ceil(manifest['native_started_at']*1000))
         (retired / 'tombstone.json').write_text(json.dumps({'id': row['native_id'], 'tag': row['tag'],
             'workspace': str(self.root / 'different-cwd'), 'created_at_ms': manifest['created_at_ms'],
             'cause': 'finished', 'containment_empty': True, 'finished_at_ms': now,
@@ -335,8 +430,27 @@ class HostTests(unittest.TestCase):
         self.native.process = None
         with self.journal.db:
             self.journal.db.execute('DELETE FROM outbox')
+            # Fixture journal surgery removes the settled launch row; its
+            # admission reservation goes with it exactly as a release would.
+            self.journal.db.execute('DELETE FROM resource_reservations')
         self.native.calls.clear()
         return row, manifest, retired
+
+    def test_origin_retirement_same_millisecond_fixture_preserves_ordering_guard(self):
+        # Native receipts use integer milliseconds; the host manifest uses
+        # fractional seconds. No real sleep is needed to model ordered evidence.
+        with patch.object(time, 'time', return_value=1794600000.0005):
+            row, manifest, retired = self.origin_retirement_fixture()
+            expected = dict(row)
+            proof = self.bridge.launcher.retired_origin(row['native_id'], expected)
+            self.assertIsNotNone(proof)
+            self.assertEqual(proof['exit']['code'], 127)
+            tombstone_path = retired / 'tombstone.json'
+            tombstone = json.loads(tombstone_path.read_text())
+            # Genuine before-start evidence must still be rejected.
+            tombstone['exit']['exited_at_ms'] = math.floor(manifest['native_started_at']*1000)
+            tombstone_path.write_text(json.dumps(tombstone))
+            self.assertIsNone(self.bridge.launcher.retired_origin(row['native_id'], expected))
 
     def test_reconcile_origin_retirement_preserves_failed_exit_without_native_effects(self):
         row, manifest, retired = self.origin_retirement_fixture()
@@ -511,7 +625,7 @@ class HostTests(unittest.TestCase):
         offer = {"operation_id": "operation-1", "session_id": "session-1", "epoch": 1,
                  'intake_id':'intake-1','project_id':'org/repo',
                  "expires_at": time.time() * 1000 + 60000,
-                 "launch": {"workspace": str(self.root), "engine": "codex", "model": "test-model",
+                 "launch": {"purpose": "review", "workspace": str(self.root), "engine": "codex", "model": "test-model",
                                  "prompt": "Print hello; $(do not interpret as shell)", "interactive": False}}
         offer.update(changes)
         return offer
@@ -680,6 +794,13 @@ class HostTests(unittest.TestCase):
         self.assertEqual(dict(self.journal.db.execute('SELECT * FROM outbox').fetchone()), receipt)
         self.assertEqual(tuple(self.journal.db.execute('SELECT * FROM outbox_dead_letters').fetchone()), unrelated)
         self.assertEqual(self.native.calls, calls)
+
+    def test_server_refusal_fails_the_claim_wait_immediately(self):
+        acknowledgement = OfferAcknowledgement(None)
+        acknowledgement.reject({'type': 'error', 'error': 'invalid_workspace_binding'})
+        self.assertEqual(acknowledgement.rejection, 'invalid_workspace_binding')
+        with self.assertRaisesRegex(RuntimeError, 'claim_ack_unverified'):
+            acknowledgement.wait(60)
 
     def test_binding_echo_is_required_only_for_historical_repair_not_fresh_starts(self):
         recovery, receipt = self.legacy_label_finished()
@@ -865,7 +986,22 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.calls, [])
         receipt = self.journal.db.execute("SELECT payload FROM outbox").fetchone()
         self.assertEqual(json.loads(receipt[0]), {"operation_id": offer["operation_id"], "epoch": offer["epoch"],
-                                                "native_id": None, "launch_failed": True, "no_dispatch": True})
+                                                "native_id": None, "launch_failed": True, "no_dispatch": True,
+                                                "failure_reason": "native_dispatch_not_started",
+                                                "detail": "Native launch did not start."})
+
+    def test_preflight_workspace_checks_missing_and_outside_paths(self):
+        missing = self.root / "does-not-exist"
+        self.assertEqual(
+            self.bridge.preflight_workspace(str(missing)),
+            {"ok": False, "reason": "workspace_unavailable", "detail": "path does not exist; Hub will not create it"},
+        )
+        outside = self.root.parent
+        self.assertEqual(
+            self.bridge.preflight_workspace(str(outside)),
+            {"ok": False, "reason": "workspace_outside_allowlist", "detail": "workspace is outside enrolled roots"},
+        )
+        self.assertEqual(self.bridge.preflight_workspace(str(self.root)), {"ok": True})
 
     def test_adapter_preparation_throttle_keeps_budget_pause_and_dispatch_proof(self):
         offer = self.offer()
@@ -982,6 +1118,79 @@ class HostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fence"):
             self.bridge.command({**command, "id": "command-2", "epoch": 2})
 
+    def observe(self, frames, **kw):
+        import types
+        frames = iter(frames)
+        def native(*args, **kwargs):
+            frame = next(frames)
+            if isinstance(frame, Exception):
+                raise frame
+            return types.SimpleNamespace(stdout=frame)
+        with patch.object(self.bridge, 'native', side_effect=native):
+            return self.bridge.observe_input_queue('n1', window_seconds=kw.get('window', 0.05), poll_seconds=0.001)
+
+    def test_observe_input_queue_is_tristate_and_never_fails_open(self):
+        queued = 'busy\nalt+m to send immediately\nPress up to edit queued messages\n'
+        repeat = lambda frame: [frame] * 200
+        self.assertEqual(self.observe(['Ready\n', 'Ready\n']), 'clear')
+        self.assertEqual(self.observe(repeat(queued)), 'queued')
+        # Reviewer repro: empty first frame, then the queued frame, must not be read as clear.
+        self.assertEqual(self.observe(['', queued] + repeat(queued)), 'queued')
+        # Capture failure, empty frames or one lone clear frame are uncertain, never clear.
+        self.assertEqual(self.observe(repeat(OSError('boom'))), 'unknown')
+        self.assertEqual(self.observe(repeat('   \n')), 'unknown')
+        self.assertEqual(self.observe(['Ready\n', OSError('x')] + repeat(OSError('x'))), 'unknown')
+        # A marker between clear frames resets the clear streak.
+        self.assertEqual(self.observe(['Ready\n', queued, 'Ready\n'] + repeat(queued)), 'queued')
+
+    def test_flush_queued_input_sends_alt_m_once_and_reobserves(self):
+        import types
+        for after, expected in (('Ready\n', 'clear'), ('alt+m to send immediately\n', 'queued')):
+            calls = []
+            def native(*args, **kwargs):
+                calls.append(args)
+                return types.SimpleNamespace(stdout=after if args[0] == 'capture' else '')
+            with patch.object(self.bridge, 'native', side_effect=native), patch.object(
+                    type(self.bridge), 'observe_input_queue', return_value=expected):
+                self.assertEqual(self.bridge.flush_queued_input('n1'), expected)
+            self.assertEqual(calls[0], ('send', 'n1', '--hex', '1b6d'))
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertEqual(self.bridge.flush_queued_input('n1'), 'unknown')
+
+    def interactive_send(self, observations):
+        offer = self.offer()
+        offer['launch']['interactive'] = True
+        self.bridge.offer(offer)
+        with patch.object(self.bridge, 'wait_until_ready', return_value=True), \
+                patch.object(self.bridge, 'observe_input_queue', side_effect=list(observations)), \
+                patch.object(self.bridge, 'flush_queued_input', return_value=observations[-1] if len(observations) > 1 else 'unknown'):
+            return self.bridge.command({"id": "send-q", "session_id": "session-1", "epoch": 1, "kind": "send", "text": "hello"})
+
+    def test_command_reports_delivery_only_when_submission_is_observed(self):
+        # Command-level regression for the reviewed fail-open (intake 42b42c9b).
+        self.assertEqual(self.interactive_send(['clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_queued_text_is_a_typed_negative_not_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'queued']),
+                         {'error': 'native_input_queued', 'reason': 'native_input_queued'})
+
+    def test_command_flush_that_submits_the_queued_text_is_delivery(self):
+        self.assertEqual(self.interactive_send(['queued', 'clear']), {'delivery': 'native_acknowledged'})
+
+    def test_command_unreadable_screen_after_send_is_uncertain_not_delivery(self):
+        self.assertEqual(self.interactive_send(['unknown']),
+                         {'error': 'command_outcome_uncertain', 'reason': 'command_outcome_uncertain'})
+
+    def test_send_waits_for_the_running_turn_to_finish_before_typing(self):
+        import types
+        screens = iter(['Working... esc to interrupt\n', 'Working... esc to interrupt\n', 'Ready\n'])
+        with patch.object(self.bridge, 'native', side_effect=lambda *a, **k: types.SimpleNamespace(stdout=next(screens))):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=5, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', return_value=types.SimpleNamespace(stdout='esc to interrupt')):
+            self.assertFalse(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+        with patch.object(self.bridge, 'native', side_effect=OSError('x')):
+            self.assertTrue(self.bridge.wait_until_ready('n1', max_seconds=0.05, poll_seconds=0.01))
+
     def test_headless_send_is_refused_without_native_effect(self):
         self.bridge.offer(self.offer())
         with self.assertRaisesRegex(ValueError, "headless"):
@@ -1013,12 +1222,38 @@ class HostTests(unittest.TestCase):
         offer = self.offer()
         offer["launch"]["interactive"] = True
         self.bridge.offer(offer)
+        self.journal.flush(self.client)  # Only the fixture's actual launch receipts.
         command = {"id": "uncertain-command", "session_id": "session-1", "epoch": 1, "kind": "send", "text": "hello"}
-        self.bridge.command(command)
-        with self.journal.db:
-            self.journal.db.execute("UPDATE commands SET state='executing',result=NULL WHERE id=?", (command["id"],))
-        with self.assertRaisesRegex(RuntimeError, "uncertain"):
-            self.bridge.command(command)
+        # Interrupt after the real fake-native input, before receipt persistence.
+        # The original executing transaction must survive; no synthetic ACK row.
+        with patch.object(self.bridge,'finish_command',side_effect=RuntimeError('synthetic crash before receipt')):
+            with self.assertRaisesRegex(RuntimeError,'synthetic crash before receipt'):
+                self.bridge.command(command)
+        row=self.journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+        self.assertEqual(row['state'],'executing');self.assertIsNone(row['result'])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
+        negative={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+        self.assertEqual(self.bridge.command(command),negative)
+        frames=[]
+        class Socket:
+            def send(inner,value):
+                with sqlite3.connect(self.journal.path) as db:
+                    self.assertEqual(db.execute('SELECT state FROM commands WHERE id=?',(command['id'],)).fetchone()[0],'done')
+                frames.append(json.loads(value))
+        for _ in range(2):
+            self.bridge.dispatch({'type':'session.command','command':command},Socket(),None)
+        self.assertEqual(len(frames),2);self.assertEqual(frames[0],frames[1])
+        launch=self.journal.db.execute('SELECT * FROM launches WHERE session_id=?',(command['session_id'],)).fetchone()
+        self.assertEqual(frames[0],{'type':'host.error','stage':'host_command','reason':'command_outcome_uncertain',
+            'session_id':command['session_id'],'message_id':command['id'],'epoch':command['epoch'],
+            'operation_id':launch['operation_id'],'native_id':launch['native_id'],'command_kind':'send','command_state':'done'})
+        row=self.journal.db.execute('SELECT * FROM commands WHERE id=?',(command['id'],)).fetchone()
+        self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),negative)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(launch['state'],'running');self.assertEqual(launch['native_id'],self.native.process['id'])
+        with self.assertRaisesRegex(ValueError,'command_id_conflict'):
+            self.bridge.command({**command,'text':'foreign input'})
         self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
 
     def test_socket_reconnect_replayed_command_executes_once_before_and_after_ack_loss(self):
@@ -1063,7 +1298,17 @@ class HostTests(unittest.TestCase):
         with patch("agent_hub_host.agent.time.sleep"), self.assertRaises(StopServe):
             self.bridge.serve("machine-1", [])
         self.assertEqual(len(connections), 3)
-        self.assertEqual(sum(call[1] == "send" for call, _ in self.native.calls), 1)
+        probes = [(call, options) for call, options in self.native.calls if call[1:] == ['send', '--help']]
+        business_sends = [(call, options) for call, options in self.native.calls
+                          if call[1] == 'send' and call[1:] != ['send', '--help']]
+        self.assertEqual(len(business_sends), 1)
+        self.assertEqual(len(probes), 1 if os.sys.platform == 'linux' else 0)
+        for call, options in probes:
+            self.assertEqual(call[1:], ['send', '--help'])
+            self.assertIsNone(options.get('input'))
+        self.assertEqual(len(self.native.help_snapshots), len(probes))
+        for before, after in self.native.help_snapshots:
+            self.assertEqual(before, after)
         self.assertEqual(self.journal.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
     def test_bad_application_event_reports_hold_without_dropping_other_work(self):
@@ -1130,7 +1375,8 @@ class HostTests(unittest.TestCase):
                 self.insert_orphan_launch(session, operation, 7, state)
                 result = self.bridge.command({"id": command_id, "session_id": session, "epoch": 7, "kind": "stop"})
                 self.assertEqual(result, {"stopped": False, "error": "stop_unconfirmed",
-                                          "reason": "stop_unconfirmed", "stage": "host_stop"})
+                                          "reason": "stop_unconfirmed", "stage": "host_stop",
+                                          "native_control_stage":"stop_status", "native_control_error":"unavailable"})
                 self.assertFalse(any(args[1] == "kill" for args, _ in self.native.calls))
                 self.journal.flush(self.client)
                 self.assertIn(("POST", f"/api/sessions/{session}/commands/{command_id}/ack?safety=operator_stop",
@@ -1222,9 +1468,19 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.native.process["phase"], "running")
         self.assertEqual([args[1:] for args, _ in self.native.calls], [['list', '--all', '--json']])
 
+    def reconcile_with_census(self):
+        """Census runs off the control loop; wait for its single worker, never in production."""
+        from agent_hub_host.launch_reaper import observation_thread
+        self.bridge.reconcile()
+        thread = observation_thread(self.bridge)
+        if thread is not None:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.bridge.reconcile()
+
     def test_reconcile_closes_legacy_launch_with_unconfirmed_failure(self):
         self.insert_orphan_launch()
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         state = self.journal.db.execute(
             "SELECT state FROM launches WHERE session_id='session-orphan'").fetchone()[0]
         self.assertEqual(state, "launch_failed_unconfirmed")
@@ -1260,7 +1516,7 @@ class HostTests(unittest.TestCase):
         with self.journal.db:
             self.journal.db.execute('UPDATE launches SET workspace=?', (str(workspace),))
         workspace.rmdir()
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         row = self.journal.db.execute('SELECT state,legacy_failure_json FROM launches').fetchone()
         self.assertEqual(row['state'], 'launch_failed_unconfirmed')
         self.assertEqual(json.loads(row['legacy_failure_json'])['evidence']['workspace'], str(workspace))
@@ -1293,7 +1549,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
         with self.journal.db:
             self.journal.db.execute("UPDATE launches SET tag='wrong-tag'")
-        self.bridge.reconcile()
+        self.reconcile_with_census()
         self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
 
     def test_legacy_resolution_cas_preserves_native_binding_and_inflight_attempt(self):
@@ -1414,9 +1670,421 @@ class HostTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "{}\n")
         self.assertEqual(self.client.calls, [("GET", "/api/status", None, None)])
 
+    def test_session_offer_failure_reports_named_cause_and_detail(self):
+        sent = []
+        class Socket:
+            def send(self, value):
+                sent.append(json.loads(value))
+        missing = self.root / "does-not-exist"
+        offer = self.offer(session_id="sess-missing-ws", operation_id="op-missing-ws:0")
+        offer["launch"]["workspace"] = str(missing)
+        with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+            self.bridge.dispatch({"type": "session.offer", "offer": offer}, Socket(), None)
+        self.assertEqual(sent[-1]["type"], "host.error")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["reason"], "workspace_unavailable")
+        self.assertEqual(sent[-1]["epoch"], offer["epoch"])
+        self.assertEqual(sent[-1]["detail"], "path does not exist; Hub will not create it")
+        self.assertNotIn(str(missing), json.dumps(sent[-1]))
+
+        with patch("agent_hub_host.agent.prepare_workspace",
+                   side_effect=ValueError("implement_worktree_branch_in_use worktree=/wt/stale lock_session=dead-1")):
+            offer2 = self.offer(session_id="sess-wt-in-use", operation_id="op-wt-in-use:0")
+            with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+                self.bridge.dispatch({"type": "session.offer", "offer": offer2}, Socket(), None)
+        self.assertEqual(sent[-1]["reason"], "implement_worktree_branch_in_use")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["detail"], "Workspace intake branch is in use by another worktree.")
+        self.assertNotIn("/wt/stale", json.dumps(sent[-1]))
+        self.assertNotIn("dead-1", json.dumps(sent[-1]))
+
+        # DESKTOP-FP4OP26 (intake 2699b8d7): the real host error must reach the
+        # session instead of the generic "Host operation failed.".
+        with patch("agent_hub_host.agent.prepare_workspace",
+                   side_effect=ValueError("implement_worktree_git_failed operation=rev-parse exit_code=128")):
+            offer3 = self.offer(session_id="sess-git-failed", operation_id="op-git-failed:0")
+            with self.assertLogs("agent_hub_host.agent", level="ERROR"):
+                self.bridge.dispatch({"type": "session.offer", "offer": offer3}, Socket(), None)
+        self.assertEqual(sent[-1]["reason"], "implement_worktree_git_failed")
+        self.assertEqual(sent[-1]["stage"], "host_launch")
+        self.assertEqual(sent[-1]["detail"], "Workspace git operation failed. (operation=rev-parse exit_code=128)")
+
+    def test_validate_launch_unwraps_missing_implement_worktree_to_parent_checkout(self):
+        from agent_hub_host.implement_workspace import _identity_and_ref
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        _, digest, _ = _identity_and_ref("intake-1", "org/repo")
+        worktree = checkout / ".local" / "hub-worktrees" / digest
+        offer = self.offer(session_id="sess-unwrap", operation_id="op-unwrap:0")
+        offer["intake_id"] = "intake-1"
+        offer["project_id"] = "org/repo"
+        offer["launch"]["purpose"] = "implement"
+        offer["launch"]["workspace"] = str(worktree)
+        self.assertEqual(self.bridge.validate_launch(offer)["workspace"], str(checkout.resolve()))
+
+        offer["launch"]["purpose"] = "review"
+        with self.assertRaisesRegex(ValueError, "workspace_unavailable"):
+            self.bridge.validate_launch(offer)
+
+        offer["launch"]["purpose"] = "implement"
+        offer["launch"]["workspace"] = str(checkout / ".local" / "hub-worktrees" / ("0" * 64))
+        with self.assertRaisesRegex(ValueError, "workspace_unavailable"):
+            self.bridge.validate_launch(offer)
+
+    def test_is_session_dead_checks_journal_and_api(self):
+        with self.journal.db:
+            self.journal.db.execute(
+                "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,interactive,state) "
+                "VALUES('op-dead','dead-local',1,'d','/w','t',0,'exited')"
+            )
+            self.journal.db.execute(
+                "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,interactive,state) "
+                "VALUES('op-live','live-local',1,'d','/w','t',0,'running')"
+            )
+        self.assertTrue(self.bridge.is_session_dead("dead-local"))
+        self.assertFalse(self.bridge.is_session_dead("live-local"))
+        with patch.object(self.client, "request", return_value={"session": {"state": "failed"}}):
+            self.assertTrue(self.bridge.is_session_dead("remote-failed"))
+        with patch.object(self.client, "request", return_value={"session": {"state": "running"}}):
+            self.assertFalse(self.bridge.is_session_dead("remote-running"))
+        with patch.object(self.client, "request", side_effect=ApiError("not found", status=404)):
+            self.assertTrue(self.bridge.is_session_dead("remote-404"))
+        with patch.object(self.client, "request", side_effect=ApiError("unavailable", status=503)):
+            self.assertFalse(self.bridge.is_session_dead("remote-503"))
+
+
+    def test_launch_privacy_closed_typed_codes_and_hostile_exception(self):
+        from agent_hub_host.agent import closed_host_failure
+        class Hostile(RuntimeError):
+            def __str__(self):
+                raise AssertionError('must never stringify private error')
+        for error in [RuntimeError('opaque_secret'), ValueError('opaque_secret path=/PRIVATE/prompt'),
+                      TypeError('PRIVATE credential prompt'), Hostile('PRIVATE'),
+                      RuntimeError({'private': 'PRIVATE'})]:
+            fields = self.bridge._undispatched_failure_fields(error)
+            self.assertEqual(fields, {'failure_reason':'native_dispatch_not_started',
+                                     'detail':'Native launch did not start.'})
+            reason, detail = closed_host_failure(error)
+            self.assertEqual(reason, 'host_operation_failed')
+            self.assertRegex(detail, r'^Host operation failed\. \(error_class=[a-z_]+\)$')
+            self.assertNotIn('PRIVATE', detail)
+        self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('workspace_unavailable')),
+                         {'failure_reason':'workspace_unavailable','detail':'path does not exist; Hub will not create it'})
+        self.assertEqual(closed_host_failure(ApiError('PRIVATE',code='provider_auth_failed')),
+                         ('provider_auth_failed','Provider credential preparation was refused.'))
+        for code in ['headless_effort_unsupported','implement_worktree_path_untrusted']:
+            self.assertEqual(closed_host_failure(ValueError(code)), (code,'Launch preparation was refused.'))
+        self.assertEqual(self.bridge._undispatched_failure_fields(None), {})
+        # Typed refusals with parameters keep their code and only closed facts
+        # (fail loudly, intake 2699b8d7); paths and free text are dropped.
+        self.assertEqual(closed_host_failure(ValueError('workspace_unavailable path=/PRIVATE/prompt')),
+                         ('workspace_unavailable','path does not exist; Hub will not create it'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=rev-parse exit_code=128')),
+                         ('implement_worktree_git_failed','Workspace git operation failed. (operation=rev-parse exit_code=128)'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_git_failed operation=PRIVATE reason=timeout')),
+                         ('implement_worktree_git_failed','Workspace git operation failed.'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_owner_conflict worktree=C:/PRIVATE')),
+                         ('implement_worktree_owner_conflict','Launch preparation was refused.'))
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_locked worktree=/PRIVATE lock=x')),
+                         ('implement_worktree_locked','Workspace intake worktree is locked.'))
+        # Free text after a path never supplies facts (review of PR 728).
+        self.assertEqual(closed_host_failure(ValueError('implement_worktree_locked worktree=C:/Some User/wt lock=x reason=injected status=injected')),
+                         ('implement_worktree_locked','Workspace intake worktree is locked.'))
+        self.assertEqual(self.bridge._undispatched_failure_fields(ValueError('implement_worktree_git_failed operation=fetch exit_code=1')),
+                         {'failure_reason':'implement_worktree_git_failed',
+                          'detail':'Workspace git operation failed. (operation=fetch exit_code=1)'})
+
+    def test_launch_privacy_actual_undispatched_receipt_has_no_private_payload(self):
+        class Hostile(RuntimeError):
+            def __str__(self):raise AssertionError('no coercion')
+        for index, error in enumerate([TypeError('PRIVATE /secret/path prompt body'),
+                                      RuntimeError('opaque_secret'), Hostile('PRIVATE')]):
+            offer=self.offer(session_id='privacy-'+str(index),operation_id='privacy-op-'+str(index))
+            with patch.object(self.bridge.launcher, 'launch', side_effect=error):
+                self.assertIsNone(self.bridge.offer(offer,None))
+            row=self.journal.db.execute('SELECT payload FROM outbox WHERE key LIKE ?',
+                                       ('no-dispatch:'+offer['operation_id']+':%',)).fetchone()
+            payload=json.loads(row[0])
+            self.assertEqual(payload['failure_reason'],'native_dispatch_not_started')
+            self.assertEqual(payload['detail'],'Native launch did not start.')
+            self.assertTrue(payload['no_dispatch']);self.assertIsNone(payload['native_id'])
+            self.assertNotIn('PRIVATE',row[0]);self.assertNotIn('opaque_secret',row[0])
+        self.assertEqual(self.native.calls,[])
+
+    def test_launch_privacy_dispatch_socket_never_formats_hostile_error(self):
+        class Hostile(RuntimeError):
+            def __str__(self):raise AssertionError('no coercion')
+        sent=[]
+        class Socket:
+            def send(self,value):sent.append(json.loads(value))
+        offer=self.offer()
+        with patch.object(self.bridge,'offer',side_effect=Hostile('PRIVATE /secret/path prompt')):
+            with self.assertLogs('agent_hub_host.agent',level='ERROR'):
+                self.bridge.dispatch({'type':'session.offer','offer':offer},Socket(),None)
+        self.assertEqual(sent[-1]['reason'],'host_operation_failed')
+        self.assertEqual(sent[-1]['stage'],'host_launch')
+        self.assertEqual(sent[-1]['detail'],'Host operation failed. (error_class=runtime_error)')
+        self.assertNotIn('PRIVATE',json.dumps(sent))
+
+    # --- Same-journal pre-dispatch physical RAM admission (intake 111b251b). ---
+
+    def reservations(self):
+        return [tuple(row) for row in self.journal.db.execute(
+            'SELECT operation_id,session_id,epoch,native_id,allowance_bytes FROM resource_reservations')]
+
+    def exact_headroom(self, spare):
+        # Physical sample = floor + one new allowance + spare bytes above it.
+        self.sample_available[0] = (resource_admission.RESERVED_FLOOR_BYTES
+                                    + resource_admission.DEFAULT_ALLOWANCE_BYTES + spare)
+
+    def quiet_census(self):
+        # Registry observation stays synthetic-empty so admission mechanics
+        # tests make no census-related native calls of their own and every
+        # other attempt keeps its full conservative allowance.
+        self.bridge.launcher.raw_census_response = lambda: '[]'
+
+    def test_admission_samples_physical_ram_and_binds_reservation_before_dispatch(self):
+        self.exact_headroom(4096)  # exactly floor + one allowance + spare passes
+        self.bridge.offer(self.offer())
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        argv = next(args for args, _ in self.native.calls if args[1] == 'start')
+        self.assertEqual(argv[argv.index('--memory') + 1], '1500M')
+        self.assertEqual(argv[argv.index('--pids') + 1], '256')
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('running', 1))
+        native_id = self.native.process['id']
+        self.assertEqual(self.reservations(), [('operation-1', 'session-1', 1, native_id,
+                                                resource_admission.DEFAULT_ALLOWANCE_BYTES)])
+
+    def test_admission_refuses_one_byte_short_and_settles_no_dispatch(self):
+        self.exact_headroom(-1)  # one byte below the floor+allowance headroom
+        self.quiet_census()
+        self.bridge.admission_backpressure_seconds = 0  # the refusal itself, without the burst wait
+        self.assertIsNone(self.bridge.offer(self.offer()))
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        self.assertEqual(self.reservations(), [])
+        receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertTrue(receipt['no_dispatch'])
+        self.assertEqual(receipt['failure_reason'], 'host_launch_queue_full')
+        self.assertEqual(receipt['detail'], 'Launch preparation was refused.')
+
+    def test_ram_headroom_refusal_waits_reports_queued_and_launches_when_headroom_frees(self):
+        # t4016u: a burst exhausts RAM headroom; the start waits (reported as
+        # queued on the host) and launches once reservations settle, instead of
+        # failing the intake as host_launch_queue_full.
+        self.exact_headroom(-1)
+        self.quiet_census()
+        frames, samples = [], []
+        self.bridge._managed_socket = SimpleNamespace(send=lambda raw: frames.append(json.loads(raw)))
+        def sample(deadline):
+            samples.append(1)
+            if len(samples) >= 3:
+                self.exact_headroom(4096)
+            return self.sample_available[0]
+        self.bridge.resource_sample = sample
+        with patch('agent_hub_host.agent.ADMISSION_RETRY_SECONDS', 0.01):
+            native = self.bridge.offer(self.offer())
+        self.assertIsNotNone(native)
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        self.assertEqual(tuple(self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()), ('running', 1))
+        queued = [frame for frame in frames if frame['type'] == 'offer_queued']
+        self.assertEqual(queued[0]['session_id'], 'session-1')
+        self.assertEqual(queued[0]['cause'], 'ram_headroom')
+        self.assertFalse(any('host_launch_queue_full' in row[0] for row in
+                             self.journal.db.execute('SELECT payload FROM outbox').fetchall()))
+
+    def test_malformed_worker_caps_refuse_launch_without_clamping(self):
+        for memory_mb, pids in ((1501, 256), (1500, 257), (True, 256), ('1500', 256), (0, 256)):
+            with self.subTest(memory_mb=memory_mb, pids=pids):
+                self.bridge.launcher.config['memory_mb'] = memory_mb
+                self.bridge.launcher.config['pids'] = pids
+                self.assertIsNone(self.bridge.offer(self.offer()))
+                self.assertEqual(self.native.calls, [])
+                row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+                self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+                receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+                self.assertEqual(receipt['failure_reason'], 'launcher_capability_unavailable')
+                self.assertEqual(self.reservations(), [])
+                with self.journal.db:
+                    self.journal.db.execute('DELETE FROM launches')
+                    self.journal.db.execute('DELETE FROM outbox')
+
+    def test_sampler_failure_refuses_truthfully_without_marker_or_reservation(self):
+        self.quiet_census()
+        def broken(deadline):
+            raise RuntimeError('host_operation_failed')
+        self.bridge.resource_sample = broken
+        self.assertIsNone(self.bridge.offer(self.offer()))
+        self.assertEqual(self.native.calls, [])
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        receipt = json.loads(self.journal.db.execute('SELECT payload FROM outbox').fetchone()[0])
+        self.assertEqual(receipt['failure_reason'], 'host_operation_failed')
+        self.assertEqual(self.reservations(), [])
+
+    def test_expired_dispatch_permit_refuses_spawn_and_keeps_uncertain_custody(self):
+        self.exact_headroom(4096)
+        # The committed permit's original deadline is already past when the
+        # launcher re-checks it: no fresh window starts after the census or
+        # the sample, and the read-only refusal keeps marker-1 custody held.
+        import time as _time
+        real_permit = resource_admission.DispatchPermit
+
+        def expired_permit(operation_id, session_id, epoch, permit_deadline):
+            return real_permit(operation_id, session_id, epoch,
+                               permit_deadline=_time.monotonic() - 1)
+
+        with patch.object(resource_admission, 'DispatchPermit', expired_permit):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                self.bridge.offer(self.offer())
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        row = self.journal.db.execute('SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('aborting', 1, None))
+        self.assertEqual(len(self.reservations()), 1)  # uncertain custody: held, never refunded
+
+    def permit_expiry_crossing_control(self, fire_sql):
+        # Actual NativeLauncher path under a synthetic resource_admission
+        # clock: admission commits with the original 100+30 deadline, the
+        # entry expiry check passes, and the armed journal proxy consumes the
+        # remaining budget during verify_permit's final state/STOP SQL reads
+        # (never during the in-transaction admission reads). The runner must
+        # not be called; committed marker-1 custody and the reservation stay
+        # held and a replay never blindly re-executes or refunds.
+        clock = {'value': 100.0}
+        fake_time = SimpleNamespace(monotonic=lambda: clock['value'], time=time.time, sleep=time.sleep)
+        real_journal = self.bridge.launcher.journal
+        armed = {'on': False}
+        verify_sql = ('SELECT state FROM launches WHERE operation_id=?'
+                      if 'state' in fire_sql else
+                      'SELECT 1 FROM stop_fences WHERE session_id=? AND epoch>=?')
+
+        class CrossingJournal:
+            @property
+            def db(self):
+                return self
+
+            def execute(self, sql, *args, **kwargs):
+                if armed['on'] and not real_journal.db.in_transaction and sql.startswith(verify_sql):
+                    clock['value'] = 131.0
+                return real_journal.db.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(real_journal, name)
+
+        self.bridge.launcher.journal = CrossingJournal()
+        self.addCleanup(setattr, self.bridge.launcher, 'journal', real_journal)
+        real_launch = self.bridge.launcher.launch
+
+        def armed_launch(task_id, specification):
+            armed['on'] = True
+            return real_launch(task_id, specification)
+
+        self.exact_headroom(4096)
+        self.quiet_census()
+        offer = self.offer()
+        with patch.object(resource_admission, 'time', fake_time), \
+                patch.object(self.bridge.launcher, 'launch', side_effect=armed_launch):
+            with self.assertRaisesRegex(RuntimeError, 'native_start_uncertain'):
+                self.bridge.offer(offer)
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))  # runner never called
+        row = self.journal.db.execute('SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('aborting', 1, None))  # uncertain custody: marker 1 held
+        self.assertEqual(len(self.reservations()), 1)  # reservation retained, never refunded
+        # Replay: no blind re-execute, no allowance refund - the committed
+        # fence refuses the same offer again with no second spawn.
+        with patch.object(resource_admission, 'time', fake_time):
+            with self.assertRaises(RuntimeError):
+                self.bridge.offer(offer)
+        self.assertFalse(any(args[1] == 'start' for args, _ in self.native.calls))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_permit_expiring_after_state_sql_read_refuses_runner(self):
+        self.permit_expiry_crossing_control('SELECT state FROM launches')
+
+    def test_permit_expiring_after_stop_fence_sql_read_refuses_runner(self):
+        self.permit_expiry_crossing_control('SELECT 1 FROM stop_fences')
+
+    def test_stop_fenced_midlaunch_admission_refuses_pre_commit(self):
+        self.quiet_census()
+        offer = self.offer()
+        launch = self.bridge.launcher.launch
+
+        def fence_then_launch(task_id, specification):
+            with self.journal.db:
+                self.journal.db.execute('INSERT INTO stop_fences VALUES(?,?)',
+                                        (offer['session_id'], offer['epoch']))
+            return launch(task_id, specification)
+
+        with patch.object(self.bridge.launcher, 'launch', side_effect=fence_then_launch):
+            self.assertIsNone(self.bridge.offer(offer))
+        self.assertEqual(self.native.calls, [])
+        row = self.journal.db.execute('SELECT state,native_dispatch_started FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('stopped_before_dispatch', 0))
+        self.assertEqual(self.reservations(), [])
+
+    def test_qualified_exit_releases_the_exact_reservation(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.assertEqual(len(self.reservations()), 1)
+        self.native.process.update(phase='exited', exit={'code': 0, 'exited_at_ms': int(time.time() * 1000)},
+                                   containment_empty=True)
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'exited')
+        self.assertEqual(self.reservations(), [])
+        self.assertEqual(self.journal.db.execute(
+            "SELECT COUNT(*) FROM outbox WHERE path LIKE '%/finish'").fetchone()[0], 1)
+
+    def test_uncertain_aborting_launch_keeps_reservation(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.native.process = None  # vanished after dispatch: absence is never exit evidence
+        with self.journal.db:
+            self.journal.db.execute("UPDATE launches SET state='aborting'")
+        self.bridge.reconcile()
+        self.assertEqual(self.journal.db.execute('SELECT state FROM launches').fetchone()[0], 'aborting')
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_stop_after_marker_crash_keeps_uncertain_custody_and_reservation(self):
+        self.quiet_census()
+        self.exact_headroom(4096)
+        with self.journal.db as db:
+            # A post-marker crash: dispatched, unbound, resident unknown.
+            db.execute("INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,"
+                       "state,interactive,runtime_deadline,native_dispatch_started) "
+                       "VALUES('operation-1','session-1',1,'digest',?, 'task-hub2-session-1',NULL,"
+                       "'launching',0,?,1)", (str(self.root), int(time.time() * 1000) + 60000))
+        self.reserve_bytes = resource_admission.DEFAULT_ALLOWANCE_BYTES
+        with self.journal.db as db:
+            db.execute('INSERT INTO resource_reservations(operation_id,session_id,epoch,digest,attempt,'
+                       'native_id,allowance_bytes,updated_at_ms) '
+                       "VALUES('operation-1','session-1',1,'digest','attempt',NULL,?,?)",
+                       (self.reserve_bytes, int(time.time() * 1000)))
+        result = self.bridge.command({'id': 'stop-after-marker', 'session_id': 'session-1',
+                                      'epoch': 1, 'kind': 'stop'})
+        self.assertEqual(result['error'], 'stop_unconfirmed')
+        self.assertFalse(any(args[1] in ('start', 'kill') for args, _ in self.native.calls))
+        row = self.journal.db.execute(
+            'SELECT state,native_dispatch_started,native_id FROM launches').fetchone()
+        self.assertEqual(tuple(row), ('launching', 1, None))
+        self.assertEqual(len(self.reservations()), 1)
+
+    def test_admission_is_private_to_this_journal_and_offers_replay_without_readmission(self):
+        self.exact_headroom(4096)
+        self.bridge.offer(self.offer())
+        self.assertEqual(len(self.reservations()), 1)
+        self.assertEqual(self.journal.db.execute(
+            'SELECT COUNT(*) FROM resource_reservations').fetchone()[0], 1)
+        self.bridge.offer(self.offer())  # replayed offer adopts the running native
+        self.assertEqual(sum(args[1] == 'start' for args, _ in self.native.calls), 1)
+        self.assertEqual(len(self.reservations()), 1)
+
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 class RetiredLookupRowTest(unittest.TestCase):
@@ -1692,10 +2360,14 @@ class RetainedManagedCaptureTests(unittest.TestCase):
         self.assertEqual(json.loads(self.journal.db.execute('SELECT payload FROM outbox WHERE key=?',('command:'+command['id'],)).fetchone()[0])['result'],result)
         with self.assertRaisesRegex(ValueError,'command_id_conflict'):
             self.bridge.command({**command,'mode':None})
-        for kind in ['send','stop']:
+        for kind in ['stop']:
             other={**command,'id':'uncertain-'+kind,'kind':kind}
             with self.journal.db:self.bridge.begin_command(other['id'],hashlib.sha256(canonical(other).encode()).hexdigest())
             with self.assertRaisesRegex(RuntimeError,'command_outcome_uncertain'):self.bridge.command(other)
+        self.assertEqual(self.native.calls,[])
+        send={**command,'id':'uncertain-send','kind':'send'}
+        with self.journal.db:self.bridge.begin_command(send['id'],hashlib.sha256(canonical(send).encode()).hexdigest())
+        self.assertEqual(self.bridge.command(send),{'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'})
         self.assertEqual(self.native.calls,[])
 
     def test_initial_screen_capture_exception_is_durable_failure_and_replay_never_calls_native(self):
@@ -1707,7 +2379,8 @@ class RetainedManagedCaptureTests(unittest.TestCase):
             return original(*args,**kwargs)
         self.bridge.native=failing_capture
         result=self.bridge.command(command)
-        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed'})
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'unknown'})
         calls=list(self.native.calls)
         self.assertEqual(self.bridge.command(command),result)
         self.assertEqual(self.native.calls,calls);self.assertEqual(len(captures),1)
@@ -1979,8 +2652,15 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.observations[self.rows['a-poison']['native_id']]['tag']='foreign-private-tag'
         healthy=self.observations[self.rows['z-healthy']['native_id']]
         healthy.update(phase=healthy_phase,containment_empty=True,exit={'code':0,'exited_at_ms':123})
-        self.effects=[];self.frames=[]
+        self.effects=[];self.frames=[];self.help_probes=[]
         def runner(argv,**kwargs):
+            if argv[1:] == ['send', '--help']:
+                self.assertIsNone(kwargs.get('input'))
+                before = json.loads(json.dumps(self.observations))
+                result = subprocess.CompletedProcess(argv, 0, STRICT_SEND_HELP, '')
+                self.help_probes.append(tuple(argv[1:]))
+                self.assertEqual(self.observations, before)
+                return result
             self.effects.append(argv[1:])
             if argv[1]=='kill':
                 self.assertEqual(argv[2],self.rows['z-healthy']['native_id'])
@@ -2014,6 +2694,7 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertNotIn('foreign-private-tag',json.dumps(errors))
         self.assertNotIn(str(self.root),json.dumps(errors))
         self.assertFalse(any(args[0]=='kill' for args in self.effects))
+        self.assertEqual(self.help_probes, [('send', '--help')] if os.sys.platform == 'linux' else [])
 
     def test_valid_interrupted_bound_launch_still_stops_only_qualified_native(self):
         rows=self.seed(healthy_state='launching')
@@ -2047,7 +2728,8 @@ class NativeObservationIsolationTests(unittest.TestCase):
                 self.assertNotIn('private ',json.dumps(self.frames))
         for error in [KeyError('programming'),sqlite3.OperationalError('database')]:
             with self.subTest(kind=type(error).__name__),patch.object(self.bridge,'lookup',side_effect=error):
-                with self.assertRaises(type(error)):self.bridge.live_sessions()
+                # live_sessions feeds the heartbeat: it must log and continue, never kill the host.
+                self.assertNotIn('a-poison',[r['session_id'] for r in self.bridge.live_sessions()])
                 with self.assertRaises(type(error)):self.bridge.reconcile()
 
     def test_reports_are_bounded_deduplicated_safe_and_reconnect_retries_failure(self):
@@ -2093,3 +2775,195 @@ class NativeObservationIsolationTests(unittest.TestCase):
         self.assertEqual(len(attempts),1)
         self.assertFalse(self.journal.db.execute('SELECT 1 FROM outbox').fetchone())
         self.assertEqual(dict(self.journal.db.execute("SELECT * FROM launches WHERE session_id='a-poison'").fetchone()),rows['a-poison'])
+        self.assertEqual(self.help_probes, [('send', '--help')] if os.sys.platform == 'linux' else [])
+
+
+class NativeControlDiagnosticsTests(unittest.TestCase):
+    setUp=HostTests.setUp
+    tearDown=HostTests.tearDown
+
+    def command(self,kind='capture'):
+        offer=HostTests.offer(self)
+        self.bridge.offer(offer)
+        return {'id':'diagnostic-'+kind,'session_id':offer['session_id'],'epoch':offer['epoch'],
+                'kind':kind, **({'mode':'screen'} if kind=='capture' else {})}
+
+    def test_native_control_diagnostic_capture_rpc_error_is_closed_and_replayed(self):
+        command=self.command();original=self.bridge.native;calls=[]
+        def native(*args,**kwargs):
+            if args[0]=='capture':
+                calls.append(args);raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertEqual(result,{'error':'capture_failed','reason':'capture_failed',
+            'native_control_stage':'capture_rpc','native_control_error':'native_nonzero'})
+        self.assertEqual(self.bridge.command(command),result)
+        self.assertEqual(len(calls),1)
+
+    def test_native_control_diagnostic_capture_status_timeout(self):
+        command=self.command()
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE_ARGV',30)):
+            result=self.bridge.command(command)
+        self.assertEqual(result['error'],'capture_failed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_status','timeout'))
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
+    def test_native_control_diagnostic_retained_failure_preserves_binding(self):
+        command=RetainedManagedCaptureTests.seed(self)
+        self.stdout.unlink()
+        result=self.bridge.command(command)
+        self.assertEqual(result['reason'],'task_output_unavailable')
+        self.assertEqual(result['capture_binding'],command['capture_binding'])
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('capture_retained','unavailable'))
+        self.assertEqual(self.native.calls,[])
+
+    def test_native_control_diagnostic_stop_status_timeout_no_kill(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        calls=len(self.native.calls)
+        with patch.object(self.bridge,'resolve_launch_native',side_effect=subprocess.TimeoutExpired('PRIVATE',5)):
+            result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual(result['reason'],'stop_unconfirmed')
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_status','timeout'))
+        self.assertEqual(len(self.native.calls),calls)
+
+    def test_native_control_diagnostic_stop_kill_timeout(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':
+                self.assertLessEqual(kwargs['timeout'],5)
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_kill','timeout'))
+        self.assertEqual(self.native.process['phase'],'running')
+
+    def test_native_control_diagnostic_stop_verify_timeout_cannot_infer_exit(self):
+        command=self.command('stop');command['deadline_ms']=int(time.time()*1000)+60000
+        original=self.bridge.lookup;calls=[]
+        def lookup(*args,**kwargs):
+            calls.append(args)
+            if len(calls)>1:
+                raise subprocess.TimeoutExpired('PRIVATE',kwargs['timeout'])
+            return original(*args,**kwargs)
+        self.bridge.lookup=lookup
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_verify','timeout'))
+        self.assertEqual(self.native.process['phase'],'exited','fakekill alone must not grant proof')
+
+    def test_native_control_diagnostic_stop_qualification_and_success_unchanged(self):
+        command=self.command('stop');original=self.bridge.native
+        def native(*args,**kwargs):
+            if args[0]=='kill':raise RuntimeError('native_command_failed')
+            return original(*args,**kwargs)
+        self.bridge.native=native
+        result=self.bridge.command(command)
+        self.assertIs(result['stopped'],False)
+        self.assertEqual((result['native_control_stage'],result['native_control_error']),('stop_qualification','unqualified'))
+        # A different original command, same owned binding: successful proof has
+        # exactly the old fields, no failure metadata and no inferred exit.
+        self.bridge.native=original
+        result=self.bridge.command(dict(command,id='diagnostic-qualified-stop'))
+        self.assertEqual(result,{'stopped':True,'evidence':'native_exit','native_id':self.native.process['id']})
+
+    def test_native_control_diagnostic_classifier_never_stringifies_unknown_error(self):
+        from agent_hub_host.agent import native_control_error
+        class PrivateError(Exception):
+            def __str__(self):raise AssertionError('secret stringification')
+        for error in [PrivateError('SECRET'),RuntimeError('SECRET'),ValueError('SECRET')]:
+            self.assertEqual(native_control_error(error),'unknown')
+        control=KeyboardInterrupt('ORIGINAL_CONTROL')
+        from agent_hub_host.agent import native_control_step
+        def cancelled():raise control
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            native_control_step({},'capture_rpc',cancelled)
+        self.assertIs(raised.exception,control)
+
+
+class OrdinarySendUncertaintyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='send-uncertainty-')
+        self.addCleanup(self.temp.cleanup)
+        self.journal=Journal(Path(self.temp.name)/'journal.sqlite')
+        self.addCleanup(self.journal.close_thread)
+        self.bridge=Bridge.__new__(Bridge);self.bridge.journal=self.journal
+        self.bridge.resolve_launch_native=lambda row:(row['native_id'],None)
+        self.calls=[]
+        def native(*args,**kwargs):
+            self.calls.append((args,kwargs))
+            raise subprocess.TimeoutExpired('synthetic owned send',60)
+        self.bridge.native=native
+        with self.journal.db:
+            self.journal.db.execute('INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive) VALUES(?,?,?,?,?,?,?,?,?)',
+                ('op','sender',7,'digest',self.temp.name,'task-hub2-sender','11111111-2222-4333-8444-555555555555','running',1))
+        self.command={'id':'send-once','session_id':'sender','epoch':7,'kind':'send','text':'synthetic owned input'}
+        self.negative={'error':'command_outcome_uncertain','reason':'command_outcome_uncertain'}
+
+    def dispatch(self):
+        frames=[]
+        class Socket:
+            def send(inner,value):
+                with sqlite3.connect(self.journal.path) as db:
+                    self.assertEqual(db.execute('SELECT state FROM commands WHERE id=?',(self.command['id'],)).fetchone()[0],'done')
+                frames.append(json.loads(value))
+        self.bridge.dispatch({'type':'session.command','command':self.command},Socket(),None)
+        return frames
+
+    def test_post_begin_native_exception_settles_negative_once_and_retains_custody(self):
+        frames=self.dispatch();self.assertEqual(len(frames),1)
+        frame=frames[0]
+        self.assertEqual(frame,{'type':'host.error','stage':'host_command','reason':'command_outcome_uncertain',
+            'session_id':'sender','message_id':'send-once','epoch':7,'operation_id':'op',
+            'native_id':'11111111-2222-4333-8444-555555555555','command_kind':'send','command_state':'done'})
+        self.assertEqual(self.dispatch(),frames)
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
+        row=self.journal.db.execute('SELECT * FROM commands').fetchone()
+        self.assertEqual(row['state'],'done');self.assertEqual(json.loads(row['result']),self.negative)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        launch=self.journal.db.execute('SELECT state,native_id FROM launches').fetchone()
+        self.assertEqual(launch['state'],'running');self.assertEqual(launch['native_id'],frame['native_id'])
+        self.assertNotIn('delivery',frame);self.assertNotIn('stopped',frame)
+
+    def test_executing_replay_settles_without_effect_and_keeps_digest_stop_fences(self):
+        from agent_hub_host.native_launch import canonical
+        digest=hashlib.sha256(canonical(self.command).encode()).hexdigest()
+        with self.journal.db:self.bridge.begin_command(self.command['id'],digest)
+        self.assertEqual(self.dispatch()[0]['command_state'],'done')
+        for changed in ({'text':'foreign'},{'epoch':8},{'kind':'stop'}):
+            with self.assertRaisesRegex(ValueError,'command_id_conflict'):
+                self.bridge.command({**self.command,**changed})
+        stop={**self.command,'id':'uncertain-stop','kind':'stop'}
+        with self.journal.db:self.bridge.begin_command(stop['id'],hashlib.sha256(canonical(stop).encode()).hexdigest())
+        with self.assertRaisesRegex(RuntimeError,'command_outcome_uncertain'):self.bridge.command(stop)
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+
+    def test_lost_error_event_replays_without_normal_ack_or_finish_poison(self):
+        class LostSocket:
+            def send(inner,value):raise OSError('synthetic lost socket')
+        with self.assertRaises(OSError):
+            self.bridge.dispatch({'type':'session.command','command':self.command},LostSocket(),None)
+        self.assertEqual(self.journal.db.execute('SELECT state FROM commands').fetchone()[0],'done')
+        self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
+        self.assertEqual(self.dispatch()[0]['reason'],'command_outcome_uncertain')
+        self.assertEqual(len([c for c in self.calls if c[0][0]=='send']),1)
+        client=FakeClient();self.journal.flush(client)
+        self.assertEqual(client.calls,[])
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox_dead_letters').fetchone()[0],0)
+
+    def test_pre_begin_epoch_headless_and_missing_launch_refusals_emit_no_receipt(self):
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
+            self.bridge.command({**self.command,'epoch':8})
+        with self.assertRaisesRegex(ValueError,'command_fence_conflict'):
+            self.bridge.command({**self.command,'session_id':'foreign'})
+        self.journal.db.execute('UPDATE launches SET interactive=0')
+        with self.assertRaisesRegex(ValueError,'headless_send_refused'):self.bridge.command(self.command)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM commands').fetchone()[0],0)
+        self.assertEqual(self.journal.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],0)
+        self.assertEqual(self.calls,[])

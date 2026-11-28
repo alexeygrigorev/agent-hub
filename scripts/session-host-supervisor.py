@@ -33,7 +33,7 @@ def ensure_runtime_bin_on_path():
             os.environ['PATH'] = os.pathsep.join([str(candidate), *parts])
 
 
-def native(*argv):
+def native(*argv, limit=131072):
     ensure_runtime_bin_on_path()
     command = ['aplexer', *argv]
     command.insert(command.index('--') if '--' in command else len(command), '--json')
@@ -45,7 +45,7 @@ def native(*argv):
         error.exit_code = result.returncode
         error.stderr = (result.stderr or '').strip()[-300:]
         raise error
-    if len(result.stdout) > 131072:
+    if len(result.stdout) > limit:
         raise RuntimeError('Native response exceeded capacity')
     return json.loads(result.stdout)
 
@@ -190,7 +190,10 @@ def main():
         # never on a non-zero action exit, so one supervisor exception left
         # the host dead until next logon (intake 88ff6766). Retry in-process.
         from agent_hub_host.bootstrap_control import replace_pending
-        supervise_windows(attempt, stop, replacing=lambda: replace_pending(args.control_dir))
+        # The Hub2 Windows installer retires this legacy host (intake 41ef7048):
+        # end the controller.ps1 loop instead of cycling on the dead Hub path.
+        supervise_windows(attempt, stop, replacing=lambda: retired_by_hub2(args.control_dir)
+                          or replace_pending(args.control_dir))
     else:
         attempt()
 
@@ -200,6 +203,13 @@ def main():
 # replace the accepted handover's task.
 RELEASE_RESTART_EXIT = 75
 HANDOVER_EXIT = 76
+# Written by the Hub2 host installer (deploy/host-install.ps1) when it replaces
+# this legacy supervisor; unlike replace-pending it never expires.
+RETIRED_BY_HUB2 = 'retired-by-hub2'
+
+
+def retired_by_hub2(control_dir):
+    return bool(control_dir) and (pathlib.Path(control_dir) / RETIRED_BY_HUB2).is_file()
 RETRY_DELAYS_S = (5, 15, 30, 60)
 HEALTHY_RUN_S = 300
 
@@ -342,6 +352,28 @@ def log_child_exit(receipt, row, boot_log, health_path, stop, status_error=None,
                   published=bool(crash_posted), record=crash_record)
 
 
+# Intake 41ef7048: DESKTOP-FP4OP26 logged 16,666 identical controller_retry
+# lines over 11 days and nobody noticed. After this many consecutive failed
+# attempts (~8 min at the capped 60 s delay) the supervisor raises a critical
+# alert on stdout and stderr, then repeats it about hourly while it persists.
+RETRY_ALERT_AFTER = 10
+RETRY_ALERT_EVERY = 60
+
+
+def retry_alert_due(failures):
+    return failures >= RETRY_ALERT_AFTER and (failures - RETRY_ALERT_AFTER) % RETRY_ALERT_EVERY == 0
+
+
+def raise_retry_alert(failures, reason):
+    fields = dict(severity='critical', attempt=failures,
+                  message='Hub controller cannot start; this host is not connected to Hub', **reason)
+    log_event('controller_retry_alert', **fields)
+    try:
+        print(json.dumps({'event': 'controller_retry_alert', **fields}), file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def supervise_windows(attempt, stop, *, clock=None, replacing=lambda: False):
     """Run attempts until a signal or planned exit; failures are logged and retried."""
     import time
@@ -363,7 +395,10 @@ def supervise_windows(attempt, stop, *, clock=None, replacing=lambda: False):
                 failures = 0
             delay = RETRY_DELAYS_S[min(failures, len(RETRY_DELAYS_S) - 1)]
             failures += 1
-            log_event('controller_retry', attempt=failures, retry_in_s=delay, **failure_reason(error))
+            reason = failure_reason(error)
+            log_event('controller_retry', attempt=failures, retry_in_s=delay, **reason)
+            if retry_alert_due(failures):
+                raise_retry_alert(failures, reason)
             for _ in range(delay):
                 if stop.wait(1) or replacing():
                     break
@@ -475,6 +510,76 @@ def recover_wedged_controller(receipt, pids, *, kill=None, forget=None):
     return killed, forgotten
 
 
+def _same_path(a, b):
+    try:
+        return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+    except (TypeError, ValueError):
+        return False
+
+
+def is_journal_controller(row, journal):
+    """A Hub controller session_host bound to this exact journal: the only host.lock contender."""
+    if not isinstance(row, dict) or row.get('engine') != 'shell' or not row.get('id'):
+        return False
+    tag, command = row.get('tag'), row.get('command')
+    if not isinstance(tag, str) or not tag.startswith('hub-controller-') or not isinstance(command, list):
+        return False
+    if 'agent_hub_host.session_host' not in command or '--journal-dir' not in command:
+        return False
+    index = command.index('--journal-dir')
+    return index + 1 < len(command) and _same_path(command[index + 1], journal)
+
+
+def journal_controllers(journal):
+    rows = native('list', '--all', limit=1048576)
+    if not isinstance(rows, list):
+        raise RuntimeError('Native controller listing is not a list')
+    return [row for row in rows if is_journal_controller(row, journal)]
+
+
+def replace_orphan_controllers(journal, *, wait_s=45, sleep=None):
+    """Stop controllers a previous supervisor left holding host.lock.
+
+    Intake 41ef7048: the desktop supervisor restarted at 11/3 13:35 and lost the
+    receipt of the session_host its predecessor started at 11:49. That orphan
+    kept host.lock, so every attempt for 11 days logged controller_spawn_blocked
+    and nothing supervised, restarted or updated the holder. A Windows lease or
+    a single systemd unit allows one supervisor per host, and this check runs
+    before our own child exists, so any controller on this journal is an
+    orphan. Only shell sessions tagged hub-controller-* that run
+    agent_hub_host.session_host on this journal qualify. Engine workers (codex,
+    claude) are separate aplexer sessions and are never selected.
+    """
+    import time
+    sleep = sleep or time.sleep
+    try:
+        orphans = journal_controllers(journal)
+    except Exception as error:
+        log_event('controller_orphan_scan_failed', **failure_reason(error))
+        return False
+    if not orphans:
+        log_event('controller_lock_holder_unknown', journal=str(journal))
+        return False
+    for row in orphans:
+        removed = False
+        try:
+            result = native('kill', row['id'], '--signal', 'TERM', '--grace-ms', '30000')
+            removed = isinstance(result, dict) and result.get('record_removed') is True
+        except Exception:
+            pass
+        killed = []
+        if not removed:
+            pids = [p for p in (row.get('worker_pid'), row.get('workload_pid')) if isinstance(p, int)]
+            killed, _forgotten = recover_wedged_controller(row, pids)
+        log_event('controller_orphan_replaced', id=row['id'], tag=row.get('tag'),
+                  created_at_ms=row.get('created_at_ms'), record_removed=removed, killed_pids=killed)
+    for _ in range(wait_s):
+        if not journal_lock_held(journal):
+            return True
+        sleep(1)
+    return not journal_lock_held(journal)
+
+
 def start_child(workspace, command, tag, env_args):
     receipt = native('start', '--workspace', str(workspace), '--cwd', str(workspace),
                      '--tag', tag, '--engine', 'shell',
@@ -510,7 +615,7 @@ def run_controller(args, workspace, command, *, tag_prefix, env_args, journal, s
             if replace_pending(args.control_dir):
                 log_event('controller_replace_exit')
                 raise SystemExit(HANDOVER_EXIT)
-        if journal_lock_held(journal):
+        if journal_lock_held(journal) and not replace_orphan_controllers(journal):
             log_event('controller_spawn_blocked', reason='journal lock held by another controller')
             raise RuntimeError('Journal lock held by another controller; not starting a second one')
         try:

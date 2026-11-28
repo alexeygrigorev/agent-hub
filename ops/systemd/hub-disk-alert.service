@@ -1,0 +1,6 @@
+[Unit]
+Description=Hub host early disk alert (85% warn / 90% crit / 24h fill)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/share/agent-hub-ops/disk_alert.py

@@ -19,7 +19,8 @@ concurrency:
 jobs:
   hub2-host-python:
     name: hub2-host-python
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -32,20 +33,25 @@ jobs:
           scripts/ci/run-python-tests.sh hub2/host/tests/QUARANTINE.md \
             "$PWD/hub2/host:$PWD/hub2/host/tests" -- hub2/host/tests
 
-  legacy-cli-python:
-    name: legacy-cli-python
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  # The legacy CLI suite runs as four disjoint shards. `legacy-cli-python` stays the stable
+  # required status and fails closed unless the shards' independently collected node ids
+  # equal the unpartitioned canonical collection exactly (scripts/ci/legacy_cli_shards.py).
+  legacy-cli-canonical:
+    name: legacy-cli-canonical
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python -m pip install pytest "websockets==16.0"
-      - name: legacy host CLI tests (disposable HOME)
+      - name: canonical unpartitioned collection (original selector, disposable HOME)
         run: |
+          mkdir -p "$RUNNER_TEMP/legacy-cli-canonical"
           scripts/ci/run-python-tests.sh host/tests/QUARANTINE-cli.md \
-            "$PWD/host:$PWD/host/tests" -- \
+            "$PWD/host:$PWD/host/tests:$PWD/scripts/ci" -- \
             host/tests/test_cli*.py host/tests/test_session_control.py host/tests/test_intake*.py host/tests/test_native_claude_import.py host/tests/test_stage_credential_monitor.py \
             host/tests/test_credentials.py::test_scoped_authoritative_generation_replaces_old_rotation_without_writeback \
             host/tests/test_credentials.py::test_scoped_materialization_refuses_conflicts_without_mutation \
@@ -53,4 +59,106 @@ jobs:
             host/tests/test_credentials.py::test_scoped_materialization_missing_first_state_and_file_repair \
             host/tests/test_credentials.py::test_scoped_materialization_existing_scalar_state_never_means_missing \
             host/tests/test_provisioning.py::test_scoped_install_refuses_newer_state_before_hooks_or_package_writes \
-            host/tests/test_provisioning.py::test_scoped_install_scalar_state_refuses_before_package_and_hooks
+            host/tests/test_provisioning.py::test_scoped_install_scalar_state_refuses_before_package_and_hooks \
+            -p legacy_cli_shards --collect-only \
+            "--legacy-cli-collected-out=$RUNNER_TEMP/legacy-cli-canonical/canonical-collected.json"
+      - name: plan shards from the canonical collection
+        run: python scripts/ci/legacy_cli_shards.py canonical --dir "$RUNNER_TEMP/legacy-cli-canonical"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: legacy-cli-canonical
+          path: ${{ runner.temp }}/legacy-cli-canonical/
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+
+  legacy-cli-shard:
+    name: legacy-cli-shard-${{ matrix.shard }}
+    needs: legacy-cli-canonical
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, contabo]
+    # Shard 3 carries the slow hub_acceptance_10 tests: ~15.5 min on an idle runner,
+    # and past 20 min on the shared contabo runners under load (25 Nov 2026).
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest "websockets==16.0"
+      - uses: actions/download-artifact@v4
+        with:
+          name: legacy-cli-canonical
+          path: ${{ runner.temp }}/canonical
+      - name: select this shard from the source-bound manifest
+        run: |
+          mkdir -p "$RUNNER_TEMP/shard"
+          python scripts/ci/legacy_cli_shards.py shard-args --manifest "$RUNNER_TEMP/canonical/manifest.json" \
+            --shard "$SHARD" --out "$RUNNER_TEMP/shard/selectors.txt"
+      - name: legacy host CLI tests shard (disposable HOME)
+        id: pytest
+        run: |
+          mapfile -t selectors < "$RUNNER_TEMP/shard/selectors.txt"
+          [ "${#selectors[@]}" -gt 0 ] || { echo "::error::empty shard selector list"; exit 1; }
+          scripts/ci/run-python-tests.sh host/tests/QUARANTINE-cli.md \
+            "$PWD/host:$PWD/host/tests:$PWD/scripts/ci" -- \
+            -p legacy_cli_shards "--legacy-cli-collected-out=$RUNNER_TEMP/shard/collected.json" \
+            "--junitxml=$RUNNER_TEMP/shard/junit.xml" --durations=25 \
+            "${selectors[@]}"
+      - name: record bounded shard evidence
+        if: always()
+        run: |
+          python scripts/ci/legacy_cli_shards.py shard-evidence --dir "$RUNNER_TEMP/shard" \
+            --manifest "$RUNNER_TEMP/canonical/manifest.json" --shard "$SHARD" \
+            --outcome "$PYTEST_OUTCOME"
+        env:
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+      - name: keep only the evidence files
+        if: always()
+        run: rm -f "$RUNNER_TEMP/shard/selectors.txt" "$RUNNER_TEMP/shard"/*.tmp
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: legacy-cli-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard/
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
+
+  legacy-cli-python:
+    name: legacy-cli-python
+    needs: [legacy-cli-canonical, legacy-cli-shard]
+    # Always evaluate so a failed, skipped or cancelled upstream job fails this required check.
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, contabo]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: legacy-cli-*
+          path: ${{ runner.temp }}/evidence
+      - name: prove shard union equals canonical collection
+        if: ${{ always() }}
+        run: |
+          python scripts/ci/legacy_cli_shards.py aggregate --evidence-root "$RUNNER_TEMP/evidence" \
+            --summary "$RUNNER_TEMP/aggregate-summary.json"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: ci-aggregate-summary
+          path: ${{ runner.temp }}/aggregate-summary.json
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true

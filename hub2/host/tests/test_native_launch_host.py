@@ -17,6 +17,28 @@ from agent_hub_host import native_launch as nl
 from agent_hub_host import provider_home as ph
 
 
+class WindowsEngineTest(unittest.TestCase):
+    def test_bare_engine_resolves_to_the_cmd_shim_on_windows_only(self):
+        with mock.patch.object(nl.os, 'name', 'nt'), \
+                mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\claude.cmd') as which:
+            self.assertEqual(nl.resolve_windows_program('claude', {'PATH': 'C:\\npm'}), 'C:\\npm\\claude.cmd')
+            which.assert_called_once_with('claude', path='C:\\npm')
+            self.assertEqual(nl.resolve_windows_program('C:\\x\\claude.exe'), 'C:\\x\\claude.exe')
+        with mock.patch.object(nl.os, 'name', 'nt'), mock.patch.object(nl.shutil, 'which', return_value=None):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+        with mock.patch.object(nl.os, 'name', 'posix'), mock.patch.object(nl.shutil, 'which', return_value='/bin/claude'):
+            self.assertEqual(nl.resolve_windows_program('claude'), 'claude')
+
+    def test_codex_is_advertised_on_windows_when_installed(self):
+        launcher = nl.NativeLauncher({})
+        route = {'provider': 'codex'}
+        with mock.patch.object(nl.os, 'name', 'nt'):
+            with mock.patch.object(nl.shutil, 'which', return_value='C:\\npm\\codex.cmd'):
+                self.assertTrue(launcher._codex_advertisable(route))
+            with mock.patch.object(nl.shutil, 'which', return_value=None):
+                self.assertFalse(launcher._codex_advertisable(route))
+
+
 class AdapterArgvTest(unittest.TestCase):
     def test_zai_route_pins_harness_flags_and_model(self):
         argv = nl.adapter_argv('zai', 'goal-text', 'glm-5.3-flash')
@@ -48,6 +70,51 @@ class AdapterArgvTest(unittest.TestCase):
 
 
 class EffortAndInteractiveTest(unittest.TestCase):
+    def test_go_interactive_matches_native_mini_flag_contract(self):
+        import argparse
+        # Native Mini usage from the owned Nov14 failure + independent mini
+        # --help: no --format/--json. This schema is independent of our builder.
+        parser = argparse.ArgumentParser(allow_abbrev=False, exit_on_error=False)
+        for option in ('--standalone', '--continue', '--fork', '--replay', '--no-replay', '--wizard'):
+            parser.add_argument(option, action='store_true')
+        for option in ('--server', '--session', '--model', '--agent', '--prompt'):
+            parser.add_argument(option)
+        parser.add_argument('--replay-limit', type=int)
+        prompt = 'Read the tracked README; preserve literal --format json and Unicode \u03bb.'
+        headless = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        argv = nl.interactive_argv('go', headless, prompt, model=nl.OPENCODE_MODEL)
+        self.assertEqual(argv[:2], ['opencode', 'mini'])
+        parsed, unknown = parser.parse_known_args(argv[2:])
+        self.assertEqual(unknown, [], 'actual Mini refuses unknown flags and positionals')
+        self.assertTrue(parsed.standalone)
+        self.assertEqual(parsed.model, nl.OPENCODE_MODEL)
+        self.assertEqual(parsed.prompt, prompt)
+        self.assertNotIn('--auto', argv)
+        # Conversion must not mutate the source headless argv in place.
+        self.assertEqual(headless, nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL))
+
+    def test_go_mini_conversion_preserves_headless_json_and_other_providers(self):
+        prompt = 'Read the tracked file'
+        base = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        self.assertEqual(base, ['opencode', 'run', '--standalone', '--auto', '--format', 'json',
+                                '--model', nl.OPENCODE_MODEL, prompt])
+        nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL)
+        self.assertEqual(base[base.index('--format') + 1], 'json')
+        with self.assertRaisesRegex(ValueError, 'interactive_effort_unsupported'):
+            nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL, effort='medium')
+        with self.assertRaisesRegex(ValueError, 'native_goal_provider_unsupported'):
+            nl.interactive_argv('go', base, prompt, model=nl.OPENCODE_MODEL, with_goal=True)
+
+    def test_go_mini_refuses_unverified_inherited_output_shape(self):
+        prompt = 'Read the tracked file'
+        base = nl.adapter_argv('go', prompt, nl.OPENCODE_MODEL)
+        absent = list(base); at = absent.index('--format'); del absent[at:at + 2]
+        wrong = list(base); wrong[wrong.index('--format') + 1] = 'text'
+        duplicate = [*base[:-1], '--format', 'json', prompt]
+        for argv in (absent, wrong, duplicate):
+            with self.subTest(argv=argv), self.assertRaisesRegex(ValueError, 'interactive_adapter_shape_unverified'):
+                nl.interactive_argv('go', argv, prompt, model=nl.OPENCODE_MODEL)
+
     def test_aplexer_prompt_flattens_windows_line_breaks_only(self):
         prompt = 'First line\r\n\r\nSecond line\nThird line'
         self.assertEqual(nl.aplexer_prompt(prompt, windows=True), 'First line Second line Third line')
@@ -70,6 +137,23 @@ class EffortAndInteractiveTest(unittest.TestCase):
         base = nl.adapter_argv('claude', 'goal', 'sonnet')
         argv = nl.headless_effort_argv('claude', base, 'high')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
+
+    def test_headless_effort_antigravity_neon(self):
+        base = ['agy', '--model', 'gemini-pro-orchestrator-neon', '--dangerously-skip-permissions', '-p', 'goal']
+        # agy rejects --effort for the orchestrator, so none is passed.
+        self.assertEqual(nl.headless_effort_argv('antigravity', base, 'medium'), base)
+        xhigh = ['agy', '--model', 'gemini-4-neon-xhigh', '-p', 'goal']
+        argv = nl.headless_effort_argv('antigravity', xhigh, 'max')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'xhigh')
+        med = ['agy', '--model', 'gemini-4-neon-medium', '-p', 'goal']
+        self.assertEqual(nl.headless_effort_argv('antigravity', med, 'medium')[3:5], ['--effort', 'medium'])
+
+    def test_headless_effort_antigravity_orchestrator_profile_route_has_no_effort(self):
+        # The profile/task-run path builds --engine-arg flags from a model-only argv.
+        orch = nl.headless_effort_argv('antigravity', ['--model', 'gemini-pro-orchestrator-neon', 'prompt'], 'medium')
+        self.assertNotIn('--effort', orch)
+        med = nl.headless_effort_argv('antigravity', ['--model', 'gemini-4-neon-medium', 'prompt'], 'medium')
+        self.assertEqual(med[2:4], ['--effort', 'medium'])
 
     def test_interactive_removes_exec_and_keeps_model(self):
         base = nl.adapter_argv('zai', 'goal', 'glm-5.3-flash')
@@ -112,6 +196,8 @@ class GoalNativeEngineTest(unittest.TestCase):
                 path=Path(workspace) / '.local' / ('first-action-' + task_id + '.json')))
             expected_child = nl.interactive_argv(provider, nl.adapter_argv(provider, prompt, model), prompt,
                                                  model=model, effort='medium', with_goal=True)
+            if provider == 'codex':
+                expected_child[0] = '/synthetic/launch-codex.sh'
             row = {}
 
             def runner(argv, **options):
@@ -145,6 +231,7 @@ class GoalNativeEngineTest(unittest.TestCase):
                  mock.patch.object(adapter, 'status', side_effect=lambda *args, **kw: dict(row)), \
                  mock.patch.object(nl, 'goal_store', side_effect=[None, proof]) as store, \
                  mock.patch.object(adapter, 'native', return_value=subprocess.CompletedProcess([], 0, json.dumps(delivery), '')) as send, \
+                 mock.patch.object(nl, 'codex_launch_wrapper', return_value=Path('/synthetic/launch-codex.sh')), \
                  mock.patch.object(adapter, 'record_evidence'):
                 receipt = adapter.launch(task_id, spec)
             expected_goal = captured['objective']
@@ -178,6 +265,7 @@ class GoalNativeEngineTest(unittest.TestCase):
 class ClaudeGoalConfigEnvironmentTests(unittest.TestCase):
     # Exact metadata-only resolver extracted from native Claude2.1.322 (Qt).
     NATIVE_RESOLVER = 'function Qt(e){return{globalConfig:nt(e||Bt(),".claude.json"),userSettings:nt(e||nt(Bt(),".claude"),"settings.json")}}'
+    NODE_METADATA_TIMEOUT_SECONDS = 20
 
     def setUp(self):
         root=Path(__file__).resolve().parents[3]/'.local/tmp'
@@ -230,7 +318,13 @@ class ClaudeGoalConfigEnvironmentTests(unittest.TestCase):
                 ';const paths=Qt(process.argv[2]||undefined);let onboarding=false;'
                 'try{onboarding=JSON.parse(require("node:fs").readFileSync(paths.globalConfig,"utf8")).hasCompletedOnboarding===true}'
                 'catch(e){if(e.code!=="ENOENT")throw e}process.stdout.write(JSON.stringify({...paths,onboarding}));')
-        done=subprocess.run(['node','-e',script,str(self.home),config_dir or ''],capture_output=True,text=True,check=True,timeout=5)
+        # A cold Node start can exceed five seconds on a busy CI runner. Keep a
+        # finite fixture-only budget, with captured output in any timeout failure.
+        try:
+            done=subprocess.run(['node','-e',script,str(self.home),config_dir or ''],capture_output=True,text=True,
+                                check=True,timeout=self.NODE_METADATA_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            self.fail(f'Node metadata resolver exceeded {error.timeout}s; stdout={error.stdout!r}; stderr={error.stderr!r}')
         return json.loads(done.stdout)
 
     def test_absent_and_empty_local_values_preserve_native_onboarding_default(self):
@@ -570,7 +664,8 @@ class CapabilityTest(unittest.TestCase):
         self.assertEqual(caps['codex'], {'headless', 'interactive', 'goal', 'effort'})
         self.assertEqual(caps['opencode'], {'headless', 'interactive'})
         self.assertNotIn('claude', caps)
-        self.assertEqual(caps['shell'], {'headless'})
+        expected_shell = {'headless', 'interactive'} if nl.resolve_interactive_shell_command() else {'headless'}
+        self.assertEqual(caps['shell'], expected_shell)
 
     def test_claude_capability_can_install_without_global_claude(self):
         config = {'private_provider_homes': True, 'routes': {'claude': {'provider': 'claude'}}}
@@ -715,6 +810,27 @@ class LaunchReceiptTest(unittest.TestCase):
             command = runner.call_args.args[0]
             self.assertEqual(command[command.index('--') + 1:], child)
 
+    def test_interactive_shell_launch_posix_and_windows(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            posix_child = ['/bin/bash', '-l']
+            output = json.dumps({'id': 'd6cf9872-8597-48a5-be64-990cdef4db31', 'tag': 'task-t1',
+                                 'workspace': workspace, 'command': posix_child, 'engine': 'shell'})
+            runner = mock.Mock(return_value=mock.Mock(returncode=0, stdout=output))
+            adapter = nl.NativeLauncher({'routes': {'shell': {'provider': 'shell'}}}, runner=runner)
+            with mock.patch.object(nl, 'resolve_interactive_shell_command', return_value=posix_child), \
+                 mock.patch.object(adapter, 'record_evidence'):
+                receipt = adapter.launch('t1', {'workspace': workspace, 'engine': 'shell', 'model': 'shell',
+                                                 'prompt': 'await operator input', 'interactive': True, 'timeout_seconds': 60})
+            self.assertTrue(receipt['interactive_verified'])
+            self.assertEqual(receipt['mode'], 'interactive')
+            argv = runner.call_args.args[0]
+            self.assertIn('--engine', argv)
+            self.assertEqual(argv[argv.index('--engine') + 1], 'shell')
+            self.assertEqual(argv[argv.index('--') + 1:], posix_child)
+        with mock.patch.object(nl.os, 'name', 'nt'), \
+             mock.patch.object(nl.shutil, 'which', side_effect=lambda name, path=None: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' if name == 'powershell.exe' else None):
+            self.assertEqual(nl.resolve_interactive_shell_command(), ['C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '-NoLogo'])
+
     def test_launch_attempts_start_without_a_host_capacity_gate(self):
         config = {'private_provider_homes': True, 'routes': {'codex': {'provider': 'zai'}}, 'min_free_mem_mb': 6000, 'memory_mb': 1500}
         with tempfile.TemporaryDirectory() as workspace:
@@ -801,6 +917,63 @@ class LaunchReceiptTest(unittest.TestCase):
                                           {'workspace': tmp, 'timeout_seconds': 1},
                                           poll=lambda selector: {'phase': 'dead'}, sleep=lambda s: None)
 
+
+class OrdinaryInteractiveNativeEngineTests(unittest.TestCase):
+    def launch(self, provider, model, *, interactive=True, with_goal=False):
+        parent=Path(__file__).resolve().parents[3]/'.local/tmp'
+        parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent,prefix='ordinary-engine-') as workspace:
+            captured={};native_id='d6cf9872-8597-48a5-be64-990cdef4db31'
+            def runner(argv,**options):
+                prefix=argv[:argv.index('--')];child=argv[argv.index('--')+1:]
+                engine=prefix[prefix.index('--engine')+1] if '--engine' in prefix else 'shell'
+                captured.update(argv=argv,child=child,native_engine=engine,options=options)
+                return subprocess.CompletedProcess(argv,0,json.dumps({'id':native_id,'tag':'task-ordinary-engine',
+                    'workspace':workspace,'command':child,'engine':engine,'created_at_ms':1,'phase':'running'}),'')
+            adapter=nl.NativeLauncher({'private_provider_homes':True,'routes':{provider:{'provider':provider}}},runner=runner,aplexer='synthetic-aplexer')
+            spec={'workspace':workspace,'engine':provider,'model':model,'prompt':'literal scoped task --with-goal is just text',
+                  'interactive':interactive,'with_goal':with_goal,'timeout_seconds':90,'operation_id':'ordinary:0','epoch':1}
+            from agent_hub_host import zai_diagnostic_selector
+            with mock.patch.object(nl,'codex_launch_wrapper',return_value=Path('/synthetic/verified-launch-codex.sh')), \
+                 mock.patch.object(adapter,'record_evidence'), \
+                 mock.patch.object(zai_diagnostic_selector,'prepare',return_value=None), \
+                 mock.patch.object(adapter,'register_goal',return_value={'status':'active'}) as register:
+                receipt=adapter.launch('ordinary-engine',spec)
+            captured.update(receipt=receipt,goal_calls=register.call_count,workspace=workspace)
+            return captured
+
+    def test_ordinary_tui_native_engine_matches_actual_family_for_every_supported_provider(self):
+        cases=[('codex','gpt-6.1-sol','codex'),('zai','glm-5.3-flash','codex'),
+               ('claude','sonnet','claude'),('go',nl.OPENCODE_MODEL,'opencode'),
+               ('antigravity','gemini-4-argon-medium','antigravity')]
+        for provider,model,engine in cases:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model);prefix=got['argv'][:got['argv'].index('--')]
+                self.assertIn('--engine',prefix);self.assertEqual(got['native_engine'],engine)
+                self.assertEqual(prefix[prefix.index('--engine')+1],engine)
+                self.assertEqual(got['goal_calls'],0);self.assertEqual(got['receipt']['mode'],'interactive')
+                self.assertNotIn('goal_registration',got['receipt'])
+                self.assertIn(model,got['child']);self.assertNotIn('exec',got['child']);self.assertNotIn('-p',got['child'])
+                self.assertEqual(prefix[prefix.index('--memory')+1],'1500M');self.assertEqual(prefix[prefix.index('--pids')+1],'256')
+                self.assertEqual(prefix[prefix.index('--workspace')+1],got['workspace'])
+                self.assertEqual(prefix[prefix.index('--cwd')+1],got['workspace'])
+                if provider=='codex':self.assertEqual(got['child'][0],'/synthetic/verified-launch-codex.sh')
+
+    def test_headless_still_has_no_outer_interactive_engine_marker(self):
+        for provider,model in [('codex','gpt-6.1-sol'),('claude','sonnet')]:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model,interactive=False)
+                self.assertNotIn('--engine',got['argv'][:got['argv'].index('--')])
+                self.assertEqual(got['goal_calls'],0);self.assertEqual(got['receipt']['mode'],'headless')
+                self.assertIn('exec' if provider=='codex' else '-p',got['child'])
+
+    def test_goal_family_and_registration_remain_exactly_the_existing_mapping(self):
+        for provider,model,engine in [('codex','gpt-6.1-sol','codex'),('zai','glm-5.3-flash','codex'),('claude','sonnet','claude')]:
+            with self.subTest(provider=provider):
+                got=self.launch(provider,model,with_goal=True)
+                self.assertEqual(got['native_engine'],engine);self.assertEqual(got['goal_calls'],1)
+                self.assertEqual(got['receipt']['goal_registration'],{'status':'active'})
+                self.assertNotIn('literal scoped task --with-goal is just text',got['child'])
 
 if __name__ == '__main__':
     unittest.main()
@@ -991,6 +1164,43 @@ class GoJsonOutputTests(unittest.TestCase):
             self.assertEqual(argv[argv.index('--profile')+1],nl.LOCAL_ROUTES['go']['profile'])
 
 
+class ZaiProfileHarnessTests(unittest.TestCase):
+    def test_profile_uses_same_snapshot_setting_as_direct_zai_without_losing_prompt_or_effort(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent, prefix='zai-profile-flags-') as root:
+            launcher = nl.NativeLauncher({'private_provider_homes': False}, aplexer='synthetic-a')
+            prompt = 'Read README; preserve Unicode λ and literal --disable.'
+            spec = {'workspace': root, 'operation_id': 'op-zai-flags', 'epoch': 1,
+                    'timeout_seconds': 120, 'model': 'glm-5.3-flash', 'effort': 'medium'}
+            argv = launcher.profile_command('zai-flags', spec, nl.LOCAL_ROUTES['zai'], prompt)
+            engine_args = [value.removeprefix('--engine-arg=') for value in argv
+                           if value.startswith('--engine-arg=')]
+            self.assertEqual(engine_args, ['--model', 'glm-5.3-flash', '--disable', 'shell_snapshot',
+                                           '-c', 'model_reasoning_effort="medium"'])
+            self.assertEqual(argv[:3], ['synthetic-a', 'task', 'run'])
+            self.assertEqual(argv[argv.index('--profile') + 1], 'hub-zai-central')
+            self.assertEqual(Path(argv[argv.index('--prompt-file') + 1]).read_text(encoding='utf-8'), prompt)
+            self.assertEqual(argv[argv.index('--timeout-secs') + 1], '120')
+            direct = nl.adapter_argv('zai', prompt, 'glm-5.3-flash')
+            self.assertEqual(direct[direct.index('--disable'):direct.index('--disable') + 2],
+                             ['--disable', 'shell_snapshot'])
+            self.assertEqual(direct.count('shell_snapshot'), 1)
+
+    def test_profile_does_not_add_zai_harness_flags_to_other_providers(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        for provider, model in [('codex', 'gpt-6.1-sol'), ('claude', 'sonnet'),
+                                ('go', nl.OPENCODE_MODEL), ('antigravity', 'gemini-4-argon-medium')]:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory(dir=parent) as root:
+                launcher = nl.NativeLauncher({}, aplexer='synthetic-a')
+                spec = {'workspace': root, 'operation_id': 'op-other-flags', 'epoch': 1,
+                        'timeout_seconds': 120, 'model': model}
+                argv = launcher.profile_command('other-flags', spec, nl.LOCAL_ROUTES[provider], 'Read README')
+                self.assertNotIn('--engine-arg=--disable', argv)
+                self.assertNotIn('--engine-arg=shell_snapshot', argv)
+
+
 class HeadlessStreamOutputTests(unittest.TestCase):
     MODELS = {'claude': 'opus', 'antigravity': 'gemini-4-argon-medium'}
 
@@ -998,6 +1208,7 @@ class HeadlessStreamOutputTests(unittest.TestCase):
         parent = Path(__file__).resolve().parents[3] / '.local/tmp'
         parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=parent, prefix='headless-stream-') as workspace:
+            self.workspace = str(Path(workspace).resolve())
             captured = {}
             native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
 
@@ -1060,7 +1271,195 @@ class HeadlessStreamOutputTests(unittest.TestCase):
                     child, prompt = self.launch(provider, effort=effort, interactive=True)
                     prefix = (['claude', '--dangerously-skip-permissions', '--model', 'opus'] if provider == 'claude'
                               else ['agy', '--model', self.MODELS[provider], '--dangerously-skip-permissions'])
-                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+                    trust = (['--settings', json.dumps({'trustedWorkspaces': [self.workspace]}, separators=(',', ':'))]
+                             if provider == 'antigravity' else [])
+                    self.assertEqual(child, [*prefix, *(['--effort', effort] if effort else []), *trust, *(['--prompt-interactive'] if provider == 'antigravity' else []), prompt])
+
+    def test_headless_and_profile_antigravity_argv_carry_no_trust_settings(self):
+        for local in (False, True):
+            with self.subTest(local=local):
+                child, _ = self.launch('antigravity', effort='medium', local=local)
+                self.assertFalse(any('--settings' in arg or 'trustedWorkspaces' in arg for arg in child))
+
+
+class AntigravityWorkspaceTrustTests(unittest.TestCase):
+    """Session-only agy trust is limited to the exact launch directory."""
+    MODEL = 'gemini-4-argon-medium'
+
+    def setUp(self):
+        parent = Path(__file__).resolve().parents[3] / '.local/tmp'
+        parent.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=parent, prefix='agy-trust-')
+        self.root = Path(self.temporary.name).resolve()
+        self.addCleanup(self.temporary.cleanup)
+
+    @staticmethod
+    def settings_of(argv):
+        options = argv[:-2] if len(argv) >= 2 and argv[-2] == '--prompt-interactive' else argv
+        values = [options[i + 1] for i, arg in enumerate(options[:-1]) if arg == '--settings']
+        assert len(values) == 1 and not any(a.startswith('--settings=') for a in options), argv
+        return json.loads(values[0])
+
+    def launch(self, workspace, *, interactive=True, effort='medium', provider='antigravity', model=None,
+               prompt='do the scoped work'):
+        captured = {}
+        native_id = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+        model = model or self.MODEL
+
+        def runner(argv, **options):
+            child = argv[argv.index('--') + 1:]
+            captured.update(argv=argv, child=child, options=options)
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': native_id, 'tag': 'task-agy-trust', 'workspace': str(workspace), 'command': child}), '')
+
+        adapter = nl.NativeLauncher({'private_provider_homes': False, 'routes': {provider: nl.LOCAL_ROUTES[provider]}},
+                                    aplexer='synthetic-aplexer', runner=runner)
+        spec = {'workspace': str(workspace), 'engine': provider, 'model': model, 'prompt': prompt,
+                'interactive': interactive, 'timeout_seconds': 90, 'operation_id': 'agy-trust-op', 'epoch': 1,
+                'effort': effort}
+        with mock.patch.object(adapter, 'record_evidence'):
+            receipt = adapter.launch('agy-trust', spec)
+        return receipt, captured
+
+    def test_interactive_agy_trusts_exactly_the_launch_cwd_and_keeps_identity(self):
+        names = ['plain', 'with space', 'ünïcødé-трест', 'quote"and\\back']
+        for name in names:
+            with self.subTest(name=name):
+                workspace = self.root / 'requested-base' / '.local' / 'hub-worktrees' / name
+                workspace.mkdir(parents=True)
+                receipt, captured = self.launch(workspace)
+                argv, child = captured['argv'], captured['child']
+                self.assertEqual(argv[argv.index('--cwd') + 1], str(workspace))
+                self.assertEqual(argv[argv.index('--workspace') + 1], str(workspace))
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                for implied in (self.root / 'requested-base', self.root, workspace.parent, Path.home()):
+                    self.assertNotIn(str(implied), self.settings_of(child)['trustedWorkspaces'])
+                self.assertEqual(child[:4], ['agy', '--model', self.MODEL, '--dangerously-skip-permissions'])
+                self.assertEqual(child[4:6], ['--effort', 'medium'])
+                self.assertEqual(child[6], '--settings')
+                self.assertEqual(child[-2], '--prompt-interactive')
+                self.assertTrue(child[-1].startswith('do the scoped work'))
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+                self.assertEqual(receipt['session_id'], 'd6cf9872-8597-48a5-be64-990cdef4db31')
+                self.assertTrue(receipt['interactive_verified'] and receipt['model_verified'] and receipt['effort_verified'])
+                self.assertEqual(captured['options']['cwd'], str(workspace))
+                self.assertEqual(captured['options']['env']['PWD'], str(workspace))
+
+    def test_symlinked_launch_spelling_trusts_the_actual_directory_only(self):
+        actual = self.root / 'actual'
+        actual.mkdir()
+        alias = self.root / 'alias'
+        alias.symlink_to(actual, target_is_directory=True)
+        _, captured = self.launch(alias)
+        self.assertEqual(self.settings_of(captured['child']), {'trustedWorkspaces': [str(actual)]})
+        self.assertEqual(captured['options']['env']['PWD'], str(actual))
+
+    def test_unverifiable_workspace_is_refused_before_native_start(self):
+        file_path = self.root / 'file'
+        file_path.write_text('x')
+        for value in ('relative/workspace', str(self.root) + '\0x', 7):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+                    nl.antigravity_launch_workspace(value)
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(self.root / 'missing'))
+        with self.assertRaisesRegex(ValueError, 'antigravity_workspace_trust_unverified'):
+            nl.antigravity_launch_workspace(str(file_path))
+
+    def test_windows_style_paths_round_trip_through_json_quoting(self):
+        path = 'C:\\Users\\Some One\\hub-worktrees\\ünï "q"'
+        with mock.patch.object(nl, 'antigravity_launch_workspace', return_value=path):
+            argv = nl.antigravity_trust_argv(['agy', '--model', 'm', '--prompt-interactive', 'p'], path)
+        self.assertEqual(argv[:3], ['agy', '--model', 'm'])
+        self.assertEqual(argv[-2:], ['--prompt-interactive', 'p'])
+        self.assertEqual(self.settings_of(argv), {'trustedWorkspaces': [path]})
+
+    def test_existing_inline_settings_are_merged_not_shadowed(self):
+        workspace = str(self.root)
+        existing = json.dumps({'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"', 'nested': {'a': [1, 2]}})
+        base = ['agy', '--model', 'm', '--settings', existing, '--effort', 'low', '--prompt-interactive', 'p']
+        argv = nl.antigravity_trust_argv(base, workspace)
+        self.assertEqual(argv[:3] + argv[5:], base[:3] + base[5:])
+        self.assertEqual(self.settings_of(argv), {'theme': 'dark', 'ratio': 1.5, 'label': 'ünï "q"',
+                                                  'nested': {'a': [1, 2]}, 'trustedWorkspaces': [workspace]})
+        equals = nl.antigravity_trust_argv(['agy', '--settings=' + existing, '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(equals)['theme'], 'dark')
+        same = nl.antigravity_trust_argv(['agy', '--settings',
+                                          json.dumps({'trustedWorkspaces': [workspace], 'theme': 'dark'}),
+                                          '--prompt-interactive', 'p'], workspace)
+        self.assertEqual(self.settings_of(same), {'trustedWorkspaces': [workspace], 'theme': 'dark'})
+
+    def test_forged_or_unverifiable_settings_never_widen_trust(self):
+        workspace = str(self.root)
+        refused = [
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [workspace, str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': [str(self.root.parent)]}), 'p'],
+            ['agy', '--settings', json.dumps({'trustedWorkspaces': True}), 'p'],
+            ['agy', '--settings', '/home/someone/.gemini/settings.json', 'p'],
+            ['agy', '--settings', '[]', 'p'],
+            ['agy', '--settings', '{}', '--settings', '{}', 'p'],
+            ['agy', '--settings'],
+            ['agy', '--settings', f'{{"trustedWorkspaces":["/evil"],"trustedWorkspaces":["{workspace}"]}}',
+             '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"theme":"light","theme":"dark"}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"a":1,"a":2}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":NaN}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":-Infinity}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":{"x":NaN}}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[1,Infinity,-Infinity]}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"x":1e500}', '--prompt-interactive', 'p'],
+            ['agy', '--settings', '{"nested":[-1e500]}', '--prompt-interactive', 'p'],
+        ]
+        for argv in refused:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(ValueError, 'antigravity_settings_unverified'):
+                    nl.antigravity_trust_argv(argv, workspace)
+
+    def test_prompt_values_starting_with_flags_are_preserved_verbatim(self):
+        workspace = self.root / 'ws-flag-prompt'
+        workspace.mkdir()
+        fa_text = nl.FIRST_ACTION_INSTRUCTION.format(path=workspace / '.local/first-action-agy-trust.json')
+        for prompt_text in (
+            '--settings={"theme":"dark"}',
+            '--settings=invalid-not-json',
+            '--settings',
+            '--prompt-interactive',
+        ):
+            with self.subTest(prompt_text=prompt_text):
+                direct_prompt = prompt_text + fa_text
+                direct = nl.antigravity_trust_argv(
+                    ['agy', '--model', self.MODEL, '--prompt-interactive', direct_prompt], str(workspace))
+                self.assertEqual(direct[-2:], ['--prompt-interactive', direct_prompt])
+                self.assertEqual(self.settings_of(direct), {'trustedWorkspaces': [str(workspace)]})
+
+                _, captured = self.launch(workspace, prompt=prompt_text)
+                child = captured['child']
+                self.assertEqual(child[-2:], ['--prompt-interactive', nl.aplexer_prompt(direct_prompt)])
+                self.assertEqual(self.settings_of(child), {'trustedWorkspaces': [str(workspace)]})
+                self.assertEqual(nl.native_command_model(child), self.MODEL)
+                self.assertEqual(nl.command_effort(child), 'medium')
+
+        merged = nl.antigravity_trust_argv(
+            ['agy', '--model', self.MODEL, '--settings', '{"theme":"dark"}', '--prompt-interactive', '--settings=bad'],
+            str(workspace))
+        self.assertEqual(merged[-2:], ['--prompt-interactive', '--settings=bad'])
+        self.assertEqual(self.settings_of(merged), {'theme': 'dark', 'trustedWorkspaces': [str(workspace)]})
+
+        without_prompt_pair = nl.antigravity_trust_argv(['agy', '--model', self.MODEL], str(workspace))
+        self.assertEqual(without_prompt_pair[:3], ['agy', '--model', self.MODEL])
+        self.assertEqual(self.settings_of(without_prompt_pair), {'trustedWorkspaces': [str(workspace)]})
+
+    def test_other_providers_and_headless_agy_argv_are_unchanged(self):
+        workspace = self.root / 'ws'
+        workspace.mkdir()
+        _, captured = self.launch(workspace, provider='claude', model='opus')
+        self.assertFalse(any('trustedWorkspaces' in arg for arg in captured['child']))
+        self.assertNotIn('--settings', captured['child'])
+        # Headless agy through the local profile path stays byte-identical.
+        _, captured = self.launch(workspace, interactive=False)
+        self.assertFalse(any('trustedWorkspaces' in arg or '--settings' in arg for arg in captured['child']))
 
 
 class ManagedClaudeReadinessTests(unittest.TestCase):
@@ -1111,6 +1510,12 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 def probe(argv,**kwargs):
                     result=subprocess.run(argv,**kwargs);results.append(result);return result
                 adapter=nl.NativeLauncher({},runner=probe)
+                # A default-only host has no managed profile yet still needs the verified archive.
+                self.assertFalse(profile.exists())
+                only=adapter.verified_release_archive(release)
+                self.assertEqual(only,{'archive':str(archive),'sha256':receipt['artifacts']['hub.pyz']['sha256']})
+                self.assertEqual(results,[],'the archive proof runs no profile probe')
+                self.assertIsNone(adapter.managed_claude_readiness(release))
                 publish([sys.executable,'-c','raise RuntimeError("old18c")','hub-claude'])
                 self.assertIsNone(adapter.managed_claude_readiness(release))
                 publish(command)
@@ -1138,6 +1543,9 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 publish(command)
                 archive.write_bytes(raw+b'corruption')
                 self.assertIsNone(adapter.managed_claude_readiness(release))
+                self.assertIsNone(adapter.verified_release_archive(release))
+                archive.write_bytes(raw);archive.chmod(0o666)
+                self.assertIsNone(adapter.verified_release_archive(release))
 
     def test_opt_in_uses_fixed_profile_and_private_context_without_changing_default(self):
         from types import SimpleNamespace
@@ -1202,3 +1610,534 @@ class ManagedClaudeReadinessTests(unittest.TestCase):
                 self.assertEqual(json.loads(context_path.read_bytes())['protocol'],'hub2-managed-claude-exec-v1')
                 self.assertNotEqual(context_path.read_bytes(),expected)
                 self.assertNotIn('provider_home',spec)
+
+
+class CodexQuotaWrapperLaunchTests(unittest.TestCase):
+    """Codex starts only through the maintained quota wrapper; refusals spawn nothing."""
+    NATIVE_ID = 'd6cf9872-8597-48a5-be64-990cdef4db31'
+
+    def setUp(self):
+        base = Path(__file__).resolve().parents[3] / '.local/tmp'
+        base.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=base, prefix='codex-wrapper-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        os.chmod(self.root, 0o700)
+        self.workspace = self.root / 'work'
+        self.workspace.mkdir(mode=0o700)
+        self.wrapper = self.write_wrapper('launch-codex.sh')
+        patcher = mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(self.wrapper)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_wrapper(self, name, text=None, mode=0o700):
+        path = self.root / name
+        path.write_text(text or ('#!/usr/bin/env bash\nset -euo pipefail\nrepo=%s\n'
+                                 'python3 "$repo/scripts/quota-gate.py"\nexec %s/codex "$@"\n' % (self.root, self.root)))
+        path.chmod(mode)
+        return path
+
+    def launch(self, *, interactive, route=None, provider='codex', readiness=True, effort='high'):
+        calls = []
+
+        def runner(argv, **options):
+            calls.append((argv, options))
+            child = argv[argv.index('--') + 1:]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace), 'command': child}), '')
+        route = route or ({'provider': provider} if interactive else {'provider': provider, 'profile': 'hub-shared-codex'})
+        config = {'routes': {'codex': route}}
+        if route.get('profile') is None:
+            config['private_provider_homes'] = True
+        adapter = nl.NativeLauncher(config, runner=runner)
+        spec = {'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol', 'prompt': 'synthetic prompt',
+                'interactive': interactive, 'effort': effort, 'timeout_seconds': 600,
+                'codex_launch_wrapper': '/offer/supplied/wrapper'}
+        proof = {'wrapper': str(self.wrapper.resolve()), 'profile': 'hub-shared-codex'} if readiness else None
+        with mock.patch.object(adapter, 'codex_exec_readiness', return_value=proof), \
+             mock.patch.object(adapter, 'record_evidence'):
+            try:
+                adapter.launch('t1', spec)
+                error = None
+            except RuntimeError as caught:
+                error = str(caught)
+        return calls, error
+
+    def child(self, calls):
+        argv = calls[0][0]
+        return argv[argv.index('--') + 1:]
+
+    def test_direct_headless_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=False, route={'provider': 'codex'})
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.headless_effort_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), 'high')
+        expected = nl._headless_insert_flags('codex', expected, nl.HEADLESS_OUTPUT_FLAGS.get('codex', ()))
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(calls[0][0]))
+
+    def test_direct_interactive_replaces_only_the_sdk_executable(self):
+        calls, error = self.launch(interactive=True, effort='medium')
+        self.assertIsNone(error)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.interactive_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), prompt,
+                                       model='gpt-6.1-sol', effort='medium')
+        self.assertEqual(self.child(calls), [str(self.wrapper.resolve())] + expected[1:])
+        self.assertIn('-c', self.child(calls))
+        self.assertNotIn('exec', self.child(calls))
+
+    def test_profile_route_keeps_task_run_and_propagates_only_the_verified_wrapper(self):
+        calls, error = self.launch(interactive=False)
+        self.assertIsNone(error)
+        argv, options = calls[0]
+        child = self.child(calls)
+        self.assertEqual(child[1:3], ['task', 'run'])
+        self.assertEqual(child[child.index('--profile') + 1], 'hub-shared-codex')
+        self.assertNotIn(str(self.wrapper), child, 'the wrapper must not wrap or replace task run')
+        self.assertIn('CODEX_LAUNCH_WRAPPER=' + str(self.wrapper.resolve()), argv[:argv.index('--')])
+        self.assertNotIn('/offer/supplied/wrapper', ' '.join(argv))
+
+    def test_missing_unsafe_or_incompatible_wrapper_refuses_before_spawn(self):
+        raw = '#!/usr/bin/env bash\nset -euo pipefail\nexec %s/codex "$@"\n' % self.root
+        cases = {'missing': str(self.root / 'absent.sh'), 'relative': 'launch-codex.sh', 'empty': '',
+                 'world-writable': str(self.write_wrapper('open.sh', mode=0o707)),
+                 'raw': str(self.write_wrapper('raw.sh', raw)),
+                 'no-failclosed': str(self.write_wrapper('loose.sh', '#!/usr/bin/env bash\npython3 quota-gate.py\nexec %s/codex "$@"\n' % self.root))}
+        for name, value in cases.items():
+            for interactive in (False, True):
+                with self.subTest(case=name, interactive=interactive), mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': value}):
+                    calls, error = self.launch(interactive=interactive)
+                    self.assertEqual(error, 'codex_launch_wrapper_unavailable')
+                    self.assertEqual(calls, [])
+        # The maintained wrapper itself is never available off Linux.
+        with mock.patch.object(nl.sys, 'platform', 'win32'):
+            with self.assertRaises(ValueError):
+                nl.codex_launch_wrapper()
+
+    def test_profile_not_proven_wrapper_aware_refuses_before_spawn(self):
+        calls, error = self.launch(interactive=False, readiness=False)
+        self.assertEqual((calls, error), ([], 'codex_launch_wrapper_unavailable'))
+
+    def test_custom_or_substituted_profile_never_proves_readiness(self):
+        adapter = nl.NativeLauncher({})
+        for profile in ('hub-other-codex', 'hub-codex-orin', None):
+            self.assertIsNone(adapter.codex_exec_readiness({'provider': 'codex', 'profile': profile},
+                                                           str(self.wrapper.resolve())))
+
+    def test_other_providers_are_unchanged_even_with_a_bad_wrapper(self):
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=False, route={'provider': 'zai'})
+        self.assertIsNone(error)
+        child = self.child(calls)
+        self.assertEqual(child[0], 'zcodex')
+        self.assertNotIn('CODEX_LAUNCH_WRAPPER', ' '.join(calls[0][0]))
+        with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+            calls, error = self.launch(interactive=True, provider='zai')
+        self.assertIsNone(error)
+        self.assertEqual(self.child(calls)[0], 'zcodex')
+
+    def test_capabilities_do_not_advertise_unusable_codex(self):
+        config = {'routes': {'codex': {'provider': 'codex'}, 'opencode': {'provider': 'go'}}}
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value={'ok': 1}):
+            self.assertIn('codex', nl.NativeLauncher(config).capabilities())
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}):
+                caps = nl.NativeLauncher(config).capabilities()
+            self.assertNotIn('codex', caps)
+            self.assertIn('opencode', caps)
+            custom = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-custom'}}}
+            self.assertNotIn('codex', nl.NativeLauncher(custom).capabilities())
+
+    def test_local_default_headless_runs_native_login_through_wrapper(self):
+        """Exit-75 regression (2026-11-23): the default local route never uses the
+        legacy managed profile home, whose credential no Hub2 component refreshes."""
+        calls = []
+
+        def runner(argv, **options):
+            calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace),
+                'command': argv[argv.index('--') + 1:]}), '')
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}}}, runner=runner)
+        self.assertEqual(adapter.config['routes']['codex'], nl.LOCAL_ROUTES['codex'])
+        self.assertIsNone(adapter.config['routes']['codex'].get('profile'))
+        spec = {'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol', 'prompt': 'synthetic prompt',
+                'interactive': False, 'effort': 'medium', 'timeout_seconds': 600}
+        with mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch.object(adapter, 'record_evidence'):
+            adapter.launch('t1', spec)
+        proof.assert_not_called()
+        child = self.child(calls)
+        prompt = nl.aplexer_prompt('synthetic prompt' + nl.FIRST_ACTION_INSTRUCTION.format(
+            path=self.workspace / '.local/first-action-t1.json'))
+        expected = nl.headless_effort_argv('codex', nl.adapter_argv('codex', prompt, 'gpt-6.1-sol'), 'medium')
+        self.assertEqual(child, [str(self.wrapper.resolve())] + expected[1:])
+        self.assertNotIn('--profile', child)
+        self.assertNotIn('hub-shared-codex', ' '.join(calls[0][0]))
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof:
+            self.assertIn('headless', nl.NativeLauncher({'routes': {'codex': {'provider': 'codex'}}}).capabilities()['codex'])
+        proof.assert_not_called()
+
+    def test_codex_headless_withdrawn_loudly_when_release_profile_proof_fails(self):
+        """A stale headless profile cannot withdraw the separate interactive path."""
+        config = {'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}}}
+        launcher = nl.NativeLauncher(config)
+        with mock.patch.object(nl.shutil, 'which', side_effect=lambda b: '/bin/' + b), \
+                mock.patch.object(nl.NativeLauncher, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch('sys.stderr') as err:
+            self.assertEqual(launcher.capabilities()['codex'], {'interactive', 'goal', 'effort'})
+            self.assertEqual(launcher.capabilities()['codex'], {'interactive', 'goal', 'effort'})
+            shown = ''.join(call.args[0] for call in err.write.call_args_list)
+        self.assertEqual(shown.count('ALERT hub2-host: codex_launch_wrapper_unavailable'), 1)
+        self.assertIn('profile_release_mismatch', shown)
+        self.assertIn('headless capability withdrawn; interactive remains available', shown)
+        self.assertEqual(proof.call_count, 1, 'proof is cached between heartbeats')
+
+    def test_stale_headless_profile_preserves_real_interactive_validation_and_launch(self):
+        from agent_hub_host.agent import Bridge
+        calls = []
+        def runner(argv, **options):
+            calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                'id': self.NATIVE_ID, 'tag': 'task-t1', 'workspace': str(self.workspace),
+                'command': argv[argv.index('--') + 1:]}), '')
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}}}, runner=runner)
+        bridge = Bridge.__new__(Bridge)
+        bridge.launcher, bridge.engines = adapter, ['codex']
+        bridge.resolve_workspace = lambda value: self.workspace
+        offer = {'session_id': 'interactive-owned', 'operation_id': 'op-interactive', 'epoch': 1,
+                 'expires_at': time.time()*1000+60000, 'launch': {
+                     'workspace': str(self.workspace), 'engine': 'codex', 'model': 'gpt-6.1-sol',
+                     'prompt': 'synthetic source review', 'interactive': True, 'effort': 'medium'}}
+        original = set(nl.PROVIDER_CAPABILITIES['codex'])
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch.object(adapter, 'record_evidence'), mock.patch('sys.stderr'):
+            spec = bridge.validate_launch(offer)
+            self.assertEqual(adapter.launch('t1', spec)['mode'], 'interactive')
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(self.child(calls)[0], str(self.wrapper.resolve()))
+            self.assertNotIn('task', self.child(calls))
+            self.assertEqual(proof.call_count, 1, 'interactive launch uses no additional headless proof')
+            offer['launch']['interactive'] = False
+            with self.assertRaisesRegex(ValueError, 'launcher_capability_unavailable_headless'):
+                bridge.validate_launch(offer)
+            with self.assertRaisesRegex(RuntimeError, 'codex_launch_wrapper_unavailable'):
+                adapter.launch('t1', dict(spec, interactive=False))
+            self.assertEqual(len(calls), 1, 'refused headless work must not spawn')
+        self.assertEqual(nl.PROVIDER_CAPABILITIES['codex'], original)
+
+    def test_codex_partial_withdrawal_recovers_after_cache_expiry_without_mutating_other_routes(self):
+        adapter = nl.NativeLauncher({'routes': {'codex': {'provider': 'codex', 'profile': 'hub-shared-codex'}, 'zai': {'provider': 'zai'}}})
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.object(nl.time, 'monotonic', return_value=1) as clock, \
+                mock.patch.object(adapter, 'codex_exec_readiness', return_value=None) as proof, \
+                mock.patch('sys.stderr') as err:
+            first = adapter.capabilities()
+            self.assertNotIn('headless', first['codex'])
+            self.assertEqual(first['zai'], nl.PROVIDER_CAPABILITIES['zai'])
+            proof.return_value = {'ok': 1}
+            clock.return_value = 32
+            self.assertEqual(adapter.capabilities()['codex'], nl.PROVIDER_CAPABILITIES['codex'])
+            self.assertEqual(adapter.capabilities()['codex'], nl.PROVIDER_CAPABILITIES['codex'])
+            shown = ''.join(call.args[0] for call in err.write.call_args_list)
+            self.assertEqual(shown.count('ALERT hub2-host:'), 1)
+            self.assertEqual(shown.count('RECOVERED hub2-host:'), 1)
+            self.assertEqual(proof.call_count, 2)
+        with mock.patch.object(nl.shutil, 'which', return_value='/synthetic/binary'), \
+                mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': '/nonexistent'}), mock.patch('sys.stderr'):
+            self.assertNotIn('codex', adapter.capabilities())
+            self.assertEqual(adapter.capabilities()['zai'], nl.PROVIDER_CAPABILITIES['zai'])
+
+    def test_packaged_archive_readiness_requires_wrapper_aware_pin_and_maintained_profile(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        import hashlib
+        import zipfile
+        release = self.root / ('b' * 40)
+        release.mkdir(mode=0o700)
+        (release / 'bin').mkdir(mode=0o700)
+        (release / 'bin/python').symlink_to(sys.executable)
+        archive = release / 'hub.pyz'
+        package = Path(__file__).resolve().parents[3] / 'host/agent_hub_host'
+
+        def build(skip=()):
+            with zipfile.ZipFile(archive, 'w') as out:
+                for file in package.glob('*.py'):
+                    out.write(file, 'agent_hub_host/' + file.name)
+                out.writestr('__main__.py', 'raise RuntimeError("CLI main must never run")')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            receipt = {'host_version': release.name, 'artifacts': {'hub.pyz': {
+                'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}
+            (release / 'release.json').write_text(json.dumps(receipt))
+            (release / 'release.json').chmod(0o600)
+        build()
+        profile = self.root / 'profiles/config.toml'
+        profile.parent.mkdir(mode=0o700)
+        code = ('import sys,json;sys.path.insert(0,sys.argv[1]);'
+                'from agent_hub_host.provisioning import module_command;'
+                'sys.argv[0]=sys.argv[1];print(json.dumps(module_command("execute","shared-codex")))')
+        command = json.loads(subprocess.check_output([str(release / 'bin/python'), '-I', '-S', '-c', code, str(archive)], text=True))
+
+        def publish(argv, name='hub-shared-codex'):
+            profile.write_text('[profiles."%s"]\nengine="codex"\ncommand=%s\n' % (name, json.dumps(argv)))
+            profile.chmod(0o600)
+        route = {'provider': 'codex', 'profile': 'hub-shared-codex'}
+        wrapper = str(self.wrapper.resolve())
+        results = []
+
+        def probe(argv, **kwargs):
+            results.append(subprocess.run(argv, **kwargs))
+            return results[-1]
+        adapter = nl.NativeLauncher({}, runner=probe)
+        with mock.patch.dict(os.environ, {'APLEXER_CONFIG': str(profile)}):
+            publish(command)
+            ready = adapter.codex_exec_readiness(route, wrapper, release)
+            self.assertIsNotNone(ready, results[-1].stderr if results else 'probe not reached')
+            self.assertEqual(ready['wrapper'], wrapper)
+            self.assertIsNone(adapter.codex_exec_readiness(route, str(self.root / 'other-wrapper'), release))
+            publish([sys.executable, '-c', 'raise SystemExit(0)', 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'custom profile bypassing gated exec')
+            publish(command, 'hub-custom-codex')
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'profile substitution')
+            publish(['/tmp/evil-python', *command[1:]])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'unverified interpreter')
+            publish([command[0], '-c', command[2].replace('import os;', f'sys.path.insert(0, {repr(str(self.root / "old.pyz"))}); import os;'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'old archive inserted ahead')
+            publish([command[0], '-c', command[2].replace('execute()', 'os.system("true"); execute()'), 'shared-codex'])
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release), 'additional statement')
+            publish(command)
+            # An old pin without the wrapper-aware readiness protocol is refused.
+            with zipfile.ZipFile(archive, 'w') as out:
+                out.writestr('agent_hub_host/__init__.py', '')
+                out.writestr('agent_hub_host/provisioning.py', 'def module_command(*a):\n    return []\n')
+            archive.chmod(0o600)
+            raw = archive.read_bytes()
+            (release / 'release.json').write_text(json.dumps({'host_version': release.name, 'artifacts': {
+                'hub.pyz': {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}}}))
+            self.assertIsNone(adapter.codex_exec_readiness(route, wrapper, release))
+
+    def test_wrapper_rejects_bypass_scripts(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        bypasses = {
+            'shebang-semicolon': '#!/usr/bin/env bash; set -euo pipefail; echo quota-gate.py; exec /synthetic/codex "$@"\n',
+            'echo-gate': '#!/usr/bin/env bash\nset -euo pipefail\necho quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'conditional-gate': '#!/usr/bin/env bash\nset -euo pipefail\nif false; then python3 /tmp/quota-gate.py; fi\nexec /synthetic/codex "$@"\n',
+            'ignored-failure': '#!/usr/bin/env bash\nset -euo pipefail\npython3 /tmp/scripts/quota-gate.py || true\nexec /synthetic/codex "$@"\n',
+            'shadowed-python': '#!/usr/bin/env bash\nset -euo pipefail\npython3() { :; }\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nexec /synthetic/codex "$@"\n' % self.root,
+            'reordered-statements': '#!/usr/bin/env bash\nrepo=%s\npython3 "$repo/scripts/quota-gate.py"\nset -euo pipefail\nexec /synthetic/codex "$@"\n' % self.root,
+            'comment-vt-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\vpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ff-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\fpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-nel-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\x85python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ls-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2028python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'comment-ps-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n# gate disabled\u2029python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ws-nbsp-smuggle': '#!/usr/bin/env bash\nset -euo pipefail\n\u00a0python3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-cr': '#!/usr/bin/env bash\nset -euo pipefail\r\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-fs': '#!/usr/bin/env bash\nset -euo pipefail\n\x1cpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-del': '#!/usr/bin/env bash\nset -euo pipefail\n# \x7f\npython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+            'ctrl-bom': '#!/usr/bin/env bash\nset -euo pipefail\n\ufeffpython3 /synthetic/quota-gate.py\nexec /synthetic/codex "$@"\n',
+        }
+        for name, body in bypasses.items():
+            bad = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(bad)}):
+                with self.assertRaises(ValueError, msg=name):
+                    nl.codex_launch_wrapper()
+                calls, error = self.launch(interactive=False)
+                self.assertEqual(error, 'codex_launch_wrapper_unavailable', name)
+                self.assertEqual(calls, [], name)
+
+    def test_wrapper_accepts_canonical_templates_with_shell_whitespace(self):
+        if sys.platform != 'linux':
+            self.skipTest('Linux wrapper')
+        canonical = {
+            'repo-template': (
+                '#!/usr/bin/env bash\n'
+                '  # maintained comment\n'
+                '\tset -euo pipefail\n'
+                f'repo={self.root}\n'
+                'python3 "$repo/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+            'direct-template': (
+                '#!/bin/bash\n'
+                'set -euo pipefail\n'
+                f'\tpython3 "{self.root}/scripts/quota-gate.py"\n'
+                f'exec {self.root}/codex "$@"\n'
+            ),
+        }
+        for name, body in canonical.items():
+            good = self.write_wrapper(f'{name}.sh', text=body)
+            with mock.patch.dict(os.environ, {'CODEX_LAUNCH_WRAPPER': str(good)}):
+                self.assertEqual(nl.codex_launch_wrapper(), good.resolve(), name)
+
+
+class NoneOutputTest(unittest.TestCase):
+    def test_native_treats_none_stdout_and_stderr_as_empty(self):
+        result = subprocess.CompletedProcess(['a'], 0, stdout=None, stderr=None)
+        launcher = nl.NativeLauncher({}, runner=lambda *a, **k: result)
+        out = launcher.native('status', 'x', '--json')
+        self.assertEqual((out.stdout, out.stderr), ("", ""))
+        self.assertIsNone(launcher.status('x'))
+
+
+class ProfileCommandUtf8PromptTest(unittest.TestCase):
+    def test_profile_command_writes_utf8_prompt_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = nl.NativeLauncher({'routes': {'claude': {'provider': 'claude'}}})
+            prompt = 'AC1 «Каждый час смотри чтобы был прогресс» — test'
+            spec = {
+                'workspace': tmp,
+                'engine': 'claude',
+                'model': 'opus',
+                'timeout_seconds': 600,
+                'operation_id': 'op-utf8',
+                'epoch': 1,
+            }
+            real_fdopen = os.fdopen
+            seen_encodings = []
+
+            def checked_fdopen(fd, mode='r', *args, **kwargs):
+                seen_encodings.append(kwargs.get('encoding'))
+                return real_fdopen(fd, mode, *args, **kwargs)
+
+            with mock.patch.object(nl.os, 'fdopen', side_effect=checked_fdopen):
+                argv = launcher.profile_command('hub2-utf8', spec, {'provider': 'claude', 'engine': 'claude'}, prompt)
+            self.assertTrue(any(enc in ('utf8', 'utf-8') for enc in seen_encodings))
+            prompt_file = Path(argv[argv.index('--prompt-file') + 1])
+            self.assertEqual(prompt_file.read_text(encoding='utf-8'), prompt)
+
+
+class AntigravityFirstRunBlockTests(unittest.TestCase):
+    def test_detects_onboarding_and_tos_screens_and_ignores_normal_output(self):
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            '\x1b[1mWelcome to Antigravity CLI!\x1b[0m Choose your color scheme: > terminal [Next]'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Terms of Service\nPlease review and accept the terms.\n> Accept  Decline  enter Confirm'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Security Notice & Data Use\n[Next] Navigate · enter Confirm'))
+        self.assertTrue(nl.detect_antigravity_first_run_block(
+            'Welcome to the Antigravity CLI. You are currently not signed in.\nAuthentication required. Please visit the URL to log in:'))
+        self.assertFalse(nl.detect_antigravity_first_run_block(''))
+        self.assertFalse(nl.detect_antigravity_first_run_block(
+            'Accessing workspace: C:\\Users\\User\\git\\agent-desktop\nDo you trust the contents of this project?\n> Yes, I trust this folder'))
+        self.assertFalse(nl.detect_antigravity_first_run_block(
+            'Checked Terms of Service docs and finished the task cleanly.'))
+
+    def test_reconcile_alerts_and_stops_hung_antigravity_first_run_session(self):
+        from agent_hub_host.agent import Bridge, HOST_FAILURE_DETAILS, Journal
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            journal = Journal(root / 'v2-journal.sqlite')
+            self.addCleanup(journal.close_thread)
+            native_id = '11111111-2222-3333-4444-555555555555'
+            killed = {'done': False}
+            exited_at = int(time.time() * 1000)
+
+            def runner(argv, **_kwargs):
+                if argv[1] == 'status':
+                    if killed['done']:
+                        row = {'id': native_id, 'tag': 'task-hub2-sess-tos', 'workspace': str(root),
+                               'engine': 'antigravity', 'phase': 'exited', 'containment_empty': True,
+                               'exit': {'code': 143, 'exited_at_ms': exited_at}}
+                    else:
+                        row = {'id': native_id, 'tag': 'task-hub2-sess-tos', 'workspace': str(root),
+                               'engine': 'antigravity', 'phase': 'running', 'containment_empty': False}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(row), '')
+                if argv[1] == 'capture':
+                    return subprocess.CompletedProcess(
+                        argv, 0, 'Welcome to Antigravity CLI! Choose your color scheme: > terminal [Next]', '')
+                if argv[1] == 'kill':
+                    killed['done'] = True
+                    return subprocess.CompletedProcess(argv, 0, '{}', '')
+                return subprocess.CompletedProcess(argv, 0, '{}', '')
+
+            bridge = Bridge(mock.Mock(), journal, [root], ['antigravity'], executable=sys.executable, runner=runner)
+            bridge._managed_socket = mock.Mock()
+            bridge.launcher.finalize = lambda *_a, **_k: 'finalized'
+            with journal.db:
+                journal.db.execute(
+                    "INSERT INTO launches(operation_id,session_id,epoch,digest,workspace,tag,native_id,state,interactive,runtime_deadline,native_dispatch_started) "
+                    "VALUES(?,?,?,?,?,?,?,'running',1,?,1)",
+                    ('op-tos', 'sess-tos', 1, 'd' * 64, str(root), 'task-hub2-sess-tos', native_id, exited_at + 60000))
+            with self.assertLogs('agent_hub_host.agent', level='ERROR') as logs:
+                bridge.reconcile()
+            self.assertTrue(any('FIRST-RUN BLOCKED' in line and 'antigravity_first_run_blocked' in line for line in logs.output))
+            frame = json.loads(bridge._managed_socket.send.call_args.args[0])
+            self.assertEqual(frame['type'], 'host.error')
+            self.assertEqual(frame['stage'], 'host_runtime')
+            self.assertEqual(frame['reason'], 'antigravity_first_run_blocked')
+            self.assertEqual(frame['detail'], HOST_FAILURE_DETAILS['antigravity_first_run_blocked'])
+            self.assertTrue(killed['done'])
+            outbox = journal.db.execute("SELECT payload FROM outbox WHERE key='finish:op-tos'").fetchone()
+            self.assertIsNotNone(outbox)
+            payload = json.loads(outbox['payload'])
+            self.assertEqual(payload['failure_reason'], 'antigravity_first_run_blocked')
+            self.assertEqual(payload['detail'], HOST_FAILURE_DETAILS['antigravity_first_run_blocked'])
+            self.assertNotIn('launch_failed', payload)
+
+
+class GoBinaryAndPreflightTests(unittest.TestCase):
+    def test_resolve_engine_binary_finds_managed_opencode_without_shell_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            managed = Path(tmp) / 'managed'
+            opencode = managed / 'shared-go-rev1/engine/node_modules/@opencode/cli-linux-x64/bin/opencode'
+            opencode.parent.mkdir(parents=True)
+            opencode.write_text('#!/bin/sh\nexit 0\n')
+            opencode.chmod(0o700)
+            with mock.patch.object(nl.shutil, 'which', return_value=None), \
+                 mock.patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(managed), 'PATH': '/usr/bin:/bin'}):
+                self.assertEqual(nl.resolve_engine_binary('go'), str(opencode))
+
+    def test_resolve_engine_binary_finds_nvm_opencode_without_shell_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            nvm_bin = home / '.nvm/versions/node/v24.13.1/bin/opencode'
+            nvm_bin.parent.mkdir(parents=True)
+            nvm_bin.write_text('#!/bin/sh\nexit 0\n')
+            nvm_bin.chmod(0o700)
+            with mock.patch.object(nl.shutil, 'which', return_value=None), \
+                 mock.patch.object(Path, 'home', return_value=home), \
+                 mock.patch.dict(os.environ, {'AGENT_HUB_MANAGED_DIR': str(home / 'none'), 'PATH': '/usr/bin:/bin'}):
+                self.assertEqual(nl.resolve_engine_binary('go'), str(nvm_bin))
+
+    def test_broken_shared_go_launcher_withdraws_headless_and_refuses_launch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / 'engine-launch/shared-go.sh'
+            launcher.parent.mkdir(parents=True)
+            missing_python = root / 'releases/deleted/bin/python'
+            launcher.write_text('#!/bin/sh\nexec ' + str(missing_python) + ' -c "pass" "$@"\n')
+            launcher.chmod(0o700)
+            config = root / 'config.toml'
+            config.write_text('[profiles.hub-shared-go]\nengine = "opencode"\ncommand = ["'
+                              + str(launcher) + '", "shared-go"]\n')
+            adapter = nl.NativeLauncher({'private_provider_homes': False,
+                                         'routes': {'go': nl.LOCAL_ROUTES['go']}},
+                                        aplexer='synthetic-aplexer', runner=lambda *a, **k: None)
+            with mock.patch.dict(os.environ, {'APLEXER_CONFIG': str(config)}), \
+                 mock.patch.object(nl, 'resolve_engine_binary', return_value='/usr/local/bin/opencode'):
+                caps = adapter.capabilities()
+                self.assertEqual(caps.get('go'), {'interactive'})
+                with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
+                    adapter.launch('task-go-broken', {
+                        'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
+                        'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
+                    })
+
+    def test_non_local_launch_refuses_missing_binary_and_uses_resolved_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            adapter = nl.NativeLauncher({'private_provider_homes': True,
+                                         'routes': {'go': {'provider': 'go'}}},
+                                        aplexer='synthetic-aplexer')
+            with mock.patch.object(nl, 'resolve_engine_binary', return_value=None):
+                with self.assertRaisesRegex(RuntimeError, '^engine_binary_unavailable$'):
+                    adapter.launch('task-go-missing', {
+                        'workspace': str(root), 'engine': 'go', 'model': nl.OPENCODE_MODEL,
+                        'prompt': 'do work', 'interactive': False, 'timeout_seconds': 90,
+                    })

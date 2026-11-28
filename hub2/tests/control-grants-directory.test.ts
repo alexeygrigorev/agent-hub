@@ -1,16 +1,21 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ControlDO} from '../src/control-do';
+import {NodeSqlStorage,NodeDurableStorage} from '../node/sqlite-storage';
 import {pickModelRouteDetailed,simulateModelRoutes} from '../src/model-picker';
 import {setImmediate as nextTurn} from 'node:timers/promises';
+import {spawnSync as pickerAdapterSpawn} from 'node:child_process';
+import {fileURLToPath as pickerAdapterFilePath} from 'node:url';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin'],family_id:'operator-family',client_id:'phone'};
 function fixture(options:{beforeAccount?:()=>Promise<void>;schemaMode?:string}={}){const database=new DatabaseSync(':memory:'),snapshots=new Map<string,unknown[]>();const state:any={storage:{async setAlarm(){},async deleteAlarm(){},sql:{exec(q:string,...a:any[]){const s=database.prepare(q);const rows=s.columns().length?s.all(...a):(s.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const v=fn();database.exec('COMMIT');return v;}catch(e){database.exec('ROLLBACK');throw e;}}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
  let control:ControlDO;
  const env:any={HUB2_SCHEMA_MIGRATIONS:options.schemaMode,
  CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:(input:string|Request,init?:RequestInit)=>control.fetch(input instanceof Request?input:new Request(input,init))})},
- ACCOUNTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{await options.beforeAccount?.();return Response.json({account:{enabled:true},hosts:['host-picker']});}})},
+ ACCOUNTS:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>{await options.beforeAccount?.();return Response.json({account:{enabled:true},quota:{remaining:80,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:['host-picker']});}})},
  MACHINES:{idFromName:(id:string)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>new URL(input instanceof Request?input.url:input).pathname.includes('routing')?Response.json({machine_id:id,connected:true,engines:['codex','claude'],capabilities:['headless']}):Response.json({sessions:snapshots.get(id)||[]})})}};
  control=new ControlDO(state,env);
  const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{control,database,call,snapshots,env,restart:()=>{control=new ControlDO(state,env);}};}
 const data=async(r:Response)=>await r.json() as any;
+/** Fail loudly (bca192ab): an existing but invisible route is a named 403, never a bare 404 route_not_found. */
+const routeDenied=async(r:Promise<Response>,scope:string)=>{const x=await r;assert.equal(x.status,403);const b=await data(x);assert.equal(b.missing_scope,scope);assert.notEqual(b.error,'route_not_found');};
 
 function addMachine(database:DatabaseSync,id:string){
  database.prepare('INSERT INTO credentials(actor_id,kind,resource_id,generation,token_hash,scopes_json,family_id,client_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
@@ -60,13 +65,13 @@ test('directory owner immutable, ACL readdress replaces readers, scoped workers 
  assert.equal((await call('/_routes/register','POST',route)).status,200);
  assert.equal((await call('/_routes/register','POST',{...route,owner:'agent:hijack'})).status,409);
  const old={id:'agent:old',kind:'agent',scopes:[]};assert.equal((await call('/api/routes/message/message-000001','GET',undefined,old)).status,200);
- await call('/_routes/register','POST',{...route,epoch:2,participants:['agent:sender','agent:new']});assert.equal((await call('/api/routes/message/message-000001','GET',undefined,old)).status,404);
+ await call('/_routes/register','POST',{...route,epoch:2,participants:['agent:sender','agent:new']});await routeDenied(call('/api/routes/message/message-000001','GET',undefined,old),'message:read');
  assert.equal((await call('/_routes/register','POST',route)).status,409);
  assert.equal((await call('/api/routes/message/message-000001','GET',undefined,{id:'agent:new',kind:'agent',scopes:[]})).status,200);
  await call('/_routes/register','POST',{kind:'intake',id:'intake-000001',owner:'project1',resource_id:'intake-000001',participants:[]});
  await call('/_routes/register','POST',{kind:'intake',id:'intake-000002',owner:'project1',resource_id:'intake-000002',participants:[]});
  const worker={id:'agent:worker',kind:'agent',scopes:['intake:read'],resource_id:'intake-000001'};
- assert.equal((await call('/api/routes/intake/intake-000002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/intake/intake-000002','GET',undefined,worker),'intake:read');
  assert.equal((await call('/api/routes/intake/intake-000001','GET',undefined,worker)).status,200);
  assert.equal((await call('/api/routes/intake/intake-','GET',undefined,admin)).status,409);
  const unique=await data(await call('/api/routes/intake/intake-','GET',undefined,worker));assert.equal(unique.route.id,'intake-000001');
@@ -123,15 +128,15 @@ test('canonical project route resource keeps bound intake and related session au
  for(const [id,intake] of [['session-shared-001','intake-shared-001'],['session-shared-002','intake-shared-002']])await call('/_routes/register','POST',{kind:'session',id,owner:'machine1',resource_id:'org/a',bound_intake_id:intake,participants:[]});
  const worker={id:'agent:bound',kind:'agent',resource_id:'intake-shared-001',scopes:['intake:read']};
  assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,worker)).status,200);
- assert.equal((await call('/api/routes/intake/intake-shared-002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/intake/intake-shared-002','GET',undefined,worker),'intake:read');
  assert.equal((await data(await call('/api/routes/intake/intake-shared-','GET',undefined,worker))).route.id,'intake-shared-001');
  assert.equal((await data(await call('/api/routes/session/session-shared-','GET',undefined,worker))).route.id,'session-shared-001');
- assert.equal((await call('/api/routes/session/session-shared-002','GET',undefined,worker)).status,404);
+ await routeDenied(call('/api/routes/session/session-shared-002','GET',undefined,worker),'intake:read');
  const reader={id:'agent:reader',kind:'agent',scopes:['project:org/a','intake:read']};
  assert.equal((await call('/api/routes/intake/intake-shared-','GET',undefined,reader)).status,409);
- assert.equal((await call('/api/routes/intake/intake-other-003','GET',undefined,reader)).status,404);
- assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['intake:read']})).status,404);
- assert.equal((await call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['project:org/a']})).status,404);
+ await routeDenied(call('/api/routes/intake/intake-other-003','GET',undefined,reader),'intake:read');
+ await routeDenied(call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['intake:read']}),'intake:read');
+ await routeDenied(call('/api/routes/intake/intake-shared-001','GET',undefined,{...reader,scopes:['project:org/a']}),'intake:read');
  assert.equal((await call('/_routes/register','POST',{kind:'session',id:'session-shared-001',owner:'machine1',resource_id:'org/a',bound_intake_id:'intake-shared-002',participants:[],epoch:2})).status,409);
 });
 
@@ -269,4 +274,243 @@ test('observer gap recovery changes coverage identity even within the same milli
  f.restart();
  const recreated=await data(await f.call('/api/picker-alerts/counters'));
  assert.deepEqual(recreated.coverage,after);assert.equal(recreated.consecutive_degraded,1);
+});
+
+test('picker control actual handler and cache produce adapter-compatible committed watermark',async()=>{
+ const f=fixture();await configurePicker(f);
+ try{
+  const initial=await f.call('/api/picker-alerts/counters');
+  assert.equal(initial.headers.get('cache-control'),'no-store');
+  const before=await data(initial);assert.equal(before.coverage.available,true);
+  for(let i=0;i<3;i++){
+   assert.equal((await f.call('/_internal/picker/draw','POST',draw('adapter-real-draw-'+i))).status,200);
+   const warm=await data(await f.call('/api/picker-alerts/counters'));
+   assert.equal(warm.total_picks,i+1); // Cache must invalidate after each actual transaction.
+  }
+  const response=await f.call('/api/picker-alerts/counters');assert.equal(response.status,200);
+  assert.equal(response.headers.get('cache-control'),'no-store');const body=await data(response);
+  const script=pickerAdapterFilePath(new URL('../../scripts/hub_alert_evidence.py',import.meta.url));
+  const python=`import importlib.util,json,sys
+s=importlib.util.spec_from_file_location('sampler',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+e={'mode':'external','source_id':'a'*64,'remote':{'kind':'picker_control_watermark_v1','base_url':'https://synthetic.example','credential_path':'/synthetic/UNREAD.json','source_id':'b'*64,'release_sha':'c'*40}}
+v=m.picker_control_observation(json.load(sys.stdin),e,observed_at_ms=int(sys.argv[2]));print(json.dumps(v))`;
+  const result=pickerAdapterSpawn('python3',['-I','-S','-B','-c',python,script,String(Date.now())],{input:JSON.stringify(body),encoding:'utf8',timeout:5000,maxBuffer:16384});
+  assert.equal(result.status,0,result.stderr);const observed=JSON.parse(result.stdout);
+  assert.equal(observed.kind,'picker_control_watermark_observation_v1');assert.equal(observed.occurrence_count,1);
+  assert.equal(observed.coverage_epoch,body.coverage.epoch);
+  for(const invented of ['complete','nonce','started_total','finished_total','controller_id'])assert.equal(invented in observed,false);
+ }finally{f.database.close();}
+});
+
+test('picker control handler unavailable coverage and actor refusal remain explicit',async()=>{
+ const f=fixture();await configurePicker(f);
+ try{
+  const machine={id:'machine:synthetic',kind:'machine',resource_id:'synthetic',scopes:['session:report']};
+  assert.equal((await f.call('/api/picker-alerts/counters','GET',undefined,machine)).status,403);
+  (f.control as any).pickerObserverDirty=true;
+  const unavailable=await data(await f.call('/api/picker-alerts/counters'));
+  assert.equal(unavailable.coverage.available,false);assert.equal(unavailable.coverage.reason,'picker_observer_unavailable');
+  assert.equal(unavailable.recipient,'dev@dtcdev.click');
+ }finally{f.database.close();}
+});
+
+
+function drawDiagnosticDbImage(database: DatabaseSync) {
+ const names=database.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all() as any[];
+ return JSON.stringify(names.map(row=>[row.name,database.prepare('SELECT * FROM "'+row.name.replaceAll('"','""')+'"').all()]));
+}
+async function seedDrawDiagnostics(f:ReturnType<typeof fixture>){
+ await f.call('/api/model-policy');
+ for(let n=1;n<=2;n++){
+  const project='secret-project',operation='secret-operation-'+n;
+  f.database.prepare('INSERT INTO picker_draws VALUES(?,?,?,?,?)').run(project,operation,0,'d'.repeat(64),
+   JSON.stringify({route:{account_id:'SENTINEL_PRIVATE_ACCOUNT'},diagnostics:{excluded:[{policy_id:'claude-opus-medium',reason:'goal_not_advertised',account_id:'SENTINEL_PRIVATE_ACCOUNT'}]},prompt:'SENTINEL_PRIVATE_PROMPT'}));
+  f.database.prepare('INSERT INTO picker_receipts(project_id,operation_id,attempt,facts_json) VALUES(?,?,?,?)')
+   .run(project,operation,0,JSON.stringify({project_id:project,operation_id:operation,attempt:0,committed_at:1000+n}));
+ }
+}
+test('draw diagnostics actual Control is admin GET only strictly bounded and entirely read only',async t=>{
+ const f=fixture();t.after(()=>f.database.close());await seedDrawDiagnostics(f);
+ const before=drawDiagnosticDbImage(f.database),changes=f.database.prepare('SELECT total_changes() AS n').get()!.n;
+ const queue=(f.control as any).pickerQueue,dirty=(f.control as any).pickerObserverDirty;
+ const response=await f.call('/api/picker-alerts/draw-diagnostics?limit=1&since_receipt_seq=1');
+ assert.equal(response.status,200);assert.equal(response.headers.get('cache-control'),'no-store');
+ const body=await data(response);assert.equal(body.items.length,1);assert.equal(body.items[0].receipt_seq,2);
+ assert.ok(!JSON.stringify(body).includes('SENTINEL_PRIVATE'));assert.ok(!JSON.stringify(body).includes('secret-operation'));
+ const nonadmin={id:'human:viewer',kind:'operator',scopes:['routing:read']};
+ assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,nonadmin)).status,403);
+ assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,{id:'host',kind:'machine',scopes:[]})).status,403);
+ for(const kind of ['machine','agent','service'])assert.equal((await f.call('/api/picker-alerts/draw-diagnostics','GET',undefined,{id:'synthetic-nonoperator',kind,scopes:['operator:admin']})).status,403);
+ for(const method of ['POST','HEAD','PUT','DELETE'])assert.equal((await f.call('/api/picker-alerts/draw-diagnostics',method)).status,405);
+ for(const query of ['limit=0','limit=26','limit=01','limit=1e1','limit=1.5','limit=','limit=1&limit=2','since_receipt_seq=-1',
+   'since_receipt_seq=9007199254740992','since_receipt_seq=NaN','since_receipt_seq=','since=1','raw=1'])
+  assert.equal((await f.call('/api/picker-alerts/draw-diagnostics?'+query)).status,400,query);
+ assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
+ assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
+});
+test('draw diagnostics real Worker forwards bounded query and rejects forged unauthenticated access',async t=>{
+ const f=fixture();t.after(()=>f.database.close());await seedDrawDiagnostics(f);
+ const {default:worker}=await import('../src/worker');
+ const token='synthetic-draw-diagnostic-operator-'+ 'x'.repeat(32),env={...f.env,HUB2_DEV_OPERATOR_TOKEN:token};
+ const call=(path:string,method='GET',auth=true,headers:Record<string,string>={})=>worker.fetch(new Request('http://127.0.0.1'+path,
+  {method,headers:{...(auth?{Authorization:'Bearer '+token}:{}),...headers}}),env);
+ // Warm ordinary dev-actor registration before measuring endpoint effects.
+ assert.equal((await call('/api/auth/me')).status,200);
+ const before=drawDiagnosticDbImage(f.database),changes=f.database.prepare('SELECT total_changes() AS n').get()!.n;
+ const queue=(f.control as any).pickerQueue,dirty=(f.control as any).pickerObserverDirty;
+ const response=await call('/api/picker-alerts/draw-diagnostics?limit=1&since_receipt_seq=1');assert.equal(response.status,200);
+ const body=await data(response);assert.equal(body.limit,1);assert.equal(body.since_receipt_seq,1);assert.equal(body.items.length,1);assert.equal(body.items[0].receipt_seq,2);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics','GET',false,{'x-hub2-actor':JSON.stringify(admin)})).status,401);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics','POST')).status,405);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics?limit=0')).status,400);
+ assert.equal((await call('/api/picker-alerts/draw-diagnostics/private')).status,404);
+ assert.equal(drawDiagnosticDbImage(f.database),before);assert.equal(f.database.prepare('SELECT total_changes() AS n').get()!.n,changes);
+ assert.equal((f.control as any).pickerQueue,queue);assert.equal((f.control as any).pickerObserverDirty,dirty);
+});
+
+test('routing-machines allows routing:read and fails loudly with missing_scope when absent',async t=>{
+ const f=fixture();t.after(()=>f.database.close());
+ const {default:worker}=await import('../src/worker');
+ const token='synthetic-routing-operator-'+'x'.repeat(32);
+ const workerToken='synthetic-routing-worker-'+'y'.repeat(32);
+ const deniedToken='synthetic-routing-denied-'+'z'.repeat(32);
+ const env={...f.env,HUB2_DEV_OPERATOR_TOKEN:token};
+ const origAuth=(f.control as any).fetch.bind(f.control);
+ const customEnv={...env,CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async(r:Request)=>{
+  if(new URL(r.url).pathname==='/_verify'){
+   const body=await r.clone().json() as {token?:string};
+   if(body.token===workerToken)return Response.json({actor:{id:'session:11111111-1111-4111-8111-111111111111',kind:'agent',resource_id:'intake-1',scopes:['intake:read','routing:read','worker_project:org/a']}});
+   if(body.token===deniedToken)return Response.json({actor:{id:'human:limited',kind:'operator',scopes:['intake:read']}});
+  }
+  return origAuth(r);
+ }})}};
+ const allowed=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+workerToken}}),customEnv);
+ assert.equal(allowed.status,200);
+ const denied=await worker.fetch(new Request('http://127.0.0.1/api/fleet/routing/machines',{headers:{Authorization:'Bearer '+deniedToken}}),customEnv);
+ assert.equal(denied.status,403);
+ const deniedBody=await data(denied);
+ assert.equal(deniedBody.missing_scope,'routing:read');
+ assert.match(String(deniedBody.detail),/routing:read/);
+});
+
+function strictNodeFixture(){
+ const sql=new NodeSqlStorage(':memory:');
+ const storage=new NodeDurableStorage(sql);
+ const state:any={storage,blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn())};
+ const env:any={HUB2_CREDENTIAL_KEY:'11'.repeat(32)};
+ const control=new ControlDO(state,env);
+ const call=(p:string,m='GET',b?:unknown,a:unknown=admin)=>control.fetch(new Request('https://control.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));
+ return {sql,storage,control,call,close:()=>sql.close()};
+}
+
+async function pairHost(call:ReturnType<typeof strictNodeFixture>['call'],machineId:string){
+ const p=await data(await call('/api/enrollments/pair','POST',{machine_id:machineId,alias:machineId}));
+ const res=await call('/api/enrollments/complete','POST',{code:p.pairing_code});
+ return {status:res.status,body:await data(res),code:p.pairing_code};
+}
+
+async function issueWorkerGrant(f:ReturnType<typeof strictNodeFixture>,machineId:string,idx:number,deadline=Date.now()+60_000){
+ const sessionId=`11111111-1111-4111-8111-${String(idx).padStart(12,'0')}`;
+ const intakeId=`22222222-2222-4222-8222-${String(idx).padStart(12,'0')}`;
+ const opId=`op-${machineId}-${idx}`;
+ const gen=String(f.sql.exec('SELECT generation FROM credentials WHERE actor_id=?','machine:'+machineId).toArray()[0].generation);
+ await f.call('/_routes/register','POST',{kind:'session',id:sessionId,owner:machineId,resource_id:'org/a',bound_intake_id:intakeId,epoch:1,participants:[]});
+ const res=await f.call('/_worker/issue','POST',{session_id:sessionId,epoch:1,operation_id:opId,machine_id:machineId,intake_id:intakeId,project_id:'org/a',deadline,machine_generation:gen});
+ assert.equal(res.status,200);
+ return {sessionId,intakeId,opId,grant:await data(res)};
+}
+
+test('machine re-enrollment under production NodeDurableStorage.transactionSync revokes active grants atomically without nesting',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ // Zero active grants: initial enroll and clean rotation both succeed.
+ const first=await pairHost(f.call,'host-rot');assert.equal(first.status,201);
+ const second=await pairHost(f.call,'host-rot');assert.equal(second.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:first.body.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:second.body.token})).status,200);
+
+ // Other machine + multiple active grants + already-revoked + expired rows.
+ const other=await pairHost(f.call,'host-other');assert.equal(other.status,201);
+ const otherGrant=await issueWorkerGrant(f,'host-other',1);
+ const g1=await issueWorkerGrant(f,'host-rot',2);
+ const g2=await issueWorkerGrant(f,'host-rot',3);
+ const alreadyRevoked=await issueWorkerGrant(f,'host-rot',4);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:alreadyRevoked.sessionId,epoch:1,operation_id:alreadyRevoked.opId,machine_id:'host-rot',intake_id:alreadyRevoked.intakeId,project_id:'org/a'})).status,200);
+ const priorRevokedAt=Number(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',alreadyRevoked.sessionId).toArray()[0].revoked_at);
+ const expiredSess='33333333-3333-4333-8333-000000000005';
+ f.sql.exec('INSERT INTO worker_credentials(session_id,epoch,operation_id,machine_id,intake_id,project_id,deadline,sealed_token,revoked_at) VALUES(?,?,?,?,?,?,?,?,NULL)',
+  expiredSess,1,'op-exp','host-rot','44444444-4444-4444-8444-000000000005','org/a',Date.now()-10_000,'sealed');
+
+ assert.equal((await f.call('/_verify','POST',{token:g1.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:g2.grant.token})).status,200);
+
+ // Re-enrollment with active grants must succeed (no nested_transaction_unsupported).
+ const rotated=await pairHost(f.call,'host-rot');assert.equal(rotated.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:second.body.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:rotated.body.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:g1.grant.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:g2.grant.token})).status,401);
+ // Exact machine isolation & untouched already-revoked/expired rows.
+ assert.equal((await f.call('/_verify','POST',{token:otherGrant.grant.token})).status,200);
+ assert.equal(Number(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',alreadyRevoked.sessionId).toArray()[0].revoked_at),priorRevokedAt);
+ assert.equal(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',expiredSess).toArray()[0].revoked_at,null);
+});
+
+test('completePairing outer transaction failure after revokeMachine rolls back worker revocations, old host, and pairing',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ const host=await pairHost(f.call,'host-rb');assert.equal(host.status,201);
+ const grant=await issueWorkerGrant(f,'host-rb',10);
+ const nextPair=await data(await f.call('/api/enrollments/pair','POST',{machine_id:'host-rb',alias:'host-rb-next'}));
+
+ f.sql.exec("CREATE TEMP TRIGGER fail_cred_update BEFORE UPDATE OF token_hash ON credentials WHEN NEW.actor_id='machine:host-rb' BEGIN SELECT RAISE(ABORT,'injected_outer_tx_failure'); END;");
+ const failed=await f.call('/api/enrollments/complete','POST',{code:nextPair.pairing_code});
+ assert.equal(failed.status,500);
+ f.sql.exec('DROP TRIGGER fail_cred_update;');
+
+ // Worker grant, old host token, and pairing code must all remain intact.
+ assert.equal(f.sql.exec('SELECT revoked_at FROM worker_credentials WHERE session_id=?',grant.sessionId).toArray()[0].revoked_at,null);
+ assert.equal((await f.call('/_verify','POST',{token:grant.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:host.body.token})).status,200);
+ assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM device_pairings WHERE machine_id='host-rb' AND used_at IS NULL").toArray()[0].n,1);
+
+ // Retrying completePairing after transient failure succeeds and revokes both.
+ const retried=await f.call('/api/enrollments/complete','POST',{code:nextPair.pairing_code});
+ assert.equal(retried.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:grant.grant.token})).status,401);
+ assert.equal((await f.call('/_verify','POST',{token:host.body.token})).status,401);
+});
+
+test('revokeMachine enforces 64-grant success and 65-grant typed 503 with zero mutation, preserving individual revoke contracts',async t=>{
+ const f=strictNodeFixture();t.after(()=>f.close());
+ // 64 active grants succeed.
+ const h64=await pairHost(f.call,'host-64');assert.equal(h64.status,201);
+ const g64First=await issueWorkerGrant(f,'host-64',100);
+ for(let i=101;i<164;i++)await issueWorkerGrant(f,'host-64',i);
+ const rot64=await pairHost(f.call,'host-64');assert.equal(rot64.status,201);
+ assert.equal((await f.call('/_verify','POST',{token:g64First.grant.token})).status,401);
+
+ // 65 active grants refuse with 503 worker_revocation_bound and mutate nothing.
+ const h65=await pairHost(f.call,'host-65');assert.equal(h65.status,201);
+ const g65First=await issueWorkerGrant(f,'host-65',200);
+ for(let i=201;i<265;i++)await issueWorkerGrant(f,'host-65',i);
+ const pair65=await data(await f.call('/api/enrollments/pair','POST',{machine_id:'host-65',alias:'host-65-2'}));
+ const fail65=await f.call('/api/enrollments/complete','POST',{code:pair65.pairing_code});
+ assert.equal(fail65.status,503);
+ assert.equal((await data(fail65)).error,'worker_revocation_bound');
+ assert.equal(Number(f.sql.exec("SELECT COUNT(*) AS n FROM worker_credentials WHERE machine_id='host-65' AND revoked_at IS NULL").toArray()[0].n),65);
+ assert.equal((await f.call('/_verify','POST',{token:g65First.grant.token})).status,200);
+ assert.equal((await f.call('/_verify','POST',{token:h65.body.token})).status,200);
+ assert.equal(f.sql.exec("SELECT COUNT(*) AS n FROM device_pairings WHERE machine_id='host-65' AND used_at IS NULL").toArray()[0].n,1);
+
+ // Individual revoke: idempotent exact binding, 409 mismatch, and absent-grant tombstone fencing.
+ const mismatch=await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'wrong-host',intake_id:g65First.intakeId,project_id:'org/a'});
+ assert.equal(mismatch.status,409);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'host-65',intake_id:g65First.intakeId,project_id:'org/a'})).status,200);
+ assert.equal((await f.call('/_worker/revoke','POST',{session_id:g65First.sessionId,epoch:1,operation_id:g65First.opId,machine_id:'host-65',intake_id:g65First.intakeId,project_id:'org/a'})).status,200);
+ const absentSess='55555555-5555-4555-8555-000000000001',absentIntake='66666666-6666-4666-8666-000000000001';
+ await f.call('/_routes/register','POST',{kind:'session',id:absentSess,owner:'host-65',resource_id:'org/a',bound_intake_id:absentIntake,epoch:1,participants:[]});
+ const absent=await data(await f.call('/_worker/revoke','POST',{session_id:absentSess,epoch:1,operation_id:'op-absent',machine_id:'host-65',intake_id:absentIntake,project_id:'org/a'}));
+ assert.equal(absent.revoked,true);assert.equal(absent.absent,true);
+ const h65Gen=String(f.sql.exec("SELECT generation FROM credentials WHERE actor_id='machine:host-65'").toArray()[0].generation);
+ const fenced=await f.call('/_worker/issue','POST',{session_id:absentSess,epoch:1,operation_id:'op-absent',machine_id:'host-65',intake_id:absentIntake,project_id:'org/a',deadline:Date.now()+60_000,machine_generation:h65Gen});
+ assert.equal(fenced.status,409);
 });

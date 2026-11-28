@@ -136,7 +136,17 @@ def get_opencode_log_paths() -> list[Path]:
         Path.home() / '.local/share/opencode/log/opencode.log',
         Path('/home/alexey/git/agent-hub/.local/platform-runtime/opencode-data/opencode/log/opencode.log'),
     ])
-    return [p for p in paths if p.is_file()]
+    found = []
+    for p in paths:
+        try:
+            if p.is_file():
+                found.append(p)
+        except PermissionError:
+            # Optional log probe: a candidate under another user's private home
+            # (e.g. a CI runner user that cannot traverse /home/alexey) is absent
+            # for this process, not a launch failure. Other OSErrors still raise.
+            continue
+    return found
 
 
 def capture_log_offsets(engine=None) -> dict[str, int]:

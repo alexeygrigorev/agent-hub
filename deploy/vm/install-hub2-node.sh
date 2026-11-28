@@ -61,6 +61,50 @@ STATE=/var/lib/agent-hub
 DB_DIR=$STATE/hub2-db
 CREDENTIAL_MONITOR_EVIDENCE_ROOT=$STATE/credential-monitor-evidence
 
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+REQUIRED_NODE_MAJOR=24
+
+# Fixed service runtime contract: agent-hub-hub2.service selects the absolute
+# /usr/bin/node, and the npm dependency build must run on the same major. The
+# runtime itself is provisioned by deploy/vm/provision-node24.sh through the
+# normal CI SSH path before any deployment mutation.
+node_runtime_major() {
+  local version
+  version="$("$1" --version)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\. ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+require_node24_runtime() {
+  local service_node path_node service_major path_major
+  service_node="${AGENT_HUB_NODE24_TEST_SERVICE_NODE:-/usr/bin/node}"
+  [[ -x "$service_node" ]] \
+    || fail "Hub2 service runtime $service_node is missing; provision Node24 first (deploy/vm/provision-node24.sh through normal CI)"
+  service_major="$(node_runtime_major "$service_node")" \
+    || fail "Hub2 service runtime probe failed at $service_node"
+  [[ "$service_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "Hub2 service runtime at $service_node is Node $service_major, not Node24; provision Node24 before deploying (deploy/vm/provision-node24.sh)"
+  path_node="$(command -v node)" \
+    || fail "no node on PATH for the npm dependency build; the build toolchain must match the Node24 service runtime"
+  path_major="$(node_runtime_major "$path_node")" \
+    || fail "PATH node probe failed at $path_node"
+  [[ "$path_major" == "$REQUIRED_NODE_MAJOR" ]] \
+    || fail "npm dependency build would run on Node $path_major ($path_node), not Node24; align the build runtime before deploying"
+  command -v npm >/dev/null 2>&1 \
+    || fail "npm is required to install release dependencies"
+  printf 'Node24 runtime check passed: service %s at %s, build Node %s at %s.\n' \
+    "$("$service_node" --version)" "$service_node" "$("$path_node" --version)" "$path_node"
+}
+
+# Direct-call guard: refuse BEFORE the first systemd unit, edge site, state
+# directory, CLI artifact or secret write. The transaction calls this installer
+# only after its own early guard and the CI provisioning step passed.
+require_node24_runtime
+
 echo "== systemd units"
 install -m 644 "$DEPLOY_DIR/agent-hub-hub2.service" /etc/systemd/system/agent-hub-hub2.service
 systemctl disable --now agent-hub-worker.service agent-hub-cron.timer agent-hub-cron.service 2>/dev/null || true
@@ -114,8 +158,8 @@ if [[ -n "$RELEASE_MODE" || -n "$SCHEMA_MIGRATIONS" ]]; then
   echo "== release configuration"
   python3 - "$REPO/.dev.vars" "$RELEASE_MODE" "$SCHEMA_MIGRATIONS" "$REPO" "$CREDENTIAL_MONITOR_EVIDENCE_ROOT" <<'PY'
 import ctypes
-import hashlib
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -126,7 +170,6 @@ import tempfile
 import uuid
 from pathlib import Path
 
-ARTIFACTS = ("hub2/node/alert-evidence.ts", "hub2/node/main.ts", "hub2/src/worker.ts")
 
 path = Path(sys.argv[1])
 mode, schema_mode = sys.argv[2:4]
@@ -156,6 +199,154 @@ def _publish_directory(src_dir_fd: int, src_name: str, dst_dir_fd: int, dst_name
     rename.restype = ctypes.c_int
     if rename(src_dir_fd, os.fsencode(src_name), dst_dir_fd, os.fsencode(dst_name), 1) != 0:
         raise OSError(ctypes.get_errno(), "exclusive evidence root publication refused")
+
+
+# Public source mode repair is separate from evidence/history. Only selected
+# Git bytes and trusted fixed source inodes may lose group/other write bits.
+NODE_SOURCES = ('hub2/node/alert-evidence.ts', 'hub2/node/main.ts', 'hub2/src/worker.ts',
+                'hub2/src/model-picker.ts', 'hub2/src/routing-pool.ts')
+NODE_ROLES = ('credential_monitor', 'picker_excluded', 'picker_quota_stale')
+
+
+class SourceModeRefused(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__('selected_source_unverified')
+
+
+def source_check(condition, reason):
+    if not condition:
+        raise SourceModeRefused(reason)
+
+
+def source_fields(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def source_parent(path, owner):
+    source_check(path.is_absolute() and os.path.normpath(path) == str(path), 'source_directory_untrusted')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd); fd = nxt
+            info = os.fstat(fd)
+            source_check(info.st_uid in (0, owner) and not info.st_mode & 0o002, 'source_directory_untrusted')
+        return fd
+    except BaseException:
+        os.close(fd); raise
+
+
+def source_read(fd, owner):
+    info = os.fstat(fd)
+    source_check(stat.S_ISREG(info.st_mode), 'source_file_not_regular')
+    source_check(info.st_uid in (0, owner), 'source_file_foreign_owner')
+    source_check(info.st_nlink == 1, 'source_file_linked')
+    source_check(info.st_size <= 16 * 1024 * 1024, 'source_file_oversized')
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = b''
+    while len(data) <= info.st_size:
+        chunk = os.read(fd, min(65536, info.st_size + 1 - len(data)))
+        if not chunk: break
+        data += chunk
+    source_check(len(data) == info.st_size and source_fields(os.fstat(fd)) == source_fields(info), 'source_file_changed')
+    return info, hashlib.sha256(data).hexdigest()
+
+
+def source_git(repo, commit, relative, env, child_options):
+    command = ['/usr/bin/git', '--no-optional-locks', '-C', str(repo), 'cat-file']
+    size = subprocess.run(command + ['-s', commit + ':' + relative], env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(size.returncode == 0 and len(size.stdout) <= 32 and size.stdout.strip().isdigit(), 'source_git_unverified')
+    count = int(size.stdout); source_check(count <= 16 * 1024 * 1024, 'source_file_oversized')
+    result = subprocess.run(command + ['blob', commit + ':' + relative], env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(result.returncode == 0 and len(result.stdout) == count, 'source_git_unverified')
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def source_head(repo, commit, env, child_options):
+    result = subprocess.run(['/usr/bin/git', '--no-optional-locks', '-C', str(repo), 'rev-parse', '--verify', 'HEAD'],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+    source_check(result.returncode == 0 and result.stdout == (commit + '\n').encode(), 'source_git_unverified')
+
+
+def source_recheck(handle, owner):
+    parent, fd, name, expected_info, expected_hash = handle
+    info, digest = source_read(fd, owner)
+    source_check(source_fields(info) == source_fields(expected_info)
+                 and source_fields(os.stat(name, dir_fd=parent, follow_symlinks=False)) == source_fields(info), 'source_file_changed')
+    source_check(digest == expected_hash, 'source_hash_mismatch')
+    source_check(not info.st_mode & 0o022, 'source_file_unsafe_mode')
+    os.fsync(fd)  # Includes a retry after prior uncertain mode durability.
+
+
+def source_close(handles):
+    failures = {}
+    for relative, (parent, fd, *_) in handles.items():
+        for descriptor in (fd, parent):
+            try: os.close(descriptor)
+            except OSError:  # Never retry a possibly consumed FD.
+                for role in (NODE_ROLES if NODE_SOURCES.index(relative) < 3 else NODE_ROLES[1:]):
+                    failures.setdefault(role, 'source_file_unavailable')
+    return failures
+
+
+def harden_node_sources(repo, commit, owner, env, child_options):
+    source_head(repo, commit, env, child_options)
+    handles, failures = {}, {}
+    for index, relative in enumerate(NODE_SOURCES):
+        parent = fd = None
+        try:
+            expected_hash = source_git(repo, commit, relative, env, child_options)
+            path = repo / relative
+            parent = source_parent(path.parent, owner)
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            info, digest = source_read(fd, owner)
+            source_check(digest == expected_hash, 'source_hash_mismatch')
+            source_check(source_fields(os.stat(path.name, dir_fd=parent, follow_symlinks=False)) == source_fields(info), 'source_file_changed')
+            desired = stat.S_IMODE(info.st_mode) & ~0o022
+            if stat.S_IMODE(info.st_mode) != desired:
+                os.fchmod(fd, desired)  # ONLY already-opened verified public source inode.
+            os.fsync(fd)
+            after = os.fstat(fd)
+            source_check((after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_nlink, after.st_size, after.st_mtime_ns) ==
+                         (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns)
+                         and stat.S_IMODE(after.st_mode) == desired, 'source_file_changed')
+            handle = (parent, fd, path.name, after, expected_hash)
+            source_recheck(handle, owner)
+            handles[relative] = handle; parent = fd = None
+        except Exception as error:
+            reason = error.reason if isinstance(error, SourceModeRefused) else 'source_file_unavailable'
+            for role in (NODE_ROLES if index < 3 else NODE_ROLES[1:]):
+                failures.setdefault(role, reason)
+        finally:
+            for descriptor in (fd, parent):
+                if descriptor is not None:
+                    try: os.close(descriptor)
+                    except OSError:
+                        for role in (NODE_ROLES if index < 3 else NODE_ROLES[1:]):
+                            failures.setdefault(role, 'source_file_unavailable')
+    try:
+        source_head(repo, commit, env, child_options)
+    except BaseException:
+        source_close(handles); raise
+    return handles, failures
+
+
+def recheck_node_sources(handles, failures, repo, commit, owner, env, child_options):
+    source_head(repo, commit, env, child_options)
+    for relative, handle in handles.items():
+        try:
+            source_recheck(handle, owner)
+        except Exception as error:
+            reason = error.reason if isinstance(error, SourceModeRefused) else 'source_file_unavailable'
+            for role in (NODE_ROLES if NODE_SOURCES.index(relative) < 3 else NODE_ROLES[1:]):
+                failures.setdefault(role, reason)
+    source_head(repo, commit, env, child_options)
+    return failures
+
 
 
 def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: int) -> None:
@@ -271,17 +462,18 @@ def ensure_private_evidence_root(target_root: Path, owner_uid: int, owner_gid: i
 
 # Match Node parseDevVars: outer JS trim, paired quotes, last assignment wins.
 OBSERVER_KEY = "HUB2_ALERT_EVIDENCE_DIR"
+OBSERVER_KEYS = (OBSERVER_KEY, "HUB2_PICKER_EXCLUDED_EVIDENCE_DIR", "HUB2_PICKER_QUOTA_STALE_EVIDENCE_DIR")
 JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 
 
-def file_observer_value(text):
+def file_observer_value(text, target=OBSERVER_KEY):
     selected = ""
     for raw in text.split("\n"):
         line = raw.strip(JS_SPACE)
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key.strip(JS_SPACE) != OBSERVER_KEY:
+        if key.strip(JS_SPACE) != target:
             continue
         value = value.strip(JS_SPACE)
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -318,7 +510,7 @@ def service_environment():
     if set(props) != set(names) - {"EnvironmentFiles"} or props["NeedDaemonReload"] != "no":
         raise ValueError("observer_service_environment_unverified")
     for name in ("PassEnvironment", "UnsetEnvironment"):
-        if any(word.split("=", 1)[0] == OBSERVER_KEY for word in shlex.split(props[name])):
+        if any(word.split("=", 1)[0] in OBSERVER_KEYS for word in shlex.split(props[name])):
             raise ValueError("observer_service_override_unsupported")
     entries = []
     for row in file_rows:
@@ -346,43 +538,27 @@ def service_environment():
         # Do not implement systemd's multiline value language. An assignment
         # affecting this target needs explicit owner resolution, not OFF.
         logical = content.decode("utf-8").replace("\\\n", "").replace("\\\r\n", "")
-        if re.search(r"(?m)^[ \t\r\v\f]*" + OBSERVER_KEY + r"[ \t\r\v\f]*=", logical):
+        if re.search(r"(?m)^[ \t\r\v\f]*(?:" + "|".join(OBSERVER_KEYS) + r")[ \t\r\v\f]*=", logical):
             raise ValueError("observer_service_override_unsupported")
     assignments = {}
     for word in shlex.split(props["Environment"]):
         key, separator, value = word.partition("=")
-        if separator and key == OBSERVER_KEY:
+        if separator and key in OBSERVER_KEYS:
             assignments[key] = value
-    if OBSERVER_KEY not in assignments:
+    if any(key not in assignments for key in OBSERVER_KEYS):
         manager = systemctl("show-environment")
-        if any(line.split("=", 1)[0] == OBSERVER_KEY for line in manager.splitlines()):
+        if any(line.split("=", 1)[0] in OBSERVER_KEYS for line in manager.splitlines()):
             raise ValueError("observer_service_override_unsupported")
     return assignments
 
 
-observer_selected = False
-if mode == "active" and (repo_arg or evidence_root_arg):
+# Observer preparation is optional to primary service availability. A refusal
+# never authorizes a zero, deletes prior evidence or fabricates activation.
+if mode == "active" and repo_arg and evidence_root_arg:
+    source_handles = {}
     try:
         overrides = service_environment()
-        if OBSERVER_KEY in overrides:
-            if overrides[OBSERVER_KEY]:
-                # A fixed process override would ignore the new file pointer.
-                raise ValueError("observer_service_override_unhonorable")
-        else:
-            observer_selected = bool(file_observer_value(original_text))
-    except Exception as exc:
-        reason = str(exc) if isinstance(exc, ValueError) and str(exc) in {
-            "observer_service_environment_unverified", "observer_service_override_unsupported",
-            "observer_service_override_unhonorable"} else "observer_service_environment_unverified"
-        raise SystemExit("observer_selection_failed: " + reason) from None
-
-
-if mode == "active" and observer_selected and (repo_arg or evidence_root_arg):
-    if not repo_arg or not evidence_root_arg:
-        raise SystemExit("credential_monitor_staging_failed")
-    try:
-        repo = Path(repo_arg)
-        evidence_root = Path(evidence_root_arg)
+        repo, evidence_root = Path(repo_arg), Path(evidence_root_arg)
         owner_uid, owner_gid = original_stat.st_uid, original_stat.st_gid
         ensure_private_evidence_root(evidence_root, owner_uid, owner_gid)
         def _drop_privileges():
@@ -390,79 +566,84 @@ if mode == "active" and observer_selected and (repo_arg or evidence_root_arg):
                 os.setgroups([owner_gid])
                 os.setresgid(owner_gid, owner_gid, owner_gid)
                 os.setresuid(owner_uid, owner_uid, owner_uid)
+        child_options = {"preexec_fn": _drop_privileges} if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else {}
+        git_env = {"PATH": os.defpath, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+        selected = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-C", str(repo),
+                                   "rev-parse", "--verify", "HEAD"], env=git_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=False, **child_options)
+        if selected.returncode or len(selected.stdout) > 64:
+            raise ValueError("observer_checkout_unverified")
+        commit = selected.stdout.decode("ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("observer_checkout_unverified")
+        source_handles, source_holds = harden_node_sources(repo, commit, owner_uid, git_env, child_options)
+        command = [sys.executable, "-I", "-S", str(repo / "scripts/stage-credential-monitor.py"),
+                   "--checkout", str(repo), "--expected-commit", commit, "--prepare-active-root", str(evidence_root)]
+        for producer, key in zip(("credential-monitor", "picker-excluded", "picker-quota-stale"), OBSERVER_KEYS):
+            command += ["--current-" + producer, file_observer_value(original_text, key)]
+            if key in overrides:
+                command += ["--blocked-producer", producer.replace("-", "_")]
+        staged = subprocess.run(command, env=git_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=15, check=False, **child_options)
+        if staged.returncode or len(staged.stdout) > 16384:
+            raise ValueError("node_observer_preparation_unavailable")
+        receipt = json.loads(staged.stdout)
+        if (not isinstance(receipt, dict) or receipt.get("kind") != "hub_node_observers_prepared_v2"
+                or receipt.get("release_sha") != commit or receipt.get("activated") is not False
+                or receipt.get("historical_coverage") is not False
+                or not isinstance(receipt.get("pointers"), dict)
+                or not set(receipt["pointers"]) <= set(OBSERVER_KEYS)
+                or not isinstance(receipt.get("held"), dict)):
+            raise ValueError("node_observer_preparation_unavailable")
+        roles = dict(zip(("credential_monitor", "picker_excluded", "picker_quota_stale"), OBSERVER_KEYS))
+        reasons = {"service_override", "selected_source_unverified", "current_identity_unverified",
+                   "same_tuple_unqualified", "same_tuple_capacity_reached", "target_ownership_unverified",
+                   "producer_state_unqualified"}
+        if (set(receipt["held"]) != {role for role, key in roles.items() if key not in receipt["pointers"]}
+                or any(reason not in reasons for reason in receipt["held"].values())
+                or any(key in overrides for key in receipt["pointers"])):
+            raise ValueError("node_observer_preparation_unavailable")
+        source_reasons = {"source_directory_untrusted", "source_directory_unavailable", "source_file_unavailable",
+                          "source_file_not_regular", "source_file_foreign_owner", "source_file_linked",
+                          "source_file_unsafe_mode", "source_file_oversized", "source_file_changed",
+                          "source_git_unverified", "source_hash_mismatch", "source_unclassified"}
+        source_failures = receipt.get("source_failures", {})
+        if (not isinstance(source_failures, dict)
+                or set(source_failures) != {role for role, reason in receipt["held"].items() if reason == "selected_source_unverified"}
+                or any(reason not in source_reasons for reason in source_failures.values())):
+            raise ValueError("node_observer_preparation_unavailable")
+        for key, value in receipt["pointers"].items():
+            if (not isinstance(value, str) or not os.path.isabs(value)
+                    or (Path(value).parent != evidence_root and value != file_observer_value(original_text, key))
+                    or any(ord(c) < 33 or ord(c) == 127 for c in value)):
+                raise ValueError("node_observer_preparation_unavailable")
+        source_holds = recheck_node_sources(source_handles, source_holds, repo, commit, owner_uid, git_env, child_options)
+        if source_holds:
+            # Root's post-child fence may ONLY remove authority; it cannot mint
+            # a pointer or repair a child receipt into a successful enrollment.
+            role_keys = dict(zip(NODE_ROLES, OBSERVER_KEYS))
+            if not isinstance(receipt, dict): raise ValueError("node_observer_preparation_unavailable")
+            for role, reason in source_holds.items():
+                receipt["pointers"].pop(role_keys[role], None)
+                if receipt["held"].get(role) != "service_override":
+                    receipt["held"][role] = "selected_source_unverified"
+                    receipt.setdefault("source_failures", {})[role] = reason
+        updates.update(receipt["pointers"])
+        for role, reason in receipt["held"].items():
+            print("node_observer_held:" + role + ":" + reason + "; no new coverage authorized", file=sys.stderr)
+            if role in source_failures:
+                print("node_observer_source:" + role + ":" + source_failures[role], file=sys.stderr)
+    except Exception:
+        # Do not print exceptions/config/paths. Existing pointers and histories
+        # remain; loaded/current/boot checks determine UNKNOWN independently.
+        print("node_observer_preparation_unavailable; no new coverage authorized", file=sys.stderr)
+    finally:
+        for role, reason in source_close(source_handles).items():
+            updates.pop(dict(zip(NODE_ROLES, OBSERVER_KEYS))[role], None)
+            print("node_observer_held:" + role + ":selected_source_unverified; no new coverage authorized", file=sys.stderr)
+            print("node_observer_source:" + role + ":" + reason, file=sys.stderr)
 
-        git_env = {
-            "PATH": os.defpath,
-            "HOME": "/nonexistent",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-        head_proc = subprocess.run(
-            ["/usr/bin/git", "--no-optional-locks", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
-            env=git_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
-        )
-        if head_proc.returncode != 0 or len(head_proc.stdout) > 64:
-            raise ValueError("unable to resolve checkout HEAD")
-        expected_commit = head_proc.stdout.decode("ascii").strip()
-        if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
-            raise ValueError("invalid checkout HEAD")
-        hashes = {}
-        for rel in ARTIFACTS:
-            artifact_path = repo / rel
-            st = os.lstat(artifact_path)
-            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_mode & 0o022):
-                raise ValueError(f"untrusted authority artifact: {rel}")
-            hashes[rel] = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-        destination = evidence_root / f"{expected_commit}-{uuid.uuid4().hex}"
-
-        stage_cmd = [
-            sys.executable,
-            "-I",
-            "-S",
-            str(repo / "scripts/stage-credential-monitor.py"),
-            "--checkout",
-            str(repo),
-            "--destination",
-            str(destination),
-            "--expected-commit",
-            expected_commit,
-            "--observer-sha256",
-            hashes["hub2/node/alert-evidence.ts"],
-            "--main-sha256",
-            hashes["hub2/node/main.ts"],
-            "--worker-sha256",
-            hashes["hub2/src/worker.ts"],
-        ]
-        stage_proc = subprocess.run(
-            stage_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
-            check=False,
-            preexec_fn=_drop_privileges if os.geteuid() == 0 and (owner_uid != 0 or owner_gid != 0) else None,
-        )
-        if stage_proc.returncode != 0:
-            raise ValueError("stage-credential-monitor refused")
-        receipt = json.loads(stage_proc.stdout.decode("utf-8"))
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("kind") != "credential_monitor_staged_boundary_v1"
-            or receipt.get("destination") != str(destination)
-            or receipt.get("release_sha") != expected_commit
-            or receipt.get("activated") is not False
-            or not (destination / "enrollment.json").is_file()
-            or not (destination / "journal.json").is_file()
-        ):
-            raise ValueError("invalid staged boundary receipt")
-        updates["HUB2_ALERT_EVIDENCE_DIR"] = str(destination)
-    except Exception as exc:
-        raise SystemExit(f"credential_monitor_staging_failed: {exc}") from None
 
 # Keep every unrelated byte, including CRLF and absent final newline.
 lines = re.findall(r"[^\n]*\n|[^\n]+$", original_text)
@@ -480,7 +661,7 @@ for line in lines:
     updated.append(line)
 for key, value in updates.items():
     if key not in inserted:
-        if key == OBSERVER_KEY:
+        if key in OBSERVER_KEYS:
             if updated and not updated[-1].endswith("\n"):
                 updated.append("\n")
             updated.append(f"{key}={value}\n")
@@ -496,7 +677,23 @@ try:
         os.fsync(temporary.fileno())
     os.chown(temporary_name, original_stat.st_uid, original_stat.st_gid)
     os.chmod(temporary_name, stat.S_IMODE(original_stat.st_mode))
+    # Publish only against the config image this installer actually read.
+    current = os.lstat(path)
+    if ((current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            != (original_stat.st_dev, original_stat.st_ino, original_stat.st_size, original_stat.st_mtime_ns, original_stat.st_ctime_ns)
+            or path.read_bytes().decode("utf-8") != original_text):
+        raise ValueError("release_configuration_changed")
+    sync_fd = os.open(temporary_name, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fsync(sync_fd)
+    finally:
+        os.close(sync_fd)
     os.replace(temporary_name, path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 except BaseException:
     try:
         os.unlink(temporary_name)
@@ -538,6 +735,36 @@ if [[ "$HUB_ONLY" != true ]]; then
   systemctl reload caddy 2>/dev/null || systemctl restart caddy
 fi
 
+# Best-effort diagnostic only: bounded exact-unit/current-invocation projection.
+# Journal field matching works without the newer journalctl --invocation option.
+report_hub2_startup_failure() {
+  (
+    set +e
+    local invocation after status markers
+    invocation="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --property=InvocationID --value 2>/dev/null)"
+    if [[ ! "$invocation" =~ ^[0-9a-f]{32}$ ]]; then
+      printf '%s\n' '[hub2-startup-diagnostic-v1] unavailable'
+      exit 0
+    fi
+    status="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --no-pager \
+      --property=ActiveState,SubState,Result,MainPID,ExecMainCode,ExecMainStatus 2>/dev/null |
+      grep -E '^(ActiveState=(active|reloading|inactive|failed|activating|deactivating|maintenance)|SubState=(running|dead|failed|start|start-pre|start-post|stop|stop-sigterm|stop-sigkill|stop-post|auto-restart|exited)|Result=(success|resources|timeout|exit-code|signal|core-dump|watchdog|start-limit-hit|oom-kill|protocol)|MainPID=[0-9]{1,10}|ExecMainCode=[0-9]{1,10}|ExecMainStatus=[0-9]{1,10})$' | head -n 6)"
+    markers="$(timeout --kill-after=0.5s 0.5s journalctl --no-pager --quiet --output=cat --lines=100 \
+      '_SYSTEMD_UNIT=agent-hub-hub2.service' "_SYSTEMD_INVOCATION_ID=$invocation" 2>/dev/null |
+      grep -E '^\[hub2-startup-v1\] stage=(preimport|imports_env|schema_probe_begin|schema_probe_end|runtime|listening) elapsed_ms=[0-9]{1,10}( objects=[0-9]{1,4})?( code=startup_failed)?$' | head -n 24)"
+    after="$(timeout --kill-after=0.5s 0.5s systemctl show agent-hub-hub2.service --property=InvocationID --value 2>/dev/null)"
+    if [[ "$after" != "$invocation" ]]; then
+      printf '%s\n' '[hub2-startup-diagnostic-v1] invocation_changed'
+      exit 0
+    fi
+    printf '%s\n' '[hub2-startup-diagnostic-v1] current_invocation'
+    [[ -z "$status" ]] || printf '%s\n' "$status"
+    [[ -z "$markers" ]] || printf '%s\n' "$markers"
+    exit 0
+  ) || true
+  return 0
+}
+
 wait_for_hub2_readiness() {
   local attempt=0 curl_rc=0 health_body="" max_wait=15 start_seconds deadline remaining max_time
   if [[ "${AGENT_HUB_DEPLOY_TEST_MODE:-0}" == 1 && "${AGENT_HUB_TEST_READINESS_DEADLINE_S:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -552,6 +779,7 @@ wait_for_hub2_readiness() {
     fi
     if ! systemctl is-active --quiet agent-hub-hub2.service; then
       printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state on readiness attempt %s/15.\n' "$attempt" >&2
+      report_hub2_startup_failure
       return 1
     fi
     remaining=$((deadline - SECONDS))
@@ -576,9 +804,11 @@ wait_for_hub2_readiness() {
   done
   if ! systemctl is-active --quiet agent-hub-hub2.service; then
     printf 'ERROR: agent-hub-hub2.service entered an inactive/failed state after %s readiness attempts.\n' "$((attempt > 15 ? 15 : attempt))" >&2
+    report_hub2_startup_failure
     return 1
   fi
   printf 'ERROR: Hub2 local health check http://127.0.0.1:8787/health did not become ready after %s attempts / %ss (last curl exit=%s): %s\n' "$((attempt > 15 ? 15 : attempt))" "$((SECONDS - start_seconds))" "$curl_rc" "$health_body" >&2
+  report_hub2_startup_failure
   return 1
 }
 

@@ -4,29 +4,89 @@
 Drives the public CLIs only (`hub sessions start|list|capture|stop`,
 `a list --json --running`). See docs/HUB-START-CANARY.md.
 """
-import argparse, datetime, errno, fcntl, hashlib, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, uuid
+import argparse, base64, datetime, errno, fcntl, hashlib, ipaddress, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time, urllib.parse, uuid
 
 ALERT_TO = "dev@dtcdev.click"  # fixed on purpose: never configurable, never orin@
 ALERT_FROM = "alerts@dtcdev.click"
 MSMTP_ACCOUNT = "alerts"
 MARKER = "CANARY-OK"
 PROMPTS = {"full": "Reply CANARY-OK and exit", "shell": "printf CANARY-OK; sleep 30"}
-STAGES = ("helper_version", "lock", "host_release", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
+STAGES = ("helper_version", "lock", "host_release", "health", "admission", "start", "running", "list_host_workspace", "capture", "stop", "gone", "cleanup")
 FAIL_THRESHOLD = 2
 RECOVER_THRESHOLD = 2
 HELPER_FILES = ("hub-deploy-gate-forced.sh", "hub-start-canary.sh", "hub_start_canary.py")
 
-# Fixed trusted ceilings for pre-commit deploy-gate mode (240s active + 60s cleanup < 360s outer wrapper).
+# Fixed trusted ceilings for pre-commit deploy-gate mode (360s active + 60s cleanup < 480s outer wrapper).
 TRUSTED_CONVERGE_TIMEOUT_S = 90.0
 TRUSTED_RUNNING_TIMEOUT_S = 90.0
 TRUSTED_CAPTURE_TIMEOUT_S = 30.0
+TRUSTED_FULL_CAPTURE_TIMEOUT_S = 120.0
 TRUSTED_STOP_TIMEOUT_S = 45.0
 TRUSTED_CMD_TIMEOUT_S = 45.0
-TRUSTED_ACTIVE_BUDGET_S = 240.0
+TRUSTED_ACTIVE_BUDGET_S = 360.0
 TRUSTED_CLEANUP_BUDGET_S = 60.0
-TRUSTED_LOCK_WAIT_S = 5.0
+TRUSTED_LOCK_WAIT_S = 60.0
 PERIODIC_DEFAULT_LOCK_WAIT_S = 120.0
 PENDING_STALE_AFTER_S_DEFAULT = 3600.0
+# Public, unauthenticated Hub health body checked before each periodic start.
+# HUB_CANARY_HEALTH_URL exists for offline tests: https anywhere, plain http
+# only on a loopback literal; path must be /health; no userinfo/query/fragment.
+DEFAULT_HEALTH_URL = "https://hub.dtcdev.click/health"
+HEALTH_TIMEOUT_S = 10.0
+HEALTH_MAX_BYTES = 4096
+HEALTH_REASONS = frozenset((
+    "health_status_bootstrap", "health_not_ok", "health_unparseable_json", "health_body_too_large",
+    "health_http_status", "health_timeout", "health_unreachable",
+))
+# Runs as `python3 -I -S -c HEALTH_CHILD scheme host port budget_s max_bytes`; prints one fixed token.
+HEALTH_CHILD = r"""
+import http.client, json, ssl, sys, time
+scheme, host, port, budget, max_bytes = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4]), int(sys.argv[5])
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate")
+        value[key] = item
+    return value
+def verdict():
+    port_num = int(port) if port else None
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port_num, timeout=budget, context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port_num, timeout=budget)
+    try:
+        conn.request("GET", "/health", headers={"Accept": "application/json", "User-Agent": "hub-start-canary"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return "health_http_status"
+        body = b""
+        while len(body) <= max_bytes:
+            chunk = resp.read(max_bytes + 1 - len(body))
+            if not chunk:
+                break
+            body += chunk
+        if len(body) > max_bytes:
+            return "health_body_too_large"
+    finally:
+        conn.close()
+    try:
+        data = json.loads(body.decode("utf-8"), object_pairs_hook=unique)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return "health_unparseable_json"
+    if not isinstance(data, dict):
+        return "health_unparseable_json"
+    if data.get("ok") is True:
+        return "ok"
+    return "health_status_bootstrap" if data.get("status") == "bootstrap" else "health_not_ok"
+try:
+    token = verdict()
+except TimeoutError:
+    token = "health_timeout"
+except Exception:
+    token = "health_unreachable"
+sys.stdout.write(token + "\n")
+"""
 HOST_UPDATER_TRIGGER_ARGV = (
     "systemctl",
     "--user",
@@ -34,12 +94,101 @@ HOST_UPDATER_TRIGGER_ARGV = (
     "--no-block",
     "agent-hub2-host-update.service",
 )
+# Trusted candidate CLI/updater publication origin.
+# Production is fixed to https://hub.dtcdev.click/cli; HUB_CANARY_CLI_BASE_URL
+# may only override with a loopback literal for hermetic offline tests.
+DEFAULT_CLI_BASE_URL = "https://hub.dtcdev.click/cli"
+CLI_FETCH_TIMEOUT_S = 20.0
+MAX_HOST_RELEASE_MANIFEST_BYTES = 1024 * 1024
+MAX_UPDATER_BYTES = 2 * 1024 * 1024
+CLI_FETCH_REASONS = frozenset(("http_status", "body_too_large", "timeout", "unreachable"))
+# Runs as `python3 -I -S -c CLI_FETCH_CHILD scheme host port req_path budget_s max_bytes`.
+CLI_FETCH_CHILD = r"""
+import base64, http.client, ssl, sys
+scheme, host, port, req_path, budget, max_bytes = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]), int(sys.argv[6])
+)
+def fetch():
+    port_num = int(port) if port else None
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port_num, timeout=budget, context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port_num, timeout=budget)
+    try:
+        conn.request("GET", req_path, headers={"Accept": "application/json, text/x-python", "User-Agent": "hub-start-canary"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None, "http_status"
+        body = b""
+        while len(body) <= max_bytes:
+            chunk = resp.read(max_bytes + 1 - len(body))
+            if not chunk:
+                break
+            body += chunk
+        if len(body) > max_bytes:
+            return None, "body_too_large"
+        return body, None
+    finally:
+        conn.close()
+try:
+    data, err = fetch()
+except TimeoutError:
+    data, err = None, "timeout"
+except Exception:
+    data, err = None, "unreachable"
+if err is not None:
+    sys.stdout.write(f"ERR:{err}\n")
+    sys.exit(1)
+sys.stdout.write(base64.b64encode(data).decode("ascii") + "\n")
+"""
 
 
 class StageFailure(Exception):
-    def __init__(self, stage, reason):
+    def __init__(self, stage, reason, *, admission_diagnostic=None):
         super().__init__(f"{stage}: {reason}")
         self.stage, self.reason = stage, reason
+        self.admission_diagnostic = admission_diagnostic
+
+
+ADMISSION_DIAGNOSTIC_VALUES = {
+    "category": frozenset(("coordinator_kernel_cap", "starting_recorded_cap", "provided_recorded_cap",
+                           "census_invalid", "census_changed", "inflight_changed", "workload_reappeared",
+                           "chosen_identity_changed", "chosen_cap_changed")),
+    "cap_status": frozenset(("unavailable", "changed")),
+    "age_class": frozenset(("young", "mature")),
+    "target_kind": frozenset(("coordinator", "workload_current")),
+    "state_class": frozenset(("running", "other")),
+    "phase_class": frozenset(("running", "other")),
+}
+
+
+def add_admission_diagnostic(result, failure):
+    """Publish closed categories only; diagnostic failure never replaces the original refusal.
+
+    No new measurements, file writes or admission decisions happen here. In particular,
+    an unavailable cap does not identify RAM exhaustion or an unbounded kernel limit.
+    """
+    try:
+        if failure.stage != "admission" or failure.reason not in ("resident_bound_unknown", "resident_fallback_changed"):
+            return
+        detail = failure.admission_diagnostic
+        if detail is None:
+            return  # Preserve the verdict shape of existing callers without diagnostic evidence.
+        if (type(detail) is not dict or "category" not in detail
+                or any(type(key) is not str or key not in ADMISSION_DIAGNOSTIC_VALUES
+                       or type(value) is not str or value not in ADMISSION_DIAGNOSTIC_VALUES[key]
+                       for key, value in detail.items())):
+            raise ValueError("closed diagnostic required")
+        result["admission_diagnostic"] = dict(detail)
+    except Exception:
+        result["admission_diagnostic"] = {"category": "unavailable"}
+
+
+def is_young_resident_hold(failure):
+    """True only for an admission hold whose sole premise is a young resident without a finite cap."""
+    detail = failure.admission_diagnostic
+    return (failure.stage == "admission" and failure.reason == "resident_bound_unknown" and type(detail) is dict
+            and detail.get("age_class") == "young" and detail.get("cap_status") == "unavailable")
 
 
 class CanaryTerminated(BaseException):
@@ -295,6 +444,133 @@ def valid_native_id(val):
 CLAUDE_EMPTY_BASH_PLACEHOLDER = "(Bash completed with no output)"
 
 
+def zai_native_return_proof(captured, expected, binding=None):
+    """One owned capture, exact native returned text; never reconstruct stdout.
+
+    The producer has paired the scheduled Bash input with the native return.
+    Provider thread/session IDs are not the aplexer UUID: learn their tuple
+    from this owned stream and refuse drift. No proof frames cross captures.
+    """
+    answer = {"seen": False, "proven": False, "invalidated": False, "binding": binding}
+
+    def identity(value):
+        return (isinstance(value, str) and bool(value) and len(value.encode("utf-8")) <= 256
+                and value == value.strip() and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value))
+
+    def optional_bool(value):
+        return value is None or type(value) is bool
+
+    def optional_uint(value):
+        return value is None or type(value) is int and 0 <= value <= 2**64 - 1
+
+    try:
+        if not isinstance(captured, str) or len(captured.encode("utf-8")) > 65536:
+            answer.update(seen=True, invalidated=True)
+            return answer
+        events, malformed, native_parse_loss = [], False, False
+        for line in captured.split("\n"):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line, object_pairs_hook=unique_object)
+            except (ValueError, TypeError):
+                # An undecodable retained line may hide a native invalidation.
+                # Initial clipping is UNKNOWN, never an ignorable/repaired tail.
+                # Complete assistant strings remain opaque to the strict decoder.
+                native_parse_loss = True
+                malformed = True
+                continue
+            if not isinstance(event, dict):
+                malformed = True
+                continue
+            events.append(event)
+        native = [event for event in events if isinstance(event.get("item"), dict)
+                  and event["item"].get("type") == "native_tool_result"]
+        # Report parse loss even when this poll contains no complete native
+        # item: an already-established native attempt must not heal later.
+        answer["seen"] = bool(native) or native_parse_loss
+        if malformed or len(events) > 128:
+            answer["invalidated"] = True
+            return answer
+        if not native:
+            return answer
+        if binding is not None and (type(binding) is not tuple or len(binding) != 3
+                                    or not all(identity(value) for value in binding)):
+            answer["invalidated"] = True
+            return answer
+        item_ids, call_ids = set(), set()
+        headers = [event.get("thread_id") for event in events if event.get("type") == "thread.started"]
+        fields = {"kind", "native_event", "native_session_id", "native_turn_id", "call_id", "tool",
+                  "command", "content", "native_success", "exit_code", "status", "timed_out",
+                  "native_truncated", "native_original_bytes", "native_returned_bytes",
+                  "local_truncated", "observation_complete"}
+        for event in native:
+            item = event["item"]
+            if (set(event) != {"type", "item"} or event["type"] != "item.completed"
+                    or set(item) != {"id", "type", "thread_id", "turn_id", "observation"}
+                    or not all(identity(item.get(k)) for k in ("id", "thread_id", "turn_id"))
+                    or item["id"] in item_ids):
+                answer["invalidated"] = True
+                return answer
+            item_ids.add(item["id"])
+            observation = item["observation"]
+            if not isinstance(observation, dict):
+                answer["invalidated"] = True
+                return answer
+            if observation.get("kind") == "invalidated":
+                answer["invalidated"] = True
+                continue
+            if (set(observation) != fields or observation.get("kind") != "result"
+                    or observation["native_event"] not in ("tool_call_result", "tool_call_error")
+                    or not identity(observation["native_session_id"])
+                    or not identity(observation["call_id"])
+                    or observation["native_turn_id"] is not None and not identity(observation["native_turn_id"])
+                    or observation["call_id"] in call_ids
+                    or observation["tool"] != "Bash"
+                    or not isinstance(observation["command"], str) or not observation["command"]
+                    or len(observation["command"].encode("utf-8")) > 8192 or "\0" in observation["command"]
+                    or not isinstance(observation["content"], str)
+                    or len(observation["content"].encode("utf-8")) > 65536
+                    or not all(optional_bool(observation[k]) for k in ("native_success", "timed_out", "native_truncated"))
+                    or type(observation["local_truncated"]) is not bool
+                    or type(observation["observation_complete"]) is not bool
+                    or not all(optional_uint(observation[k]) for k in ("native_original_bytes", "native_returned_bytes"))
+                    or observation["exit_code"] is not None and not (type(observation["exit_code"]) is int
+                                                                 and -(2**31) <= observation["exit_code"] < 2**31)
+                    or observation["status"] not in (None, "completed", "failed", "timed_out", "cancelled", "running", "backgrounded")):
+                answer["invalidated"] = True
+                return answer
+            call_ids.add(observation["call_id"])
+            current = (item["thread_id"], item["turn_id"], observation["native_session_id"])
+            if answer["binding"] is None:
+                answer["binding"] = current
+            if current != answer["binding"] or any(header != current[0] for header in headers):
+                answer["invalidated"] = True
+                return answer
+            if observation["local_truncated"]:
+                answer["invalidated"] = True
+            complete = (observation["observation_complete"] is True
+                        and identity(observation["native_turn_id"])
+                        and observation["native_truncated"] is False
+                        and observation["local_truncated"] is False
+                        and type(observation["native_original_bytes"]) is int
+                        and type(observation["native_returned_bytes"]) is int
+                        and observation["native_returned_bytes"] == len(observation["content"].encode("utf-8"))
+                        and observation["native_original_bytes"] <= observation["native_returned_bytes"])
+            if observation["observation_complete"] is True and not complete:
+                answer["invalidated"] = True
+            if (complete and observation["native_event"] == "tool_call_result"
+                    and observation["native_success"] is True
+                    and type(observation["exit_code"]) is int and observation["exit_code"] == 0
+                    and observation["status"] == "completed" and observation["timed_out"] is False
+                    and observation["content"] == expected):
+                answer["proven"] = True
+        answer["proven"] &= not answer["invalidated"]
+        return answer
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        answer.update(seen=True, proven=False, invalidated=True)
+        return answer
+
 def paired_stream_output_ok(captured, expected, engine):
     """Complete provider frames from ONE capture only; never repair clipped JSON."""
     if len(captured.encode()) > 65536:
@@ -524,7 +800,1631 @@ def paired_stream_output_ok(captured, expected, engine):
     return proven
 
 
-class Canary:
+# ---- fixed workspace authority and finite pre-start admission --------------
+
+# Root-owned, non-secret, fixed path. Deliberately not overridable through the
+# environment or an argument: callers (including the forced wrapper, which runs
+# under env -i) cannot select a different production config.
+CANARY_WORKSPACE_CONFIG = "/etc/agent-hub/canary-workspace.json"
+WORKSPACE_CONFIG_MAX_BYTES = 4096
+WORKSPACE_CONFIG_UID = 0
+WORKSPACE_CONFIG_TRUST_ROOT = "/"
+ADMISSION_BUDGET_S = 60.0
+YOUNG_HOLD_ADMISSION_BUDGET_S = 195.0
+ADMISSION_RAM_FLOOR_BYTES = 10 * 1024 ** 3
+# Policy CEILINGS for the new worker. The caps that count are the ones the
+# selected Host launcher will actually apply (read_launcher_caps); anything above
+# these ceilings, or unknowable, holds admission.
+NEW_WORKER_MEMORY_BYTES = 1500 * 1024 ** 2
+NEW_WORKER_PIDS = 256
+# Host launcher defaults when the selected config omits them: hub2/host/agent_hub_host/
+# native_launch.py reads config["launcher"].get("memory_mb", 1500) / .get("pids", 256)
+# and passes them as `--memory <N>M --pids <N>` to the native `a start`.
+LAUNCHER_DEFAULT_MEMORY_MB = 1500
+LAUNCHER_DEFAULT_PIDS = 256
+LAUNCHER_CONFIG_RELATIVE = ".config/agent-hub/v2.json"  # hub2 CLI --config default; the Host service passes no --config
+LAUNCHER_CONFIG_MAX_BYTES = 256 * 1024
+HOST_UNIT_CGROUP_SUFFIX = "/agent-hub2-host.service"  # deploy/agent-hub2-host.service
+# Disk, all on the actual cwd/TMP devices after the validated floor:
+#  - SPIKE: one transient write margin shared by the start itself.
+#  - WORKER_RESERVE: a planning estimate per worker that may still write on the
+#    same device, charged for the NEW worker (this task's own known growth) and for
+#    every live current worker or uncovered in-flight task there (mature RAM proof
+#    says nothing about disk). The figure and the cap borrow the maintained
+#    launcher disk gate constants (host launcher_recovery.py: next_disk_mb=512,
+#    active reserve cap 8192 MiB). That gate belongs to the quota launcher; its
+#    linkage to NativeLauncher starts is NOT proven here, so this is a bounded
+#    conservative estimate, not a measured or guaranteed growth bound.
+ADMISSION_DISK_SPIKE_BYTES = 512 * 1024 ** 2
+ADMISSION_DISK_WORKER_RESERVE_BYTES = 512 * 1024 ** 2
+ADMISSION_DISK_RESERVE_CAP_BYTES = 8192 * 1024 ** 2
+DISK_FLOOR_GB_RANGE = (1, 1048576)
+MATURE_RESIDENT_AGE_S = 180.0
+QUOTA_STALE_S = 1200.0
+CODEX_QUOTA_RESERVE_PERCENT = 15.0
+# Supported quse routes with their required window groups (any alias satisfies a group) and the
+# source-proven optional null plan slots. Data semantics only. Window shapes come from quse
+# usage.py `windows()` (5h/7d/monthly canonical slots; null slots are plan windows the provider
+# does not have): Claude and Gemini (underlying buckets in gemini_quota.py; a missing 5h/7d
+# bucket is an unknown REQUIRED window, not an unsupported provider) and ZAI carry 5h+7d with a
+# null monthly; Go has a real monthly window; Codex requires weekly. Provider support follows
+# the Hub's actual native routes (hub2 native_launch.py: claude, codex, go/opencode, zai via
+# zcodex, antigravity via agy; model-policy.ts: engine zai only on account zai-central, Gemini
+# engine antigravity on account gemini), NOT the presence of agent-quota-launcher
+# provider_admission.py REQUIRED_WINDOWS, which only supplies Claude/Codex/Go data semantics.
+# Aliases: quse key `gemini` (canonical) with probe aliases `agy`/`antigravity`; `codex-orin` is
+# the second Codex ACCOUNT reported under its own wire key and keeps the Codex requirements
+# and strict >15 reserve. Not eligible: copilot (no native route), Grok (quota-only label in
+# worker.ts; no native engine in PROVIDER_CAPABILITIES/LOCAL_ROUTES/CENTRAL_ROUTES, so a
+# Grok-only reading must not qualify a native start; data schema 7d+monthly/optional 5h and the
+# entitlement/5% controls are intentionally not wired until a Hub route exists) and unknown names.
+# This is data validation only: the launcher's executor lifecycle and its independent Codex
+# execution prohibition are not imported; the protected Codex wrapper stays authoritative.
+_FIVE_H_7D = (("5h", "five_hour"), ("7d", "weekly", "seven_day"))
+_CODEX_POLICY = {"required": (("7d", "weekly"),), "optional": frozenset(("5h", "monthly"))}
+_GEMINI_POLICY = {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))}
+QUOTA_ROUTE_POLICY = {
+    "claude": {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))},
+    "go": {"required": (("5h", "rolling"), ("7d", "weekly"), ("monthly",)), "optional": frozenset()},
+    "codex": _CODEX_POLICY,
+    "codex-orin": _CODEX_POLICY,
+    "zai": {"required": _FIVE_H_7D, "optional": frozenset(("monthly",))},
+    "gemini": _GEMINI_POLICY,
+    "agy": _GEMINI_POLICY,
+    "antigravity": _GEMINI_POLICY,
+}
+CODEX_RESERVE_ROUTES = frozenset(("codex", "codex-orin"))
+ADMISSION_JSON_MAX_BYTES = 16 * 1024 * 1024
+ADMISSION_MAX_ROWS = 5000
+PROC_ROOT = "/proc"
+CGROUP_ROOT = "/sys/fs/cgroup"
+# Hub session states with no live physical obligation vs. states that reserve capacity.
+HUB_TERMINAL_STATES = frozenset((
+    "failed", "stopped", "cancelled", "closed", "aborted", "lost", "completed", "completed-awaiting-review", "exited", "archived", "expired",
+))
+HUB_INFLIGHT_STATES = frozenset(("queued", "pending", "dispatching", "staged", "offered", "claimed", "starting", "running", "exiting", "stopping", "needs_attention"))
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+# Fixed read-only bridge executed through the already whole-archive-verified CLI (sealed
+# memfd, isolated interpreter) for the two current physical inputs: resource settings and the
+# complete current session inventory. argv: archive mode remaining_seconds.
+# Guarantees (every refusal is a fixed exit code, never raw text):
+#   * no worker/env/URL override: the ACTUAL effective config (config.load_config, what the
+#     request path really uses) must equal the genuine human profile and be human/non-worker,
+#     re-proved before EVERY GET;
+#   * the caller's finite budget is installed as the maintained request deadline, which clips
+#     each GET and suppresses ALL 401 auth refresh; refresh and every config write are
+#     additionally trapped (hard exit) so a login/refresh/profile save can never happen;
+#   * only fixed GET routes; page/cursor/row bounds; duplicate ids, repeated or unterminated
+#     cursors and bad shapes refuse.
+# Exit codes: 3 unavailable, 4 unauthorized/not human, 5 deadline, 6 invalid/incomplete, 8 write attempt.
+ADMISSION_BRIDGE = r"""
+import json, math, os, sys, time
+sys.path.insert(0, sys.argv[1])
+class Refuse(Exception):
+    def __init__(self, code):
+        self.code = code
+def _trap(*args, **kwargs):
+    os._exit(8)
+try:
+    from agent_hub_host import api, auth, config, session_control, worker_auth
+    mode = sys.argv[2]
+    budget = float(sys.argv[3])
+    if mode not in ("settings", "sessions") or not math.isfinite(budget) or not 0 < budget <= 600:
+        raise Refuse(6)
+    deadline = time.monotonic() + budget
+    for name in ("refresh_token", "login", "save_tokens"):
+        if hasattr(auth, name):
+            setattr(auth, name, _trap)
+    for name in ("save_config", "save_human_config", "save_host_config", "_save_to", "clear_human_config"):
+        if hasattr(config, name):
+            setattr(config, name, _trap)
+    session_control._request_deadline.set(deadline)
+    def proof():
+        for key in ("HUB_CONFIG_FILE", "HUB_JOB_TOKEN", "HUB_TOKEN", "HUB_WORKER_CONFIG_FILE", "HUB2_CONFIG", "HUB_ALLOW_LEGACY_ROUTES"):
+            if os.environ.get(key):
+                raise Refuse(4)
+        if worker_auth.is_v2_worker():
+            raise Refuse(4)
+        human = config.load_human_config()
+        effective = config.load_config()
+        if (not config.is_human_config(human) or effective != human or human.get("client_kind") != "human"
+                or "_hub2_worker" in effective or effective.get("worker_launch_id")):
+            raise Refuse(4)
+        base = human.get("base_url")
+        api.check_url(base)
+        for key in ("HUB_URL", "HUB_BASE_URL"):
+            override = os.environ.get(key)
+            if override and override.rstrip("/") != base.rstrip("/"):
+                raise Refuse(4)
+        return human
+    anchor = proof()
+    def get(path):
+        if time.monotonic() >= deadline:
+            raise Refuse(5)
+        if proof() != anchor:
+            raise Refuse(4)
+        try:
+            return session_control.request("GET", path)
+        except session_control.SessionHTTPError as exc:
+            raise Refuse(4 if exc.status in (401, 403) else 3)
+        except Exception:
+            raise Refuse(5 if time.monotonic() >= deadline else 3)
+    if mode == "settings":
+        data = get("/api/resource-settings")
+        settings = data.get("resource_settings") if isinstance(data, dict) else None
+        floor = settings.get("disk_floor_gb") if isinstance(settings, dict) else None
+        print(json.dumps({"disk_floor_gb": floor}))
+    else:
+        from urllib.parse import quote
+        rows, known, cursors, cursor = [], set(), set(), None
+        for _ in range(PAGES_MAX):
+            path = "/api/sessions?live=1&limit=100" + ("&cursor=" + quote(cursor, safe="") if cursor else "")
+            try:
+                entries, cursor = session_control._session_page(get(path))
+            except ValueError:
+                raise Refuse(6)
+            if len(entries) > 100:
+                raise Refuse(6)
+            for entry in entries:
+                if entry["id"] in known:
+                    raise Refuse(6)
+                known.add(entry["id"])
+                rows.append(entry)
+            if len(rows) > ROWS_MAX:
+                raise Refuse(6)
+            if not cursor:
+                break
+            if cursor in cursors:
+                raise Refuse(6)
+            cursors.add(cursor)
+        else:
+            raise Refuse(6)
+        print(json.dumps({"sessions": rows}))
+except Refuse as refused:
+    sys.exit(refused.code)
+except BaseException:
+    sys.exit(3)
+""".replace("PAGES_MAX", str(ADMISSION_MAX_ROWS // 100 + 2)).replace("ROWS_MAX", str(ADMISSION_MAX_ROWS))
+
+
+def _closed_json(raw, limit):
+    if not isinstance(raw, str) or len(raw.encode("utf-8", "replace")) > limit:
+        raise ValueError("json too large")
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and value == value and value not in (float("inf"), float("-inf"))
+
+
+def _nofollow_ancestors(path, trust_root):
+    """Ancestor directories of path from trust_root downward (trust_root first)."""
+    parts = []
+    cur = pathlib.Path(path).parent
+    root = pathlib.Path(trust_root)
+    while True:
+        parts.append(cur)
+        if cur == root or cur.parent == cur:
+            break
+        cur = cur.parent
+    if parts[-1] != root:
+        raise OSError(errno.EINVAL, "config outside trust root")
+    return list(reversed(parts))
+
+
+def read_workspace_config(path=None):
+    """Return the configured DATA workspace, or None when the file is absent.
+
+    Present but unsafe or malformed config raises StageFailure and never falls
+    back. The file is non-secret and read by UID 1000, so root:root 0644 is
+    the expected mode; only group/world write is refused.
+    """
+    path = CANARY_WORKSPACE_CONFIG if path is None else path
+    def fail(reason):
+        raise StageFailure("admission", "workspace_config_" + reason)
+    try:
+        ancestors = _nofollow_ancestors(path, WORKSPACE_CONFIG_TRUST_ROOT)
+    except OSError:
+        fail("path")
+    absent = False
+    for directory in ancestors:
+        try:
+            st = os.lstat(directory)
+        except FileNotFoundError:
+            absent = True
+            break
+        except OSError:
+            fail("parent")
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            fail("parent")
+        if st.st_uid not in (0, WORKSPACE_CONFIG_UID) or (st.st_mode & 0o022):
+            fail("parent")
+    if absent:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        fail("symlink" if error.errno == errno.ELOOP else "unreadable")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail("not_regular")
+        if before.st_uid != WORKSPACE_CONFIG_UID:
+            fail("owner")
+        if before.st_nlink != 1:
+            fail("nlink")
+        if before.st_mode & 0o022:
+            fail("writable")
+        if before.st_size > WORKSPACE_CONFIG_MAX_BYTES:
+            fail("size")
+        raw = os.read(fd, WORKSPACE_CONFIG_MAX_BYTES + 1)
+        after = os.fstat(fd)
+        if len(raw) > WORKSPACE_CONFIG_MAX_BYTES:
+            fail("size")
+        if (before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns, before.st_uid, before.st_mode) != (
+            after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns, after.st_uid, after.st_mode
+        ) or len(raw) != after.st_size:
+            fail("unstable")
+    except OSError:
+        fail("unreadable")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError):
+        fail("json")
+    if not isinstance(data, dict) or set(data) != {"workspace"}:
+        fail("schema")
+    workspace = data["workspace"]
+    if (not isinstance(workspace, str) or not workspace.startswith("/") or "\0" in workspace
+            or len(workspace) > 1024 or os.path.normpath(workspace) != workspace or workspace == "/"):
+        fail("schema")
+    return workspace
+
+
+def selected_launcher_config_path():
+    """The Host's selected enrollment/launcher config: the hub2 CLI default, no --config."""
+    try:
+        home = pathlib.Path.home()
+    except (RuntimeError, KeyError, OSError):
+        raise StageFailure("admission", "launcher_config_path")
+    if not home.is_absolute() or "\0" in str(home):
+        raise StageFailure("admission", "launcher_config_path")
+    return home / LAUNCHER_CONFIG_RELATIVE
+
+
+def host_module_serve_program(argv, release_tree):
+    """The release interpreter of `hub host serve`: argv == [<release_tree>releases/<id>/bin/python*, -I, -m, agent_hub_host.cli, serve, ...].
+
+    Exact leading tokens, not a substring search. The program is a canonical absolute lexical path of the
+    form <release_tree>releases/<id>/bin/python* (the venv interpreter may itself be a symlink to the system
+    python; it is never resolved). Returns the program or None.
+    """
+    if len(argv) < 5 or argv[1:5] != ["-I", "-m", "agent_hub_host.cli", "serve"]:
+        return None
+    program = argv[0]
+    if not program.startswith("/") or os.path.normpath(program) != program or not program.startswith(release_tree):
+        return None
+    parts = program[len(release_tree):].split("/")
+    if len(parts) != 4 or parts[0] != "releases" or not parts[1] or parts[2] != "bin" or not parts[3].startswith("python"):
+        return None
+    return program
+
+
+def prove_loaded_host_config(config_stat, home):
+    """Exactly one Host daemon of this user, from this home, started with no --config, after the config last changed.
+
+    Source alone cannot prove the daemon loaded the file; this narrows it: the
+    process in the Host unit's cgroup is `hub2 serve` (or the release interpreter `-I -m agent_hub_host.cli serve` of `hub host serve`) run from this home's
+    agent-hub2 release tree without a --config override, and neither mtime nor
+    ctime of the selected config is later than that process's start. It cannot
+    see systemd drop-ins or environment, so it is evidence, not an attestation.
+    """
+    def fail(reason):
+        raise StageFailure("admission", "launcher_config_" + reason)
+    euid = os.geteuid()
+    release_tree = f"{home}/.local/share/agent-hub2/"
+    found = []
+    try:
+        names = [n for n in os.listdir(PROC_ROOT) if n.isdigit()]
+    except OSError:
+        fail("host_unproven")
+    for name in names[:200000]:
+        try:
+            if os.stat(f"{PROC_ROOT}/{name}").st_uid != euid:
+                continue
+            if not any(line.startswith("0::") and line.endswith(HOST_UNIT_CGROUP_SUFFIX)
+                       for line in read_text_limited(f"{PROC_ROOT}/{name}/cgroup").splitlines()):
+                continue
+            argv = read_text_limited(f"{PROC_ROOT}/{name}/cmdline").split("\0")
+        except (OSError, ValueError):
+            continue
+        hub2 = [i for i, a in enumerate(argv) if os.path.basename(a) == "hub2"]
+        if hub2 and "serve" in argv[hub2[0] + 1:]:
+            found.append((int(name), argv, argv[hub2[0]]))
+        elif host_module_serve_program(argv, release_tree):
+            found.append((int(name), argv, argv[0]))
+    if len(found) != 1:
+        fail("host_unproven")
+    pid, argv, program = found[0]
+    if not program.startswith(release_tree) or any(a == "--config" or a.startswith("--config=") for a in argv):
+        fail("host_unproven")
+    def start_ticks():
+        fields = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+        return int(fields[fields.rindex(")") + 2:].split()[19])
+    try:
+        first = start_ticks()
+        # Closed selector: only the daemon's own HOME entry is extracted (RAM only, rest dropped).
+        with open(f"{PROC_ROOT}/{pid}/environ", "rb") as handle:
+            environ = handle.read(1024 * 1024 + 1)
+        if len(environ) > 1024 * 1024:
+            fail("host_unproven")
+        daemon_home = [e[5:] for e in environ.split(b"\0") if e.startswith(b"HOME=")]
+        del environ
+        if daemon_home != [os.fsencode(home)]:
+            fail("host_unproven")
+        started = time.time() - (time.clock_gettime(time.CLOCK_BOOTTIME) - first / os.sysconf("SC_CLK_TCK"))
+        if start_ticks() != first:
+            fail("host_unproven")
+    except (OSError, ValueError, IndexError):
+        fail("host_unproven")
+    # Strictly before the conservative process birth (one clock tick of slack); ambiguous boundaries refuse.
+    if max(config_stat.st_mtime_ns, config_stat.st_ctime_ns) / 1e9 >= started - 1.0 / os.sysconf("SC_CLK_TCK"):
+        fail("changed_after_host_start")
+
+
+def read_launcher_caps(path, expected_machine):
+    """(memory_bytes, pids) the selected Host launcher will apply to a new worker.
+
+    Reads the selected Host config in RAM only (it also holds the enrollment
+    token): bounded, regular, NOFOLLOW, owner-private, machine identity checked,
+    and only machine_id and launcher.memory_mb/pids are extracted; nothing else is
+    kept, logged or reported. Unreadable, unsafe, mismatched, invalid,
+    changed-since-the-Host-started, unattributable or above-ceiling values raise
+    StageFailure and never fall back to a default (the documented source defaults
+    apply only when the keys are absent).
+    """
+    def fail(reason):
+        raise StageFailure("admission", "launcher_config_" + reason)
+    path = pathlib.Path(path)
+    euid = os.geteuid()
+    chain = list(reversed([path.parent, *path.parent.parents]))
+    try:
+        for directory in chain[-3:]:  # ~, ~/.config, ~/.config/agent-hub
+            st = os.lstat(directory)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != euid:
+                fail("parent")
+        if os.lstat(path.parent).st_mode & 0o077:
+            fail("parent")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        fail("absent")
+    except OSError as error:
+        fail("symlink" if error.errno == errno.ELOOP else "unreadable")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail("not_regular")
+        if before.st_uid != euid or before.st_mode & 0o077 or before.st_nlink != 1:
+            fail("unsafe")
+        if before.st_size > LAUNCHER_CONFIG_MAX_BYTES:
+            fail("size")
+        raw = os.read(fd, LAUNCHER_CONFIG_MAX_BYTES + 1)
+        after = os.fstat(fd)
+        if len(raw) > LAUNCHER_CONFIG_MAX_BYTES or len(raw) != after.st_size or (
+            before.st_ino, before.st_dev, before.st_size, before.st_mtime_ns,
+        ) != (after.st_ino, after.st_dev, after.st_size, after.st_mtime_ns):
+            fail("unstable")
+    except OSError:
+        fail("unreadable")
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        fail("json")
+    finally:
+        del raw
+    if not isinstance(data, dict):
+        fail("schema")
+    machine = data.get("machine_id")
+    launcher = data.get("launcher")
+    del data
+    if not isinstance(machine, str) or machine != expected_machine:
+        fail("machine_mismatch")
+    if launcher is None:
+        launcher = {}
+    if not isinstance(launcher, dict):
+        fail("schema")
+    memory_mb = launcher.get("memory_mb", LAUNCHER_DEFAULT_MEMORY_MB)
+    pids = launcher.get("pids", LAUNCHER_DEFAULT_PIDS)
+    del launcher
+    if type(memory_mb) is not int or type(pids) is not int or memory_mb <= 0 or pids <= 0:
+        fail("caps_invalid")
+    prove_loaded_host_config(before, path.parent.parent.parent)
+    if memory_mb * 1024 ** 2 > NEW_WORKER_MEMORY_BYTES:
+        fail("memory_cap_too_high")
+    if pids > NEW_WORKER_PIDS:
+        fail("pids_cap_too_high")
+    return memory_mb * 1024 ** 2, pids
+
+
+def parse_iso_utc(value):
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _quota_record_unhealthy(record):
+    return any(record.get(flag) for flag in ("error", "stale", "limit_reached", "infinite"))
+
+
+def quota_route_usable(name, route, now):
+    """Mirror of the maintained quota sanitizer's fail-closed data acceptance of one route.
+
+    Pure and in-memory; raw quota is never retained or printed. Only the finite routes in
+    QUOTA_ROUTE_POLICY can be eligible. A route is usable only when it is status ok, fresh,
+    not stale/limit-reached, every window (required and extra) is well formed with an ok
+    status, every required window group has a validated present member, and the lowest
+    present remaining percentage is strictly above the provider reserve (Codex: 15). A fully
+    null slot (no percentage, no reset, not explicitly present, no error/status fault) is
+    skipped only when it is a source-proven optional plan window of that provider.
+    """
+    policy = QUOTA_ROUTE_POLICY.get(name)
+    if policy is None or not isinstance(route, dict) or route.get("status") != "ok" or _quota_record_unhealthy(route):
+        return False
+    details = route.get("details") if route.get("details") is not None else {}
+    if not isinstance(details, dict) or details.get("limit_reached") is True or _quota_record_unhealthy(details):
+        return False
+    if details.get("limit_reached") is not None and type(details.get("limit_reached")) is not bool:
+        return False
+    for holder in (route, details):
+        if holder.get("stale") not in (None, False):
+            return False
+    observed = [holder["observed_at"] for holder in (route, details) if holder.get("observed_at") is not None]
+    parsed = [parse_iso_utc(value) for value in observed]
+    if any(value is None for value in parsed) or (len(parsed) == 2 and parsed[0] != parsed[1]):
+        return False
+    if parsed:
+        age = (now - parsed[0]).total_seconds()
+        if not 0 <= age < QUOTA_STALE_S:
+            return False
+    windows = route.get("windows")
+    if not isinstance(windows, dict) or not 1 <= len(windows) <= 32:
+        return False
+    lowest = None
+    available = set()
+    for window_name, window in windows.items():
+        if not isinstance(window_name, str) or not window_name or not isinstance(window, dict):
+            return False
+        # Health and status are checked before any absent-slot handling, so a null slot
+        # cannot hide an explicit error or a non-ok status.
+        if _quota_record_unhealthy(window) or ("status" in window and window["status"] != "ok"):
+            return False
+        if "present" in window and type(window["present"]) is not bool:
+            return False
+        if (window_name in policy["optional"]
+                and window.get("percent_remaining") is None and window.get("reset_at") is None
+                and window.get("present") is not True):
+            continue
+        if window.get("present") is False:
+            return False
+        percent = window.get("percent_remaining")
+        if not _finite_number(percent) or not 0 <= percent <= 100:
+            return False
+        if window.get("reset_at") is not None and parse_iso_utc(window["reset_at"]) is None:
+            return False
+        available.add(window_name)
+        lowest = percent if lowest is None else min(lowest, percent)
+    if any(not available.intersection(group) for group in policy["required"]):
+        return False
+    reserve = CODEX_QUOTA_RESERVE_PERCENT if name in CODEX_RESERVE_ROUTES else 0.0
+    return lowest is not None and lowest > reserve
+
+
+def evaluate_quota(raw, *, require_eligible_route, now=None):
+    """Return None when quota acquisition is acceptable, else a closed reason."""
+    if not isinstance(raw, dict):
+        return "quota_unparseable"
+    if not require_eligible_route:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if any(quota_route_usable(name, route, now) for name, route in raw.items() if isinstance(name, str)):
+        return None
+    return "quota_no_eligible_route"
+
+
+def read_text_limited(path, limit=65536):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "proc file too large")
+    return data.decode("utf-8", "replace")
+
+
+BIRTH_WINDOW_S = (-2.0, 30.0)  # kernel start (btime + starttime) minus SDK created_at_ms, as qualified for current launches
+PROC_STAT_MAX_BYTES = 4 * 1024 * 1024
+CENSUS_SIGNATURE_FIELDS = (
+    "worker_alive", "worker_pid", "worker_cgroup", "workload_pid", "workload_cgroup", "state", "phase",
+    "created_at_ms", "workspace", "cwd", "limits", "containment_empty", "containment_cgroup_identity",
+)
+
+
+def read_proc_btime():
+    """Kernel boot wall-clock seconds from /proc/stat, read in bounded chunks (the intr line can be huge)."""
+    fd = os.open(f"{PROC_ROOT}/stat", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        data = b""
+        while len(data) <= PROC_STAT_MAX_BYTES:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > PROC_STAT_MAX_BYTES:
+        raise OSError(errno.EFBIG, "proc stat too large")
+    for line in data.decode("utf-8", "replace").splitlines():
+        if line.startswith("btime "):
+            value = int(line.split()[1])
+            if value > 0:
+                return value
+    raise ValueError("btime")
+
+
+def birth_matches(created_ms, start_ticks, btime, hz):
+    return (type(created_ms) is int and created_ms > 0 and type(start_ticks) is int and btime > 0 and hz > 0
+            and BIRTH_WINDOW_S[0] <= btime + start_ticks / hz - created_ms / 1000 <= BIRTH_WINDOW_S[1])
+
+
+def relative_cgroup(raw):
+    """Normalized '/a/b' cgroup path relative to the cgroup root, or None when malformed."""
+    if not isinstance(raw, str) or not raw.startswith("/") or "\0" in raw:
+        return None
+    if raw.startswith(CGROUP_ROOT + "/"):
+        raw = raw[len(CGROUP_ROOT):]
+    parts = raw.split("/")[1:]
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    return raw
+
+
+def read_at_limited(dir_fd, name, limit=65536):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+    try:
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(errno.EFBIG, "cgroup file too large")
+    return data.decode("utf-8", "replace")
+
+
+def open_cgroup_dir(group, root_fd=None):
+    """Directory fd of a cgroup reached component-by-component without following symlinks.
+
+    With root_fd the walk starts from (a duplicate of) that already-held cgroup mount root, so the
+    returned directory is provably below the root whose identity the caller recorded.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(CGROUP_ROOT, flags) if root_fd is None else os.dup(root_fd)
+    try:
+        for part in group.split("/")[1:]:
+            nxt = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def parse_fdinfo_mount_id(text):
+    """The single positive decimal mnt_id of a /proc/self/fdinfo/<fd> text; ValueError otherwise."""
+    values = [line.partition(":")[2].strip() for line in text.splitlines() if line.startswith("mnt_id:")]
+    if len(values) != 1 or not values[0].isdecimal() or int(values[0]) <= 0:
+        raise ValueError("mnt_id")
+    return int(values[0])
+
+
+def read_fd_mount_id(fd):
+    return parse_fdinfo_mount_id(read_text_limited(f"{PROC_ROOT}/self/fdinfo/{fd}"))
+
+
+def open_target_cgroup_root(pid_fd):
+    """Directory fd of the cgroup mount root as the CHOSEN process sees it, opened relative to its held /proc/<pid> fd.
+
+    Only the literal ``root`` entry of that bound proc directory may follow the kernel's procfs magic link (O_NOFOLLOW on
+    it would reject the very mechanism); this is a deliberately bounded exception, never generic symlink following. The
+    fixed ``sys/fs/cgroup`` components below it are then walked one by one with O_NOFOLLOW.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("root", flags, dir_fd=pid_fd)
+    try:
+        for part in ("sys", "fs", "cgroup"):
+            nxt = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def parse_stat_state_ticks(raw):
+    """(state, start ticks) of a /proc/<pid>/stat text; ValueError/IndexError when malformed."""
+    fields = raw[raw.rindex(")") + 2:].split()
+    return fields[0], int(fields[19])
+
+
+PROVIDED_COORDINATES = (
+    "cgroup_namespace_device", "cgroup_namespace_inode", "mount_namespace_device", "mount_namespace_inode",
+    "cgroup_root_device", "cgroup_root_inode", "cgroup_mount_id",
+)
+
+
+def provided_coordinates(identity, boot_id):
+    """PRESENT known coordinates of a provided SDK containment identity, strictly typed; ValueError otherwise.
+
+    The boot id must be the current one; every present coordinate must be a positive int (never bool/float/
+    string/null) and no unknown key is accepted. Missing optional coordinates stay missing (never invented).
+    """
+    if not isinstance(identity, dict) or type(identity.get("boot_id")) is not str or identity["boot_id"] != boot_id:
+        raise ValueError("boot")
+    if set(identity) - {"boot_id", *PROVIDED_COORDINATES}:
+        raise ValueError("unknown coordinate")
+    present = {key: identity[key] for key in PROVIDED_COORDINATES if key in identity}
+    if any(type(value) is not int or value <= 0 for value in present.values()):
+        raise ValueError("coordinate type")
+    return present
+
+
+def census_signature(census):
+    """Signature keyed by lowercase UUID ids, the same validation/uniqueness as the initial inventory.
+
+    Raises ValueError on an invalid or duplicate id; the raw id is part of the frozen row.
+    """
+    def freeze(row):
+        # A missing key and an explicit null differ: absent identity becoming provided/malformed is a change.
+        return (row["id"], *((field in row, json.dumps(row.get(field), sort_keys=True, default=str)) for field in CENSUS_SIGNATURE_FIELDS))
+    signature = {}
+    for row in census:
+        ident = row.get("id") if isinstance(row, dict) else None
+        if not isinstance(ident, str) or UUID_RE.fullmatch(ident) is None or ident.lower() in signature:
+            raise ValueError("census id")
+        signature[ident.lower()] = freeze(row)
+    return signature
+
+
+def parse_meminfo_available(text):
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == "kB" and parts[1].isdigit():
+                return int(parts[1]) * 1024
+            return None
+    return None
+
+
+def nearest_existing(path):
+    cur = pathlib.Path(os.path.abspath(path))
+    while True:
+        try:
+            if os.path.lexists(cur):
+                return pathlib.Path(os.path.realpath(cur))
+        except OSError:
+            return None
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+
+
+
+class PhysicalAdmission:
+    """Read-only physical admission: current census, residency, disk, launcher caps and final RAM.
+
+    Shared by Canary.admit and the standalone read-only physical check, which constructs
+    only this class (no Canary state, lock, key, pending file or provider quota).
+    """
+
+    def __init__(self):
+        self.hub = shlex.split("hub")
+        self.a = shlex.split("a")
+        self.cmd_timeout = 90.0
+        self.in_cleanup = False
+        self.active_deadline = None
+        self.pyz_fd = None
+        self.bridge_fd = None
+        self.hub_pass_fds = ()
+        self.current_stage = "admission"
+        self.machine = "hetzner-aplexer"
+        self.workspace = None
+
+    def admission_deadline(self, deadline):
+        if deadline is None:
+            deadline = time.monotonic() + ADMISSION_BUDGET_S
+        if not self.in_cleanup and self.active_deadline is not None:
+            deadline = min(deadline, self.active_deadline)
+        return deadline
+
+    @staticmethod
+    def admission_time_left(deadline):
+        if time.monotonic() >= deadline:
+            raise StageFailure("admission", "admission_deadline_exceeded")
+
+    def sample_mem_available(self):
+        try:
+            value = parse_meminfo_available(read_text_limited(f"{PROC_ROOT}/meminfo"))
+        except OSError:
+            value = None
+        if type(value) is not int or value <= 0:
+            raise StageFailure("admission", "mem_available_unknown")
+        return value
+
+    def bridge_artifact_fd(self):
+        """Sealed fd of the whole-archive-verified CLI (candidate), or of the owned periodic CLI."""
+        if self.pyz_fd is not None:
+            return self.pyz_fd
+        if self.bridge_fd is not None:
+            return self.bridge_fd
+        if len(self.hub) != 1:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        import io, shutil, zipfile
+        found = shutil.which(self.hub[0])
+        if not found:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        try:
+            real = os.path.realpath(found)
+            st = os.lstat(real)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.geteuid()) or (st.st_mode & 0o022):
+                raise StageFailure("admission", "cli_artifact_unbindable")
+            data = read_regular_nofollow(real)
+            if not zipfile.is_zipfile(io.BytesIO(data)):
+                raise StageFailure("admission", "cli_artifact_unbindable")
+            self.bridge_fd = create_sealed_pyz_fd(data)
+        except OSError:
+            raise StageFailure("admission", "cli_artifact_unbindable")
+        return self.bridge_fd
+
+    def bridge_get(self, mode, deadline):
+        """Run the fixed read-only bridge with the SAME original budget; returns (rc, stdout)."""
+        fd = self.bridge_artifact_fd()
+        remaining = self.admission_deadline(deadline) - time.monotonic()
+        if remaining <= 0:
+            return 124, ""
+        rc, out, _ = self.run(
+            [sys.executable, "-I", "-S", "-c", ADMISSION_BRIDGE, f"/proc/self/fd/{fd}", mode, f"{remaining:.3f}"],
+            deadline=deadline, pass_fd=fd,
+        )
+        return rc, out
+
+    @staticmethod
+    def bridge_reason(rc, prefix):
+        suffix = {124: "timeout", 5: "timeout", 4: "unauthorized", 6: "invalid"}.get(rc, "unavailable")
+        return prefix + "_" + suffix
+
+    def fetch_disk_floor_gb(self, deadline):
+        rc, out = self.bridge_get("settings", deadline)
+        if rc != 0:
+            raise StageFailure("admission", self.bridge_reason(rc, "resource_settings"))
+        try:
+            data = _closed_json(out, 4096)
+        except ValueError:
+            raise StageFailure("admission", "resource_settings_invalid")
+        floor = data.get("disk_floor_gb") if isinstance(data, dict) and set(data) == {"disk_floor_gb"} else None
+        if not _finite_number(floor) or not DISK_FLOOR_GB_RANGE[0] <= floor <= DISK_FLOOR_GB_RANGE[1]:
+            raise StageFailure("admission", "resource_settings_invalid")
+        return floor
+
+    def read_census(self, deadline):
+        rc, out, _ = self.run([*self.a, "list", "--json"], deadline=deadline)  # current inventory; no --all history
+        if rc != 0:
+            raise StageFailure("admission", "native_inventory_unavailable")
+        try:
+            rows = _closed_json(out, ADMISSION_JSON_MAX_BYTES)
+        except ValueError:
+            raise StageFailure("admission", "native_inventory_invalid")
+        if not isinstance(rows, list) or len(rows) > ADMISSION_MAX_ROWS or not all(isinstance(r, dict) for r in rows):
+            raise StageFailure("admission", "native_inventory_invalid")
+        return rows
+
+    def read_hub_rows(self, deadline):
+        """Complete current session inventory through the fixed read-only bridge (never the ordinary CLI)."""
+        rc, out = self.bridge_get("sessions", deadline)
+        if rc != 0:
+            raise StageFailure("admission", self.bridge_reason(rc, "managed_inflight"))
+        try:
+            data = _closed_json(out, ADMISSION_JSON_MAX_BYTES)
+        except ValueError:
+            raise StageFailure("admission", "managed_inflight_invalid")
+        rows = data.get("sessions") if isinstance(data, dict) and set(data) == {"sessions"} else None
+        if not isinstance(rows, list) or len(rows) > ADMISSION_MAX_ROWS or not all(isinstance(r, dict) for r in rows):
+            raise StageFailure("admission", "managed_inflight_invalid")
+        return rows
+
+    def boottime(self):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+    def namespace_inode(self, name):
+        return os.stat(f"{PROC_ROOT}/self/ns/{name}").st_ino
+
+    def read_launcher_caps(self, deadline):
+        """Actual new-worker caps of the selected Host launcher (seam; production reads the Host config)."""
+        return read_launcher_caps(selected_launcher_config_path(), self.machine)
+
+    def row_positively_dead(self, row):
+        """True only for a current row whose worker is dead and whose containment holds nothing.
+
+        worker_alive must be False. containment_empty True is positive proof.
+        When aplexer left it NULL/absent (older terminal rows), the row must be
+        terminal and any current cgroup it names must be gone or have no members;
+        missing historical pid/cgroup metadata alone is not a live obligation.
+        A phase of exited/failed on its own, or a live/unknown worker, never counts.
+        """
+        if row.get("worker_alive") is not False:
+            return False
+        empty = row.get("containment_empty")
+        if empty is True:
+            return True
+        if empty is not None:
+            return False
+        if row.get("phase") not in ("exited", "failed") and row.get("state") not in ("exited", "failed"):
+            return False
+        for key in ("workload_cgroup", "containment_cgroup"):
+            cgroup = row.get(key)
+            if cgroup is None:
+                continue
+            if isinstance(cgroup, str) and cgroup.startswith(CGROUP_ROOT + "/"):
+                cgroup = cgroup[len(CGROUP_ROOT):]
+            if (not isinstance(cgroup, str) or not cgroup.startswith("/") or "\0" in cgroup
+                    or ".." in cgroup.split("/")):
+                return False
+            try:
+                members = read_text_limited(f"{CGROUP_ROOT}{cgroup}/cgroup.procs").split()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if members:
+                return False
+        return True
+
+    def row_memory_cap(self, row):
+        limits = row.get("limits")
+        cap = limits.get("memory_bytes") if isinstance(limits, dict) else None
+        if type(cap) is int and cap > 0:
+            return cap
+        return None
+
+    def workload_pid_absent(self, pid):
+        """True only when opening the workload's /proc/PID identity genuinely returns ENOENT."""
+        try:
+            fd = os.open(f"{PROC_ROOT}/{pid}/stat", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            return True
+        except OSError:
+            raise StageFailure("admission", "resident_measurement_unknown")
+        os.close(fd)
+        return False
+
+    def select_residency_target(self, row):
+        """Chosen live PID/cgroup of a live current row, resolved BEFORE the duplicate/shared maps.
+
+        The workload is chosen unless its PID is None (not starting) or opening its
+        /proc/PID identity returns ENOENT. Only then is the SAME row's native
+        coordinator (worker_pid/worker_cgroup, worker_alive is True) selected. Any other
+        condition (existing PID, EACCES, invalid type) stays on the workload path and holds there.
+        """
+        pid, phase, state = row.get("workload_pid"), row.get("phase"), row.get("state")
+        recorded_group = row.get("workload_cgroup")
+        workload = {"kind": "workload", "pid": pid, "group": recorded_group if isinstance(recorded_group, str) else None}
+        if pid is None:
+            if phase == "starting" or state == "starting":
+                return workload  # starting rows keep their recorded-cap reservation
+            premise, failure = "none", "resident_identity_unknown"
+        elif type(pid) is int and pid > 0:
+            if not self.workload_pid_absent(pid):
+                if row.get("containment_cgroup_identity") is None:
+                    # Unrecorded identity: the key is missing OR the whole value is null (public SDK
+                    # Option<CgroupIdentity>, serde default/skip-None). A non-null value, however malformed, is a
+                    # PROVIDED object and takes the strict path below; null INSIDE an object still holds there.
+                    return self.select_current_workload(row, pid)
+                return workload
+            premise, failure = "enoent", "resident_measurement_unknown"
+        else:
+            return workload
+        worker_pid, worker_group = row.get("worker_pid"), relative_cgroup(row.get("worker_cgroup"))
+        if row.get("worker_alive") is not True or type(worker_pid) is not int or worker_pid <= 0 or worker_group is None:
+            raise StageFailure("admission", failure)
+        return {"kind": "coordinator", "pid": worker_pid, "group": worker_group, "premise": premise}
+
+    def select_current_workload(self, row, pid):
+        """Chosen target for an EXISTING workload whose recorded containment identity key is genuinely absent.
+
+        The same workload PID stays chosen (never the coordinator). Its cgroup is derived from the kernel
+        (the single `0::` line of /proc/PID/cgroup) here, before the duplicate/shared maps. A recorded
+        workload_cgroup, when present, must be valid and equal to it; any contradiction, malformed value,
+        unproven worker liveness or unreadable kernel state is a HOLD, never a fallback.
+        """
+        if row.get("worker_alive") is not True:
+            raise StageFailure("admission", "resident_identity_unknown")
+        try:
+            lines = read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines()
+        except OSError:
+            raise StageFailure("admission", "resident_measurement_unknown")
+        groups = [line[3:] for line in lines if line.startswith("0::")]
+        derived = relative_cgroup(groups[0]) if len(groups) == 1 else None
+        recorded = row.get("workload_cgroup")
+        if derived is None or (recorded is not None and relative_cgroup(recorded) != derived):
+            raise StageFailure("admission", "resident_identity_unknown")
+        return {"kind": "workload_current", "pid": pid, "group": derived, "premise": "identity_absent"}
+
+    def sample_coordinator(self, target, boot_id, ns_ids):
+        """One fresh kernel sample of a chosen kernel-proven PID: identity plus anonymous/cap accounting.
+
+        Used for a coordinator, a current-proof workload and (target["provided"] set) a workload whose
+        recorded identity is PROVIDED. The provided sample additionally holds the cgroup MOUNT ROOT fd
+        (dev/ino/mnt_id) and checks every present recorded coordinate against the real kernel object. Only
+        the CHOSEN pid's identity and membership are proven; the other members of its cgroup are never compared.
+        """
+        pid, group = target["pid"], target["group"]
+        provided = target.get("provided")
+        fd = root_fd = pid_fd = troot_fd = tscope_fd = None
+        differing = False
+        try:
+            if read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip() != boot_id:
+                raise StageFailure("admission", "resident_identity_unknown")
+            raw = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+            fields = raw[raw.rindex(")") + 2:].split()
+            if fields[0] in ("Z", "X"):
+                raise StageFailure("admission", "resident_identity_unknown")
+            start_ticks = int(fields[19])
+            groups = [line[3:] for line in read_text_limited(f"{PROC_ROOT}/{pid}/cgroup").splitlines() if line.startswith("0::")]
+            ns_stats = {name: os.stat(f"{PROC_ROOT}/{pid}/ns/{name}") for name in ("cgroup", "mnt")}
+            namespaces = {name: st.st_ino for name, st in ns_stats.items()}
+            self_stats = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
+            ident = lambda st: (st.st_dev, st.st_ino)
+            # Differing MNT only: same cgroup namespace (never translated) but the target and this observer live in
+            # different mount namespaces (e.g. PrivateTmp). Everything else keeps the exact same-namespace proof.
+            differing = ident(ns_stats["cgroup"]) == ident(self_stats["cgroup"]) and ident(ns_stats["mnt"]) != ident(self_stats["mnt"])
+            if groups != [group] and provided is not None:
+                raise StageFailure("admission", "resident_measurement_unknown")  # the provided pid is not in its recorded cgroup
+            if groups != [group] or (not differing and namespaces != ns_ids) or (
+                    differing and (namespaces["cgroup"] != ns_ids["cgroup"] or self_stats["mnt"].st_ino != ns_ids["mnt"])):
+                raise StageFailure("admission", "resident_identity_unknown")
+            root = mount_id = None
+            if differing:
+                # Bind the CHOSEN process directory, re-prove it through that held directory, then view the cgroup
+                # objects through ITS kernel root: they must be the very objects this observer holds.
+                dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                pid_fd = os.open(f"{PROC_ROOT}/{pid}", dir_flags)
+                pid_stat = os.fstat(pid_fd)
+                if ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                state_held, ticks_held = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
+                if state_held in ("Z", "X") or ticks_held != start_ticks:
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if [line[3:] for line in read_at_limited(pid_fd, "cgroup").splitlines() if line.startswith("0::")] != [group]:
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if any(ident(os.stat(f"ns/{name}", dir_fd=pid_fd)) != ident(ns_stats[name]) for name in ("cgroup", "mnt")):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                root_fd = os.open(CGROUP_ROOT, dir_flags)
+                root = os.fstat(root_fd)
+                if ident(os.stat(CGROUP_ROOT)) != ident(root):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                troot_fd = open_target_cgroup_root(pid_fd)
+                troot = os.fstat(troot_fd)
+                mount_id = read_fd_mount_id(troot_fd)
+                if ident(troot) != ident(root):
+                    raise StageFailure("admission", "resident_identity_unknown")
+                if provided is not None:
+                    actual = {
+                        "cgroup_namespace_device": ns_stats["cgroup"].st_dev, "cgroup_namespace_inode": ns_stats["cgroup"].st_ino,
+                        "mount_namespace_device": ns_stats["mnt"].st_dev, "mount_namespace_inode": ns_stats["mnt"].st_ino,
+                        "cgroup_root_device": troot.st_dev, "cgroup_root_inode": troot.st_ino, "cgroup_mount_id": mount_id,
+                    }
+                    if any(actual[key] != value for key, value in provided.items()):
+                        raise StageFailure("admission", "resident_identity_unknown")
+            elif provided is not None:
+                root_fd = os.open(CGROUP_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+                root, mount_id = os.fstat(root_fd), read_fd_mount_id(root_fd)
+                root_path = os.stat(CGROUP_ROOT)
+                if (root_path.st_dev, root_path.st_ino) != (root.st_dev, root.st_ino):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                actual = {
+                    "cgroup_namespace_device": ns_stats["cgroup"].st_dev, "cgroup_namespace_inode": ns_stats["cgroup"].st_ino,
+                    "mount_namespace_device": ns_stats["mnt"].st_dev, "mount_namespace_inode": ns_stats["mnt"].st_ino,
+                    "cgroup_root_device": root.st_dev, "cgroup_root_inode": root.st_ino, "cgroup_mount_id": mount_id,
+                }
+                if any(actual[key] != value for key, value in provided.items()):
+                    raise StageFailure("admission", "resident_identity_unknown")
+            fd = open_cgroup_dir(group, root_fd) if root_fd is not None else open_cgroup_dir(group)
+            opened = os.fstat(fd)
+            if differing:
+                tscope_fd = open_cgroup_dir(group, troot_fd)
+                tscope = os.fstat(tscope_fd)
+                if ident(tscope) != ident(opened):
+                    raise StageFailure("admission", "resident_identity_unknown")
+            members = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            mem_stat = {}
+            for line in read_at_limited(fd, "memory.stat").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    mem_stat[parts[0]] = int(parts[1])
+            current = int(read_at_limited(fd, "memory.current").strip())
+            maximum = None if provided is not None else read_at_limited(fd, "memory.max").strip()  # provided rows keep the recorded cap
+            status = {}
+            for line in read_text_limited(f"{PROC_ROOT}/{pid}/status").splitlines():
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    status[key] = value.split()
+            if len(status["RssAnon"]) != 2 or status["RssAnon"][1] != "kB" or not status["RssAnon"][0].isdecimal():
+                raise ValueError("RssAnon")
+            rss_anon = int(status["RssAnon"][0]) * 1024
+            raw_again = read_text_limited(f"{PROC_ROOT}/{pid}/stat")
+            after = os.fstat(fd)
+            on_path = os.stat(f"{CGROUP_ROOT}{group}")
+            members_again = {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}
+            # The namespace tuple was read before the memory reads: re-read the chosen PID's AND this process's
+            # cgroup/mnt namespaces (dev, inode) at the end; initial chosen, initial/current self and the provided
+            # coordinates must all be one and the same, so a switch during the memory reads cannot pass stale.
+            if differing:
+                # Target and observer mount namespaces are each stable on their own; the cgroup namespaces stay one.
+                # Reopen the target view from scratch through the same held process directory: a retained fd alone
+                # cannot show the current pathname still names the same objects and the same mount instance.
+                troot_again = open_target_cgroup_root(pid_fd)
+                try:
+                    tscope_again = open_cgroup_dir(group, troot_again)
+                    try:
+                        if (ident(os.fstat(troot_again)) != ident(troot) or read_fd_mount_id(troot_again) != mount_id
+                                or ident(os.fstat(tscope_again)) != ident(tscope)):
+                            raise StageFailure("admission", "resident_identity_unstable")
+                    finally:
+                        os.close(tscope_again)
+                finally:
+                    os.close(troot_again)
+                if (ident(os.fstat(troot_fd)) != ident(troot) or read_fd_mount_id(troot_fd) != mount_id
+                        or ident(os.fstat(tscope_fd)) != ident(tscope)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                # END boundary, AFTER every target-view reopen and fdinfo read above: re-read the held chosen PID's
+                # live state/start/group, its membership in the held scope, the numeric process directory and the chosen
+                # and self namespace tuples, so a change during those final reads can never pass a stale snapshot.
+                final_pid = {name: os.stat(f"ns/{name}", dir_fd=pid_fd) for name in ("cgroup", "mnt")}
+                final_self = {name: os.stat(f"{PROC_ROOT}/self/ns/{name}") for name in ("cgroup", "mnt")}
+                if (len({ident(ns_stats["cgroup"]), ident(self_stats["cgroup"]), ident(final_pid["cgroup"]), ident(final_self["cgroup"])}) != 1
+                        or ident(final_pid["mnt"]) != ident(ns_stats["mnt"]) or ident(final_self["mnt"]) != ident(self_stats["mnt"])
+                        or final_self["cgroup"].st_ino != ns_ids["cgroup"] or final_self["mnt"].st_ino != ns_ids["mnt"]):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                state_end, ticks_end = parse_stat_state_ticks(read_at_limited(pid_fd, "stat"))
+                if (state_end in ("Z", "X") or ticks_end != start_ticks or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)
+                        or ident(os.fstat(pid_fd)) != ident(pid_stat)
+                        or ident(os.fstat(root_fd)) != ident(root) or ident(os.stat(CGROUP_ROOT)) != ident(root)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if ([line[3:] for line in read_at_limited(pid_fd, "cgroup").splitlines() if line.startswith("0::")] != [group]
+                        or ident(os.stat(f"{PROC_ROOT}/{pid}")) != ident(pid_stat)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+                if pid not in {int(x) for x in read_at_limited(fd, "cgroup.procs").split()}:
+                    raise StageFailure("admission", "resident_measurement_unknown" if provided is not None else "resident_identity_unknown")
+            else:
+                final_ns = {who: {name: os.stat(f"{PROC_ROOT}/{path}/ns/{name}") for name in ("cgroup", "mnt")} for who, path in (("pid", pid), ("self", "self"))}
+                for name in ("cgroup", "mnt"):
+                    if len({ident(ns_stats[name]), ident(self_stats[name]), ident(final_ns["pid"][name]), ident(final_ns["self"][name])}) != 1:
+                        raise StageFailure("admission", "resident_identity_unstable")
+            if provided is not None and not differing:
+                root_after, mount_after, root_path_after = os.fstat(root_fd), read_fd_mount_id(root_fd), os.stat(CGROUP_ROOT)
+                if ((root_after.st_dev, root_after.st_ino, mount_after) != (root.st_dev, root.st_ino, mount_id)
+                        or (root_path_after.st_dev, root_path_after.st_ino) != (root.st_dev, root.st_ino)):
+                    raise StageFailure("admission", "resident_identity_unstable")
+        except (OSError, ValueError, KeyError, IndexError):
+            raise StageFailure("admission", "resident_measurement_unknown")
+        finally:
+            for held in (fd, root_fd, pid_fd, troot_fd, tscope_fd):
+                if held is not None:
+                    os.close(held)
+        try:
+            if (int(raw_again[raw_again.rindex(")") + 2:].split()[19]) != start_ticks
+                    or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+                    or (on_path.st_dev, on_path.st_ino) != (opened.st_dev, opened.st_ino)):
+                raise StageFailure("admission", "resident_identity_unstable")
+            if pid not in members or pid not in members_again:
+                raise StageFailure("admission", "resident_measurement_unknown" if provided is not None else "resident_identity_unknown")
+            identity = (boot_id, start_ticks, group, opened.st_dev, opened.st_ino, tuple(sorted(namespaces.items())))
+            if provided is not None:
+                identity += (pid, ns_stats["cgroup"].st_dev, ns_stats["mnt"].st_dev, root.st_dev, root.st_ino, mount_id)
+            if differing:
+                identity += ("target_view", ident(ns_stats["mnt"]), ident(self_stats["mnt"]), ident(self_stats["cgroup"]),
+                             ident(root), mount_id, ident(opened))
+            return {
+                "identity": identity,
+                "start_ticks": start_ticks, "rss_anon": rss_anon, "group_anon": mem_stat["anon"], "group_current": current,
+                "cap": None if maximum is None else (int(maximum) if maximum.isdecimal() and int(maximum) > 0 else None),
+            }
+        except (ValueError, KeyError, IndexError):
+            raise StageFailure("admission", "resident_measurement_unknown")
+
+    def coordinator_reserve(self, row, target, boot_id, ns_ids, boot_now, btime, deadline):
+        """Reserve for a chosen native coordinator or current-proof workload, proven only by its own kernel identity.
+
+        Recorded SDK scope, identity and caps prove nothing here (the current-proof workload's recorded
+        identity is genuinely absent and is never invented). A mature
+        (>= 180 s), positively resident coordinator reserves 0 extra even with memory.max=max
+        (already counted in MemAvailable; not a growth bound). A young or uncertain one needs
+        a finite kernel cap, charged whole per row, else the admission holds.
+        """
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        first = self.sample_coordinator(target, boot_id, ns_ids)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        second = self.sample_coordinator(target, boot_id, ns_ids)
+        if first["identity"] != second["identity"]:
+            raise StageFailure("admission", "resident_identity_unstable")
+        ticks = os.sysconf("SC_CLK_TCK")
+        try:
+            if btime is None:
+                btime = read_proc_btime()
+        except (OSError, ValueError):
+            raise StageFailure("admission", "resident_identity_unknown")
+        if not birth_matches(row.get("created_at_ms"), first["start_ticks"], btime, ticks):
+            raise StageFailure("admission", "resident_identity_unknown")
+        age = boot_now - first["start_ticks"] / ticks
+        if not _finite_number(age) or age < 0:
+            raise StageFailure("admission", "resident_age_unknown")
+        for sample in (first, second):
+            if sample["rss_anon"] <= 0 or not 0 < sample["group_anon"] <= sample["group_current"]:
+                raise StageFailure("admission", "resident_anonymous_unknown")
+        target["identity"] = first["identity"]
+        target["cap"] = None
+        if age >= MATURE_RESIDENT_AGE_S and row.get("state") == "running" and row.get("phase") == "running":
+            return 0, "mature"
+        if first["cap"] is None or first["cap"] != second["cap"]:
+            raise StageFailure("admission", "resident_bound_unknown", admission_diagnostic={
+                "category": "coordinator_kernel_cap", "target_kind": target.get("kind"),
+                "age_class": "mature" if age >= MATURE_RESIDENT_AGE_S else "young",
+                "state_class": "running" if row.get("state") == "running" else "other",
+                "phase_class": "running" if row.get("phase") == "running" else "other",
+                "cap_status": "unavailable" if first["cap"] is None else "changed",
+            })
+        target["cap"] = first["cap"]
+        return first["cap"], "young"
+
+    def revalidate_fallbacks(self, census, targets, boot_id, ns_ids, deadline, *, hub_rows=None, native_ids=None):
+        """Final bounded check: every kernel-derived premise, selection and chosen identity is still the sampled one.
+
+        Covers native-coordinator fallbacks, current-proof workloads (absent recorded identity) and measured
+        provided-identity workloads. For the latter two the managed in-flight rows are re-read once as well and
+        must not gain or lose an uncovered row. Returns the extra reserve (bytes, never negative) a young provided
+        row must add because its final anonymous usage is lower than the credited one; the caller adds it ONCE
+        before the final MemAvailable sample.
+        """
+        derived = [(row, targets[row["id"]]) for row in census
+                   if targets.get(row.get("id"), {}).get("kind") in ("coordinator", "workload_current")
+                   or targets.get(row.get("id"), {}).get("proof") == "provided"]
+        if not derived:
+            return 0
+        self.admission_time_left(deadline)
+        final = self.read_census(deadline)
+        try:
+            changed = census_signature(final) != census_signature(census)
+        except ValueError:
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "census_invalid"})
+        if changed:
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "census_changed"})
+        if hub_rows is not None and any(target["kind"] == "workload_current" or target.get("proof") == "provided" for _row, target in derived):
+            self.admission_time_left(deadline)
+            freeze = lambda rows: sorted(json.dumps([r.get(k) for k in ("id", "native_id", "workspace", "cwd", "host", "machine_id", "machine")], default=str)
+                                         for r in self.uncovered_inflight_rows(rows, native_ids))
+            if freeze(self.read_hub_rows(deadline)) != freeze(hub_rows):
+                raise StageFailure("admission", "resident_fallback_changed",
+                                   admission_diagnostic={"category": "inflight_changed"})
+        final_rows = {r["id"].lower(): r for r in final}
+        delta = 0
+        for row, target in derived:
+            self.admission_time_left(deadline)
+            if target.get("proof") == "provided":
+                delta += self.revalidate_provided(final_rows[row["id"].lower()], target, boot_id, ns_ids)
+                continue
+            if target["kind"] == "coordinator":
+                if row.get("workload_pid") is not None and not self.workload_pid_absent(row["workload_pid"]):
+                    raise StageFailure("admission", "resident_fallback_changed",
+                                       admission_diagnostic={"category": "workload_reappeared"})
+                if self.sample_coordinator(target, boot_id, ns_ids)["identity"] != target["identity"]:
+                    raise StageFailure("admission", "resident_fallback_changed",
+                                       admission_diagnostic={"category": "chosen_identity_changed"})
+                continue
+            sample = self.sample_coordinator(target, boot_id, ns_ids)
+            if sample["identity"] != target["identity"] or (target["cap"] is not None and sample["cap"] != target["cap"]):
+                raise StageFailure("admission", "resident_fallback_changed", admission_diagnostic={
+                    "category": "chosen_identity_changed" if sample["identity"] != target["identity"] else "chosen_cap_changed",
+                })
+        return delta
+
+    def revalidate_provided(self, final_row, target, boot_id, ns_ids):
+        """Final sample of a measured provided workload; returns the (non-negative) extra young reserve to add once.
+
+        The re-read PRESENT recorded coordinates are validated strictly and against the final kernel objects before
+        any credit is accepted. Credit is min(first, second, final) accounting anon (shared: the chosen PID's own
+        RssAnon, unshared: the validated group anon); the unchanged cap-minus-credit formula is recomputed and only
+        an increase over the initially reserved extra is returned. A rising anon never lowers a reserve.
+        """
+        try:
+            provided = provided_coordinates(final_row.get("containment_cgroup_identity"), boot_id)
+        except ValueError:
+            raise StageFailure("admission", "resident_identity_unknown")
+        target["provided"] = provided
+        sample = self.sample_coordinator(target, boot_id, ns_ids)
+        if sample["identity"] != target["identity"]:
+            raise StageFailure("admission", "resident_fallback_changed",
+                               admission_diagnostic={"category": "chosen_identity_changed"})
+        if not target["credited"]:
+            return 0  # no credit was taken (whole recorded cap reserved): nothing a later sample can lower
+        group_ok = 0 < sample["group_anon"] <= sample["group_current"]
+        if sample["rss_anon"] <= 0 or (not target["shared"] and not group_ok):
+            raise StageFailure("admission", "resident_anonymous_unknown")
+        if target["mature"]:
+            return 0
+        final_anon = sample["rss_anon"] if target["shared"] else sample["group_anon"]
+        credit = min(target["anon"], final_anon)
+        return max(0, max(0, target["recorded_cap"] - credit) - target["extra"])
+
+    def resident_reserve(self, row, shared, boot_id, ns_ids, boot_now, *, target=None, btime=None, deadline=None):
+        """(extra bytes, kind) this current native row may still claim beyond what MemAvailable already reflects.
+
+        kind is "dead" (positively no obligation), "mature" (identity-bound proven
+        resident) or "young" (anything else that is live or still ramping).
+        """
+        if self.row_positively_dead(row):
+            return 0, "dead"
+        if target is None:
+            target = self.select_residency_target(row)
+        if target["kind"] in ("coordinator", "workload_current"):
+            return self.coordinator_reserve(row, target, boot_id, ns_ids, boot_now, btime, deadline)
+        phase, state = row.get("phase"), row.get("state")
+        cap = self.row_memory_cap(row)
+        pid = row.get("workload_pid")
+        if pid is None and (phase == "starting" or state == "starting"):
+            if cap is None:
+                raise StageFailure("admission", "resident_bound_unknown",
+                                   admission_diagnostic={"category": "starting_recorded_cap", "cap_status": "unavailable"})
+            return cap, "young"
+        identity = row.get("containment_cgroup_identity")
+        if type(pid) is not int or pid <= 0 or not isinstance(identity, dict) or identity.get("boot_id") != boot_id:
+            raise StageFailure("admission", "resident_identity_unknown")
+        try:
+            provided = provided_coordinates(identity, boot_id)
+        except ValueError:
+            raise StageFailure("admission", "resident_identity_unknown")
+        recorded = row.get("workload_cgroup")
+        group = relative_cgroup(recorded)
+        if group is None or group != recorded:
+            raise StageFailure("admission", "resident_measurement_unknown")
+        # Chosen-PID kernel proof (the strong sampler shared with the coordinator path): identity, held scope and
+        # mount-root fds, namespaces and membership of THIS pid, twice under the same deadline. Other members of the
+        # cgroup may join or leave freely; only the chosen identity must be stable.
+        target.update(group=group, provided=provided)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        first = self.sample_coordinator(target, boot_id, ns_ids)
+        if deadline is not None:
+            self.admission_time_left(deadline)
+        second = self.sample_coordinator(target, boot_id, ns_ids)
+        if first["identity"] != second["identity"]:
+            raise StageFailure("admission", "resident_identity_unstable")
+        ticks = os.sysconf("SC_CLK_TCK")
+        age = boot_now - first["start_ticks"] / ticks
+        if not _finite_number(age) or age < 0:
+            raise StageFailure("admission", "resident_age_unknown")
+        group_ok = 0 < first["group_anon"] <= first["group_current"] and 0 < second["group_anon"] <= second["group_current"]
+        pid_ok = first["rss_anon"] > 0 and second["rss_anon"] > 0
+        if shared:
+            # A shared cgroup cannot prove one row's usage: per-PID anonymous memory only.
+            mature_ok = pid_ok
+            anon = min(first["rss_anon"], second["rss_anon"])
+        else:
+            mature_ok = pid_ok and group_ok
+            anon = min(first["group_anon"], second["group_anon"])
+        mature = age >= MATURE_RESIDENT_AGE_S and mature_ok
+        if not mature and cap is None:
+            raise StageFailure("admission", "resident_bound_unknown", admission_diagnostic={
+                "category": "provided_recorded_cap", "cap_status": "unavailable",
+                "age_class": "mature" if age >= MATURE_RESIDENT_AGE_S else "young",
+            })
+        extra = 0 if mature else (max(0, cap - anon) if mature_ok else cap)
+        target.update(proof="provided", identity=first["identity"], credited=mature_ok, mature=mature, shared=shared,
+                      anon=anon, recorded_cap=cap, extra=extra)
+        return extra, ("mature" if mature else "young")
+
+    def uncovered_inflight_rows(self, hub_rows, native_ids):
+        """Current Hub in-flight rows on this machine with no native census row yet."""
+        rows = []
+        for item in hub_rows:
+            if not isinstance(item, dict):
+                raise StageFailure("admission", "managed_inflight_invalid")
+            host = item.get("host") or item.get("machine_id") or item.get("machine")
+            if host is not None and host != self.machine:
+                continue
+            state = item.get("state")
+            if state in HUB_TERMINAL_STATES:
+                continue
+            if state not in HUB_INFLIGHT_STATES:
+                raise StageFailure("admission", "managed_inflight_unknown_state")
+            native = item.get("native_id")
+            if isinstance(native, str) and native.lower() in native_ids:
+                continue
+            rows.append(item)
+        return rows
+
+    def uncovered_inflight_reserve(self, hub_rows, native_ids):
+        return len(self.uncovered_inflight_rows(hub_rows, native_ids)) * NEW_WORKER_MEMORY_BYTES
+
+    @staticmethod
+    def growth_devices(*paths):
+        """Device ids a worker's workspace, cwd and workspace/.local/tmp write to; None if unknowable."""
+        real = [os.path.realpath(p) for p in paths if isinstance(p, str) and p.startswith("/") and "\0" not in p]
+        if not real:
+            return None
+        real.append(os.path.join(real[0], ".local", "tmp"))
+        devices = set()
+        for path in real:
+            existing = nearest_existing(path)
+            if existing is None:
+                return None
+            try:
+                devices.add(os.stat(existing).st_dev)
+            except OSError:
+                return None
+        return devices
+
+    def disk_free_after_margin(self, paths):
+        """{st_dev: free bytes} for the nearest existing ancestors of paths (one entry per device)."""
+        seen = {}
+        for path in paths:
+            existing = nearest_existing(path)
+            if existing is None:
+                raise StageFailure("admission", "disk_unknown")
+            try:
+                st = os.stat(existing)
+                vfs = os.statvfs(existing)
+            except OSError:
+                raise StageFailure("admission", "disk_unknown")
+            seen.setdefault(st.st_dev, vfs.f_bavail * vfs.f_frsize)
+        return seen
+
+    def physical_inputs(self, deadline, workspace=None):
+        """Validated workspace, actual new-worker memory cap and disk floor (GB), in the original order."""
+        workspace = self.workspace if workspace is None else workspace
+        if (not isinstance(workspace, str) or not workspace.startswith("/") or "\0" in workspace):
+            raise StageFailure("admission", "workspace_invalid")
+        self.admission_time_left(deadline)
+        worker_bytes, worker_pids = self.read_launcher_caps(deadline)
+        if (type(worker_bytes) is not int or type(worker_pids) is not int or worker_bytes <= 0 or worker_pids <= 0
+                or worker_bytes > NEW_WORKER_MEMORY_BYTES or worker_pids > NEW_WORKER_PIDS):
+            raise StageFailure("admission", "launcher_config_caps_invalid")
+        floor_gb = self.fetch_disk_floor_gb(deadline)
+        self.admission_time_left(deadline)
+        return workspace, worker_bytes, floor_gb
+
+    def physical_admit(self, deadline, workspace, worker_bytes, floor_gb):
+        """Current census, residency, disk growth and final RAM arithmetic (no quota, no spawn, no state).
+
+        Returns closed aggregate counts/headrooms only; raises StageFailure('admission', closed_reason).
+        """
+        census = self.read_census(deadline)
+        hub_rows = self.read_hub_rows(deadline)
+        self.admission_time_left(deadline)
+        try:
+            boot_id = read_text_limited(f"{PROC_ROOT}/sys/kernel/random/boot_id").strip()
+            ns_ids = {"cgroup": self.namespace_inode("cgroup"), "mnt": self.namespace_inode("mnt")}
+            boot_now = self.boottime()
+        except (OSError, ValueError):
+            raise StageFailure("admission", "resident_identity_unknown")
+        native_ids, by_pid, by_group = set(), {}, {}
+        counts = {"census_rows": len(census), "mature": 0, "young": 0, "kernel_current": 0, "coordinator_fallback": 0}
+        for row in census:
+            native_id = row.get("id")
+            if not isinstance(native_id, str) or not UUID_RE.fullmatch(native_id) or native_id.lower() in native_ids:
+                raise StageFailure("admission", "native_inventory_invalid")
+            native_ids.add(native_id.lower())
+        # Positively dead rows carry no live pid/cgroup claim: they join neither the
+        # identity-ambiguity maps nor the reserves (their stale pid/cgroup may be reused).
+        live = [row for row in census if not self.row_positively_dead(row)]
+        # Resolve every row's CHOSEN live PID/group (workload, or coordinator fallback) before the maps.
+        targets = {}
+        for row in live:
+            self.admission_time_left(deadline)
+            targets[row["id"]] = self.select_residency_target(row)
+        for row in live:
+            target = targets[row["id"]]
+            by_pid.setdefault(target["pid"], []).append(row["id"])
+            by_group.setdefault(target["group"], []).append(row["id"])
+        reserve = 0
+        growing = []  # (workspace, cwd) of every live current worker / uncovered task that may still write to disk
+        for row in live:
+            target = targets[row["id"]]
+            pid, group = target["pid"], target["group"]
+            # (A coordinator's cgroup may hold other processes: coordinator_reserve always proves per PID.)
+            shared = len(by_group.get(group, ())) > 1 and group is not None
+            if pid is not None and len(by_pid.get(pid, ())) > 1:
+                raise StageFailure("admission", "resident_identity_ambiguous")
+            extra, kind = self.resident_reserve(row, shared, boot_id, ns_ids, boot_now, target=target, deadline=deadline)
+            reserve += extra
+            if kind in ("mature", "young"):
+                counts[kind] += 1
+            if target["kind"] == "workload_current":
+                counts["kernel_current"] += 1
+            elif target["kind"] == "coordinator":
+                counts["coordinator_fallback"] += 1
+            growing.append((row.get("workspace"), row.get("cwd")))  # RAM maturity proves nothing about disk
+        uncovered = self.uncovered_inflight_rows(hub_rows, native_ids)
+        # Not-yet-native tasks may have been (or be) launched under other caps: the ceiling, never the selected value.
+        reserve += len(uncovered) * NEW_WORKER_MEMORY_BYTES
+        growing.extend((item.get("workspace"), item.get("cwd")) for item in uncovered)
+        # Disk: actual resolved cwd and own TMP filesystems, one charge per device.
+        resolved = os.path.realpath(workspace)
+        tmp_dir = os.path.join(resolved, ".local", "tmp")
+        floor_bytes = int(floor_gb * 1024 ** 3)
+        free_by_device = self.disk_free_after_margin([resolved, tmp_dir])
+        charged = {device: 0 for device in free_by_device}
+        for paths in growing:
+            devices = self.growth_devices(*paths)
+            if devices is None:
+                raise StageFailure("admission", "disk_growth_unknown")
+            for device in devices & set(free_by_device):
+                charged[device] = min(ADMISSION_DISK_RESERVE_CAP_BYTES, charged[device] + ADMISSION_DISK_WORKER_RESERVE_BYTES)
+        disk_headroom = None
+        for device, free in free_by_device.items():
+            # floor + start spike + this new worker's own known growth + same-device others
+            room = free - ADMISSION_DISK_SPIKE_BYTES - ADMISSION_DISK_WORKER_RESERVE_BYTES - charged[device] - floor_bytes
+            if room < 0:
+                raise StageFailure("admission", "disk_below_floor")
+            disk_headroom = room if disk_headroom is None else min(disk_headroom, room)
+        # Final fresh RAM sample after every slow read, before any spawn.
+        self.admission_time_left(deadline)
+        reserve += self.revalidate_fallbacks(census, targets, boot_id, ns_ids, deadline, hub_rows=hub_rows, native_ids=native_ids)
+        self.admission_time_left(deadline)
+        available = self.sample_mem_available()
+        if available - reserve - worker_bytes < ADMISSION_RAM_FLOOR_BYTES:
+            raise StageFailure("admission", "memory_below_floor")
+        self.admission_time_left(deadline)
+        counts.update(
+            live_rows=len(live), uncovered_inflight=len(uncovered), reserve_bytes=reserve, new_worker_bytes=worker_bytes,
+            ram_headroom_bytes=available - reserve - worker_bytes - ADMISSION_RAM_FLOOR_BYTES, disk_headroom_bytes=disk_headroom,
+        )
+        return counts
+
+    def run(self, argv, timeout=None, *, deadline=None, env=None, pass_fd=None):
+        limit = self.cmd_timeout if timeout is None else timeout
+        effective_deadline = deadline
+        if not self.in_cleanup and self.active_deadline is not None:
+            effective_deadline = self.active_deadline if effective_deadline is None else min(effective_deadline, self.active_deadline)
+        if effective_deadline is not None:
+            limit = min(limit, effective_deadline - time.monotonic())
+        if limit <= 0:
+            return 124, "", ""
+        pass_fds = self.hub_pass_fds if (self.pyz_fd is not None and f"/proc/self/fd/{self.pyz_fd}" in argv) else ()
+        if pass_fd is not None and f"/proc/self/fd/{pass_fd}" in argv:
+            pass_fds = (pass_fd,)
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                pass_fds=pass_fds,
+                env=env,
+            )
+        except OSError as error:
+            return 127, "", type(error).__name__
+        try:
+            out, err = proc.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            out, err = proc.communicate()
+            return 124, out or "", err or ""
+        except BaseException:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+            raise
+        if effective_deadline is not None and time.monotonic() >= effective_deadline:
+            return 124, out, err
+        return proc.returncode, out, err
+
+    @staticmethod
+    def failure_reason(rc, err):
+        if rc == 124:
+            return "hub_cli_timeout"
+        typed = re.search(r"\bstatus\s+\d{3}\s+\(([a-z][a-z0-9_]{0,79})\)", err)
+        return typed.group(1) if typed else f"hub_cli_exit_{rc}"
+
+    def hub_json(self, stage, *args, deadline=None):
+        rc, out, err = self.run([*self.hub, *args], deadline=deadline)
+        if rc != 0:
+            raise StageFailure(stage, self.failure_reason(rc, err))
+        try:
+            return json.loads(out)
+        except ValueError:
+            raise StageFailure(stage, "unparseable_json")
+
+    def list_items(self, stage, deadline):
+        # Current hub CLI exhausts the indexed cursor. Prefer its aggregated
+        # sessions[] over an inherited items[] from the first API page.
+        data = self.hub_json(stage, "sessions", "list", "--all", "--json", deadline=deadline)
+        items = data.get("sessions", data.get("items")) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            raise StageFailure(stage, "unparseable_json")
+        if isinstance(data, dict) and data.get("next_cursor", data.get("next")):
+            raise StageFailure(stage, "incomplete_listing")
+        return items
+
+
+
+PHYSICAL_CHECK_COUNT_KEYS = (
+    "census_rows", "live_rows", "mature", "young", "kernel_current", "coordinator_fallback", "uncovered_inflight",
+    "reserve_bytes", "new_worker_bytes", "ram_headroom_bytes", "disk_headroom_bytes",
+)
+
+
+def physical_admission_check(admission=None):
+    """Read-only physical admission preview: one JSON-able dict of closed counts and reasons.
+
+    Runs BEFORE any Canary construction: no lock, key, pending/once/state file, provider quota, session
+    start/capture/stop/send, auth refresh or config mutation. It uses the same PhysicalAdmission algorithm
+    as Canary.admit (target selection, residency, disk growth/floor, launcher caps, final revalidation and
+    RAM). Workspace authority is the fixed root config (or the default), never an argument or environment
+    value. Never authorizes a start; quota_checked is always false.
+    """
+    result = {"kind": "physical_admission_check", "ok": False, "status": "hold", "reason": None, "quota_checked": False,
+              "full_admission": False, "source_sha256": None}
+    try:
+        result["source_sha256"] = compute_helper_sha256()
+    except (OSError, ValueError):
+        result["source_sha256"] = "unavailable"
+    try:
+        admission = PhysicalAdmission() if admission is None else admission
+        deadline = time.monotonic() + ADMISSION_BUDGET_S
+        configured = read_workspace_config()
+        workspace = configured if configured is not None else str(pathlib.Path.home() / "work" / "hub-canary")
+        workspace, worker_bytes, floor_gb = admission.physical_inputs(deadline, workspace)
+        counts = admission.physical_admit(deadline, workspace, worker_bytes, floor_gb)
+        result.update(ok=True, status="pass", reason="physical_ok")
+        result.update({key: counts[key] for key in PHYSICAL_CHECK_COUNT_KEYS if type(counts.get(key)) is int})
+        result["disk_floor_gb"] = floor_gb
+    except StageFailure as failure:
+        result["reason"] = failure.reason if re.fullmatch(r"[a-z][a-z0-9_]{0,79}", str(failure.reason)) else "physical_check_failed"
+        add_admission_diagnostic(result, failure)
+    except Exception:  # closed output only: never a raw exception text
+        result["reason"] = "physical_check_internal_error"
+    return result
+
+
+QUOTA_QUERY_PROVIDERS = ("claude", "codex", "zai", "go", "gemini")
+
+
+class Canary(PhysicalAdmission):
     def __init__(
         self,
         mode,
@@ -533,13 +2433,16 @@ class Canary:
         deploy_gate=False,
         candidate_sha=None,
         candidate_cli_sha256=None,
+        candidate_updater_sha256=None,
         run_token=None,
         expected_helper_sha256=None,
     ):
+        super().__init__()
         self.mode, self.run_id = mode, run_id
         self.deploy_gate = bool(deploy_gate)
         self.candidate_sha = candidate_sha
         self.candidate_cli_sha256 = candidate_cli_sha256
+        self.candidate_updater_sha256 = candidate_updater_sha256
         self.run_token = run_token
         self.expected_helper_sha256 = expected_helper_sha256
         self.durable_pending_enabled = (not self.deploy_gate) or (self.candidate_sha is not None)
@@ -550,7 +2453,11 @@ class Canary:
         self.host_updater_triggered = False
         self.host_updater_trigger = "not_needed"
         self.host_updater_trigger_error = None
+        self.host_updater_sha256 = None
         self.pyz_fd = None
+        self.bridge_fd = None
+        self.admission_hold = None
+        self.workspace_source = "env_default"
         self.hub_pass_fds = ()
         self.lock_fd = None
         self.state_dir_path = None
@@ -565,7 +2472,8 @@ class Canary:
         if candidate_sha is not None:
             self.converge_timeout = min(env_num("HUB_CANARY_CONVERGE_TIMEOUT_S", TRUSTED_CONVERGE_TIMEOUT_S), TRUSTED_CONVERGE_TIMEOUT_S)
             self.running_timeout = min(env_num("HUB_CANARY_RUNNING_TIMEOUT_S", TRUSTED_RUNNING_TIMEOUT_S), TRUSTED_RUNNING_TIMEOUT_S)
-            self.capture_timeout = min(env_num("HUB_CANARY_CAPTURE_TIMEOUT_S", TRUSTED_CAPTURE_TIMEOUT_S), TRUSTED_CAPTURE_TIMEOUT_S)
+            capture_ceiling = TRUSTED_FULL_CAPTURE_TIMEOUT_S if mode == "full" else TRUSTED_CAPTURE_TIMEOUT_S
+            self.capture_timeout = min(env_num("HUB_CANARY_CAPTURE_TIMEOUT_S", capture_ceiling), capture_ceiling)
             self.stop_timeout = min(env_num("HUB_CANARY_STOP_TIMEOUT_S", TRUSTED_STOP_TIMEOUT_S), TRUSTED_STOP_TIMEOUT_S)
             self.cmd_timeout = min(env_num("HUB_CANARY_CMD_TIMEOUT_S", TRUSTED_CMD_TIMEOUT_S), TRUSTED_CMD_TIMEOUT_S)
             self.active_budget = min(env_num("HUB_CANARY_ACTIVE_BUDGET_S", TRUSTED_ACTIVE_BUDGET_S), TRUSTED_ACTIVE_BUDGET_S)
@@ -598,7 +2506,11 @@ class Canary:
                 f"printf '%s:%s:%s\\n' CANARY-OK {sha12} {run_token}; sleep 30"
                 if mode == "shell"
                 else (
-                    "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
+                    "Use two sequential shell tool calls. First run a separate foreground shell command. "
+                    "If the session wrapper requires a private first-action evidence file, begin that same command with the required `aplexer whoami --json` "
+                    "and its complete stdout redirected only to that exact private evidence path; use `&&` before the marker operation so the file-writing step must succeed first. "
+                    "This foreground command must output only the marker: never tee or print the whoami JSON or extra prose. "
+                    "In that same foreground command, print the "
                     f'concatenation of "CANARY-", "OK:", and "{sha12}:{run_token}" as one output line and let it finish. '
                     "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
                     "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "
@@ -615,7 +2527,11 @@ class Canary:
             # The complete expected output never occurs in the model prompt. A
             # wrapped echo of the prompt therefore cannot count as execution.
             self.prompt = PROMPTS["shell"] if mode == "shell" else (
-                "Use two sequential shell tool calls. First run a separate foreground shell command that prints the "
+                "Use two sequential shell tool calls. First run a separate foreground shell command. "
+                    "If the session wrapper requires a private first-action evidence file, begin that same command with the required `aplexer whoami --json` "
+                    "and its complete stdout redirected only to that exact private evidence path; use `&&` before the marker operation so the file-writing step must succeed first. "
+                    "This foreground command must output only the marker: never tee or print the whoami JSON or extra prose. "
+                    "In that same foreground command, print the "
                 f'concatenation of "CANARY-", "OK:", and "{run_id}" as one output line and let it finish. '
                 "Immediately after the marker print finishes, run a separate foreground `sleep 60` command using the "
                 "existing shell tool with a supported timeout sufficient for the 60-second hold so the orchestrator can "
@@ -644,8 +2560,89 @@ class Canary:
                 "or exit early. For every other runtime, follow this unchanged sequence: " + self.prompt
             )
         self.session = self.native = self.engine = None
+        self._zai_native_seen = self._zai_native_invalidated = False
+        self._zai_native_binding = None
         self.started_at = self.running_deadline = None
         self.start_attempted = self.stopped = False
+
+    # ---- workspace authority ------------------------------------------------
+
+    def resolve_workspace(self):
+        """Fixed root-owned config wins over env/default; invalid never falls back."""
+        self.current_stage = "admission"
+        configured = read_workspace_config()
+        if configured is not None:
+            self.workspace = configured
+            self.workspace_source = "root_config"
+        else:
+            self.workspace_source = "env_default"
+
+    # ---- admission collectors (each is a narrow, replaceable seam) ----------
+
+    def acquire_quota(self, deadline):
+        rc, out, _ = self.run(["quse", *QUOTA_QUERY_PROVIDERS, "--json"], deadline=deadline)
+        if rc != 0:
+            raise StageFailure("admission", "quota_timeout" if rc == 124 else "quota_acquisition_failed")
+        try:
+            raw = _closed_json(out, 1024 * 1024)
+        except ValueError:
+            raise StageFailure("admission", "quota_unparseable")
+        reason = evaluate_quota(raw, require_eligible_route=(self.mode == "full"))
+        del raw, out
+        if reason:
+            raise StageFailure("admission", reason)
+
+    def admit(self, deadline=None, workspace=None, *, seam="start"):
+        """Finite fresh pre-start admission. Raises StageFailure('admission', closed_reason)."""
+        self.current_stage = "admission" if not self.in_cleanup else self.current_stage
+        deadline = self.admission_deadline(deadline)
+        workspace, worker_bytes, floor_gb = self.physical_inputs(deadline, workspace)
+        self.acquire_quota(deadline)
+        self.admission_time_left(deadline)
+        self.physical_admit(deadline, workspace, worker_bytes, floor_gb)
+
+    def admit_past_young_holds(self, deadline):
+        """Fresh admission, repeated while the refusal is only a still-young resident without a finite cap.
+
+        That premise expires by itself: once the row is mature (>= MATURE_RESIDENT_AGE_S) and running it
+        reserves nothing extra (coordinator_reserve / resident_reserve). Every repeat is a complete fresh
+        admission inside the same bounded deadline; any other refusal ends at once, and when the deadline
+        runs out the last young-hold refusal (with its closed diagnostic) is the one reported.
+        """
+        held = None
+        while True:
+            attempt_deadline = min(deadline, time.monotonic() + ADMISSION_BUDGET_S)
+            try:
+                return self.admit(attempt_deadline)
+            except StageFailure as failure:
+                if held is not None and (
+                    failure.reason == "admission_deadline_exceeded"
+                    or (
+                        time.monotonic() >= deadline
+                        and failure.reason in (
+                            "quota_timeout",
+                            "managed_inflight_timeout",
+                            "native_inventory_timeout",
+                        )
+                    )
+                ):
+                    raise held
+                if not is_young_resident_hold(failure) or time.monotonic() + self.poll >= deadline:
+                    raise
+                held = failure
+            self.pause(deadline)
+
+    def admission_allows(self, deadline, workspace=None):
+        """Replay-seam wrapper: True only when a fresh admission passes."""
+        stage = self.current_stage
+        try:
+            self.admit(deadline, workspace, seam="replay")
+            return True
+        except StageFailure as failure:
+            self.admission_hold = failure.reason
+            return False
+        finally:
+            self.current_stage = stage
 
     def stage_deadline(self, timeout_s):
         target = time.monotonic() + timeout_s
@@ -661,6 +2658,55 @@ class Canary:
             raise StageFailure("helper_version", "helper_bundle_unreadable")
         if self.expected_helper_sha256 is not None and self.helper_sha256 != self.expected_helper_sha256:
             raise StageFailure("helper_version", "helper_sha256_mismatch")
+
+    @staticmethod
+    def parse_health_url(raw):
+        try:
+            parts = urllib.parse.urlsplit(raw)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return None
+        if not host or parts.username is not None or parts.password is not None:
+            return None
+        if parts.path != "/health" or parts.query or parts.fragment or "@" in parts.netloc:
+            return None
+        if parts.scheme == "http":
+            try:
+                if not ipaddress.ip_address(host).is_loopback:
+                    return None
+            except ValueError:
+                return None
+        elif parts.scheme != "https":
+            return None
+        return parts.scheme, host, port
+
+    def check_health(self):
+        """Fail before start unless the public /health body is HTTP 200 JSON with literal ok:true.
+
+        The request runs in an isolated child (fixed code, no shell) through
+        self.run, so DNS, connect, headers and body are all ended by killing
+        and reaping that child's process group at min(HEALTH_TIMEOUT_S,
+        remaining active budget). Sends no credentials, follows no redirects,
+        reads at most HEALTH_MAX_BYTES + 1 and never reports URL, headers or body.
+        """
+        self.current_stage = "health"
+        target = self.parse_health_url(os.environ.get("HUB_CANARY_HEALTH_URL") or DEFAULT_HEALTH_URL)
+        if target is None:
+            raise StageFailure("health", "health_url_invalid")
+        scheme, host, port = target
+        deadline = self.stage_deadline(HEALTH_TIMEOUT_S)
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise StageFailure("health", "health_timeout")
+        argv = [sys.executable, "-I", "-S", "-c", HEALTH_CHILD, scheme, host, "" if port is None else str(port),
+                f"{budget:.3f}", str(HEALTH_MAX_BYTES)]
+        rc, out, _ = self.run(argv, timeout=budget, deadline=deadline)
+        if rc == 124:
+            raise StageFailure("health", "health_timeout")
+        token = out.strip() if rc == 0 else ""
+        if token == "ok":
+            return
+        raise StageFailure("health", token if token in HEALTH_REASONS else "health_unreachable")
 
     def acquire_deploy_gate_lock(self):
         if not self.durable_pending_enabled:
@@ -691,6 +2737,7 @@ class Canary:
             "machine": self.machine,
             "workspace": str(pathlib.Path(self.workspace).resolve()),
             "prompt": self.prompt,
+            "purpose": "review",
             "candidate_sha": self.candidate_sha,
             "session_id": self.session,
             "native_id": self.native,
@@ -875,10 +2922,137 @@ class Canary:
             return None, "host_updater_xdg_runtime_dir_not_private"
         return str(candidate), None
 
+    @staticmethod
+    def parse_cli_base_url(raw):
+        """Accept only https://hub.dtcdev.click or loopback-IP origins (offline tests) with path '' or '/cli'."""
+        try:
+            parts = urllib.parse.urlsplit(raw)
+            host, port = parts.hostname, parts.port
+        except ValueError:
+            return None
+        if not host or parts.username is not None or parts.password is not None:
+            return None
+        if parts.query or parts.fragment or "@" in parts.netloc:
+            return None
+        norm_path = parts.path.rstrip("/")
+        if norm_path not in ("", "/cli"):
+            return None
+        if parts.scheme == "https" and parts.netloc == "hub.dtcdev.click" and port is None:
+            return parts.scheme, host, port, "https://hub.dtcdev.click", "/cli"
+        if parts.scheme not in ("http", "https"):
+            return None
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            return None
+        return parts.scheme, host, port, f"{parts.scheme}://{parts.netloc}", "/cli"
+
+    def fetch_cli_asset(self, target, filename, max_bytes, deadline, *, error_prefix):
+        scheme, host, port, _, cli_prefix = target
+        req_path = f"{cli_prefix}/{filename}"
+        remaining = deadline - time.monotonic()
+        if not self.in_cleanup and self.active_deadline is not None:
+            remaining = min(remaining, self.active_deadline - time.monotonic())
+        budget = min(CLI_FETCH_TIMEOUT_S, remaining)
+        if budget <= 0:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = f"{error_prefix}_timeout"
+            raise StageFailure("host_release", f"{error_prefix}_timeout")
+        argv = [
+            sys.executable, "-I", "-S", "-c", CLI_FETCH_CHILD,
+            scheme, host, "" if port is None else str(port),
+            req_path, f"{budget:.3f}", str(max_bytes),
+        ]
+        rc, out, _ = self.run(argv, timeout=budget, deadline=deadline)
+        if rc == 124:
+            self.host_updater_trigger = "timeout"
+            self.host_updater_trigger_error = f"{error_prefix}_timeout"
+            raise StageFailure("host_release", f"{error_prefix}_timeout")
+        if rc != 0:
+            token = out.strip()
+            reason = token[4:] if token.startswith("ERR:") and token[4:] in CLI_FETCH_REASONS else "unreachable"
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"{error_prefix}_{reason}"
+            raise StageFailure("host_release", f"{error_prefix}_{reason}")
+        try:
+            return base64.b64decode(out.strip(), validate=True)
+        except ValueError:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = f"{error_prefix}_invalid"
+            raise StageFailure("host_release", f"{error_prefix}_invalid")
+
+    def fetch_and_verify_candidate_updater_manifest(self, target, deadline):
+        raw = self.fetch_cli_asset(
+            target, "host-release.json", MAX_HOST_RELEASE_MANIFEST_BYTES,
+            deadline, error_prefix="candidate_updater_manifest",
+        )
+        try:
+            manifest = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_invalid"
+            raise StageFailure("host_release", "candidate_updater_manifest_invalid")
+        if not isinstance(manifest, dict) or manifest.get("host_version") != self.candidate_sha:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_version_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_version_mismatch")
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, dict):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        pyz_rec = artifacts.get("hub.pyz")
+        if (
+            not isinstance(pyz_rec, dict)
+            or not isinstance(pyz_rec.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", pyz_rec["sha256"])
+            or not isinstance(pyz_rec.get("size"), int)
+            or isinstance(pyz_rec.get("size"), bool)
+            or pyz_rec["size"] <= 0
+        ):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        if self.candidate_cli_sha256 is not None and pyz_rec["sha256"] != self.candidate_cli_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_cli_sha_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_cli_sha_mismatch")
+        upd_rec = artifacts.get("hub2-self-update.py")
+        if (
+            not isinstance(upd_rec, dict)
+            or not isinstance(upd_rec.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", upd_rec["sha256"])
+            or not isinstance(upd_rec.get("size"), int)
+            or isinstance(upd_rec.get("size"), bool)
+            or not (1 <= upd_rec["size"] <= MAX_UPDATER_BYTES)
+        ):
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_metadata_invalid"
+            raise StageFailure("host_release", "candidate_updater_metadata_invalid")
+        if self.candidate_updater_sha256 is None or upd_rec["sha256"] != self.candidate_updater_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_manifest_updater_sha_mismatch"
+            raise StageFailure("host_release", "candidate_updater_manifest_updater_sha_mismatch")
+        return upd_rec["sha256"], upd_rec["size"]
+
+    def read_matching_installed_updater(self, expected_sha, expected_size):
+        try:
+            data = read_regular_nofollow(self.host_release_root / "updater.py", max_bytes=MAX_UPDATER_BYTES)
+        except OSError:
+            return None
+        if len(data) != expected_size or hashlib.sha256(data).hexdigest() != expected_sha:
+            return None
+        return data
+
     def trigger_host_updater(self, deadline):
         if self.host_updater_triggered:
             return
         self.host_updater_triggered = True
+        if not self.candidate_sha or not self.candidate_cli_sha256 or not self.candidate_updater_sha256:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_binding_missing"
+            raise StageFailure("host_release", "candidate_updater_binding_missing")
         effective_deadline = deadline
         if not self.in_cleanup and self.active_deadline is not None:
             effective_deadline = min(effective_deadline, self.active_deadline)
@@ -891,18 +3065,75 @@ class Canary:
             self.host_updater_trigger = "failed"
             self.host_updater_trigger_error = xdg_err
             return
+        target = self.parse_cli_base_url(os.environ.get("HUB_CANARY_CLI_BASE_URL") or DEFAULT_CLI_BASE_URL)
+        if target is None:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_url_invalid"
+            raise StageFailure("host_release", "candidate_updater_url_invalid")
+        expected_updater_sha, expected_updater_size = self.fetch_and_verify_candidate_updater_manifest(
+            target, effective_deadline,
+        )
+        self.host_updater_sha256 = expected_updater_sha
         updater_env = dict(os.environ)
         updater_env["XDG_RUNTIME_DIR"] = xdg_dir
-        rc, _, _ = self.run(list(HOST_UPDATER_TRIGGER_ARGV), deadline=deadline, env=updater_env)
+        updater_env.pop("HUB_BASE_URL", None)
+        updater_bytes = self.read_matching_installed_updater(expected_updater_sha, expected_updater_size)
+        if updater_bytes is not None:
+            trigger_mode = "triggered"
+            timeout_token = "host_updater_trigger_timeout"
+            exit_prefix = "host_updater_trigger_exit_"
+        else:
+            # Installed updater is missing or legacy (e.g. pre-unified hub-only): bootstrap
+            # using the verified candidate-approved updater before Host convergence.
+            updater_bytes = self.fetch_cli_asset(
+                target, "hub2-self-update.py", MAX_UPDATER_BYTES,
+                effective_deadline, error_prefix="candidate_updater_fetch",
+            )
+            if len(updater_bytes) != expected_updater_size or hashlib.sha256(updater_bytes).hexdigest() != expected_updater_sha:
+                self.host_updater_trigger = "failed"
+                self.host_updater_trigger_error = "candidate_updater_digest_mismatch"
+                raise StageFailure("host_release", "candidate_updater_digest_mismatch")
+            trigger_mode = "bootstrapped"
+            timeout_token = "candidate_updater_bootstrap_timeout"
+            exit_prefix = "candidate_updater_bootstrap_exit_"
+        try:
+            updater_fd = create_sealed_pyz_fd(updater_bytes)
+        except OSError:
+            self.host_updater_trigger = "failed"
+            self.host_updater_trigger_error = "candidate_updater_memfd_failed"
+            raise StageFailure("host_release", "candidate_updater_memfd_failed")
+        base_origin = target[3]
+        try:
+            rc, _, _ = self.run(
+                [
+                    sys.executable, "-I", f"/proc/self/fd/{updater_fd}",
+                    "--base-url", base_origin,
+                    "--root", str(self.host_release_root),
+                    "--install-service",
+                    "--expected-host-version", self.candidate_sha,
+                    "--expected-cli-sha256", self.candidate_cli_sha256,
+                    "--expected-updater-sha256", self.candidate_updater_sha256,
+                ],
+                deadline=effective_deadline,
+                env=updater_env,
+                pass_fd=updater_fd,
+            )
+        finally:
+            try:
+                os.close(updater_fd)
+            except OSError:
+                pass
         if rc == 0:
-            self.host_updater_trigger = "triggered"
+            self.host_updater_trigger = trigger_mode
             self.host_updater_trigger_error = None
         elif rc == 124:
             self.host_updater_trigger = "timeout"
-            self.host_updater_trigger_error = "host_updater_trigger_timeout"
+            self.host_updater_trigger_error = timeout_token
+            raise StageFailure("host_release", f"timeout_{timeout_token}")
         else:
             self.host_updater_trigger = "failed"
-            self.host_updater_trigger_error = f"host_updater_trigger_exit_{rc}"
+            self.host_updater_trigger_error = f"{exit_prefix}{rc}"
+            raise StageFailure("host_release", f"{exit_prefix}{rc}")
 
     def verify_candidate_host_release(self):
         if not self.candidate_sha:
@@ -1137,12 +3368,16 @@ class Canary:
         native_id = raw_native if self.valid_native_id(raw_native) else None
         if not key or not repo or not machine or not workspace:
             raise StageFailure("cleanup", "prior_pending_corrupt")
-        if not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode")):
+        if (not sid and all(isinstance(rec.get(k), str) and rec.get(k) for k in ("repo", "machine", "workspace", "name", "key", "prompt", "mode"))
+                and self.admission_allows(deadline, rec["workspace"])):
+            # Replays keep the ORIGINAL recorded workspace/key/body; admission only
+            # decides whether a possible new START may be sent now. When it is held
+            # the pending file is retained and resolution continues by lookup only.
             replay_args = [
                 *self.hub, "sessions", "start", "--no-wait",
                 "--repo", rec["repo"], "--machine", rec["machine"],
                 "--workspace", rec["workspace"], "--name", rec["name"],
-                "--key", rec["key"], "--prompt", rec["prompt"],
+                "--key", rec["key"], "--prompt", rec["prompt"], "--purpose", rec.get("purpose", "implement"),
             ]
             if rec["mode"] == "shell":
                 replay_args += ["--engine", "shell"]
@@ -1226,78 +3461,6 @@ class Canary:
             deadline = self.stage_deadline(self.stop_timeout)
             self._reconcile_one_pending_file(pfile, deadline)
 
-    def run(self, argv, timeout=None, *, deadline=None, env=None):
-        limit = self.cmd_timeout if timeout is None else timeout
-        effective_deadline = deadline
-        if not self.in_cleanup and self.active_deadline is not None:
-            effective_deadline = self.active_deadline if effective_deadline is None else min(effective_deadline, self.active_deadline)
-        if effective_deadline is not None:
-            limit = min(limit, effective_deadline - time.monotonic())
-        if limit <= 0:
-            return 124, "", ""
-        pass_fds = self.hub_pass_fds if (self.pyz_fd is not None and f"/proc/self/fd/{self.pyz_fd}" in argv) else ()
-        try:
-            proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-                pass_fds=pass_fds,
-                env=env,
-            )
-        except OSError as error:
-            return 127, "", type(error).__name__
-        try:
-            out, err = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            out, err = proc.communicate()
-            return 124, out or "", err or ""
-        except BaseException:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=1)
-            except Exception:
-                pass
-            raise
-        if effective_deadline is not None and time.monotonic() >= effective_deadline:
-            return 124, out, err
-        return proc.returncode, out, err
-
-    @staticmethod
-    def failure_reason(rc, err):
-        if rc == 124:
-            return "hub_cli_timeout"
-        typed = re.search(r"\bstatus\s+\d{3}\s+\(([a-z][a-z0-9_]{0,79})\)", err)
-        return typed.group(1) if typed else f"hub_cli_exit_{rc}"
-
-    def hub_json(self, stage, *args, deadline=None):
-        rc, out, err = self.run([*self.hub, *args], deadline=deadline)
-        if rc != 0:
-            raise StageFailure(stage, self.failure_reason(rc, err))
-        try:
-            return json.loads(out)
-        except ValueError:
-            raise StageFailure(stage, "unparseable_json")
-
-    def list_items(self, stage, deadline):
-        # Current hub CLI exhausts the indexed cursor. Prefer its aggregated
-        # sessions[] over an inherited items[] from the first API page.
-        data = self.hub_json(stage, "sessions", "list", "--all", "--json", deadline=deadline)
-        items = data.get("sessions", data.get("items")) if isinstance(data, dict) else data
-        if not isinstance(items, list):
-            raise StageFailure(stage, "unparseable_json")
-        if isinstance(data, dict) and data.get("next_cursor", data.get("next")):
-            raise StageFailure(stage, "incomplete_listing")
-        return items
-
     def a_running_ids(self, deadline):
         rc, out, _ = self.run([*self.a, "list", "--json", "--running"], deadline=deadline)
         if rc != 0:
@@ -1313,7 +3476,7 @@ class Canary:
     def start_args(self):
         args = [*self.hub, "sessions", "start", "--no-wait", "--repo", self.repo,
                 "--machine", self.machine, "--workspace", self.workspace, "--name", self.name,
-                "--key", self.key, "--prompt", self.prompt]
+                "--key", self.key, "--prompt", self.prompt, "--purpose", "review"]
         if self.mode == "shell":
             args += ["--engine", "shell"]
         return args
@@ -1343,6 +3506,10 @@ class Canary:
         return True
 
     def start(self):
+        self.current_stage = "admission"
+        # Fresh admission before EVERY possible Hub START; refusal happens before
+        # any pending state or session exists, so there is nothing to clean up.
+        self.admit_past_young_holds(self.stage_deadline(YOUNG_HOLD_ADMISSION_BUDGET_S))
         self.current_stage = "start"
         ensure_private_dir(self.workspace, stage="start", prefix="workspace")
         self.started_at = time.monotonic()
@@ -1429,6 +3596,13 @@ class Canary:
             return False
         if eng in ("claude", "antigravity"):
             return paired_stream_output_ok(out, self.marker, eng)
+        if eng == "zai":
+            native = zai_native_return_proof(out, self.marker, getattr(self, "_zai_native_binding", None))
+            if native["invalidated"] or native["seen"] or getattr(self, "_zai_native_seen", False):
+                self._zai_native_seen = True
+                self._zai_native_invalidated = getattr(self, "_zai_native_invalidated", False) or native["invalidated"]
+                self._zai_native_binding = native["binding"]
+                return native["proven"] and not self._zai_native_invalidated
 
         def marker_in(text):
             return isinstance(text, str) and any(line.strip() == self.marker for line in text.splitlines())
@@ -1471,6 +3645,10 @@ class Canary:
     def check_capture(self):
         self.current_stage = "capture"
         deadline = self.stage_deadline(self.capture_timeout)
+        if self.candidate_sha is not None and self.mode == "full" and self.active_deadline is not None:
+            # Keep the original active deadline and reserve the normal STOP
+            # ceiling even when an operator lowers a stage timeout.
+            deadline = min(deadline, self.active_deadline - TRUSTED_STOP_TIMEOUT_S)
         reason = "no_output"
         attempt = 0
         while time.monotonic() < deadline:
@@ -1752,7 +3930,7 @@ class Canary:
         if eff_candidate:
             archive_args = [
                 *self.hub, "intake", "update", intake_id,
-                "--status", "archived", "--reason", "deploy_gate_shell_canary",
+                "--status", "archived", "--reason", f"deploy_gate_{clean(eff_mode, 16)}_canary",
             ]
         else:
             archive_args = [
@@ -1779,8 +3957,9 @@ class Canary:
         if not self.session and self.start_attempted:
             # A lost or interrupted response is reconciled first with the identical
             # idempotent key and payload, then by unambiguous client_key/key + scope.
-            _, out, _ = self.run(self.start_args(), deadline=limit_deadline)
-            self.remember_receipt(out)
+            if self.admission_allows(limit_deadline):
+                _, out, _ = self.run(self.start_args(), deadline=limit_deadline)
+                self.remember_receipt(out)
             if not self.session:
                 try:
                     items = self.list_items("cleanup", limit_deadline)
@@ -1848,9 +4027,12 @@ class Canary:
         try:
             self.active_deadline = time.monotonic() + self.active_budget
             self.verify_helper_digest()
+            self.resolve_workspace()
             self.acquire_deploy_gate_lock()
             self.verify_candidate_host_release()
             self.reconcile_prior_pending()
+            if not self.deploy_gate:
+                self.check_health()
             self.start()
             self.wait_running()
             self.check_capture()
@@ -1863,6 +4045,7 @@ class Canary:
             result.update(ok=True)
         except StageFailure as failure:
             result.update(stage=failure.stage, reason=failure.reason)
+            add_admission_diagnostic(result, failure)
         except CanaryTerminated as terminated:
             stage = self.current_stage if self.current_stage in STAGES else ("start" if not self.session else "stop")
             result.update(stage=stage, reason=f"terminated_{terminated.sig_name.lower()}")
@@ -1904,6 +4087,12 @@ class Canary:
                     pass
                 self.pyz_fd = None
                 self.hub_pass_fds = ()
+            if self.bridge_fd is not None:
+                try:
+                    os.close(self.bridge_fd)
+                except OSError:
+                    pass
+                self.bridge_fd = None
             if self.lock_fd is not None:
                 try:
                     os.close(self.lock_fd)
@@ -1929,6 +4118,8 @@ class Canary:
             result["host_updater_trigger"] = self.host_updater_trigger
             if self.host_updater_trigger_error is not None:
                 result["host_updater_trigger_error"] = self.host_updater_trigger_error
+            if self.host_updater_sha256 is not None:
+                result["host_updater_sha256"] = self.host_updater_sha256
         return result
 
 
@@ -1961,16 +4152,100 @@ def send_mail(subject, body):
     return r.returncode == 0
 
 
-def record_dev_alert_occurrence(sdir, mode, result, state, *, decision):
-    """Reserved integration hook for the finite Hub dev@ occurrence counter
-    (dev_alert_occurrences_v1; invoked before dedup/SMTP on alert decisions:
-    critical/critical_dedup/recovery increment cumulative occurrences, while
-    pass/recovering/failure_below_threshold update observation coverage only).
+# Canary decision -> (observer decision, condition, recipient_class) on the
+# existing bounded observer API. Vocabulary and conditions are the fixed
+# literals of scripts/hub_alert_client.py (CONDITIONS; ram.DECISIONS mirrors
+# hub2 alert_authority DECISIONS: only alert/alert_dedup/recovery increment
+# occurrences; observation is coverage-only and must never count).
+CANARY_ALERT_DECISIONS = {
+    "critical": ("alert", "critical", "dev"),
+    "critical_dedup": ("alert_dedup", "critical_dedup", "dev"),
+    # Recovery mail goes to the same dev recipient as critical mail.
+    "recovery": ("recovery", "recovery", "dev"),
+}
+
+# Truthful flag for branches that never reach the mailer (deploy gate,
+# metadata previews, lock-busy/error accounting, coverage-only observations).
+# Counted alert decisions claim nothing about mail here: each frame is emitted
+# before the single dedupe/SMTP action it precedes, so no flag may assert a
+# mail outcome.
+_NO_MAIL_FLAGS = {"no_mail": True}
+
+
+def _observer_emit(observer, phase, **fields):
+    """Best-effort emit against a trusted injected observer. A raising emit or
+    any non-True acknowledgement is observation failure: the observer is
+    marked failed and the occurrence evidence stays unknown. This never gates,
+    suppresses or retries the business/mail action, and never yields a healthy
+    or complete claim."""
+    if observer is None:
+        return
+    try:
+        acked = observer.emit(phase, **fields)
+    except Exception:
+        acked = False
+    if acked is not True:
+        try:
+            observer.fail()
+        except Exception:
+            pass
+
+
+class _CanaryAttempt:
+    """One bounded single-decision canary attempt over the injected observer.
+
+    The alert authority (hub2 alert_authority.LiveRAM.hook) admits one attempt
+    per canary run and requires begin -> exactly one decision -> terminal: a
+    second decision or a terminal without any decision poisons the
+    start_canary producer, so the first decision wins and later ones drop.
     """
-    _ = (sdir, mode, result, state, decision)
+
+    def __init__(self, observer):
+        self._observer = observer
+        self._decision = None
+
+    @property
+    def decided(self):
+        return self._decision is not None
+
+    def decision(self, decision, condition, recipient_class="none", flags=None):
+        if self._observer is None or self._decision is not None:
+            return
+        self._decision = (decision, condition)
+        _observer_emit(self._observer, "decision", decision=decision,
+                       condition=condition, recipient_class=recipient_class,
+                       flags=dict(flags) if flags else {})
 
 
-def apply_alerting(result):
+def record_dev_alert_occurrence(sdir, mode, result, state, *, decision, _attempt=None):
+    """Bounded occurrence hook for the finite Hub dev@ occurrence counter
+    (invoked before dedup/SMTP on alert decisions: critical/critical_dedup/
+    recovery map to the counted decisions alert/alert_dedup/recovery with the
+    fixed condition literals critical/critical_dedup/recovery and the truthful
+    dev recipient (all canary mail, including recovery, goes to the fixed dev
+    address), while pass/recovering/failure_below_threshold emit
+    coverage-only observation decisions that never count and carry the
+    no_mail flag). The attempt is a private trusted-caller injection
+    (_managed_observer -> main -> apply_alerting); unmanaged runs stay
+    observation-silent with their existing behavior, and this hook claims
+    no authority of its own."""
+    _ = (sdir, result, state)
+    if _attempt is None:
+        return
+    counted = CANARY_ALERT_DECISIONS.get(decision)
+    if counted is not None:
+        _attempt.decision(counted[0], counted[1], recipient_class=counted[2])
+    else:
+        _attempt.decision("observation", decision, flags=_NO_MAIL_FLAGS)
+
+
+def apply_alerting(result, *, _attempt=None):
+    if _attempt is None:
+        _attempt = _CanaryAttempt(None)
+    _apply_alerting_locked(result, _attempt)
+
+
+def _apply_alerting_locked(result, attempt):
     sdir = state_dir()
     lock_fd = acquire_lock_fd(sdir / f"{result['mode']}.lock", 30.0, stage="lock", busy_reason="alert_state_lock_busy")
     try:
@@ -1978,6 +4253,7 @@ def apply_alerting(result):
         st = load_state(path)
         mode = result["mode"]
         if not result["ok"] and result.get("stage") == "lock" and result.get("reason") == "deploy_gate_lock_busy":
+            attempt.decision("observation", "lock_busy", flags=_NO_MAIL_FLAGS)
             st["last_lock_busy"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
             save_state(path, st)
             return
@@ -1986,16 +4262,16 @@ def apply_alerting(result):
             if st.get("incident_open"):
                 st["successes"] = st.get("successes", 0) + 1
                 if st["successes"] >= RECOVER_THRESHOLD:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery")
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovery", _attempt=attempt)
                     body = (f"Hub start canary ({mode}) recovered at {result['timestamp']}.\n"
                             f"Run id: {result['run_id']}\nIncident: {st.get('incident_id')}\n")
                     if send_mail(f"[RECOVERED] Hub start canary ({mode}) is passing again", body):
                         st.update(incident_open=False, successes=0, incident_id="-")
                 else:
-                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering")
+                    record_dev_alert_occurrence(sdir, mode, result, st, decision="recovering", _attempt=attempt)
             else:
                 st["successes"] = 0
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass")
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="pass", _attempt=attempt)
         else:
             st["successes"] = 0
             st["failures"] = st.get("failures", 0) + 1
@@ -2006,6 +4282,7 @@ def apply_alerting(result):
                     result,
                     st,
                     decision="critical_dedup" if st.get("incident_open") else "critical",
+                    _attempt=attempt,
                 )
                 if not st.get("incident_open"):
                     incident = st.get("incident_id") if st.get("incident_id", "-") != "-" else result["run_id"]
@@ -2017,67 +4294,124 @@ def apply_alerting(result):
                     if send_mail(f"[CRITICAL] Hub start canary ({mode}) failing at stage {result['stage']}: {result['reason']}", body):
                         st.update(incident_open=True, incident_id=incident)
             else:
-                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold")
+                record_dev_alert_occurrence(sdir, mode, result, st, decision="failure_below_threshold", _attempt=attempt)
         st["last"] = {k: result[k] for k in ("ok", "stage", "reason", "timestamp", "run_id")}
         save_state(path, st)
     finally:
         os.close(lock_fd)
 
 
-def main():
+def main(argv=None, *, _managed_observer=None):
+    """Trusted-caller injection point for the bounded managed observer (same
+    pattern as the quota publisher): natural invocations pass no observer and
+    keep the legacy unmanaged defaults; no observer is ever derived from the
+    environment, files or CLI flags here. One injected observer spans exactly
+    one canary attempt: begin right after argument parsing, exactly one
+    decision (the alerting branch decision, or a fixed deploy_gate/lock_busy/
+    metadata_only/error observation on no-mail branches), terminal at exit —
+    covering the read-only metadata previews too. Argparse usage failures exit
+    before any frame: no attempt ever began, so nothing needs a terminal."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=("shell", "full"), default=None)
     p.add_argument("--deploy-gate", action="store_true", help="run the canary once (default mode full, or --mode shell), no mail, JSON verdict")
     p.add_argument("--candidate-sha", default=None, help="40-hex candidate commit SHA for pre-commit deploy gate")
     p.add_argument("--candidate-cli-sha256", default=None, help="64-hex expected SHA-256 of the candidate hub.pyz")
+    p.add_argument("--candidate-updater-sha256", default=None, help="64-hex expected SHA-256 of the candidate hub2-self-update.py")
     p.add_argument("--run-token", default=None, help="32..64-hex run token binding the pre-commit deploy gate verdict")
     p.add_argument("--helper-sha256", default=None, help="64-hex expected SHA-256 of the installed canary helper bundle")
     p.add_argument("--print-helper-sha256", action="store_true", help="print canonical helper bundle SHA-256 and exit")
-    args = p.parse_args()
-    if args.print_helper_sha256:
-        print(compute_helper_sha256())
-        return 0
-    bound_args = (args.candidate_sha, args.candidate_cli_sha256, args.run_token, args.helper_sha256)
-    if any(v is not None for v in bound_args):
-        if not args.deploy_gate or not all(v is not None for v in bound_args):
-            p.error("--candidate-sha, --candidate-cli-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
-        if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
-            p.error("--candidate-sha must be a 40-character lowercase hex SHA")
-        if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_cli_sha256):
-            p.error("--candidate-cli-sha256 must be a 64-character lowercase hex SHA-256")
-        if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
-            p.error("--run-token must be a 32..64-character lowercase hex token")
-        if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
-            p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
-    mode = args.mode or "full"
-    run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
-    result = Canary(
-        mode,
-        run_id,
-        deploy_gate=args.deploy_gate,
-        candidate_sha=args.candidate_sha,
-        candidate_cli_sha256=args.candidate_cli_sha256,
-        run_token=args.run_token,
-        expected_helper_sha256=args.helper_sha256,
-    ).execute()
-    if args.deploy_gate:
-        result["deploy_gate"] = True
-    else:
-        try:
-            apply_alerting(result)
-        except StageFailure as failure:
-            result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
-            if result["ok"]:
-                result.update(ok=False, stage=failure.stage, reason=failure.reason)
-        except OSError:
-            result["alert_state_error"] = "lock:alert_state_write_failed"
-            if result["ok"]:
-                result.update(ok=False, stage="lock", reason="alert_state_write_failed")
-    line = json.dumps(result, sort_keys=True)
-    print(line, flush=True)
-    if not result["ok"]:
-        print(line, file=sys.stderr, flush=True)
-    return 0 if result["ok"] else 1
+    p.add_argument("--physical-admission-check", action="store_true",
+                   help="read-only preview of the physical admission (no quota, no start, no state); never authorizes a start")
+    args = p.parse_args(argv)
+    attempt = _CanaryAttempt(_managed_observer)
+    _observer_emit(_managed_observer, "begin", recipient_class="none")
+    try:
+        if args.physical_admission_check:
+            if (args.mode or args.deploy_gate or args.print_helper_sha256 or args.candidate_sha
+                    or args.candidate_cli_sha256 or args.candidate_updater_sha256
+                    or args.run_token or args.helper_sha256):
+                p.error("--physical-admission-check takes no other option")
+            result = physical_admission_check()
+            attempt.decision("observation", "metadata_only", flags=_NO_MAIL_FLAGS)
+            print(json.dumps(result, sort_keys=True), flush=True)
+            return 0 if result["ok"] else 1
+        if args.print_helper_sha256:
+            attempt.decision("observation", "metadata_only", flags=_NO_MAIL_FLAGS)
+            print(compute_helper_sha256())
+            return 0
+        bound_args = (
+            args.candidate_sha,
+            args.candidate_cli_sha256,
+            args.candidate_updater_sha256,
+            args.run_token,
+            args.helper_sha256,
+        )
+        if any(v is not None for v in bound_args):
+            if not args.deploy_gate or not all(v is not None for v in bound_args):
+                p.error("--candidate-sha, --candidate-cli-sha256, --candidate-updater-sha256, --run-token, and --helper-sha256 must be provided together with --deploy-gate")
+            if not re.fullmatch(r"[0-9a-f]{40}", args.candidate_sha):
+                p.error("--candidate-sha must be a 40-character lowercase hex SHA")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_cli_sha256):
+                p.error("--candidate-cli-sha256 must be a 64-character lowercase hex SHA-256")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.candidate_updater_sha256):
+                p.error("--candidate-updater-sha256 must be a 64-character lowercase hex SHA-256")
+            if not re.fullmatch(r"[0-9a-f]{32,64}", args.run_token):
+                p.error("--run-token must be a 32..64-character lowercase hex token")
+            if not re.fullmatch(r"[0-9a-f]{64}", args.helper_sha256):
+                p.error("--helper-sha256 must be a 64-character lowercase hex SHA-256")
+        mode = args.mode or "full"
+        run_id = f"{args.candidate_sha[:12]}-{args.run_token[:12]}" if args.candidate_sha else uuid.uuid4().hex[:12]
+        result = Canary(
+            mode,
+            run_id,
+            deploy_gate=args.deploy_gate,
+            candidate_sha=args.candidate_sha,
+            candidate_cli_sha256=args.candidate_cli_sha256,
+            candidate_updater_sha256=args.candidate_updater_sha256,
+            run_token=args.run_token,
+            expected_helper_sha256=args.helper_sha256,
+        ).execute()
+        if args.deploy_gate:
+            result["deploy_gate"] = True
+            attempt.decision("observation", "deploy_gate", flags=_NO_MAIL_FLAGS)
+        else:
+            try:
+                apply_alerting(result, _attempt=attempt)
+            except StageFailure as failure:
+                result["alert_state_error"] = f"{failure.stage}:{failure.reason}"
+                if result["ok"]:
+                    result.update(ok=False, stage=failure.stage, reason=failure.reason)
+            except OSError:
+                result["alert_state_error"] = "lock:alert_state_write_failed"
+                if result["ok"]:
+                    result.update(ok=False, stage="lock", reason="alert_state_write_failed")
+        line = json.dumps(result, sort_keys=True)
+        print(line, flush=True)
+        if not result["ok"]:
+            print(line, file=sys.stderr, flush=True)
+        return 0 if result["ok"] else 1
+    finally:
+        # Exactly one decision per attempt: a run that crashed, errored or was
+        # rejected before any branch decision keeps the sequence well-formed
+        # with a coverage-only error observation that claims no mail and
+        # counts no occurrence.
+        if not attempt.decided:
+            attempt.decision("observation", "error", flags=_NO_MAIL_FLAGS)
+        if _managed_observer is not None and sys.exc_info()[0] is not None:
+            # An active business/control exception keeps priority: terminal
+            # observation failure (a raise or a non-True ACK) must never mask
+            # or replace it, but still marks the evidence failed.
+            try:
+                acked = _managed_observer.emit("terminal", recipient_class="none")
+            except BaseException:
+                acked = False
+            if acked is not True:
+                try:
+                    _managed_observer.fail()
+                except BaseException:
+                    pass
+        else:
+            _observer_emit(_managed_observer, "terminal", recipient_class="none")
 
 
 if __name__ == "__main__":

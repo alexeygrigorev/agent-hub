@@ -17,13 +17,32 @@ function absolute(value:string):boolean {
   return value.startsWith('/') || /^[A-Za-z]:\\/.test(value) || /^\\\\[^\\]+\\[^\\]+/.test(value);
 }
 
+// Host-authenticated redirection of an absolute enrolled checkout is limited
+// to the deterministic intake-worktree namespace beneath that checkout.
+function intakeWorktree(requested:string,resolved:string):boolean {
+  const separator=requested.includes('\\')?'\\':'/';
+  const prefix=requested.replace(/[\\/]+$/,'')+separator+'.local'+separator+'hub-worktrees'+separator;
+  return resolved.startsWith(prefix)&&/^[a-f0-9]{64}$/.test(resolved.slice(prefix.length));
+}
+
+// A retained intake branch stays checked out where it was first created, so a
+// later start in another enrolled checkout continues in that same worktree:
+// `<any absolute checkout>/.local/hub-worktrees/<64-hex intake digest>`.
+function retainedIntakeWorktree(resolved:string):boolean {
+  const parts=resolved.split(/[\\/]/);
+  const marker=parts.length-3;
+  return marker>=2&&parts[marker]==='.local'&&parts[marker+1]==='hub-worktrees'&&/^[a-f0-9]{64}$/.test(parts[marker+2])
+    &&!parts.slice(0,marker).includes('..')&&!parts.slice(0,marker).includes('.');
+}
+
 function validate(requested:unknown,value:unknown):WorkspaceBinding {
   const binding=value as Partial<WorkspaceBinding>|null;
   if(typeof requested!=='string'||!binding||typeof binding!=='object'||Array.isArray(binding)
     ||Object.keys(binding).length!==3||binding.version!==1||binding.requested_workspace!==requested
     ||typeof binding.resolved_workspace!=='string'||binding.resolved_workspace.length>1024
     ||/[\u0000-\u001f]/.test(binding.resolved_workspace)||!absolute(binding.resolved_workspace)
-    ||(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(requested)&&binding.resolved_workspace!==requested)) {
+    ||(!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(requested)&&binding.resolved_workspace!==requested
+      && !intakeWorktree(requested,binding.resolved_workspace)&&!retainedIntakeWorktree(binding.resolved_workspace))) {
     throw new HttpError('invalid_workspace_binding',409);
   }
   return {version:1,requested_workspace:requested,resolved_workspace:binding.resolved_workspace};
@@ -39,4 +58,16 @@ export function mergeWorkspaceBinding(requested:unknown,stored:unknown,incoming?
 
 export function boundWorkspace(launch:JsonRecord,stored:unknown=launch[WORKSPACE_BINDING_FIELD]):unknown {
   return mergeWorkspaceBinding(launch.workspace,stored)?.resolved_workspace??launch.workspace;
+}
+
+/** When a bound workspace is an ephemeral `.local/hub-worktrees/<64-hex>`
+ * worktree beneath an absolute checkout, continuations and verifiers target
+ * that parent checkout so a cleaned-up worktree never fails with
+ * `workspace_unavailable`: `implement` recreates the worktree and `review`
+ * inspects the checkout directly. */
+export function checkoutWorkspace(launch:JsonRecord,stored:unknown=launch[WORKSPACE_BINDING_FIELD]):unknown {
+  const bound=boundWorkspace(launch,stored);
+  if(typeof bound!=='string'||!retainedIntakeWorktree(bound))return bound;
+  const parts=bound.split(/[\\/]/);
+  return parts.slice(0,-3).join(bound.includes('\\')?'\\':'/')||bound;
 }

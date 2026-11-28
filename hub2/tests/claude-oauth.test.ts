@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {CLAUDE_OAUTH,claudeAuthorization,claudeExchange,loginRefusal} from '../src/claude-oauth';
-import * as legacy from '../../src/credentials';
+import * as legacy from '../compat/credential-refresh';
 
 const now=1_700_000_000_000;
 test('PKCE authorization binds independent verifier and state to the maintained endpoint and scopes',async()=>{
@@ -75,7 +75,7 @@ test('token refusal and transport errors retain bounded sanitized classification
  assert.deepEqual(await claudeExchange('code','verifier','state',async()=>{throw new Error('private-network-error');},now),{ok:false,invalid:false,reason:'login_unreachable',detail:'egress_unreachable',blocked:true});
 });
 
-test('retained Hub1 exports use the same implementation and legacy Claude refresh preserves existing files',async()=>{
+test('compatibility exports use the same implementation and retained Claude refresh preserves existing files',async()=>{
  assert.equal(legacy.CLAUDE_OAUTH,CLAUDE_OAUTH);assert.equal(legacy.claudeAuthorization,claudeAuthorization);
  assert.equal(legacy.claudeExchange,claudeExchange);assert.equal(legacy.loginRefusal,loginRefusal);
  const files={'.claude/.credentials.json':JSON.stringify({retained:'value',claudeAiOauth:{refreshToken:'synthetic-old',scopes:['user:inference'],subscriptionType:'max'}}),'unrelated':'preserved'};
@@ -87,4 +87,64 @@ test('retained Hub1 exports use the same implementation and legacy Claude refres
  assert.equal(result.ok,true);if(!result.ok)throw new Error('expected refresh');
  assert.equal(result.files.unrelated,'preserved');
  assert.deepEqual(JSON.parse(result.files['.claude/.credentials.json']),{retained:'value',claudeAiOauth:{refreshToken:'synthetic-rotated',accessToken:'synthetic-new',scopes:['user:inference'],subscriptionType:'max',expiresAt:now+60_000}});
+});
+
+
+test('retained Codex refresh preserves unknown files and prior metadata with optional rotation',async()=>{
+ const files={'.codex/auth.json':JSON.stringify({retained:'value',tokens:{access_token:'old',refresh_token:'refresh',id_token:'id-old',account_id:'account'}}),unrelated:'unchanged'};
+ for(const token of [{access_token:'new'},{access_token:'new',refresh_token:'rotated',id_token:'id-new'}]){
+  const result=await legacy.refreshCredential('codex',files,async(url,init)=>{
+   assert.equal(url,legacy.CODEX_OAUTH.token);
+   assert.equal(init?.redirect,'manual');assert.equal(init?.method,'POST');
+   assert(init?.signal instanceof AbortSignal);
+   assert.deepEqual(JSON.parse(String(init?.body)),{client_id:legacy.CODEX_OAUTH.client,grant_type:'refresh_token',refresh_token:'refresh',scope:'openid profile email'});
+   return Response.json(token);
+  },now);
+  assert.equal(result.ok,true);if(!result.ok)throw new Error('expected refresh');
+  assert.equal(result.files.unrelated,'unchanged');
+  assert.deepEqual(JSON.parse(result.files['.codex/auth.json']),{retained:'value',tokens:{refresh_token:'refresh',id_token:'id-old',account_id:'account',...token},last_refresh:new Date(now).toISOString()});
+  assert.equal(JSON.parse(files['.codex/auth.json']).tokens.access_token,'old');
+ }
+});
+
+test('retained Claude refresh defaults scopes and only replaces explicitly returned token fields',async()=>{
+ const files={'.claude/.credentials.json':JSON.stringify({retained:'value',claudeAiOauth:{refreshToken:'old',accessToken:'prior',expiresAt:123,subscriptionType:'max'}})};
+ const result=await legacy.refreshCredential('claude',files,async(url,init)=>{
+  assert.equal(url,CLAUDE_OAUTH.token);
+  assert.equal(JSON.parse(String(init?.body)).scope,CLAUDE_OAUTH.scopes.join(' '));
+  return Response.json({access_token:'new',scope:' user:profile  user:inference '});
+ },now);
+ assert.equal(result.ok,true);if(!result.ok)throw new Error('expected refresh');
+ assert.deepEqual(JSON.parse(result.files['.claude/.credentials.json']),{retained:'value',claudeAiOauth:{refreshToken:'old',accessToken:'new',expiresAt:123,subscriptionType:'max',scopes:['user:profile','user:inference']}});
+});
+
+test('both retained refresh branches keep fixed refusal classifications and never expose provider bodies',async()=>{
+ for(const provider of ['codex','claude']){
+  const files={'.codex/auth.json':JSON.stringify({tokens:{refresh_token:'synthetic'}}),'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{refreshToken:'synthetic'}})};
+  for(const [status,body,invalid,reason] of [
+   [400,JSON.stringify({error:'invalid_grant',error_description:'private-reason'}),true,'refresh_token_rejected'],
+   [401,JSON.stringify({error:'other_error'}),true,'refresh_unauthorized'],
+   [403,'<html>private-challenge</html>',false,'refresh_blocked'],
+   [429,'private-rate-limit',false,'refresh_blocked'],
+   [503,'private-outage',false,'refresh_provider_unavailable'],
+   [418,JSON.stringify({error:'other_error'}),false,'refresh_http_418'],
+   [200,JSON.stringify({refresh_token:'private-invalid'}),false,'refresh_invalid_response'],
+  ] as const){
+   const result=await legacy.refreshCredential(provider,files,async()=>new Response(body,{status}),now);
+   assert.deepEqual(result,{ok:false,invalid,reason});assert(!JSON.stringify(result).includes('private'));
+  }
+ }
+});
+
+test('retained refresh transport, malformed credential and unsupported-provider paths stay distinct',async()=>{
+ const files={'.codex/auth.json':JSON.stringify({tokens:{refresh_token:'synthetic'}}),'.claude/.credentials.json':JSON.stringify({claudeAiOauth:{refreshToken:'synthetic'}})};
+ for(const provider of ['codex','claude']){
+  assert.deepEqual(await legacy.refreshCredential(provider,files,async()=>{throw new Error('private-network');},now),{ok:false,invalid:false,reason:'refresh_unreachable'});
+  let calls=0;
+  assert.deepEqual(await legacy.refreshCredential(provider,{},async()=>{calls++;throw new Error('must not fetch');},now),{ok:false,invalid:false,reason:'refresh_unreachable'});
+  assert.equal(calls,0);
+ }
+ let calls=0;
+ assert.deepEqual(await legacy.refreshCredential('go',{},async()=>{calls++;throw new Error('must not fetch');},now),{ok:false,invalid:false,reason:'refresh_unsupported'});
+ assert.equal(calls,0);
 });

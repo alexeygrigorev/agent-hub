@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hub host early disk alert every 5 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=5m
+Persistent=true
+Unit=hub-disk-alert.service
+
+[Install]
+WantedBy=timers.target

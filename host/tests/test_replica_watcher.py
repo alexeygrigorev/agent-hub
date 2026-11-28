@@ -281,6 +281,17 @@ class ReplicaWatcherTest(unittest.TestCase):
         self.assertEqual(result['skipped_blobs'], 1)
         self.assertEqual(result['accepted'], 1)
 
+    def test_unchanged_poll_skips_reading_replica_blobs(self):
+        from unittest import mock
+        self.write(DEV, [entry('t1u')])
+        watcher = self.watcher(FakeHub())
+        first = watcher.step()
+        self.assertEqual(first['accepted'], 1)
+        self.tick(rw.POLL_S)
+        with mock.patch.object(rw, 'read_entries', side_effect=AssertionError('should not re-read unchanged blob')):
+            second = watcher.step()
+        self.assertEqual(second, {'skipped': 'unchanged', 'agents': 1})
+
 
 if __name__ == '__main__':
     unittest.main()

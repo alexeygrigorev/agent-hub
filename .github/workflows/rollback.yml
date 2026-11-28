@@ -10,7 +10,7 @@ permissions:
   contents: read
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, contabo]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -18,8 +18,15 @@ jobs:
           ref: ${{ inputs.source_ref }}
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
+      # Rollback compatibility must agree with the forward deploy lane on
+      # Node24: the previous reviewed source (and its native dependencies)
+      # rebuild and start on the same runtime CI provisions on the VM.
+      - run: |
+          node --version | grep -Eq '^v24\.' \
+            || { echo "::error::rollback validation must run on Node24; setup-node drifted" >&2; exit 1; }
+          npm --version
       - run: npm ci
       - run: node --test test/release-contract.test.mjs
       - run: npm run typecheck

@@ -14,3 +14,12 @@ await import('./machine-picker-evidence.test.ts');
 await import('./native-inventory.test.ts');
 
 await import('./native-commands.test.ts');
+
+await import('./p7-finish.test.ts');
+await import('./implement-workspace.test.ts');
+
+await import('./native-mail-uncertainty.test.ts');
+
+await import('./host-disconnect-alert.test.ts');
+
+await import('./session-wakes.test.ts');

@@ -39,7 +39,7 @@ async function snapshots(){const out={};for(const [kind,id] of [['control','glob
 function delta(before,after){return Object.fromEntries(Object.keys(before).map(k=>[k,{reads:after[k].counts.rows_read-before[k].counts.rows_read,writes:after[k].counts.rows_written-before[k].counts.rows_written,alarm_calls:after[k].counts.alarm_operations-before[k].counts.alarm_operations}]));}
 async function test(name,fn){try{await fn();results.push({name,passed:true});}catch(e){results.push({name,passed:false,error:String(e.message),stack:String(e.stack).split('\n').slice(0,6).join('\n')});}}
 async function intake(key,title='Synthetic core lifecycle'){
- const body={title,text:'Explicitly synthetic workerd integration fixture; no native model is launched.',acceptance_criteria:['Synthetic fixture output is received and remains awaiting independent review.'],key};
+ const body={title,text:'Explicitly synthetic workerd integration fixture; no native model is launched.',acceptance_criteria:['Synthetic fixture output is received and remains awaiting independent review.'],code_task:false,key};
  return {body,response:await api('/api/intakes?project='+encodeURIComponent(project),'POST',body)};
 }
 async function start(id,key,targetMachine=machine,engine='opencode'){return api(`/api/intakes/${id}/start?project=${encodeURIComponent(project)}`,'POST',{machine_id:targetMachine,workspace,engine,override_reason:'Deterministic synthetic integration fixture requests explicit engine and host',interactive:false,timeout_seconds:60,key,...(engine==='shell'?{reason:'Explicit synthetic transport-security test, no process launch'}:{})});}
@@ -71,7 +71,10 @@ try{
   if(process.env.HUB2_CORE_PROVISION)expect(await api('/api/account/discovery','POST',{}),200,'actual provider collector over synthetic HTTP');
   else expect(await api('/api/account/quota','PUT',{remaining:80,captured_at:Date.now(),valid_until:Date.now()+300000,source:'synthetic-native-integration-fixture'}),200,'synthetic quota');
   expect(await api('/api/account/hosts','PUT',{hosts:[machine]}),200,'approve synthetic account host');
-  expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[{id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true}]}),200,'configure actual synthetic model policy');
+  expect(await api('/api/model-policy','PUT',{expected_version:0,candidates:[
+   {id:'synthetic-model',engine:'opencode',model:'synthetic-test-model',account_id:account,weight:1,capabilities:[],enabled:true},
+   {id:'synthetic-review-model',engine:'opencode',model:'synthetic-review-model',account_id:account,weight:1,capabilities:[],enabled:true},
+  ]}),200,'configure actual synthetic model policy with an independent verifier route');
   expect(await api('/api/account','PATCH',{provider:'forbidden',enabled:true},hostToken,{'x-hub2-actor':JSON.stringify({id:'forged',kind:'operator',scopes:['*']})}),403,'machine cannot edit account');
  });
  await test('intake idempotency and acceptance criteria guard',async()=>{
@@ -79,7 +82,7 @@ try{
   const replay=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',first.body),200,'replay intake');assert.equal(replay.intake.id,created.intake.id);
   expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,text:'changed under same key'}),409,'intake digest conflict');
   expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'empty-ac',acceptance_criteria:[]}),400,'empty AC');
-  const text=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'text-ac',acceptance_criteria:'- first criterion\n2. second criterion\n\n'}),201,'text AC block');assert.deepEqual(text.intake.acceptance_criteria,['first criterion','second criterion']);
+  const text=expect(await api('/api/intakes?project='+encodeURIComponent(project),'POST',{...first.body,key:'text-ac',acceptance_criteria:'- first criterion\n2. second criterion t7\n\n'}),201,'text AC block');assert.deepEqual(text.intake.acceptance_criteria,['first criterion','second criterion t7']);
  });
  await test('sessions start honors an existing intake_task_id without minting another intake',async()=>{
   const made=expect((await intake('intake-start-existing')).response,201,'intake to start').intake;
@@ -132,26 +135,53 @@ try{
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',finish,hostToken),200,'finish retry');
   if(workerCheck)expect(await fixture('machine',machine,'due-outbox',{id:'finish:'+offer.operation_id}),200,'retry second independent lost Project finish response after revoked worker replay');
   expect(await api(`/api/sessions/${started.id}/finish`,'POST',{...finish,exit_code:1},hostToken),409,'finish conflict');
-  if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   const final=expect(await api(`/api/intakes/${created.id}?project=${encodeURIComponent(project)}`),200,'final intake');assert.equal(final.intake.status,'completed-awaiting-review');assert.notEqual(final.intake.status,'done');completedIntakeId=created.id;
+  if(workerCheck)measurements.worker_credentials=await workerCheck.afterFinish();
   assert.equal('occupied' in expect(await api('/api/account/quota'),200,'account view has no per-session slots').account,false);
   const offers=expect(await api('/api/offers','GET',undefined,hostToken),200,'no finished offer');
   assert.equal(offers.offers.some(offer=>offer.session_id===started.id),false,'finished session must not remain offered');
-  liveSocket.socket.close();liveSocket=null;
-  // Hub itself delivers the terminal outcome to the intake owner; then the alarm settles.
+  // A completion claim starts a distinct verifier session; no terminal outcome is delivered yet.
   expect(await fixture('project',project,'alarm',{}),200,'project completion alarm');
+  const verificationStart=expect(await api(`/api/intakes/${created.id}/history`),200,'verifier start history').events
+   .find(e=>e.kind==='task_verification_started');
+  assert(verificationStart,'completion alarm starts independent verification');
+  assert.equal(verificationStart.body.original_session_id,started.id);
+  const verifierId=verificationStart.body.session_id;
+  const verifierOffer=(await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===verifierId)).offer;
+  assert.notEqual(verifierOffer.launch.model,offer.launch.model,'verifier must use an independent model');
+  liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:verifierId,epoch:verifierOffer.epoch}));
+  await liveSocket.wait(v=>v.type==='ack'&&v.session_id===verifierId);
+  const verifierAdmission=expect(await api(`/api/sessions/${verifierId}/admission`,'POST',
+   {epoch:verifierOffer.epoch,operation_id:verifierOffer.operation_id},hostToken),200,'verifier admission');
+  const verifierNative='33333333-4444-4555-8666-777777777777';
+  expect(await api(`/api/sessions/${verifierId}/started`,'POST',
+   {operation_id:verifierOffer.operation_id,epoch:verifierOffer.epoch,native_id:verifierNative},hostToken),201,'verifier started');
+  const verdict={kind:'acceptance_verification',session_id:verifierId,verdict:'pass',summary:'Synthetic independent verification passed',
+   acceptance:verifierOffer.acceptance_criteria.map(()=>({status:'met',proof:'synthetic verifier inspected the fixture evidence'}))};
+  expect(await api(`/api/intakes/${created.id}/events`,'POST',{key:'verify-'+verifierId,event:verdict}),201,'independent verifier verdict');
+  const verifierEvidence={source:'aplexer_retirement',fixture:true,artifact:'synthetic-verifier.txt',independent_acceptance:true,
+   native_identity:{id:verifierNative,tag:'task-hub2-'+verifierId,workspace:verifierOffer.launch.workspace},containment_empty:true,
+   native_deadline:{deadline_ms:verifierAdmission.runtime_deadline,exceeded:false},native_exit:{code:0,exited_at_ms:Date.now()}};
+  expect(await api(`/api/sessions/${verifierId}/finish`,'POST',
+   {operation_id:verifierOffer.operation_id,epoch:verifierOffer.epoch,native_id:verifierNative,exit_code:0,
+    evidence:verifierEvidence,native_exit_confirmed:true},hostToken),201,'verifier finish');
+  // Hub delivers only after the verifier passes; the following alarm settles that action.
+  expect(await fixture('project',project,'alarm',{}),200,'project verification completion alarm');
   // Named-agent forwarding leaves a durable Control wake even after mail delivery.
   // Settle that known work before measuring idle; an unsettled alarm must fail below.
   expect(await fixture('control','global','alarm',{}),200,'control mailbox wake alarm');
+  liveSocket.socket.close();liveSocket=null;
   const completionHistory=expect(await api(`/api/intakes/${created.id}/history`),200,'completion history').events;
   assert(completionHistory.some(e=>e.kind==='task_completion_claimed'),'completion claim recorded');
+  assert(completionHistory.some(e=>e.kind==='task_verification_started'),'independent verification starts after DONE');
+  assert(completionHistory.some(e=>e.kind==='task_acceptance_verified'),'independent verification pass is recorded');
   assert.equal(completionHistory.filter(e=>e.kind==='task_outcome_delivered').length,1,'terminal outcome delivered once: '+JSON.stringify(completionHistory.filter(e=>e.kind.startsWith('task_')).map(e=>[e.kind,e.body])));
   const after=await snapshots();measurements.complete_flow=delta(before,after);measurements.quiescent=after;const total=Object.values(measurements.complete_flow).reduce((n,v)=>n+v.reads+v.writes,0);assert(total<2000,'warm core flow exceeds2000row guard');
   measurements.machine_deadlines=expect(await fixture('machine',machine,'machine-deadlines'),200,'exact machine pending work diagnostics');
   assert.equal(after.control.alarm,null,'finished control has no pending mailbox wake');
   if(process.env.HUB2_CORE_PUBLIC_MAIL)assert.equal(after['mailbox:global'].alarm,null,'finished mailbox has no pending alarm');
   assert.equal(after.project.alarm,null,'finished project has no pending alarm');
-  assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id),'machine alarm reflects only unrelated open offers');
+  assert.equal(after.machine.alarm===null,!offers.offers.some(offer=>offer.session_id!==started.id&&offer.session_id!==verifierId),'machine alarm reflects only unrelated open offers (the verifier may already be offered when the offer list was read on a slow runner): '+JSON.stringify(offers.offers.map(o=>o.session_id)));
   assert.equal(after.account.alarm,null,'released account has no pending alarm');
   const quietBefore=await snapshots();await sleep(120);const quietAfter=await snapshots();for(const k of Object.keys(quietBefore)){assert.equal(quietAfter[k].counts.rows_read,quietBefore[k].counts.rows_read,k+' idle reads');assert.equal(quietAfter[k].counts.rows_written,quietBefore[k].counts.rows_written,k+' idle writes');}
  });
@@ -313,7 +343,7 @@ try{
  await test('persistent restart preserves auth and terminal outcome',async()=>{
   if(liveSocket){liveSocket.socket.close();liveSocket=null;}rt = await restartFixture(rt,spec); base = rt.origin;
   expect(await api('/api/offers','GET',undefined,hostToken),200,'credential survives restart');
-  assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'completed-awaiting-review');assert.equal(restored.intake.final_evidence.exit_code,0);
+  assert(completedIntakeId,'completed lifecycle prerequisite did not pass');const restored=expect(await api(`/api/intakes/${completedIntakeId}?project=${encodeURIComponent(project)}`),200,'restored terminal intake');assert.equal(restored.intake.status,'accepted');assert.equal(restored.intake.final_evidence.exit_code,0);
   const snap=await snapshots();for(const v of Object.values(snap))assert.equal(v.counts.measurement_valid,true);measurements.restart=snap;
  });
  await test('one machine accepts multiple sessions below the global live-session cap',async()=>{
@@ -324,6 +354,72 @@ try{
   const third=await start((await intake('intake-multi-3')).response.data.intake.id,'start-multi-3');
   assert([201,202].includes(third.status),'third start must be accepted below the global cap: '+JSON.stringify(third.data));
   assert.notEqual(third.data.error,'active_session_limit');
+ });
+ await test('public worker forwards canonical and compat merge-evidence into the project merge gate without accepting',async()=>{
+  const q='?project='+encodeURIComponent(project),proof={kind:'merge_gate',repository:project,pr_url:'https://github.com/'+project+'/pull/555',base_ref:'main',merged_at:'2026-11-13T10:00:00.000Z',head_sha:'a'.repeat(40),checks_head_sha:'a'.repeat(40),checks_state:'success',checks_total:2,checks_successful:2,checks_pending:0,checks_failed:0,merge_commit_sha:'b'.repeat(40),main_head_sha:'c'.repeat(40),merge_commit_in_main:true,checked_at:'2026-11-13T10:01:00.000Z'};
+  const made=await api('/api/intakes'+q,'POST',{title:'Synthetic merge evidence route',text:'Synthetic public-worker merge evidence fixture.',acceptance_criteria:['Synthetic merge proof reaches the gate.'],code_task:true,key:'merge-route-intake'});
+  const id=expect(made,201,'code intake').intake.id;
+  const post=(path,body,auth=token,query=q)=>api(path+'/merge-evidence'+query,'POST',body,auth);
+  expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof},null),401,'anonymous refused');
+  assert.notEqual((await post('/api/intakes/'+id,{key:'merge-actor',evidence:proof},hostToken)).status,201,'machine actor must not append merge evidence');
+  assert.equal((await post('/api/intakes/'+id,{key:'merge-wrong-project',evidence:proof},token,'?project='+encodeURIComponent('synthetic/other'))).status>=400,true,'wrong project refused');
+  expect(await post('/api/intakes/'+id,{key:'merge-bad',evidence:{...proof,checks_total:-1}}),400,'invalid proof refused');
+  expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof}),201,'canonical route reaches gate');
+  assert.equal(expect(await post('/api/intakes/'+id,{key:'merge-canon',evidence:proof}),200,'replay').duplicate,true);
+  expect(await post('/api/intake/tasks/'+id,{key:'merge-compat',evidence:{...proof,head_sha:'d'.repeat(40),checks_head_sha:'d'.repeat(40)}}),201,'compat alias reaches gate');
+  const events=JSON.stringify(expect(await api('/api/intakes/'+id+'/history'+q),200,'history'));
+  assert(events.includes('a'.repeat(40))&&events.includes('d'.repeat(40)),'merge proofs persisted');
+  assert.equal(expect(await api('/api/intakes/'+id+q),200,'intake').intake.status,'open','merge evidence alone never accepts the intake');
+
+  // merge-state (13 Nov: 404 live on d324b268 because the router omitted it).
+  const state=expect(await api('/api/intakes/'+id+'/merge-state'+q),200,'canonical merge-state');
+  assert.equal(state.intake_id,id);assert.equal(state.code_task,true);assert.equal(state.merge_gate.ok,true,JSON.stringify(state));
+  const compat=expect(await api('/api/intake/tasks/'+id+'/merge-state'),200,'compat merge-state without ?project resolves the intake route');
+  assert.equal(compat.merge_gate.evidence.head_sha,'d'.repeat(40),'newest evidence decides');
+  expect(await api('/api/intakes/'+id+'/merge-state'+q,'GET',undefined,null),401,'anonymous merge-state refused');
+  expect(await api('/api/intake/tasks/'+id+'/reevaluate','POST',{key:'reeval-open'}),409,'re-evaluation needs a finished session');
+ });
+ await test('interactive shell through real edge enforces common operator flow, per-host grant, owner binding, and revocation stop-only cleanup',async()=>{
+  // 1. Default deny without grant: even dev operator (operator:admin / *) cannot start an interactive shell without an explicit grant on the host.
+  const deniedStart=await api('/api/sessions','POST',{key:'shell-no-grant',workspace,repo:project,machine,engine:'shell',mode:'interactive'});
+  assert.equal(deniedStart.status,403,'interactive shell must be refused without an explicit per-host grant');
+  // 2. Grant human:dev on synthetic-machine; wrong host is still refused, granted host starts and binds shell_actor_id=human:dev.
+  expect(await api('/api/shell-grants','POST',{actor_id:'human:dev',machine_id:machine}),201,'grant human:dev on machine');
+  assert.equal((await api('/api/sessions','POST',{key:'shell-wrong-host',workspace,repo:project,machine:'other-host',engine:'shell',mode:'interactive'})).status,403,'ungranted host refused');
+  if(liveSocket){liveSocket.socket.close();liveSocket=null;}
+  liveSocket=await socket(hostToken);
+  const started=expect(await api('/api/sessions','POST',{key:'shell-granted-1',workspace,repo:project,machine,engine:'shell',mode:'interactive',engine_override_reason:'common operator interactive shell test'}),201,'start interactive shell');
+  const sid=started.id;assert.equal(typeof sid,'string');
+  const offered=await liveSocket.wait(v=>v.type==='session.offer'&&v.offer.session_id===sid);
+  assert.equal(offered.offer.launch.engine,'shell');assert.equal(offered.offer.launch.interactive,true);assert.equal(offered.offer.launch.shell_actor_id,'human:dev');
+  liveSocket.socket.send(JSON.stringify({type:'offer_ack',session_id:sid,epoch:offered.offer.epoch}));
+  await liveSocket.wait(v=>v.type==='ack'&&v.session_id===sid);
+  expect(await api(`/api/sessions/${sid}/admission`,'POST',{operation_id:offered.offer.operation_id,epoch:offered.offer.epoch},hostToken),200,'admit shell');
+  const nativeId='77777777-7777-4777-8777-777777777777';
+  expect(await api(`/api/sessions/${sid}/started`,'POST',{operation_id:offered.offer.operation_id,epoch:offered.offer.epoch,native_id:nativeId},hostToken),201,'shell started');
+  // 3. Common operator can send, capture, show, list commands; machine/worker tokens are denied.
+  assert.equal((await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-host',body:'echo no'},hostToken)).status,403,'machine token denied send');
+  const sent=expect(await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-1',body:'X_VAR=42; echo $X_VAR'}),201,'operator send');
+  const sendCmd=await liveSocket.wait(v=>v.type==='session.command'&&v.command.id===sent.command_id);
+  assert.equal(sendCmd.command.kind,'send');assert.equal(sendCmd.command.text,'X_VAR=42; echo $X_VAR');
+  expect(await api(`/api/sessions/${sid}/commands/${sent.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{delivery:'native_acknowledged'}},hostToken),200,'ack send');
+  const cap=expect(await api(`/api/sessions/${sid}/capture`,'POST',{key:'sh-cap-1'}),201,'operator capture');
+  await liveSocket.wait(v=>v.type==='session.command'&&v.command.id===cap.command_id);
+  expect(await api(`/api/sessions/${sid}/commands/${cap.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{output:'42\n'}},hostToken),200,'ack capture');
+  const cmds=expect(await api(`/api/sessions/${sid}/commands`),200,'list commands');
+  assert.equal(cmds.commands.find(c=>c.id===cap.command_id)?.ack?.capture,'42\n');
+  expect(await api(`/api/sessions/${sid}`),200,'show shell session');
+  // 4. Revoke grant: queued command is cancelled, stop is dispatched, and subsequent send/capture/stop/show/commands are denied.
+  const queuedSend=expect(await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-queued',body:'echo after'}),201,'queue send before revoke');
+  const revoked=expect(await api('/api/shell-grants','POST',{actor_id:'human:dev',machine_id:machine,revoke:true}),200,'revoke grant');
+  assert.equal(revoked.revoked,true);assert.equal(revoked.cleanup.status,'dispatched');assert.equal(revoked.cleanup.stop_requested,1);
+  await liveSocket.wait(v=>v.type==='session.command'&&v.command.session_id===sid&&v.command.kind==='stop');
+  assert.equal((await api(`/api/sessions/${sid}/send`,'POST',{key:'sh-send-revoked',body:'echo denied'})).status,403,'send after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/capture`,'POST',{key:'sh-cap-revoked'})).status,403,'capture after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/stop`,'POST',{key:'sh-stop-revoked'})).status,403,'stop after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}`)).status,404,'show after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/commands`)).status,404,'commands after revoke denied');
+  assert.equal((await api(`/api/sessions/${sid}/commands/${queuedSend.command_id}/ack`,'POST',{epoch:offered.offer.epoch,result:{delivery:'native_acknowledged'}},hostToken)).status,409,'late ack of cancelled send rejected');
  });
 }finally{
  if(liveSocket)liveSocket.socket.close();await rt.dispose();

@@ -42,8 +42,11 @@ export class WorkerCredentials {
       generation: this.generation(row), expires_at: row.deadline,
       revoked_at: row.revoked_at, family_id: 'worker:' + row.session_id + ':' + row.epoch,
       client_id: 'native-worker', scopes_json: JSON.stringify([
-        'intake:read', 'intake:append', 'claim:read', 'claim:write',
+        'intake:read', 'intake:append', 'intake:create',
+        'session:start', 'routing:read',
+        'claim:read', 'claim:write',
         'message:read', 'message:send', 'mailbox:' + actor,
+        'worker_project:' + row.project_id,
       ]),
     }, this.env);
   }
@@ -195,28 +198,31 @@ export class WorkerCredentials {
     },200,{'Cache-Control':'private, no-store'});
   }
   private revoke(b: Binding): Response {
-    return this.db.transaction(this.ctx, () => {
-      const row = this.db.one<Grant>(
-        'SELECT * FROM worker_credentials WHERE session_id=? AND epoch=?',
-        b.session_id,
-        b.epoch,
-      );
-      if (!row) {
-        // A concurrent issue may be awaiting encryption. Persist the negative
-        // result so its publish transaction cannot resurrect a finished child.
-        this.db.run('INSERT INTO worker_credentials(session_id,epoch,operation_id,machine_id,intake_id,project_id,deadline,sealed_token,revoked_at) VALUES(?,?,?,?,?,?,0,?,?)', b.session_id,b.epoch,b.operation_id,b.machine_id,b.intake_id,b.project_id,'',Date.now());
-        return json({revoked:true,absent:true});
-      }
-      if (!this.same(row, b)) return error('worker_binding_mismatch', 409);
-      this.db.run(
-        'UPDATE worker_credentials SET revoked_at=COALESCE(revoked_at,?) WHERE session_id=? AND epoch=?',
-        Date.now(),
-        b.session_id,
-        b.epoch,
-      );
-      return json({ revoked: true });
-    });
+    return this.db.transaction(this.ctx, () => this.revokeInTransaction(b));
   }
+  /** Caller must already hold the active SQLite transaction (e.g. ControlDO.completePairing). */
+  private revokeInTransaction(b: Binding): Response {
+    const row = this.db.one<Grant>(
+      'SELECT * FROM worker_credentials WHERE session_id=? AND epoch=?',
+      b.session_id,
+      b.epoch,
+    );
+    if (!row) {
+      // A concurrent issue may be awaiting encryption. Persist the negative
+      // result so its publish transaction cannot resurrect a finished child.
+      this.db.run('INSERT INTO worker_credentials(session_id,epoch,operation_id,machine_id,intake_id,project_id,deadline,sealed_token,revoked_at) VALUES(?,?,?,?,?,?,0,?,?)', b.session_id,b.epoch,b.operation_id,b.machine_id,b.intake_id,b.project_id,'',Date.now());
+      return json({revoked:true,absent:true});
+    }
+    if (!this.same(row, b)) return error('worker_binding_mismatch', 409);
+    this.db.run(
+      'UPDATE worker_credentials SET revoked_at=COALESCE(revoked_at,?) WHERE session_id=? AND epoch=?',
+      Date.now(),
+      b.session_id,
+      b.epoch,
+    );
+    return json({ revoked: true });
+  }
+  /** Revoke up to 64 active grants for `machine`; caller must already hold the active SQLite transaction. */
   revokeMachine(machine: string): void {
     const rows = this.db.all<Grant>(
       'SELECT * FROM worker_credentials WHERE machine_id=? AND revoked_at IS NULL AND deadline>? ORDER BY deadline,session_id,epoch LIMIT 65',
@@ -224,6 +230,6 @@ export class WorkerCredentials {
       Date.now(),
     );
     if (rows.length > 64) throw new HttpError('worker_revocation_bound', 503);
-    for (const row of rows) this.revoke(row);
+    for (const row of rows) this.revokeInTransaction(row);
   }
 }

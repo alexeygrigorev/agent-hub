@@ -107,6 +107,9 @@ class Container {
               void Promise.resolve(this.ensure().handler.webSocketError?.(socket, error)).catch(() => {});
             },
           };
+          // Hibernation-style acceptance is open before the 101 wire binds;
+          // hooks/registry are ready first, and send() queues initial frames.
+          socket.accept();
         },
       } as never;
       this.instance = new this.doClass(state, this.env);

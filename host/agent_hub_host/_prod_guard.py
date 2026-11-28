@@ -11,10 +11,7 @@ import sys
 import urllib.parse
 
 
-PRODUCTION_HUB_HOSTS = frozenset({
-    "hub.dtcdev.click",
-    "agent-hub.cloudflare-ai-agent-de9ca0.workers.dev",
-})
+PRODUCTION_HUB_HOSTS = frozenset({"hub.dtcdev.click"})
 E2E_ENV = "HUB_E2E"
 TEST_GUARD_HOME_ENV = "HUB_TEST_GUARD_HOME"
 PROTECTED_PREFIXES = (

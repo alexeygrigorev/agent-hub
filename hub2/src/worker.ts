@@ -1,13 +1,18 @@
 import { mcp } from './mcp';
 import { publicAuthentication, cookieActor, noStore } from './auth';
 import { safeEqual } from './crypto';
-import { bodyObject, boundedText, error, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
+import { bodyObject, boundedText, error, forbiddenScope, hasScope, HttpError, HUB2_FORWARD_BODY_LIMIT, json } from './http';
 import { pickModelRouteDetailed, simulateModelRoutes, type PickInput } from './model-picker';
 import { sessionPurpose } from './session-purpose';
 import { isLiveActiveSession, type LiveSession } from './session-liveness';
+import { qualifiedRepositoryWorkspace, REPOSITORY_IDENTITY_CAPABILITY } from './repository-identity';
+import { ARTIFACT_BODY_LIMIT, ARTIFACT_MAX_BYTES, PREREQUISITE_HEADER } from './intake-relations';
 import type { Actor, Hub2Env, JsonRecord } from './types';
 
 const CONTROL = 'https://control.hub2.internal';
+const HOST_INSTALLER_ALIASES = new Map<string, string>([
+  ['/host/install.ps1', '/cli/host-install.ps1'], ['/host/install.sh', '/cli/host-install.sh'],
+]);
 let devActorRegistration: Promise<boolean> | undefined;
 
 export default {
@@ -22,9 +27,19 @@ const router = {
       if (!path) return error('internal_route_forbidden', 404);
       // Install/update clients have no credential yet. Only the published CLI
       // artifacts and dashboard are public; API routes still authenticate.
-      const cliAsset = /^\/cli\/(?:manifest\.json|host-release\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1)|hub2-(?:self-update|enroll)\.py|agent-hub2-host\.service|agent-hub2-host-update\.(?:service|timer)|agent_hub_host_v2-2\.0\.0\+g[0-9a-f]{40}-py3-none-any\.whl|websockets-16\.0-py3-none-any\.whl)$/.test(path);
+      const cliAsset = /^\/cli\/(?:manifest\.json|host-release\.json|hub\.pyz(?:\.sha256)?|(?:host-)?install\.(?:sh|ps1)|hub2-(?:self-update|enroll)\.py|hub_alert_client\.py|agent-hub-quota-dispatcher\.pyz|(?:hub-quota-publish|natural-quota-prelude)\.py|agent-hub2-host\.service|agent-hub2-host-update\.(?:service|timer)|agent_hub_host_v2-2\.0\.0\+g[0-9a-f]{40}-py3-none-any\.whl|websockets-16\.0-py3-none-any\.whl)$/.test(path);
       if (env.ASSETS && ['GET', 'HEAD'].includes(request.method) && (path === '/' || cliAsset))
         return secureStatic(await env.ASSETS.fetch(request));
+      // Legacy hosts self-update through `irm .../host/install.ps1 | iex` (and
+      // install.sh); serve the published Hub2 host installers there so they
+      // migrate instead of failing on a dead route (intake 41ef7048).
+      const hostInstaller = HOST_INSTALLER_ALIASES.get(path);
+      if (env.ASSETS && hostInstaller && ['GET', 'HEAD'].includes(request.method)) {
+        const target = new URL(request.url);
+        target.pathname = hostInstaller;
+        target.search = '';
+        return secureStatic(await env.ASSETS.fetch(new Request(target.toString(), { method: request.method })));
+      }
       const authResponse = await publicAuthentication(request, env);
       if (authResponse) return authResponse;
       const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
@@ -78,6 +93,10 @@ const router = {
         return control.fetch(await forwardRequest(request, CONTROL + '/_auth/me'));
       }
       if (path === '/api/resource-settings') return resourceSettings(request, env, actor);
+      // GrokBot <1% quota export (intake 408b585e): Control enforces read-any /
+      // admin-write on the sanitized per-account evidence.
+      if (/^\/api\/quota\/[a-z][a-z0-9_-]{0,63}$/.test(path))
+        return control.fetch(await forwardRequest(request, CONTROL + path, actor));
       if (path === '/api/quota' && request.method === 'GET')
         return quotaProjection(request, env, actor);
       if (path === '/mcp') return mcp(request, env, (r, e) => router.fetch(r, e), actor);
@@ -86,7 +105,9 @@ const router = {
         path === '/api/deployment-credentials' ||
         /^\/api\/deployment-credentials\/deployment:[0-9a-f-]+\/revoke$/.test(path) ||
         path === '/api/named-agents' ||
+        path === '/api/shell-grants' ||
         /^\/api\/named-agents\/[^/]+\/grants$/.test(path) ||
+        /^\/api\/named-agents\/[^/]+\/(?:sticky|claim)$/.test(path) ||
         path === '/api/directory' ||
         path.startsWith('/api/routes/')
       )
@@ -108,9 +129,11 @@ const router = {
         );
       if (path === '/api/sessions' && request.method !== 'GET' && request.method !== 'HEAD')
         return request.method === 'POST' ? await startSession(request, env, actor) : error('method_not_allowed', 405);
-      if (/^\/api\/picker-alerts\/(?:counters|offers|[1-9][0-9]*\/(?:ack|nack))$/.test(path)) {
+      if (/^\/api\/picker-alerts\/(?:counters|offers|draw-diagnostics|[1-9][0-9]*\/(?:ack|nack))$/.test(path)) {
         if(!admin(actor))return error('forbidden',403);
-        return control.fetch(await forwardRequest(request, CONTROL + path, actor));
+        if(path==='/api/picker-alerts/draw-diagnostics'&&actor.kind!=='operator')return error('forbidden',403);
+        const query=path==='/api/picker-alerts/draw-diagnostics'?new URL(request.url).search:'';
+        return control.fetch(await forwardRequest(request, CONTROL + path + query, actor));
       }
       if (path === '/api/model-picker/credential-monitor-evidence') {
         if (!admin(actor)) return error('forbidden', 403);
@@ -120,7 +143,7 @@ const router = {
         try {
           if (env.CREDENTIAL_MONITOR_EVIDENCE) return json(await observerBound(
             env.CREDENTIAL_MONITOR_EVIDENCE.snapshot(nonce)), 200, { 'Cache-Control': 'no-store' });
-        } catch { try { env.CREDENTIAL_MONITOR_EVIDENCE?.invalidate(); } catch {} }
+        } catch (caught) { try { env.CREDENTIAL_MONITOR_EVIDENCE?.invalidate(caught instanceof ObserverDeadline ? 'snapshot_route_timeout' : 'snapshot_route_rejected'); } catch {} }
         return json({kind:'hub_alert_evidence_unavailable_v1',available:false,reason:'coverage_unknown',nonce},
           200, {'Cache-Control':'no-store'});
       }
@@ -133,7 +156,7 @@ const router = {
         const observer = env.PICKER_DIAGNOSTIC_EVIDENCE?.[producer];
         try {
           if (observer) return json(await observerBound(observer.snapshot(nonce)), 200, {'Cache-Control': 'no-store'});
-        } catch { try { observer?.invalidate(); } catch {} }
+        } catch (caught) { try { observer?.invalidate(caught instanceof ObserverDeadline ? 'snapshot_route_timeout' : 'snapshot_route_rejected'); } catch {} }
         return json({kind: 'hub_alert_evidence_unavailable_v1', available: false, reason: 'coverage_unknown', nonce},
           200, {'Cache-Control': 'no-store'});
       }
@@ -205,9 +228,11 @@ const router = {
         path === '/api/schedules' ||
         /^\/api\/schedules\/[^/]+(?:\/(?:pause|resume|cancel|occurrences))?$/.test(path) ||
         path === '/api/intakes' ||
-        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path) ||
+        /^\/api\/intakes\/[^/]+(?:\/(?:start|history|append|events|context|audit|depend|links|artifacts|finished|merge-evidence|merge-state|reevaluate|stats|promote))?$/.test(path) ||
+        /^\/api\/intakes\/[^/]+\/artifacts\/[^/]+$/.test(path) ||
         path === '/api/intake/tasks' ||
-        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events|context|audit))?$/.test(path);
+        /^\/api\/intake\/tasks\/[^/]+(?:\/(?:start|history|append|events|context|audit|depend|links|artifacts|finished|merge-evidence|merge-state|reevaluate|stats|promote))?$/.test(path) ||
+        /^\/api\/intake\/tasks\/[^/]+\/artifacts\/[^/]+$/.test(path);
       if (projectPath) {
         const url = requestUrl(request);
         let requested = url.searchParams.get('project');
@@ -217,6 +242,10 @@ const router = {
           if (typeof body?.project === 'string' && body.project) requested = body.project;
         }
         const intakeId = path.match(/^\/api\/(?:intakes|intake\/tasks)\/([^/]+)/)?.[1];
+        const boundSession = actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id;
+        // Control routes cover only a worker's own intake; its parent intake is resolved and authorized
+        // by the worker's own project object, so a denied route here is not yet final for a session.
+        let routeDenied: Response | undefined;
         if (!requested && intakeId) {
           const response = await control.fetch(
             await forwardRequest(
@@ -225,21 +254,44 @@ const router = {
               actor,
             ),
           );
-          if (!response.ok) return response;
-          const { route } = (await response.json()) as {
-            route: { id: string; owner: string };
-          };
-          requested = route.owner;
-          url.pathname = url.pathname.replace('/' + intakeId, '/' + route.id);
+          if (!response.ok && !(boundSession && (response.status === 403 || response.status === 404))) return response;
+          if (!response.ok) routeDenied = response;
+          else {
+            const { route } = (await response.json()) as {
+              route: { id: string; owner: string };
+            };
+            requested = route.owner;
+            url.pathname = url.pathname.replace('/' + intakeId, '/' + route.id);
+          }
         }
-        if (actor.kind === 'agent' && actor.id.startsWith('session:') && actor.resource_id) {
+        if (boundSession && actor.resource_id) {
           const response = await control.fetch(await forwardRequest(new Request(request.url, {headers:request.headers}), CONTROL+'/api/routes/intake/'+encodeURIComponent(actor.resource_id), actor));
           if (!response.ok) return response;
           const {route} = await response.json() as {route:{owner:string}};
-          if (requested && requested !== route.owner) return error('project_forbidden',403);
+          if (requested && requested !== route.owner)
+            return json({ error: 'project_forbidden', missing_scope: `project:${requested}`, detail: `session is scoped to project ${route.owner}; missing scope project:${requested} or operator:admin` }, 403);
           url.searchParams.set('project',route.owner);
           const internalPath = url.pathname.replace('/api/intake/tasks','/api/intakes');
-          return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor));
+          const relation = await relationForward(request, env, control, actor, internalPath);
+          if (relation instanceof Response) return relation;
+          const forwarded = await env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,'https://project.internal'+internalPath+url.search,actor,undefined,undefined,undefined,relation));
+          // Not the worker's own or parent intake: a GET of an intake its own intake text cites as
+          // evidence is read-only granted; otherwise report Control's named refusal, not the project miss.
+          if (routeDenied && intakeId && (forwarded.status === 404 || forwarded.status === 403)) {
+            const sub = internalPath.match(/^\/api\/intakes\/[^/]+(?:\/(history))?$/);
+            if (request.method === 'GET' && sub) {
+              const grant = await evidenceGrant(env, control, actor, 'intake', decodeURIComponent(intakeId), routeDenied);
+              if (grant instanceof Response) return grant;
+              const evidencePath = '/api/intakes/' + encodeURIComponent(grant.route.id) + (sub[1] ? '/' + sub[1] : '');
+              // Keep the read's own paging (history after/limit); the project is always the worker's own.
+              const query = new URLSearchParams();
+              for (const key of ['after', 'limit']) { const v = url.searchParams.get(key); if (v !== null) query.set(key, v); }
+              query.set('project', route.owner);
+              return env.PROJECTS.get(env.PROJECTS.idFromName(route.owner)).fetch(await forwardRequest(request,
+                'https://project.internal' + evidencePath + '?' + query.toString(), grant.actor));
+            }
+          }
+          return routeDenied && forwarded.status === 404 ? routeDenied : forwarded;
         }
         if (!requested && !intakeId && request.method === 'GET' && (path === '/api/intakes' || path === '/api/intake/tasks'))
           return control.fetch(await forwardRequest(request, CONTROL + '/api/intakes' + url.search, actor));
@@ -262,11 +314,17 @@ const router = {
           ? url.pathname.replace('/api/intake/tasks', '/api/intakes')
           : url.pathname;
         const stub = env.PROJECTS.get(env.PROJECTS.idFromName(repo.repo.canonical_name));
+        const relation = await relationForward(request, env, control, actor, internalPath);
+        if (relation instanceof Response) return relation;
         return stub.fetch(
           await forwardRequest(
             request,
             `https://project.hub2.internal${internalPath}${url.search}`,
             actor,
+            undefined,
+            undefined,
+            undefined,
+            relation,
           ),
         );
       }
@@ -288,6 +346,13 @@ const router = {
         const machine=env.MACHINES.get(env.MACHINES.idFromName(nativeInventory[1]));
         return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/native-inventory',actor));
       }
+      const engineUpdateAck=path.match(/^\/api\/machines\/([A-Za-z0-9_.-]{1,80})\/engine-updates\/([0-9a-f-]{36})\/ack$/i);
+      if(engineUpdateAck){
+        if(request.method!=='POST')return error('method_not_allowed',405);
+        if(actor.kind!=='machine'||actor.resource_id!==engineUpdateAck[1])return error('forbidden',403);
+        const machine=env.MACHINES.get(env.MACHINES.idFromName(engineUpdateAck[1]));
+        return machine.fetch(await forwardRequest(request,'https://machine.hub2.internal/api/engine-updates/'+engineUpdateAck[2]+'/ack',actor));
+      }
       if (path === '/api/heartbeat' || path === '/api/offers' || path === '/api/connect') {
         if (actor.kind !== 'machine' || !actor.resource_id) return error('forbidden', 403);
         const machine = env.MACHINES.get(env.MACHINES.idFromName(actor.resource_id));
@@ -303,7 +368,7 @@ const router = {
         );
       }
       const session = path.match(
-        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|link|commands(?:\/[^/]+\/ack)?))?$/,
+        /^\/api\/sessions\/([^/]+)(?:\/(started|finish|admission|credentials|stop|send|capture|wake|wakes|link|events|commands(?:\/[^/]+\/ack)?))?$/,
       );
       if (session) {
         let machineId =
@@ -311,6 +376,7 @@ const router = {
             ? actor.resource_id
             : requestUrl(request).searchParams.get('machine_id');
         let sessionPath = path;
+        let sessionActor = actor;
         if (!machineId && actor.kind !== 'machine') {
           const response = await control.fetch(
             await forwardRequest(
@@ -319,10 +385,17 @@ const router = {
               actor,
             ),
           );
-          if (!response.ok) return response;
-          const { route } = (await response.json()) as {
-            route: { id: string; owner: string };
-          };
+          let route: { id: string; owner: string };
+          if (!response.ok) {
+            // Read-only evidence path: only `show` and `events` GETs, never commands, capture or send.
+            if (response.status !== 403 || request.method !== 'GET' || (session[2] && session[2] !== 'events') || !boundWorker(actor)) return response;
+            const grant = await evidenceGrant(env, control, actor, 'session', decodeURIComponent(session[1]), response);
+            if (grant instanceof Response) return grant;
+            route = grant.route;
+            sessionActor = grant.actor;
+          } else {
+            ({ route } = (await response.json()) as { route: { id: string; owner: string } });
+          }
           machineId = route.owner;
           sessionPath = path.replace('/' + session[1], '/' + route.id);
         }
@@ -335,7 +408,7 @@ const router = {
           await forwardRequest(
             request,
             `https://machine.hub2.internal${sessionPath}${requestUrl(request).search}`,
-            actor,
+            sessionActor,
             undefined,
             undefined,
             safetyMode || undefined,
@@ -414,6 +487,7 @@ const router = {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 message_id: id,
+                phase: body.phase,
                 epoch: body.epoch,
                 operation_id: body.operation_id,
                 recipient: owner,
@@ -561,6 +635,32 @@ function secureStatic(response: Response): Response {
   });
 }
 
+// Sanctioned least-privilege evidence read (intake 37e34dcd): a bound worker session may read a
+// session or intake that its own requester-authored intake text names as evidence. Control
+// resolves the id with a routing-only service identity, the target must be in the worker's own
+// project, the worker's Project object decides and audits, and the edge then forwards exactly one
+// GET with an actor whose only scope is reading that one object. Anything else keeps the denial.
+const EVIDENCE_ROUTER: Actor = { id: 'service:evidence-read', kind: 'operator', scopes: ['routing:read'] };
+function boundWorker(actor: Actor): boolean {
+  return actor.kind === 'agent' && actor.id.startsWith('session:') && !!actor.resource_id && hasScope(actor, 'intake:read');
+}
+async function evidenceGrant(env: Hub2Env, control: DurableObjectStub, actor: Actor, kind: 'session' | 'intake',
+  ref: string, denied: Response): Promise<{ route: { id: string; owner: string; resource_id: string }; actor: Actor } | Response> {
+  const project = actor.scopes.find(s => s.startsWith('worker_project:'))?.slice('worker_project:'.length);
+  if (!project || !boundWorker(actor)) return denied;
+  const looked = await control.fetch(new Request(CONTROL + '/api/routes/' + kind + '/' + encodeURIComponent(ref),
+    { headers: { 'x-hub2-actor': JSON.stringify(EVIDENCE_ROUTER) } }));
+  if (!looked.ok) return denied;
+  const { route } = (await looked.json()) as { route: { id: string; owner: string; resource_id: string } };
+  if (!route || route.resource_id !== project) return denied;
+  const decided = await env.PROJECTS.get(env.PROJECTS.idFromName(project)).fetch(new Request(
+    'https://project.hub2.internal/_internal/evidence-read', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, target_id: route.id, ref, actor_id: actor.id, intake_id: actor.resource_id }) }));
+  if (!decided.ok) return decided;
+  return { route, actor: { id: actor.id, kind: 'agent', resource_id: route.id, client_id: 'evidence-read',
+    scopes: [kind === 'session' ? 'session:read' : 'intake:read'] } };
+}
+
 async function forwardRequest(
   request: Request,
   target: string,
@@ -568,17 +668,19 @@ async function forwardRequest(
   mailbox?: string,
   deliverySession?: string,
   safetyMode?: 'operator_stop',
+  options?: ForwardOptions,
 ): Promise<Request> {
   const headers = new Headers(request.headers);
   for (const key of [...headers.keys()])
     if (key.toLowerCase().startsWith('x-hub2-')) headers.delete(key);
+  for (const [key, value] of Object.entries(options?.headers ?? {})) headers.set(key, value);
   if (actor) headers.set('x-hub2-actor', JSON.stringify(actor));
   if (mailbox) headers.set('x-hub2-mailbox', mailbox);
   if (deliverySession) headers.set('x-hub2-delivery-session', deliverySession);
   if (safetyMode === 'operator_stop') headers.set('x-hub2-safety-mode', safetyMode);
   let body: ArrayBuffer | undefined;
   if (!['GET', 'HEAD'].includes(request.method)) {
-    const text = await boundedText(request.clone(), HUB2_FORWARD_BODY_LIMIT);
+    const text = await boundedText(request.clone(), options?.bodyLimit ?? HUB2_FORWARD_BODY_LIMIT);
     const encoded = new TextEncoder().encode(text);
     const copied = new Uint8Array(new ArrayBuffer(encoded.byteLength));
     copied.set(encoded);
@@ -591,13 +693,70 @@ async function forwardRequest(
   });
 }
 
+type ForwardOptions = { bodyLimit?: number; headers?: Record<string, string> };
+
+/**
+ * Intake relation routes: artifacts get a PNG-sized body bound; `depend` resolves the
+ * prerequisite (`on`, possibly in another project) with the caller's own visibility, refuses
+ * cross-project cycles, and hands the canonical id/project to the dependent's project object
+ * in a trusted header (client x-hub2-* headers are always stripped).
+ */
+async function relationForward(request: Request, env: Hub2Env, control: DurableObjectStub, actor: Actor,
+  internalPath: string): Promise<ForwardOptions | Response | undefined> {
+  const match = internalPath.match(/^\/api\/intakes\/([^/]+)\/(depend|artifacts)(?:\/[^/]+)?$/);
+  if (!match || request.method !== 'POST') return undefined;
+  if (match[2] === 'artifacts') {
+    const length = Number(request.headers.get('Content-Length'));
+    if (Number.isFinite(length) && length > ARTIFACT_BODY_LIMIT)
+      return error('artifact_too_large', 413, `size check failed: PNG over ${ARTIFACT_MAX_BYTES} bytes (6 MiB limit)`);
+    // Cheap scope gate before the router buffers the large body; the project object rechecks per intake.
+    if (!['operator:admin', '*', 'intake:write', 'intake:append'].some(scope => actor.scopes.includes(scope)))
+      return error('forbidden', 403, 'uploading an artifact needs intake:write, intake:append or operator access');
+    return { bodyLimit: ARTIFACT_BODY_LIMIT };
+  }
+  const dependent = decodeURIComponent(match[1]);
+  let body: { on?: unknown; remove?: unknown } | null = null;
+  try { body = JSON.parse(await boundedText(request.clone(), 4096)); } catch { body = null; }
+  if (!body || typeof body.on !== 'string' || !body.on || body.on.length > 180)
+    return error('prerequisite_required', 400, 'pass the prerequisite intake id with --on');
+  const remove = body.remove === true;
+  const routed = await control.fetch(new Request(`${CONTROL}/api/routes/intake/${encodeURIComponent(body.on)}`,
+    { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
+  // Removing never needs the prerequisite to be visible or the graph walk: a stale or cyclic link stays removable.
+  if (!routed.ok && remove)
+    return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: body.on, project: '' }) } };
+  if (!routed.ok) {
+    const code = ((await routed.json().catch(() => null)) as { error?: string } | null)?.error;
+    if (code === 'ambiguous_prefix') return error('prerequisite_ambiguous', 409, `prerequisite id prefix ${body.on} matches several intakes; pass the full id`);
+    if (code === 'prefix_too_short') return error('prerequisite_prefix_too_short', 400, 'prerequisite id prefix must be at least 6 characters');
+    return error('prerequisite_not_found', 404, `prerequisite intake ${body.on} does not exist or is not visible to this caller`);
+  }
+  const { route } = (await routed.json()) as { route: { id: string; owner: string } };
+  if (remove) return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: route.id, project: route.owner }) } };
+  if (route.id === dependent) return error('dependency_self', 409, 'an intake cannot depend on itself');
+  // Bounded walk over the prerequisite's own prerequisites, across projects.
+  const seen = new Set<string>(), queue: Array<{ id: string; project: string }> = [{ id: route.id, project: route.owner }];
+  while (queue.length) {
+    const next = queue.shift()!;
+    if (next.id === dependent) return error('dependency_cycle', 409, `${route.id} already depends (directly or transitively) on ${dependent}`);
+    if (seen.has(next.id) || !next.project) continue;
+    seen.add(next.id);
+    if (seen.size > 64) return error('dependency_graph_too_large', 409, 'prerequisite chain exceeds 64 intakes; cycle check could not complete');
+    const response = await env.PROJECTS.get(env.PROJECTS.idFromName(next.project))
+      .fetch(new Request('https://project.hub2.internal/_internal/prerequisites/' + encodeURIComponent(next.id)));
+    if (!response.ok) return error('dependency_check_unavailable', 503, `could not read prerequisites of ${next.id}; cycle check failed closed, retry`);
+    const view = (await response.json()) as { depends_on?: Array<{ intake_id: string; project: string }> };
+    for (const item of view.depends_on ?? []) queue.push({ id: item.intake_id, project: item.project });
+  }
+  return { headers: { [PREREQUISITE_HEADER]: JSON.stringify({ id: route.id, project: route.owner }) } };
+}
+
 /**
  * POST /api/sessions: `hub sessions start`. Creates a project intake and starts
  * it through the normal model-picker and dispatch path.
  * Every refusal names a reason; nothing here waits on a machine.
  */
 async function startSession(request: Request, env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor) && !actor.scopes.includes('session:start')) return error('forbidden', 403);
   let body: JsonRecord;
   try {
     const parsed = JSON.parse(await boundedText(request, 32_768));
@@ -607,21 +766,23 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     if (caught instanceof HttpError) return error(caught.code, caught.status);
     return error('invalid_json', 400);
   }
-  const key = body.key;
-  if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(key)) return error('idempotency_key_required', 400);
+  const interactiveShellRequest =
+    typeof body.engine === 'string' && body.engine.toLowerCase() === 'shell' && body.mode === 'interactive';
+  if (!admin(actor) && !hasScope(actor, 'session:start')
+    && !(interactiveShellRequest && actor.kind === 'operator' && hasScope(actor, 'shell:start')))
+    return forbiddenScope('session:start', 'grant session:start or operator:admin to start sessions');
+  const key = request.headers.get('idempotency-key') || body.key;
+  if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(key)) return error('idempotency_key_required', 400);
   const purpose = sessionPurpose(body.purpose);
   const text = (field: string): string | undefined => typeof body[field] === 'string' && (body[field] as string).trim() ? (body[field] as string).trim() : undefined;
   const requestedProject = text('repo') ?? text('project');
-  const repoWorkspace = requestedProject && /^[A-Za-z0-9_.-]{1,80}\/[A-Za-z0-9_.-]{1,100}$/.test(requestedProject)
-    ? requestedProject.split('/').at(-1) : undefined;
-  const label = text('workspace') ?? repoWorkspace;
+  const label = text('workspace');
   // `--cwd` is the directory the session must run in (a task worktree). It is the launch workspace;
   // the label only names the project. Dropping it started sessions in the repository's label directory.
   const cwd = text('cwd');
   if (cwd !== undefined && (cwd.length > 1024 || cwd.includes('\0') || !(cwd.startsWith('/') || /^[A-Za-z]:\\/.test(cwd))))
     return error('invalid_cwd', 400, '--cwd must be an absolute path on the target host');
-  const workspace = cwd ?? label;
-  if (!workspace)
+  if (!cwd && !label && !requestedProject && !text('intake_task_id'))
     return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const interactive = body.mode === 'interactive';
   const brief = text('brief');
@@ -658,6 +819,10 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     if (items.length !== 1) return error('project_required', 400, 'pass --repo owner/name (no unique default project)');
     project = items[0].canonical_name;
   }
+  if (actor.kind === 'agent' && actor.id.startsWith('session:') && !admin(actor)
+    && !hasScope(actor, `project:${project}`) && !hasScope(actor, `worker_project:${project}`)) {
+    return forbiddenScope(`project:${project}`, `session is scoped to its own project; grant project:${project} or operator:admin`);
+  }
   const repoResponse = await control.fetch(new Request(`${CONTROL}/api/repos/${encodeURIComponent(project)}`, { headers: { 'x-hub2-actor': JSON.stringify(actor) } }));
   let repoBody = repoResponse;
   // First start for a repo the registry has not seen: an operator registers it from its GitHub name
@@ -669,9 +834,24 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     }));
   }
   if (!repoBody.ok) return error('project_not_found_or_forbidden', repoBody.status === 403 ? 403 : 404, 'register it with: hub repos import / PATCH /api/repos/owner%2Fname');
-  const repo = (await repoBody.json()) as { repo?: { canonical_name?: string; status?: string } };
+  const repo = (await repoBody.json()) as { repo?: { canonical_name?: string; canonical_url?: string; status?: string } };
   if (repo.repo?.status !== 'active' || !repo.repo.canonical_name) return error('project_inactive', 409);
   const canonical = repo.repo.canonical_name;
+  let workspace = cwd ?? label;
+  let requiredCapabilities = Array.isArray(body.needs) ? body.needs : undefined;
+  const repoOnly = workspace === undefined && (requestedProject !== undefined || taskRef !== undefined);
+  if (repoOnly) {
+    // Identity is derived only from the registry's canonical record. Alias and
+    // caller spelling never become the placement key or a basename fallback.
+    // The 236-bit token binds identity; it grants no access by itself. The host
+    // must advertise new-protocol support and reread a unique full origin.
+    const qualified = await qualifiedRepositoryWorkspace(repo.repo.canonical_url);
+    if (!qualified) return error('repository_identity_unavailable', 409);
+    workspace = qualified;
+    requiredCapabilities = [...new Set([...(requiredCapabilities || []), REPOSITORY_IDENTITY_CAPABILITY])];
+  }
+  if (!workspace)
+    return error('workspace_required', 400, 'pass --repo owner/name to use that repository workspace, or --workspace <registered label or absolute target-host path>');
   const stub = env.PROJECTS.get(env.PROJECTS.idFromName(canonical));
   const call = async (path: string, payload: JsonRecord): Promise<{ response: Response; data: JsonRecord }> => {
     const response = await stub.fetch(await forwardRequest(
@@ -689,6 +869,9 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   const intakeId = (intake.data.intake as { id?: string } | undefined)?.id ?? (intake.data.id as string | undefined);
   if (!intake.response.ok || !intakeId) return json({ ...intake.data, error: intake.data.error ?? 'intake_create_failed', stage: 'intake' }, intake.response.ok ? 502 : intake.response.status);
   const createdHere = !existingIntake && intake.response.status === 201;
+  const intakeWorktree = body.intake_worktree === undefined ? undefined : text('intake_worktree');
+  if (intakeWorktree !== undefined && intakeWorktree !== 'detached' && intakeWorktree !== 'successor')
+    return error('invalid_intake_worktree', 400);
   const start: JsonRecord = {
     key, workspace, interactive, purpose, with_goal: body.with_goal === true,
     ...(brief ? { prompt: brief } : {}),
@@ -698,7 +881,8 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
     ...(text('effort') ? { effort: text('effort') } : {}),
     ...(text('tier') ? { tier: text('tier') } : {}),
     ...(text('engine_override_reason') ? { override_reason: text('engine_override_reason') } : {}),
-    ...(Array.isArray(body.needs) ? { required_capabilities: body.needs } : {}),
+    ...(intakeWorktree ? { intake_worktree: intakeWorktree } : {}),
+    ...(requiredCapabilities ? { required_capabilities: requiredCapabilities } : {}),
   };
   const started = await call(`/api/intakes/${encodeURIComponent(intakeId)}/start`, start);
   const session = started.data.session as JsonRecord | undefined;
@@ -723,11 +907,13 @@ async function startSession(request: Request, env: Hub2Env, actor: Actor): Promi
   return json({ ...session, project: canonical, intake_id: intakeId }, started.response.status);
 }
 
+class ObserverDeadline extends Error {}
+
 /** Optional observation never becomes a second dispatch/authorization dependency. */
 async function observerBound<T>(work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([work, new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error('observer_unavailable')), 250);
+    timer = setTimeout(() => reject(new ObserverDeadline('observer_unavailable')), 250);
   })]); } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
@@ -747,11 +933,11 @@ async function dryRunPick(request: Request, env: Hub2Env, actor: Actor): Promise
     ? env.CREDENTIAL_MONITOR_EVIDENCE : undefined;
   let identity: unknown;
   try { identity = observer?.begin(); }
-  catch { try { observer?.invalidate(); } catch {} observer = undefined; }
+  catch { try { observer?.invalidate('dry_run_begin_failed'); } catch {} observer = undefined; }
   const observed = async (decision: 'alert' | 'observation' | null) => {
     if (!observer) return;
     try { await observerBound(observer.finish(identity, decision)); }
-    catch { try { observer.invalidate(); } catch {} }
+    catch (caught) { try { observer.invalidate(caught instanceof ObserverDeadline ? 'dry_run_finish_timeout' : 'dry_run_finish_failed'); } catch {} }
   };
   try {
     const { route, diagnostics } = await pickModelRouteDetailed(env, {
@@ -781,7 +967,7 @@ async function routingSimulation(request: Request, env: Hub2Env, actor: Actor): 
   const raw=params.get('n')??'1000';
   if(!/^[1-9][0-9]{0,3}$/.test(raw)||Number(raw)>1000)return error('invalid_simulation_count',400);
   if(params.has('mode')&&!['headless','interactive'].includes(params.get('mode')!))return error('invalid_session_mode',400);
-  if(params.has('effort')&&!['low','medium','max'].includes(params.get('effort')!))return error('invalid_effort',400);
+  if(params.has('effort')&&!['low','medium','high','max'].includes(params.get('effort')!))return error('invalid_effort',400);
   const input:PickInput={interactive:params.get('mode')==='interactive',purpose:sessionPurpose(params.get('purpose')??undefined)};
   for(const key of ['tier','machine_id','engine','model','effort','workspace'] as const){
     const value=params.get(key);
@@ -840,7 +1026,8 @@ async function ownMachineConnection(env: Hub2Env, actor: Actor): Promise<Respons
 
 /** `hub routing-machines`: registered host routing information. */
 async function routingMachines(env: Hub2Env, actor: Actor): Promise<Response> {
-  if (!admin(actor)) return error('forbidden', 403);
+  if (!admin(actor) && !hasScope(actor, 'routing:read'))
+    return forbiddenScope('routing:read', 'grant routing:read or operator:admin to read fleet routing machines');
   const control = env.CONTROL.get(env.CONTROL.idFromName('global'));
   const ids:string[]=[];let after='';
   do{
@@ -1021,8 +1208,9 @@ function resourceSettings(request: Request, env: Hub2Env, actor: Actor): Respons
 
 /** Canonical quota account labels published by `hub quota publish`; unconfigured ones are skipped. */
 const QUOTA_ACCOUNT_ENGINES: Record<string, string[]> = {
-  claude: ['claude'], codex: ['codex'], 'codex-orin': ['codex'], gemini: ['gemini'],
-  grok: ['grok'], copilot: ['copilot'], 'shared-go': ['opencode'],
+  claude: ['claude'], codex: ['codex'], gemini: ['gemini'],
+  grok: ['grok'], copilot: ['copilot'], 'shared-go': ['opencode'], 'go-orin': ['opencode'],
+  'zai-central': ['zcodex'],
 };
 
 /** Bounded, usage-only view of the accounts referenced by the routing policy. */

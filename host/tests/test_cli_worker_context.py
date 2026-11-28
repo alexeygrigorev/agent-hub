@@ -17,7 +17,17 @@ from agent_hub_host import api, auth, config, intake, session_control, worker_au
 SID = '11111111-1111-4111-8111-111111111111'
 INTAKE = '33333333-3333-4333-8333-333333333333'
 TOKEN = 'FAKE_WORKER_ONLY_' + 'x' * 40
-DIAGNOSTIC = 'Worker context unavailable or unsafe; host re-issuance required.'
+REISSUE = 'host re-issuance required'
+
+
+def assert_reason(exc, reason, *, reissue):
+    """Typed, fixed diagnostic: right code, re-issuance only where it helps, nothing leaked."""
+    message = str(exc.value)
+    assert exc.value.reason == reason
+    assert message.startswith('Worker context refused (' + reason + '): ')
+    assert (REISSUE in message) is reissue
+    for secret in (TOKEN, 'FAKE_PRIVILEGED_ONLY', '/', 'example.invalid', SID, INTAKE):
+        assert secret not in message
 
 
 @pytest.fixture
@@ -109,10 +119,13 @@ def test_bad_context_never_falls_back_or_sends(scoped, monkeypatch, fault):
         elif fault == 'bad_intake': data['worker']['intake_id'] = 'not-an-intake'
         elif fault == 'extra_worker': data['worker']['unknown'] = 'unexpected'
         write(data)
+    reason = {'missing': 'context_missing', 'expired': 'context_expired'}.get(fault, 'context_invalid')
     for call in (config.load_config, lambda: intake.request('GET', '/api/intakes/' + INTAKE),
                  lambda: session_control.request('GET', '/api/fleet')):
-        with pytest.raises(worker_auth.WorkerContextError, match='^' + DIAGNOSTIC.replace('.', r'\.') + '$'):
+        with pytest.raises(worker_auth.WorkerContextError) as exc:
             call()
+        assert_reason(exc, reason, reissue=True)
+        assert intake.diagnostic(exc.value) == session_control.diagnostic(exc.value) == str(exc.value)
 
 
 @pytest.mark.parametrize('key,value', [('HUB_CONFIG_FILE', 'host_profile'),
@@ -121,8 +134,92 @@ def test_bad_context_never_falls_back_or_sends(scoped, monkeypatch, fault):
     ('HUB_BASE_URL', 'https://worker.example.invalid/evil'), ('HUB_URL', 'http://localhost')])
 def test_bound_worker_rejects_profile_and_transport_overrides(scoped, monkeypatch, key, value):
     monkeypatch.setenv(key, value)
-    with pytest.raises(worker_auth.WorkerContextError):
+    with pytest.raises(worker_auth.WorkerContextError) as exc:
         config.load_config()
+    # Names the variable, never its value, and never sends anyone after a re-issue.
+    assert_reason(exc, 'worker_env_override_forbidden', reissue=False)
+    assert exc.value.variable == key
+    assert 'Unset ' + key + ' and retry' in str(exc.value)
+    assert value not in str(exc.value)
+
+
+@pytest.mark.parametrize('key', ['HUB_CONFIG_FILE', 'HUB_WORKER_CONFIG_FILE'])
+def test_profile_override_is_named_even_when_context_is_also_missing(scoped, monkeypatch, key):
+    # Regression for session 8246f41e: `env HUB_CONFIG_FILE=<human cli.json> hub sessions show`
+    # printed only the generic re-issuance text. The override is the cause and is reported first.
+    path, _, _ = scoped
+    path.unlink()
+    monkeypatch.setenv(key, str(config._default_human_config_path()))
+    for call in (config.load_config, lambda: session_control.request('GET', '/api/sessions/' + SID),
+                 lambda: intake.request('GET', '/api/intakes/' + INTAKE)):
+        with pytest.raises(worker_auth.WorkerContextError) as exc:
+            call()
+        assert_reason(exc, 'worker_env_override_forbidden', reissue=False)
+        assert exc.value.variable == key
+
+
+def test_actual_cli_subprocess_prints_typed_override_reason(scoped, tmp_path):
+    # The exact AC2 reproduction: a worker brief told the worker to point HUB_CONFIG_FILE at the
+    # human profile. Nonzero exit, the variable named, no re-issuance advice, no path or token.
+    path, _, _ = scoped
+    human = config._default_human_config_path()
+    env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'XDG_CONFIG_HOME', 'APPDATA',
+        'APLEXER_TAG', 'APLEXER_WORKSPACE', 'APLEXER_SESSION_ID', 'HUB2_CONFIG', 'HUB_CLI_SKIP_STALE_CHECK')}
+    env.update(PYTHONPATH=str(Path(__file__).resolve().parents[1]), PYTHONDONTWRITEBYTECODE='1',
+               HUB_CONFIG_FILE=str(human))
+    code = '''import http.client,runpy,sys
+sys.addaudithook(lambda event,args: (_ for _ in ()).throw(AssertionError('network forbidden')) if event in ('socket.connect','socket.getaddrinfo') else None)
+runpy.run_module('agent_hub_host',run_name='__main__')
+'''
+    for command in (['sessions', 'show', SID[:8]], ['intake', 'show', INTAKE]):
+        result = subprocess.run([sys.executable, '-c', code, *command], env=env, text=True,
+                                capture_output=True, timeout=10, cwd=tmp_path)
+        assert result.returncode != 0
+        assert 'Worker context refused (worker_env_override_forbidden): HUB_CONFIG_FILE is set' in result.stderr
+        for leaked in (REISSUE, str(human), str(path), TOKEN, 'FAKE_PRIVILEGED_ONLY', 'Traceback', 'network forbidden'):
+            assert leaked not in result.stderr
+
+
+def test_unsafe_context_file_is_typed_unsafe(scoped):
+    path, _, _ = scoped
+    path.chmod(0o644)
+    with pytest.raises(worker_auth.WorkerContextError) as exc:
+        config.load_config()
+    assert_reason(exc, 'context_unsafe', reissue=True)
+
+
+def test_missing_launch_selector_is_typed_missing(scoped, monkeypatch):
+    monkeypatch.delenv('HUB2_CONFIG')
+    with pytest.raises(worker_auth.WorkerContextError) as exc:
+        worker_auth._v2_context()
+    assert_reason(exc, 'context_missing', reissue=True)
+
+
+def test_profile_io_and_refresh_are_typed_forbidden_not_reissue(scoped):
+    for call in (lambda: config.save_config({'access_token': 'FAKE'}),
+                 lambda: config._load_from(config.get_host_config_path()),
+                 lambda: worker_auth.refresh_guard().__enter__()):
+        with pytest.raises(worker_auth.WorkerContextError) as exc:
+            call()
+        assert_reason(exc, 'worker_profile_io_forbidden', reissue=False)
+
+
+def test_context_rotated_mid_command_is_typed_changed(scoped):
+    path, original, write = scoped
+    profile = config.load_config()
+    data = copy.deepcopy(original)
+    data['token'] = 'FAKE_ROTATED_WORKER_' + 'y' * 40
+    write(data)
+    with pytest.raises(worker_auth.WorkerContextError) as exc:
+        worker_auth.validate_v2_request(profile)
+    assert_reason(exc, 'context_changed', reissue=False)
+
+
+def test_unknown_reason_and_variable_never_interpolate():
+    exc = worker_auth.WorkerContextError('/home/x/secret', 'hubt_SECRET')
+    assert exc.reason == 'context_invalid' and 'secret' not in str(exc).lower()
+    exc = worker_auth.WorkerContextError('worker_env_override_forbidden', '/etc/passwd')
+    assert exc.variable == 'A Hub profile override variable' and '/etc' not in str(exc)
 
 
 def test_matching_origin_and_token_overrides_are_not_privilege_changes(scoped, monkeypatch):
@@ -227,7 +324,7 @@ runpy.run_module('agent_hub_host',run_name='__main__')
     result = subprocess.run([sys.executable, '-c', code, *command], env=env, text=True,
                             capture_output=True, timeout=10, cwd=tmp_path)
     assert result.returncode != 0
-    assert DIAGNOSTIC in result.stderr
+    assert 'Worker context refused (context_missing): ' in result.stderr
     assert TOKEN not in result.stderr and str(path) not in result.stderr
     assert 'Traceback' not in result.stderr and 'network forbidden' not in result.stderr
     assert snapshot(tmp_path) == before
@@ -304,7 +401,7 @@ runpy.run_module('agent_hub_host',run_name='__main__')
     result = subprocess.run([sys.executable, '-c', code, 'intake', 'summary'], env=env,
                             capture_output=True, text=True, cwd=tmp_path, timeout=10)
     assert result.returncode != 0
-    assert DIAGNOSTIC in result.stderr
+    assert 'Worker context refused (context_missing): ' in result.stderr
     for secret in (TOKEN, 'FAKE_PRIVILEGED_ONLY', str(scoped[0]), 'network forbidden', 'Traceback'):
         assert secret not in result.stderr
     assert snapshot(tmp_path) == before

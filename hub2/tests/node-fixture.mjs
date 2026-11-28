@@ -32,7 +32,7 @@ export async function createFixture(spec) {
   const runtime = new Hub2Runtime({
     classes: spec.classes,
     entry: spec.entry,
-    env: { ...spec.env, ASSETS: assetFetcher(resolve(here, '../public')) },
+    env: { ...spec.env, ASSETS: assetFetcher(spec.assetsDir ?? resolve(here, '../public')) },
     dataDir,
   });
   const server = await startServer(runtime, { host: '127.0.0.1', port: 0 });

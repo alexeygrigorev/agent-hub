@@ -9,9 +9,13 @@ registerHooks({resolve(specifier,context,next){
  return next(specifier,context);
 }});
 await import('./model-picker.test.ts');
+await import('./carbon-routing.test.ts');
+await import('./neon-routing.test.ts');
 await import('./routing-simulation.test.ts');
 await import('./machine-capabilities.test.ts');
 
 await import('./alert-evidence.test.ts');
 
 await import('./workspace-routing.test.ts');
+
+await import('./workspace-advertisement.test.ts');

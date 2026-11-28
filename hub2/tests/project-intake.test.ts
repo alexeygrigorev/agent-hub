@@ -2,22 +2,172 @@ import {ControlDO} from '../src/control-do';
 import {MachineDO} from '../src/machine-do';
 import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';import {ProjectDO} from '../src/project-do';
 const admin={id:'human:admin',kind:'operator',scopes:['operator:admin']};
-function fixture(options:{realMachineRouting?:boolean;machineCapabilities?:string[];modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
+function fixture(options:{realMachineRouting?:boolean;machineCapabilities?:string[];modelCandidates?:any[];accountHosts?:Record<string,string[]>;connected?:boolean;lostReleaseFailures?:number;machineFetch?:(request:Request)=>Promise<Response>;lostDrawResponse?:boolean;schemaMode?:string;denyCapacity?:boolean;lostCapResponse?:boolean;codexQuota?:number|null}={}){const sql=new DatabaseSync(':memory:');let alarm:any=null;const storageValues=new Map<string,unknown>(),ctx:any={id:{toString:()=> 'synthetic-project'},storage:{sql:{exec(q:string,...a:any[]){const p=sql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){sql.exec('BEGIN');try{const r=fn();sql.exec('COMMIT');return r;}catch(e){sql.exec('ROLLBACK');throw e;}},async getAlarm(){return alarm;},async setAlarm(at:number){alarm=at;},async deleteAlarm(){alarm=null;},async get(key:string){return storageValues.get(key);},async put(key:string,value:unknown){storageValues.set(key,value);},async delete(key:string){return storageValues.delete(key);}},blockConcurrencyWhile:(f:any)=>Promise.resolve(f())};
  const collectorSql=new DatabaseSync(':memory:');
  const collectorContext:any={...ctx,storage:{...ctx.storage,sql:{exec(q:string,...a:any[]){const statement=collectorSql.prepare(q);const rows=statement.columns().length?statement.all(...a):(statement.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){collectorSql.exec('BEGIN');try{const result=fn();collectorSql.exec('COMMIT');return result;}catch(error){collectorSql.exec('ROLLBACK');throw error;}}}};
  let control:ControlDO;let loseDraw=options.lostDrawResponse,loseCap=options.lostCapResponse;
  const routes:any[]=[],machineCalls:string[]=[],accountCalls:string[]=[],capReleases:any[]=[];
  let remainingReleaseFailures=options.lostReleaseFailures??0;
  const requestOf=(input:string|Request,init?:RequestInit)=>input instanceof Request?input:new Request(input,init);
- const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.clone().json();routes.push(value);if(path==='/_internal/session-cap/check'&&options.lostCapResponse){const response=await control.fetch(request);if(loseCap&&response.ok){loseCap=false;throw new Error('synthetic_crash_after_capacity_reservation');}return response;}if(path==='/_internal/session-cap/check'&&options.denyCapacity)return Response.json({error:'active_session_limit'},{status:429});if(path==='/_internal/picker/draw'){const response=await control.fetch(request);if(loseDraw&&response.ok){loseDraw=false;throw new Error('synthetic_lost_draw_response');}return response;}if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
+ const CONTROL={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init),path=new URL(request.url).pathname;const value=request.method==='GET'?{}:await request.clone().json();routes.push(value);if(path==='/_internal/session-cap/check'&&options.lostCapResponse){const response=await control.fetch(request);if(loseCap&&response.ok){loseCap=false;throw new Error('synthetic_crash_after_capacity_reservation');}return response;}if(path==='/_internal/session-cap/check'&&options.denyCapacity)return Response.json({error:'active_session_limit'},{status:429});if(path==='/_internal/picker/draw'){const response=await control.fetch(request);if(loseDraw&&response.ok){loseDraw=false;throw new Error('synthetic_lost_draw_response');}return response;}if(path.startsWith('/_internal/shell-grants/')||path==='/api/shell-grants'){return control.fetch(request);}if(path==='/_internal/session-cap/release'){capReleases.push(value);if(remainingReleaseFailures>0){remainingReleaseFailures--;return Response.json({error:'unavailable'},{status:503});}}if(path==='/_routing-policy')return Response.json({version:1,candidates:options.modelCandidates||[]});if(path==='/api/directory')return Response.json({items:[{id:'h1'}],next:null});return Response.json({registered:true,accepted:true});}})};
  const MACHINES={idFromName:(id:any)=>id,get:()=>({fetch:async(input:string|Request,init?:RequestInit)=>{const request=requestOf(input,init);const path=new URL(request.url).pathname;machineCalls.push(path);if(options.machineFetch&&(path!=='/_internal/routing'||options.realMachineRouting))return options.machineFetch(request);if(path==='/_internal/routing')return Response.json({machine_id:'h1',connected:options.connected??true,engines:['codex','claude'],capabilities:options.machineCapabilities||['headless','interactive']});return Response.json(path.endsWith('/reserve')?{state:'staged',epoch:1}:{state:'offered'});}})};
  const unused={idFromName:(id:any)=>id,get:()=>({fetch:async()=>Response.json({ok:true})})};
- const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:{remaining:id==='codex'?90:70},hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
+ const ACCOUNTS={idFromName:(id:any)=>id,get:(id:string)=>({fetch:async(input:string|Request)=>{const path=new URL(input instanceof Request?input.url:input).pathname;accountCalls.push(path);return Response.json({account:{enabled:true},quota:id==='codex'&&options.codexQuota===null?null:{remaining:id==='codex'?options.codexQuota??90:70,captured_at:Date.now(),valid_until:Date.now()+900000},fresh:true,hosts:options.accountHosts?.[id]||['h1'],credential_usable:false});}})};
  const env:any={CONTROL,PROJECTS:unused,MACHINES,ACCOUNTS,MAILBOXES:unused,HUB2_SCHEMA_MIGRATIONS:options.schemaMode};
  control=new ControlDO(collectorContext,env);
- let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,collectorSql,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
+ let project=new ProjectDO(ctx,env);const call=(p:string,m='GET',b?:unknown,a:any=admin)=>project.fetch(new Request('https://p.test'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(b===undefined?{}:{body:JSON.stringify(b)})}));return{sql,collectorSql,control,get project(){return project;},restart:()=>project=new ProjectDO(ctx,env),routes,machineCalls,accountCalls,capReleases,call,getAlarm:()=>alarm,storageValues};}
 const body=async(r:Response)=>await r.json() as any;
 async function intake(f:ReturnType<typeof fixture>,key='task'){const result=await f.call('/api/intakes?project=org/a','POST',{key,title:'Original task',text:'Original requested behavior',acceptance_criteria:['Actual result']});assert.equal(result.status,201);return(await body(result)).intake;}
+
+const scopedModels=[
+ {id:'opus-route',engine:'claude',model:'opus',effort:'medium',account_id:'claude',weight:1e6,capabilities:[],enabled:true},
+ {id:'sonnet-renamed-route',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true},
+];
+const sonnetConstraint={models_by_engine:{claude:['sonnet']},efforts:['medium','unspecified']};
+
+test('operator constraints persist across restart; descendants intersect and unrelated global picks remain unchanged',async()=>{
+ const f=fixture({modelCandidates:scopedModels}),random=Math.random;Math.random=()=>0;
+ try{
+  const rootResponse=await f.call('/api/intakes?project=org/a','POST',{
+   key:'constrained-root',title:'Root',text:'Keep semantic route restrictions',acceptance_criteria:['Result'],model_constraints:sonnetConstraint});
+  assert.equal(rootResponse.status,201);
+  const root=(await body(rootResponse)).intake;
+  assert.deepEqual(root.provenance.model_constraints,sonnetConstraint);
+  const childResponse=await f.call('/api/intakes?project=org/a','POST',{
+   key:'constrained-child',title:'Child',text:'Cannot widen its parent',acceptance_criteria:['Result'],parent_intake_id:root.id,
+   model_constraints:{models_by_engine:{claude:['opus','sonnet']}}});
+  assert.equal(childResponse.status,201);const child=(await body(childResponse)).intake;
+  f.restart();
+  assert.equal((await f.call('/api/intakes/'+child.id,'PATCH',{key:'clear-child-only',model_constraints:null})).status,200);
+  const started=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'scoped-start',workspace:'/owned/scope'});
+  assert.equal(started.status,201,JSON.stringify(await started.clone().json()));
+  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+  assert.equal(JSON.parse(saga.launch_spec_json).model,'sonnet');
+  assert.deepEqual(JSON.parse(saga.routing_json).model_constraint_sources,[{intake_id:root.id,constraint:sonnetConstraint}]);
+  const unrelated=await intake(f,'unrelated');
+  assert.equal((await f.call('/api/intakes/'+unrelated.id+'/start','POST',{key:'global-start',workspace:'/owned/scope'})).status,201);
+  assert.equal(JSON.parse((f.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE intake_id=?').get(unrelated.id) as any).launch_spec_json).model,'opus');
+  const read=(await body(await f.call('/api/intakes/'+root.id))).intake;
+  const changed=await f.call('/api/intakes/'+root.id,'PATCH',{key:'both-metadata',expected_updated_at:read.updated_at,
+   code_task:false,model_constraints:{models_by_engine:{claude:['sonnet']}}});
+  assert.equal(changed.status,200);const source=(await body(changed)).intake.provenance;
+  assert.equal(source.code_task,false);assert.deepEqual(source.model_constraints,{models_by_engine:{claude:['sonnet']}});
+ }finally{Math.random=random;}
+});
+
+test('only operators may change constraints; start bodies and worker metadata cannot override ancestry',async()=>{
+ const f=fixture({modelCandidates:scopedModels}),own=await intake(f,'constraint-authority');
+ const writer={id:'human:writer',kind:'operator',scopes:['intake:read','intake:write','session:start','project:org/a']};
+ assert.equal((await f.call('/api/intakes?project=org/a','POST',{
+  key:'writer-create-plain',title:'Writer',text:'Ordinary project write authority',acceptance_criteria:['Result']},writer)).status,201);
+ for(const actor of [writer,{id:'session:worker',kind:'agent',resource_id:own.id,scopes:['intake:append']}]){
+  assert.equal((await f.call('/api/intakes/'+own.id,'PATCH',{key:'deny-'+actor.id,model_constraints:null},actor)).status,403);
+ }
+ assert.equal((await f.call('/api/intakes?project=org/a','POST',{
+  key:'writer-create',title:'Writer',text:'No authority',acceptance_criteria:['Result'],model_constraints:sonnetConstraint},writer)).status,403);
+ const forged=await f.call('/api/intakes/'+own.id+'/start','POST',{
+  key:'forged-start',workspace:'/owned/scope',model_constraints:[]});
+ assert.equal(forged.status,403);assert.equal((await body(forged)).error,'model_constraints_start_forbidden');
+ for(const [index,rule] of [{},{efforts:[]},{models_by_engine:{claude:[]}}].entries()){
+  const result=await f.call('/api/intakes/'+own.id,'PATCH',{key:'invalid-'+index,model_constraints:rule});
+  assert.equal(result.status,400);assert.equal((await body(result)).error,'invalid_model_constraints');
+ }
+});
+
+test('auth fallback reloads inherited restrictions and never restores a forbidden high-weight model',async()=>{
+ const sol={id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[sol,...scopedModels]}),random=Math.random;Math.random=()=>0;
+ try{
+  const parent=await intake(f,'fallback-parent');
+  const created=await f.call('/api/intakes?project=org/a','POST',{key:'fallback-child',title:'Child',text:'Do work',acceptance_criteria:['Result'],parent_intake_id:parent.id});
+  const child=(await body(created)).intake;
+  assert.equal((await f.call('/api/intakes/'+child.id+'/start','POST',{key:'scoped-fallback',workspace:'/owned/scope'})).status,201);
+  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+  assert.equal(JSON.parse(first.launch_spec_json).model,'gpt-6.1-sol');
+  assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{key:'parent-policy-during-offer',model_constraints:sonnetConstraint})).status,200);
+  const fallback=await f.call('/_internal/auth-fallback','POST',{operation_id:first.operation_id,
+   attempt_operation_id:first.attempt_operation_id,session_id:first.session_id,machine_id:first.machine_id,
+   epoch:first.epoch,reason:'provider_auth_failed'});
+  assert.equal(fallback.status,200,JSON.stringify(await fallback.clone().json()));
+  const next=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE operation_id=?').get(first.operation_id) as any;
+  assert.equal(JSON.parse(next.launch_spec_json).model,'sonnet');
+  assert.deepEqual(JSON.parse(next.routing_json).model_constraint_sources,[{intake_id:parent.id,constraint:sonnetConstraint}]);
+ }finally{Math.random=random;}
+});
+
+test('concurrent parent restriction edit fences a prepared draw before a saga can be persisted',async()=>{
+ let f:ReturnType<typeof fixture>,parentId='',changed=false;
+ f=fixture({modelCandidates:scopedModels,machineFetch:async request=>{
+  if(new URL(request.url).pathname==='/_internal/workspace-preflight'&&!changed){
+   changed=true;
+   assert.equal((await f.call('/api/intakes/'+parentId,'PATCH',{key:'racing-parent',model_constraints:sonnetConstraint})).status,200);
+   return Response.json({checked:true,ok:true});
+  }
+  return Response.json({state:'offered'});
+ }});
+ const parent=await intake(f,'racing-parent');parentId=parent.id;
+ const response=await f.call('/api/intakes?project=org/a','POST',{key:'racing-child',title:'Child',text:'Work',acceptance_criteria:['Result'],parent_intake_id:parent.id});
+ const child=(await body(response)).intake;
+ const result=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'racing-start',workspace:'/owned/scope'});
+ assert.equal(result.status,409);assert.equal((await body(result)).error,'intake_model_constraints_changed');
+ assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any).n,0);
+ assert.equal(f.capReleases.length,1,'capacity reservation released without a launch');
+});
+
+test('normal verifier, pinned continuation and unpinned second retry all enforce current ancestor constraints',async()=>{
+ const sol={id:'sol-route',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const random=Math.random;Math.random=()=>0;
+ try{
+  for(const mode of ['verifier','continuation','second-retry']){
+   const f=fixture({modelCandidates:[...scopedModels,sol]}),parent=await intake(f,'auto-parent-'+mode);
+   const created=await f.call('/api/intakes?project=org/a','POST',{
+    key:'auto-child-'+mode,title:'Read-only audit',text:'Read-only source review; no code changes',
+    acceptance_criteria:['Record source findings'],code_task:false,parent_intake_id:parent.id});
+   const child=(await body(created)).intake;
+   if(mode!=='continuation')assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{
+    key:'auto-parent-rule-'+mode,model_constraints:sonnetConstraint})).status,200);
+   const model=mode==='verifier'?'gpt-6.1-sol':mode==='continuation'?'opus':'sonnet';
+   const started=await f.call('/api/intakes/'+child.id+'/start','POST',{
+    key:'auto-start-'+mode,workspace:'/owned/scope',model,effort:'medium'});
+   assert.equal(started.status,201,JSON.stringify(await started.clone().json()));
+   const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(child.id) as any;
+   if(mode==='second-retry'){
+    // A retained legacy attempt has no completion contract. Exercise the real
+    // second-retry builder, which intentionally drops its previous model pin.
+    const route=JSON.parse(first.routing_json);delete route.completion_contract;
+    f.sql.prepare("UPDATE dispatch_sagas SET state='complete',routing_json=? WHERE operation_id=?").run(JSON.stringify(route),first.operation_id);
+    f.sql.prepare("UPDATE intakes SET status='failed',final_evidence_json='{}' WHERE id=?").run(child.id);
+    const row=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(child.id) as any;
+    await (f.project as any).startFailedIntakeRetry({...row,saga_operation_id:first.operation_id,
+     saga_machine_id:first.machine_id,launch_spec_json:first.launch_spec_json,routing_json:JSON.stringify(route)},1,'launch_failed',Date.now());
+   }else{
+    f.sql.prepare("UPDATE dispatch_sagas SET state='admitted' WHERE operation_id=?").run(first.operation_id);
+    const binding={operation_id:first.operation_id,attempt_operation_id:first.attempt_operation_id,
+     session_id:first.session_id,machine_id:first.machine_id,epoch:first.epoch,native_id:crypto.randomUUID()};
+    assert.equal((await f.call('/_internal/started','POST',binding)).status,201);
+    if(mode==='verifier')assert.equal((await f.call('/api/intakes/'+child.id+'/events','POST',{
+     key:'auto-complete',event:{kind:'task_complete',session_id:first.session_id,
+      acceptance:[{status:'met',proof:'Read-only findings recorded in owned audit output'}]}})).status,201);
+    assert.equal((await f.call('/_internal/finish','POST',{...binding,exit_code:0,native_exit_confirmed:true,
+     evidence:{result:'exit',native_deadline:{exceeded:false}}})).status,200);
+    if(mode==='continuation')assert.equal((await f.call('/api/intakes/'+parent.id,'PATCH',{
+     key:'auto-parent-rule-'+mode,model_constraints:sonnetConstraint})).status,200);
+    await f.project.alarm();
+   }
+   const sagas=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').all(child.id) as any[];
+   if(mode==='continuation'){
+    assert.equal(sagas.length,1,'a now-forbidden pinned continuation must never launch Opus');
+    const final=JSON.parse((f.sql.prepare('SELECT final_evidence_json FROM intakes WHERE id=?').get(child.id) as any).final_evidence_json);
+    assert.equal(final.completion.continuation.last_reason,'model_policy_unavailable');
+   }else{
+    assert.equal(sagas.length,2,mode);
+    const next=sagas.find(row=>row.session_id!==first.session_id)!;
+    assert.equal(JSON.parse(next.launch_spec_json).model,mode==='verifier'?'sonnet':'gpt-6.1-sol',mode);
+    assert.deepEqual(JSON.parse(next.routing_json).model_constraint_sources,[{intake_id:parent.id,constraint:sonnetConstraint}]);
+   }
+  }
+ }finally{Math.random=random;}
+});
 
 test('real Machine claim carries repo label binding through normal, aborted and legacy terminal paths',async()=>{
  for(const outcome of ['normal','aborted','legacy']){
@@ -124,6 +274,25 @@ test('internal workspace metadata envelopes remain byte bounded and malformed JS
   assert.equal(malformed.status,400,path);
  }
 });
+test('Codex reserve: a real Project start needs fresh known quota above 15 and never falls back to an unknown or low Codex',async()=>{
+ const codex={id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const claude={id:'claude-sonnet',engine:'claude',model:'sonnet',effort:'medium',account_id:'claude',weight:1,capabilities:[],enabled:true};
+ const originalRandom=Math.random;Math.random=()=>0;
+ try{
+  for(const quota of [6,15,null]){
+   const only=fixture({modelCandidates:[codex],codexQuota:quota}),own=await intake(only,'reserve-only');
+   const refused=await only.call('/api/intakes/'+own.id+'/start','POST',{key:'reserve-only',workspace:'/tmp/synthetic-reserve',purpose:'think'});
+   assert.equal(refused.status,503,String(quota));assert.equal((await body(refused)).error,'model_policy_unavailable');
+   assert.equal((only.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,0,'no launch is created for '+quota);
+   const mixed=fixture({modelCandidates:[codex,claude],codexQuota:quota,accountHosts:{codex:['h1'],claude:['h1']}}),other=await intake(mixed,'reserve-mixed');
+   assert.equal((await mixed.call('/api/intakes/'+other.id+'/start','POST',{key:'reserve-mixed',workspace:'/tmp/synthetic-reserve',purpose:'think'})).status,201);
+   assert.equal(JSON.parse((mixed.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE intake_id=?').get(other.id) as any).launch_spec_json).engine,'claude',String(quota));
+  }
+  const healthy=fixture({modelCandidates:[codex],codexQuota:16}),own=await intake(healthy,'reserve-ok');
+  assert.equal((await healthy.call('/api/intakes/'+own.id+'/start','POST',{key:'reserve-ok',workspace:'/tmp/synthetic-reserve',purpose:'think'})).status,201);
+  assert.equal(JSON.parse((healthy.sql.prepare('SELECT launch_spec_json FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).launch_spec_json).engine,'codex');
+ }finally{Math.random=originalRandom;}
+});
 test('model-less start falls back to another allowed model after an auth failure',async()=>{
  const candidates=[
   {id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true},
@@ -158,6 +327,23 @@ test('intake edits preserve original ask and notes/history; archive search pagin
  assert.equal((await f.call('/api/intakes/'+initial.id,'PATCH',{key:'foreign',note:'bad'},{id:'agent:x',kind:'agent',resource_id:'other',scopes:['intake:write']})).status,403);
  assert.equal((await f.call('/api/intakes/'+initial.id,'PATCH',{key:'stale',expected_updated_at:-1,priority:1})).status,409);
 });
+test('long verbatim acceptance criteria are accepted and criteria failures name the exact check',async()=>{
+ const f=fixture(),verbatim='AC1 verbatim: '+'Alexey words '.repeat(170);assert(verbatim.length>2100);
+ const created=await f.call('/api/intakes?project=org/a','POST',{key:'long-ac',title:'Long AC',text:'Long verbatim criterion',acceptance_criteria:[verbatim,'AC2 short t12a']});
+ assert.equal(created.status,201);const stored=(await body(created)).intake;assert.equal(stored.acceptance_criteria[0],verbatim.trim());
+ const reject=async(criteria:unknown,code:string,detail:RegExp)=>{const result=await f.call('/api/intakes?project=org/a','POST',{key:'bad-'+code,title:'Bad',text:'Bad criteria',acceptance_criteria:criteria});assert.equal(result.status,400);const value=await body(result);assert.equal(value.error,code);assert.match(value.detail,detail);};
+ await reject(['ok','x'.repeat(6001)],'acceptance_criterion_too_long',/criterion 2 is 6001 characters; max 6000/);
+ await reject([],'acceptance_criteria_required',/at least one/);
+ await reject(['ok','  '],'acceptance_criterion_empty',/criterion 2/);
+ await reject(['AC1 free text','invented line without citation'],'acceptance_criterion_missing_t_id',/criterion 2 \(AC2\).*invented line without citation/);
+ await reject(['AC1 free text','ok t5','longer words like t5xy or at5 do not count'],'acceptance_criterion_missing_t_id',/criterion 3/);
+ const lintEdit=await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-no-tid',acceptance_criteria:['first','second without id']});assert.equal(lintEdit.status,400);assert.equal((await body(lintEdit)).error,'acceptance_criterion_missing_t_id');
+ assert.equal((await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-tid',acceptance_criteria:['first','second cites t3416u']})).status,200);
+ await reject(Array.from({length:33},(_,i)=>'AC'+i),'acceptance_criteria_too_many',/33 criteria; max 32/);
+ const edit=await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-long',acceptance_criteria:['y'.repeat(6001)]});assert.equal(edit.status,400);assert.equal((await body(edit)).error,'acceptance_criterion_too_long');
+ assert.equal((await f.call('/api/intakes/'+stored.id,'PATCH',{key:'edit-ok',acceptance_criteria:[verbatim]})).status,200);
+});
+
 test('schedule adapter creates distinct child provenance and actual launch saga, replay creates no duplicate',async()=>{
  const f=fixture(),parent=await intake(f);
  const created=await body(await f.call('/api/schedules','POST',{key:'writer',intake_id:parent.id,kind:'writer',interval_ms:60000,overlap:'allow',payload:{start:{workspace:'/tmp/synthetic-workspace',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test only'}}}));
@@ -285,7 +471,46 @@ test('pre-claim host launch refusal fails clearly and is not silently re-offered
  assert.equal(retry.status,201,JSON.stringify(await retry.clone().json()));
  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,2);
 });
-test('an expired unclaimed offer terminates instead of scheduling an unbounded retry',async()=>{
+
+test('unconfirmed custody composes real Machine and Project until qualified STOP releases once',async()=>{
+ const database=new DatabaseSync(':memory:'),sockets:any[]=[];
+ const context:any={storage:{sql:{exec(query:string,...args:any[]){const s=database.prepare(query);return{toArray:()=>s.columns().length?s.all(...args):(s.run(...args),[])};}},
+  transactionSync(fn:()=>unknown){database.exec('BEGIN');try{const r=fn();database.exec('COMMIT');return r;}catch(e){database.exec('ROLLBACK');throw e;}},
+  async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){}},blockConcurrencyWhile:(fn:()=>unknown)=>Promise.resolve(fn()),getWebSockets:()=>sockets};
+ let machine:MachineDO;
+ const f=fixture({machineFetch:r=>machine.fetch(r)});
+ machine=new MachineDO(context,{CONTROL:{idFromName:(id:string)=>id,get:()=>({fetch:async()=>Response.json({authorized:true,revoked:true})})},
+  PROJECTS:{idFromName:(id:string)=>id,get:()=>({fetch:(r:Request)=>f.project.fetch(r)})}} as any);
+ const own=await intake(f,'custody-composed');
+ assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'custody-start',workspace:'relay',engine:'shell',machine_id:'h1'})).status,201);
+ const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
+ const socket={readyState:1,deserializeAttachment:()=>({machine_id:'h1',actor_id:'machine:h1',generation:'1',connected_at:1,connection_id:'custody'}),send:(_v:string)=>{}};
+ sockets.push(socket);
+ await machine.webSocketMessage(socket as any,JSON.stringify({type:'offer_ack',session_id:saga.session_id,epoch:saga.epoch}));
+ const machineActor={id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report','machine:heartbeat']};
+ const call=(path:string,value:unknown,actor:any=machineActor)=>machine.fetch(new Request('https://machine.test'+path,{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(actor)},body:JSON.stringify(value)}));
+ const native='11111111-2222-4333-8444-555555555555';
+ assert.equal((await call('/api/sessions/'+saga.session_id+'/started',{operation_id:saga.attempt_operation_id,epoch:saga.epoch,native_id:native})).status,201);
+ const stopPath='/api/sessions/'+saga.session_id+'/commands';
+ const first=await body(await call(stopPath,{key:'first-stop',kind:'stop'},admin));
+ assert(first.command);
+ assert.equal((await call('/api/heartbeat',{labels:[],engines:['shell'],capabilities:['headless'],native_sessions:[{session_id:saga.session_id,native_id:native,phase:'missing',last_activity_at:null,exit_code:null,containment_empty:false}]})).status,200);
+ assert.equal((await call(stopPath+'/'+first.command.id+'/ack',{epoch:saga.epoch,result:{stopped:false,error:'stop_unconfirmed',reason:'stop_unconfirmed',stage:'host_stop'}})).status,200);
+ assert.equal((database.prepare('SELECT state FROM sessions WHERE id=?').get(saga.session_id) as any).state,'running');
+ assert.equal((f.sql.prepare('SELECT state FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).state,'running');
+ assert.equal(f.capReleases.length,0);
+ const rejected=await f.call('/_internal/reaped','POST',{operation_id:saga.operation_id,attempt_operation_id:saga.attempt_operation_id,session_id:saga.session_id,machine_id:saga.machine_id,epoch:saga.epoch,native_id:native,reason:'native_process_absent',stopped:false,unconfirmed:true,reaped:true,observed_at:Date.now()});
+ assert.equal(rejected.status,400);assert.equal(f.capReleases.length,0);
+ const later=await body(await call(stopPath,{key:'later-qualified-stop',kind:'stop'},admin));assert(later.command);
+ const proof={epoch:saga.epoch,result:{stopped:true,evidence:'native_exit',native_id:native}};
+ assert.equal((await call(stopPath+'/'+later.command.id+'/ack',proof)).status,200);
+ assert.equal((await call(stopPath+'/'+later.command.id+'/ack',proof)).status,200);
+ assert.equal((database.prepare('SELECT state FROM sessions WHERE id=?').get(saga.session_id) as any).state,'stopped');
+ assert.equal((f.sql.prepare('SELECT state FROM dispatch_sagas WHERE operation_id=?').get(saga.operation_id) as any).state,'complete');
+ assert.equal(f.capReleases.length,1);assert.equal(f.capReleases[0].session_id,saga.session_id);
+});
+
+test('an expired unclaimed offer terminates the attempt and schedules a bounded machine-fallback retry',async()=>{
  const f=fixture(),own=await intake(f,'expired-offer-stop'),start={key:'expired-offer-stop',workspace:'/tmp/synthetic-expired-stop',engine:'shell',machine_id:'h1',override_reason:'Synthetic semantic test'};
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',start)).status,201);
  const first=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
@@ -299,7 +524,9 @@ test('an expired unclaimed offer terminates instead of scheduling an unbounded r
  const intakeRow=f.sql.prepare('SELECT * FROM intakes WHERE id=?').get(own.id) as any;
  assert.equal(intakeRow.status,'failed');assert.equal(JSON.parse(intakeRow.final_evidence_json).reason,'host_no_response');
  const calls=f.machineCalls.length;
- await f.project.alarm();assert.equal(f.machineCalls.length,calls);assert.equal(f.getAlarm(),null);
+ await f.project.alarm();
+ assert.equal(f.machineCalls.length,calls,'the retry waits for its backoff step instead of reserving at once');
+ assert.notEqual(f.getAlarm(),null,'the failed offer is retried bounded: Hub schedules the retry alarm');
 });
 
 test('session admission checks the current saga without quota or account-capacity reads',async()=>{
@@ -411,6 +638,24 @@ test('start purpose is validated and bound to launch and idempotency',async()=>{
  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{...start,purpose:'implement'})).status,200);
  const conflict=await f.call('/api/intakes/'+own.id+'/start','POST',{...start,purpose:'review'});
  assert.equal(conflict.status,409);assert.equal((await body(conflict)).error,'idempotency_conflict');
+});
+
+test('project starts reject Carbon identity outside thinking even when policy omits its marker',async()=>{
+ const carbon={id:'antigravity-carbon-medium',engine:'antigravity',model:'gemini-4-carbon-medium',effort:'medium',account_id:'gemini',weight:1,capabilities:['think-only'],enabled:true};
+ const cases=[
+  {id:'omitted-marker',candidate:{...carbon,capabilities:[]},model:'gemini-4-carbon-medium'},
+  {id:'generic-id',candidate:{...carbon,id:'generic-route',capabilities:[]},model:'generic-route'},
+  {id:'carbon-alias',candidate:{...carbon,id:'generic-carbon-alias',capabilities:[]},model:'generic-carbon-alias'},
+ ];
+ for(const scenario of cases)for(const purpose of [undefined,'fix','implement','review']){
+  const key=`carbon-${scenario.id}-${purpose||'omitted'}`,f=fixture({modelCandidates:[scenario.candidate]}),own=await intake(f,key);
+  const response=await f.call('/api/intakes/'+own.id+'/start','POST',{key,workspace:'/tmp/synthetic-carbon-purpose',model:scenario.model,override_reason:'Synthetic Carbon boundary test',...(purpose?{purpose}:{})});
+  const result=await body(response);
+  assert.equal(response.status,400,JSON.stringify(result));
+  assert.deepEqual(result,{error:'think_only_model_requires_think_purpose'});
+  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas').get() as any).n,0);
+  assert.equal(f.machineCalls.length,0);
+ }
 });
 
 test('project starts enforce Astra purpose even through non-Astra policy ids',async()=>{
@@ -878,7 +1123,7 @@ test('ordinary Claude start preserves exact pre-selector request digest',async()
  const saga=f.sql.prepare('SELECT * FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any;
  const {createHash}=await import('node:crypto');
  const prior=createHash('sha256').update(JSON.stringify({intake_id:own.id,criteria:['Actual result'],workspace:start.workspace,
-  prompt:'Original requested behavior',interactive:false,with_goal:false,timeout_seconds:1800,
+  prompt:'Original requested behavior',interactive:false,with_goal:false,timeout_seconds:7200,
   route:{machine_id:'h1',engine:'claude',model:'opus',effort:'medium',override_reason:null,required_capabilities:[],with_goal:false}})).digest('hex');
  assert.equal(saga.request_digest,prior);assert(!Object.hasOwn(JSON.parse(saga.launch_spec_json),'managed_credential_label'));
  f.sql.close();f.collectorSql.close();
@@ -970,4 +1215,308 @@ test('same-intake history honors limit with exclusive after cursor and traverses
  assert.equal((await f.call('/api/intakes/00000000-0000-4000-8000-000000000000/history?limit=5')).status,404);
  assert.equal((await f.call(path+'?limit=5','GET',undefined,{id:'human:nobody',kind:'operator',scopes:[]})).status,403);
  f.sql.close();f.collectorSql.close();
+});
+
+test('scoped worker session creates child intakes and starts child sessions while failing loudly on missing scopes',async()=>{
+ const candidate={id:'codex-sol',engine:'codex',model:'gpt-6.1-sol',effort:'medium',account_id:'codex',weight:1,capabilities:[],enabled:true};
+ const f=fixture({modelCandidates:[candidate]}),parent=await intake(f,'orch-parent'),unrelated=await intake(f,'unrelated-task');
+ const worker={id:'session:11111111-1111-4111-8111-111111111111',kind:'agent' as const,resource_id:parent.id,
+  scopes:['intake:read','intake:append','intake:create','session:start','routing:read','worker_project:org/a']};
+ const created=await f.call('/api/intakes?project=org/a','POST',{key:'worker-child-1',title:'Child task',text:'Do child work',acceptance_criteria:['Child done']},worker);
+ assert.equal(created.status,201);
+ const child=(await body(created)).intake;
+ assert.equal(child.parent_intake_id,parent.id);
+ assert.equal((await f.call('/api/intakes/'+child.id,'GET',undefined,worker)).status,200);
+ assert.equal((await f.call('/api/intakes/'+unrelated.id,'GET',undefined,worker)).status,403);
+ const started=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'start-child-1',workspace:'/tmp/child'},worker);
+ assert.equal(started.status,201);
+ const selfStart=await f.call('/api/intakes/'+parent.id+'/start','POST',{key:'start-self',workspace:'/tmp/self'},worker);
+ assert.equal(selfStart.status,403);
+ assert.equal((await body(selfStart)).missing_scope,'operator:admin');
+ const unrelatedStart=await f.call('/api/intakes/'+unrelated.id+'/start','POST',{key:'start-unrelated',workspace:'/tmp/u'},worker);
+ assert.equal(unrelatedStart.status,403);
+ assert.equal((await body(unrelatedStart)).missing_scope,'session:start');
+ const foreignCreate=await f.call('/api/intakes?project=org/b','POST',{key:'foreign-c',title:'X',text:'Y',acceptance_criteria:['Z']},worker);
+ assert.equal(foreignCreate.status,403);
+ assert.equal((await body(foreignCreate)).missing_scope,'intake:write');
+ const noStart={id:'human:limited',kind:'operator' as const,scopes:['intake:read']};
+ const deniedStart=await f.call('/api/intakes/'+child.id+'/start','POST',{key:'no-scope-start',workspace:'/tmp/n'},noStart);
+ assert.equal(deniedStart.status,403);
+ assert.equal((await body(deniedStart)).missing_scope,'session:start');
+ f.sql.close();f.collectorSql.close();
+});
+
+test('shell interactive start is refused with a typed capability reason before any dispatch is consumed',async()=>{
+ const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:h']});
+ try{
+  const own=await intake(f,'shell-interactive');
+  await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1'})}));
+  const refused=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'shell-interactive-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},{id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']});
+  assert.equal(refused.status,409);
+  assert.equal((await body(refused)).error,'launcher_capability_unavailable_interactive');
+  assert.equal((f.sql.prepare('SELECT COUNT(*) AS n FROM dispatch_sagas WHERE intake_id=?').get(own.id) as any).n,0);
+ }finally{f.sql.close();f.collectorSql.close();}
+});
+
+test('interactive shell enforces capability, per-user/host grants, revocation, and scoped session ID binding',async()=>{
+ const f=fixture({schemaMode:'apply',machineCapabilities:['headless','modes:v1:shell:hi']});
+ let controlDown=false;
+ const machineSql=new DatabaseSync(':memory:');
+ const machineCtx:any={id:{toString:()=>'m/h1'},getWebSockets:()=>[],storage:{sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){}},blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn())};
+ const machine=new MachineDO(machineCtx,{HUB2_SCHEMA_MIGRATIONS:'apply',CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{if(controlDown)throw new Error('control_down');const r=i instanceof Request?i:new Request(i,init);return new URL(r.url).pathname.startsWith('/_internal/shell-grants/')?f.control.fetch(r):Response.json({ok:true});}})},PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},MACHINES:{idFromName:()=>'h1',get:()=>machine},ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})}} as any);
+ try{
+  const operator={id:'human:alexey',kind:'operator',scopes:['shell:start','project:org/a']};
+  const agent={id:'session:other',kind:'agent',resource_id:'org/a',scopes:['operator:admin','session:start','shell:start','project:org/a']};
+  const own=await intake(f,'shell-grant');
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'no-grant',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'agent-deny',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},agent)).status,403);
+  const granted=await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1'})}));
+  assert.equal(granted.status,201);
+  assert.equal((await f.call('/api/intakes/'+own.id+'/start','POST',{key:'wrong-host',workspace:'relay',engine:'shell',machine_id:'h2',interactive:true},operator)).status,403);
+  const started=await f.call('/api/intakes/'+own.id+'/start','POST',{key:'granted-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator);
+  assert.equal(started.status,201);
+  const sid=(await body(started)).session.id;
+  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-1',dispatch_id:'d-1',session_id:sid,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'a'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alexey'}})}));
+  assert.equal(reserve.status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='11111111-1111-4111-8111-111111111111' WHERE id=?").run(sid);
+  const cmd=(p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},body:JSON.stringify({kind:'send',text:'echo hi',key:p})}));
+  assert.equal((await cmd('k-proj',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-other',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-other-admin',{id:'human:alexey',kind:'operator',resource_id:'other-sid',scopes:['operator:admin']})).status,403);
+  assert.equal((await cmd('k-agent',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
+  assert.equal((await cmd('k-ok',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,201);
+  // Common authenticated operator credential (ControlAuth.preparedIssue / verifyKnownCredential: scopes=['operator:admin'], resource_id=undefined) works for the owning granted principal.
+  const commonAlexey={id:'human:alexey',kind:'operator',scopes:['operator:admin'],family_id:'fam-alexey',generation:'gen-alexey',client_id:'hub-cli'};
+  assert.equal((await cmd('k-common-ok',commonAlexey)).status,201);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify(commonAlexey)}}))).status,200);
+  // Missing shell_actor_id on an interactive shell session fails closed even for a granted operator.
+  const sidNoOwner='99999999-9999-4999-8999-999999999999';
+  assert.equal((await machine.fetch(new Request('https://m.test/_internal/reserve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({operation_id:'op-no-owner',dispatch_id:'d-no-owner',session_id:sidNoOwner,project_id:'org/a',intake_id:own.id,machine_id:'h1',request_digest:'f'.repeat(64),attempt:0,title:'shell-no-owner',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60}})}))).status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='88888888-8888-4888-8888-888888888888' WHERE id=?").run(sidNoOwner);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sidNoOwner+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(commonAlexey)},body:JSON.stringify({kind:'send',text:'echo no-owner',key:'k-no-owner'})}))).status,403);
+  // 6. Wake endpoints also enforce operator-only, exact-session-ID / owner binding on shell sessions.
+  const wake=(m:string,p:string,a:any)=>machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/'+p,{method:m,headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(a)},...(m==='POST'?{body:JSON.stringify({key:'w-'+p,at:'now',prompt:'echo hi'})}:{})}));
+  assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:send']})).status,404);
+  assert.equal((await wake('POST','wake',{id:'session:worker',kind:'agent',resource_id:sid,scopes:['operator:admin','session:send']})).status,404);
+  assert.equal((await wake('GET','wakes',{id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:'org/a',scopes:['session:read']})}}))).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,200);
+  // Common authenticated operator credential (scopes=['operator:admin'], resource_id=undefined) also starts interactive shell when granted.
+  const ownCommon=await intake(f,'shell-common-op');
+  assert.equal((await f.call('/api/intakes/'+ownCommon.id+'/start','POST',{key:'common-start',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},commonAlexey)).status,201);
+  // Grant lookup failure fails closed (never allows) for a principal that otherwise holds the exact scope or common operator credential.
+  controlDown=true;
+  assert.equal((await cmd('k-ctl-down',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  assert.equal((await cmd('k-ctl-down-common',commonAlexey)).status,403);
+  controlDown=false;
+  // Admin has no interactive shell exception: no grant -> start and session access denied.
+  const adminNoGrant={id:'human:root',kind:'operator',scopes:['operator:admin','shell:start','project:org/a']};
+  const own3=await intake(f,'shell-admin-nogrant');
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await f.call('/api/intakes/'+own3.id+'/start','POST',{key:'admin-nogrant-auto',workspace:'relay',engine:'shell',interactive:true},adminNoGrant)).status,403);
+  assert.equal((await cmd('k-admin',{id:'human:root',kind:'operator',resource_id:sid,scopes:['operator:admin','session:send']})).status,403);
+  assert.equal((await cmd('k-admin-bare',{id:'human:root',kind:'operator',scopes:['operator:admin']})).status,403);
+  assert.equal((await cmd('k-nogrant-other',{id:'human:other',kind:'operator',resource_id:sid,scopes:['session:send']})).status,403);
+  // Revocation applies to the running session on the very next request.
+  assert.equal((await f.control.fetch(new Request('https://c.test/api/shell-grants',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},body:JSON.stringify({actor_id:'human:alexey',machine_id:'h1',revoke:true})}))).status,200);
+  for(const [k,kind] of [['r-send','send'],['r-cap','capture'],['r-stop','stop']] as const){
+    const r=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})},body:JSON.stringify({kind,...(kind==='send'?{text:'echo hi'}:{}),key:k})}));
+    assert.equal(r.status,403,kind);
+  }
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid,{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{headers:{'x-hub2-actor':JSON.stringify({id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:read']})}}))).status,404);
+  assert.equal((await wake('POST','wake',{id:'human:alexey',kind:'operator',resource_id:sid,scopes:['session:send','session:capture','session:stop','session:read']})).status,404);
+  const own2=await intake(f,'shell-revoked');
+  assert.equal((await f.call('/api/intakes/'+own2.id+'/start','POST',{key:'after-revoke',workspace:'relay',engine:'shell',machine_id:'h1',interactive:true},operator)).status,403);
+  // Legacy headless shell start stays admin-only and is not affected by shell grants.
+  const own4=await intake(f,'shell-headless');
+  assert.equal((await f.call('/api/intakes/'+own4.id+'/start','POST',{key:'hl-op',workspace:'relay',engine:'shell',machine_id:'h1'},operator)).status,403);
+ }finally{machineSql.close();f.sql.close();f.collectorSql.close();}
+});
+
+test('interactive shell revocation runs bounded stop-only cleanup and queued commands cannot outlive the grant',async()=>{
+ let controlDown=false;
+ let skipMachineRevokePush=false;
+ const pushed:any[]=[];
+ let socketAttachment:any={machine_id:'h1',actor_id:'machine:h1',generation:'gen-1',stop_only:false};
+ const fakeSocket:any={
+  readyState:1,
+  deserializeAttachment:()=>socketAttachment,
+  send:(raw:string)=>{pushed.push(JSON.parse(raw));},
+  close:()=>{},
+ };
+ const machineSql=new DatabaseSync(':memory:');
+ const machineCtx:any={
+  id:{toString:()=>'m/h1'},
+  getWebSockets:()=>[fakeSocket],
+  storage:{
+   sql:{exec(q:string,...a:any[]){const p=machineSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},
+   transactionSync(fn:any){machineSql.exec('BEGIN');try{const r=fn();machineSql.exec('COMMIT');return r;}catch(e){machineSql.exec('ROLLBACK');throw e;}},
+   async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){},
+  },
+  blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn()),
+ };
+ const controlSql=new DatabaseSync(':memory:');
+ const controlCtx:any={
+  id:{toString:()=>'control/global'},
+  storage:{
+   sql:{exec(q:string,...a:any[]){const p=controlSql.prepare(q);const rows=p.columns().length?p.all(...a):(p.run(...a),[]);return{toArray:()=>rows};}},
+   transactionSync(fn:any){controlSql.exec('BEGIN');try{const r=fn();controlSql.exec('COMMIT');return r;}catch(e){controlSql.exec('ROLLBACK');throw e;}},
+   async getAlarm(){return null;},async setAlarm(){},async deleteAlarm(){},async get(){return undefined;},async put(){},async delete(){},
+  },
+  blockConcurrencyWhile:(fn:any)=>Promise.resolve(fn()),
+ };
+ let machine!:MachineDO;
+ const control=new ControlDO(controlCtx,{
+  HUB2_SCHEMA_MIGRATIONS:'apply',
+  MACHINES:{idFromName:()=>'h1',get:()=>({fetch:async(i:any,init?:any)=>{
+   if(skipMachineRevokePush)throw new Error('machine_push_skipped');
+   const r=i instanceof Request?i:new Request(i,init);
+   return machine.fetch(r);
+  }})},
+ } as any);
+ machine=new MachineDO(machineCtx,{
+  HUB2_SCHEMA_MIGRATIONS:'apply',
+  CONTROL:{idFromName:()=>'global',get:()=>({fetch:async(i:any,init?:any)=>{
+   const r=i instanceof Request?i:new Request(i,init);
+   const p=new URL(r.url).pathname;
+   if(p==='/_authorize')return Response.json({current:true});
+   if(p.startsWith('/_internal/shell-grants/')){
+    if(controlDown)throw new Error('control_down');
+    return control.fetch(r);
+   }
+   return Response.json({ok:true});
+  }})},
+  PROJECTS:{idFromName:()=>'org/a',get:()=>({fetch:async()=>Response.json({ok:true})})},
+  MACHINES:{idFromName:()=>'h1',get:()=>machine},
+  ACCOUNTS:{idFromName:()=>'a',get:()=>({fetch:async()=>Response.json({ok:true})})},
+  MAILBOXES:{idFromName:()=>'m',get:()=>({fetch:async()=>Response.json({ok:true})})},
+ } as any);
+ try{
+  const grant=(actorId:string,revoke=false)=>control.fetch(new Request('https://c.test/api/shell-grants',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify(admin)},
+   body:JSON.stringify({actor_id:actorId,machine_id:'h1',...(revoke?{revoke:true}:{})}),
+  }));
+  // 1. Grant two principals on h1 and verify checkSessionCap allows shell:start without session:start/admin.
+  assert.equal((await grant('human:alice')).status,201);
+  assert.equal((await grant('human:bob')).status,201);
+  const capRes=await control.fetch(new Request('https://c.test/_internal/session-cap/check',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',scopes:['shell:start']})},
+   body:JSON.stringify({operation_id:'op-cap-1',session_id:'sid-cap-1'}),
+  }));
+  assert.equal(capRes.status,200);
+
+  // 2. Reserve and start an interactive shell owned by human:alice.
+  const sid='11111111-1111-4111-8111-111111111111';
+  const reserve=await machine.fetch(new Request('https://m.test/_internal/reserve',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({operation_id:'op-sh1',dispatch_id:'d-sh1',session_id:sid,project_id:'org/a',intake_id:'in-1',machine_id:'h1',request_digest:'b'.repeat(64),attempt:0,title:'shell',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alice'}}),
+  }));
+  assert.equal(reserve.status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='22222222-2222-4222-8222-222222222222' WHERE id=?").run(sid);
+
+  // Owner binding: bob has a grant on h1 but cannot access alice's shell session even with exact resource_id or common operator:admin credential.
+  const bobCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',resource_id:sid,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo stolen',key:'bob-1'}),
+  }));
+  assert.equal(bobCmd.status,403);
+  const bobAdminCmd=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:bob',kind:'operator',scopes:['operator:admin']})},
+   body:JSON.stringify({kind:'send',text:'echo stolen-admin',key:'bob-2'}),
+  }));
+  assert.equal(bobAdminCmd.status,403);
+
+  // 3. Queue send + capture commands while grant is active, then revoke via ControlDO.
+  pushed.length=0;
+  const sendRes=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo secret-cmd',key:'alice-send-1'}),
+  }));
+  assert.equal(sendRes.status,201);
+  const sendId=(await body(sendRes)).command.id;
+  const capCmdRes=await machine.fetch(new Request('https://m.test/api/sessions/'+sid+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid,scopes:['session:capture']})},
+   body:JSON.stringify({kind:'capture',key:'alice-cap-1'}),
+  }));
+  assert.equal(capCmdRes.status,201);
+
+  pushed.length=0;
+  const revoked=await grant('human:alice',true);
+  assert.equal(revoked.status,200);
+  const revokeBody=await body(revoked);
+  // Cleanup response is strictly bounded metadata: zero command text or capture output.
+  assert.equal(revokeBody.revoked,true);
+  assert.equal(revokeBody.cleanup.status,'dispatched');
+  assert.equal(revokeBody.cleanup.stop_requested,1);
+  assert.equal(revokeBody.cleanup.commands_cancelled,2);
+  assert.equal(JSON.stringify(revokeBody).includes('secret-cmd'),false);
+
+  // Queued send and capture were immediately failed with shell_grant_revoked; only stop was pushed.
+  const rows=machineSql.prepare('SELECT kind,state,result_json FROM session_commands WHERE session_id=? ORDER BY created_at,id').all(sid) as any[];
+  const byKind=Object.fromEntries(rows.map(r=>[r.kind,r]));
+  assert.equal(byKind.send.state,'failed');
+  assert.equal(JSON.parse(byKind.send.result_json).error,'shell_grant_revoked');
+  assert.equal(byKind.capture.state,'failed');
+  assert.equal(JSON.parse(byKind.capture.result_json).error,'shell_grant_revoked');
+  assert.equal(byKind.stop.state,'pending');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].type,'session.command');
+  assert.equal(pushed[0].command.kind,'stop');
+
+  // Late host ack for the cancelled send command is rejected (409 command_not_pending).
+  const lateAck=await machine.fetch(new Request(`https://m.test/api/sessions/${sid}/commands/${sendId}/ack`,{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'machine:h1',kind:'machine',resource_id:'h1',scopes:['session:report']})},
+   body:JSON.stringify({epoch:1,result:{delivered:true}}),
+  }));
+  assert.equal(lateAck.status,409);
+
+  // 4. Defense-in-depth: queued command cannot outlive revocation even if the revocation push to MachineDO was missed.
+  assert.equal((await grant('human:alice',false)).status,201);
+  const sid2='33333333-3333-4333-8333-333333333333';
+  assert.equal((await machine.fetch(new Request('https://m.test/_internal/reserve',{
+   method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({operation_id:'op-sh2',dispatch_id:'d-sh2',session_id:sid2,project_id:'org/a',intake_id:'in-2',machine_id:'h1',request_digest:'c'.repeat(64),attempt:0,title:'shell2',acceptance_criteria:['ok'],launch:{workspace:'/tmp',engine:'shell',model:'shell',prompt:'await',interactive:true,timeout_seconds:60,shell_actor_id:'human:alice'}}),
+  }))).status,201);
+  machineSql.prepare("UPDATE sessions SET state='running',native_id='44444444-4444-4444-8444-444444444444' WHERE id=?").run(sid2);
+  // Mark sid1 stopped so only sid2 has pending commands.
+  machineSql.prepare("UPDATE sessions SET state='stopped' WHERE id=?").run(sid);
+  machineSql.prepare("UPDATE session_commands SET state='acked' WHERE session_id=? AND kind='stop'").run(sid);
+  // Queue a send while host socket is detached (no sockets), then revoke with missed MachineDO push.
+  const savedGetWs=machineCtx.getWebSockets;
+  machineCtx.getWebSockets=()=>[];
+  assert.equal((await machine.fetch(new Request('https://m.test/api/sessions/'+sid2+'/commands',{
+   method:'POST',headers:{'Content-Type':'application/json','x-hub2-actor':JSON.stringify({id:'human:alice',kind:'operator',resource_id:sid2,scopes:['session:send']})},
+   body:JSON.stringify({kind:'send',text:'echo must-not-dispatch',key:'alice-queued-2'}),
+  }))).status,201);
+  skipMachineRevokePush=true;
+  const rev2=await grant('human:alice',true);
+  assert.equal(rev2.status,200);
+  assert.equal((await body(rev2)).cleanup.status,'unavailable');
+  skipMachineRevokePush=false;
+  machineCtx.getWebSockets=savedGetWs;
+
+  // Fail closed when CONTROL is down at dispatch time: queued send must NOT be pushed.
+  controlDown=true;
+  pushed.length=0;
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,0);
+  controlDown=false;
+
+  // When CONTROL is reachable, dispatch re-checks grant, cancels the queued send, and pushes ONLY stop.
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].command.kind,'stop');
+  assert.equal(pushed[0].command.session_id,sid2);
+  const send2=machineSql.prepare("SELECT state,result_json FROM session_commands WHERE session_id=? AND kind='send'").get(sid2) as any;
+  assert.equal(send2.state,'failed');
+  assert.equal(JSON.parse(send2.result_json).error,'shell_grant_revoked');
+
+  // Stop-only safety socket delivers ONLY stop, never send/capture.
+  socketAttachment={machine_id:'h1',actor_id:'machine:h1',generation:'gen-1',stop_only:true};
+  pushed.length=0;
+  await (machine as any).notifyPendingCommands('h1');
+  assert.equal(pushed.length,1);
+  assert.equal(pushed[0].command.kind,'stop');
+ }finally{machineSql.close();controlSql.close();}
 });
