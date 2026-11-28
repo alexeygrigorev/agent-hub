@@ -48,8 +48,15 @@ routes now serve these installers, so an old Windows host that still runs
   `run-host.ps1`: `hub host serve --log-file %LOCALAPPDATA%\agent-hub2\serve.log`
   restarts after 30 s on exit and sends an HTTP heartbeat in between;
 - registers the daily `AgentHub2HostUpdate` task (`hub host self-update`). On
-  Windows that downloads the verified installer and runs it detached in update
-  mode, so it can stop and restart `AgentHub2Host`;
+  Windows that downloads the verified installer and runs it in update mode in
+  the foreground of the same task, so it can stop and restart `AgentHub2Host`;
+- keeps the evidence of each self-update: the installer's output and its exit
+  code go to `%LOCALAPPDATA%\agent-hub2\self-update.log`, the installer appends
+  its steps to `install.log`, and the task's last run result is the installer's
+  exit code. The launcher starts the installer with `CREATE_NO_WINDOW` and waits
+  for it: started with `DETACHED_PROCESS`, Windows PowerShell exits 0 without
+  running the script, which is how the daily task once reported success
+  without installing anything;
 - retires the legacy supervisor: it writes `replace-pending` and the permanent
   `retired-by-hub2` marker in `%LOCALAPPDATA%\Programs\agent-hub\controller`,
   disables (never deletes) `AgentHubController-*`/`AgentHubSessionHost*`, and stops

@@ -4,7 +4,8 @@ Intake 41ef7048: a Windows Hub2 host refused every launch with a bare reason and
 left serve.log empty, because `hub host serve` only logged to an unredirected stderr.
 The daemon now owns its log file. On Windows `hub host self-update` installs the
 verified published release through the release's own host-install.ps1, which
-stops and restarts the AgentHub2Host scheduled task.
+stops and restarts the AgentHub2Host scheduled task. `self-update` keeps the
+installer in the foreground of the same scheduled task and records its exit.
 """
 import hashlib
 import json
@@ -15,6 +16,9 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -25,6 +29,8 @@ LOG_BACKUPS = 3
 MAX_MANIFEST = 128 * 1024
 MAX_INSTALLER = 512 * 1024
 INSTALLER = 'host-install.ps1'
+SELF_UPDATE_LOG = 'self-update.log'
+INSTALL_TIMEOUT_S = 30 * 60
 CREDENTIAL_MODES = ('local', 'central')
 
 
@@ -130,24 +136,98 @@ def verified_installer(base_url, opener=urlopen):
     return version, data
 
 
+def installed_host_version():
+    """On-disk release identity, read again after the installer replaced this package under us."""
+    sys.modules.pop('agent_hub_host._release', None)
+    return host_release()[0]
+
+
+def _handoff_step(stream, message):
+    stream.write((datetime.now(timezone.utc).isoformat(timespec='milliseconds') + ' ' + message + '\n')
+                 .encode('utf-8', 'replace'))
+    stream.flush()
+
+
+def _relay_installer_output(process, stream, out):
+    """Keep the installer's output in the handoff log and show it to an interactive caller."""
+    interactive = bool(getattr(out, 'isatty', lambda: False)())
+    for line in iter(process.stdout.readline, b''):
+        stream.write(line)
+        stream.flush()
+        if interactive:
+            out.write(line.decode('utf-8', 'replace'))
+            out.flush()
+
+
+def _terminate(process, expired):
+    # Mark the deadline before anything is killed: this wait can end as soon as
+    # the installer's tree is gone, which is before taskkill.exe returns.
+    expired.set()
+    try:
+        subprocess.run(['taskkill.exe', '/PID', str(process.pid), '/T', '/F'], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        if process.poll() is None:
+            process.kill()
+
+
 def windows_self_update(base_url, force=False, opener=urlopen, spawn=subprocess.Popen, out=sys.stdout):
-    """Start the verified installer detached; it restarts AgentHub2Host, so it must outlive this process."""
+    """Run the verified installer in update mode, wait for it and return its exit code.
+
+    Intake 56a34448: the daily AgentHub2HostUpdate task reported result 0 while
+    nothing was installed. The installer was started with DETACHED_PROCESS;
+    Windows PowerShell then exits 0 within a tenth of a second without running
+    the script, whether or not its launcher is still alive. Nothing recorded
+    that, because its output went to DEVNULL and the launcher returned success
+    at once. The launcher now starts the installer with CREATE_NO_WINDOW, keeps
+    its output in self-update.log and returns the installer's exit code, so the
+    task fails when the install fails. Task Scheduler refuses breakaway from a
+    task's job, so the launcher waits in the foreground as the ordinary user.
+    """
     version, data = verified_installer(base_url, opener)
     current, _ = host_release()
     if current == version and not force:
         print(json.dumps({'updated': False, 'host_version': version, 'reason': 'already_current'}), file=out)
         return 0
-    directory = state_root() / 'tmp'
+    root = state_root()
+    directory = root / 'tmp'
     directory.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='host-install-', suffix='.ps1', dir=directory)
     with os.fdopen(fd, 'wb') as stream:
         stream.write(data)
     env = {**os.environ, 'HUB_BASE_URL': base_url.rstrip('/'), 'HUB2_INSTALL_MODE': 'update',
-           'HUB2_EXPECTED_HOST_VERSION': version}
-    flags = getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-    spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', temporary],
-          env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-          creationflags=flags, close_fds=True)
-    print(json.dumps({'updated': 'started', 'from': current, 'host_version': version,
-                      'log': str(state_root() / 'install.log')}), file=out)
-    return 0
+           'HUB2_EXPECTED_HOST_VERSION': version, 'HUB2_UPDATE_FOREGROUND': '1'}
+    log = root / SELF_UPDATE_LOG
+    started = time.monotonic()
+    with open(log, 'ab') as stream:
+        _handoff_step(stream, f'self-update start from={current} host_version={version} installer={temporary}')
+        process = spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', temporary],
+                        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        # The label follows the timer having fired. Timer.finished would not do:
+        # it is set only after _terminate returns, and that is later than the
+        # moment the killed tree ends this wait.
+        expired = threading.Event()
+        deadline = threading.Timer(INSTALL_TIMEOUT_S, _terminate, (process, expired))
+        deadline.start()
+        try:
+            _relay_installer_output(process, stream, out)
+            code = process.wait()
+        finally:
+            timed_out = expired.is_set()
+            deadline.cancel()
+        installed = installed_host_version()
+        if timed_out:
+            code, reason = code or 1, 'installer_timeout'
+        elif code != 0:
+            reason = 'installer_failed'
+        elif installed != version:
+            code, reason = 1, 'installed_version_mismatch'
+        else:
+            reason = 'installed'
+        _handoff_step(stream, f'self-update exit code={code} reason={reason} '
+                              f'elapsed_s={round(time.monotonic() - started)} installed_host_version={installed}')
+    print(json.dumps({'updated': reason == 'installed', 'from': current, 'host_version': version, 'reason': reason,
+                      'exit_code': code, 'installed_host_version': installed, 'log': str(log),
+                      'install_log': str(root / 'install.log')}), file=out)
+    return code

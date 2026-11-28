@@ -11,7 +11,10 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -142,7 +145,37 @@ class CredentialModeTests(unittest.TestCase):
             self.assertNotIn('private_provider_homes', saved.get('launcher', {}))
 
 
+class InstallerProcess:
+    """What the launcher may touch on the installer it started: pid, stdout, wait."""
+
+    pid = 4321
+
+    def __init__(self, output, code):
+        self.stdout = io.BytesIO(output)
+        self.code = code
+
+    def wait(self, timeout=None):
+        return self.code
+
+    def poll(self):
+        return self.code
+
+
 class WindowsSelfUpdateTests(unittest.TestCase):
+    def run_update(self, process, installed):
+        version, files = release_files()
+        spawn = Mock(return_value=process)
+        out = io.StringIO()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        with patch.object(windows_host, 'state_root', return_value=Path(directory.name)), \
+                patch.object(windows_host, 'host_release', return_value=('c' * 40, 1)), \
+                patch.object(windows_host, 'installed_host_version', return_value=installed):
+            code = windows_host.windows_self_update('https://hub.example/', opener=opener_for(files), spawn=spawn,
+                                                    out=out)
+        log = (Path(directory.name) / 'self-update.log').read_text()
+        return code, json.loads(out.getvalue()), spawn.call_args, log
+
     def test_verified_installer_checks_manifest_digest_and_size(self):
         version, files = release_files()
         self.assertEqual(windows_host.verified_installer('https://hub.example', opener_for(files)),
@@ -157,23 +190,89 @@ class WindowsSelfUpdateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'HTTPS'):
             windows_host.verified_installer('http://hub.example', opener_for(files))
 
-    def test_self_update_starts_detached_installer_in_update_mode(self):
+    def test_installed_host_version_drops_the_cached_release_module(self):
+        stale = SimpleNamespace(HOST_VERSION='a' * 40, PROTOCOL_VERSION=1)
+        with patch.dict(sys.modules, {'agent_hub_host._release': stale}):
+            self.assertEqual(windows_host.host_release()[0], 'a' * 40)
+            with patch.object(windows_host, 'host_release', return_value=('b' * 40, 1)) as fresh:
+                self.assertEqual(windows_host.installed_host_version(), 'b' * 40)
+            fresh.assert_called_once_with()
+        self.assertNotIn('agent_hub_host._release', sys.modules)
+
+    def test_self_update_waits_for_the_foreground_installer_and_reports_its_exit(self):
         version, files = release_files()
-        spawn = Mock()
-        with tempfile.TemporaryDirectory() as directory, \
-                patch.object(windows_host, 'state_root', return_value=Path(directory)), \
-                patch.object(windows_host, 'host_release', return_value=('c' * 40, 1)):
-            out = io.StringIO()
-            self.assertEqual(windows_host.windows_self_update('https://hub.example/', opener=opener_for(files),
-                                                              spawn=spawn, out=out), 0)
-            argv = spawn.call_args.args[0]
-            self.assertEqual(argv[:2], ['powershell.exe', '-NoProfile'])
-            script = Path(argv[argv.index('-File') + 1])
-            self.assertEqual(script.read_bytes(), files['host-install.ps1'])
-            env = spawn.call_args.kwargs['env']
-            self.assertEqual((env['HUB2_INSTALL_MODE'], env['HUB_BASE_URL'], env['HUB2_EXPECTED_HOST_VERSION']),
-                             ('update', 'https://hub.example', version))
-            self.assertEqual(json.loads(out.getvalue())['host_version'], version)
+        process = InstallerProcess(b'2026-11-28 Hub2 host install from https://hub.example (mode=update)\n'
+                                   b'2026-11-28 installed host_version=' + version.encode() + b'\n', 0)
+        code, report, call, log = self.run_update(process, version)
+        self.assertEqual((code, report['updated'], report['reason'], report['exit_code']), (0, True, 'installed', 0))
+        self.assertEqual((report['from'], report['host_version'], report['installed_host_version']),
+                         ('c' * 40, version, version))
+        argv = call.args[0]
+        self.assertEqual(argv[:2], ['powershell.exe', '-NoProfile'])
+        script = Path(argv[argv.index('-File') + 1])
+        self.assertEqual(script.read_bytes(), files['host-install.ps1'])
+        # The installer is an ordinary child of this process: no console window, but
+        # its output is captured instead of discarded and its exit is not assumed.
+        self.assertEqual(call.kwargs['stdin'], subprocess.DEVNULL)
+        self.assertEqual((call.kwargs['stdout'], call.kwargs['stderr']), (subprocess.PIPE, subprocess.STDOUT))
+        self.assertEqual(call.kwargs['creationflags'], getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        env = call.kwargs['env']
+        self.assertEqual((env['HUB2_INSTALL_MODE'], env['HUB_BASE_URL'], env['HUB2_EXPECTED_HOST_VERSION'],
+                          env['HUB2_UPDATE_FOREGROUND']), ('update', 'https://hub.example', version, '1'))
+        self.assertIn('self-update start from=' + 'c' * 40 + ' host_version=' + version, log)
+        self.assertIn('installed host_version=' + version, log)
+        self.assertIn('self-update exit code=0 reason=installed elapsed_s=0 installed_host_version=' + version, log)
+        self.assertEqual(report['log'], str(Path(script.parents[1]) / 'self-update.log'))
+
+    def test_self_update_returns_installer_failure_with_its_output(self):
+        version, _ = release_files()
+        process = InstallerProcess(b'pip install failed; see install.log\n', 3)
+        code, report, _, log = self.run_update(process, 'c' * 40)
+        self.assertEqual((code, report['updated'], report['reason'], report['exit_code']),
+                         (3, False, 'installer_failed', 3))
+        self.assertIn('pip install failed; see install.log', log)
+        self.assertIn('self-update exit code=3 reason=installer_failed', log)
+
+    def test_self_update_fails_when_the_installed_release_is_not_the_published_one(self):
+        version, _ = release_files()
+        code, report, _, log = self.run_update(InstallerProcess(b'', 0), 'c' * 40)
+        self.assertEqual((code, report['updated'], report['reason']), (1, False, 'installed_version_mismatch'))
+        self.assertIn('self-update exit code=1 reason=installed_version_mismatch', log)
+
+    def test_self_update_records_installer_timeout_when_the_killer_outlives_the_killed_tree(self):
+        # A real child and the real launcher. Timer.finished is set only once
+        # _terminate returns, and on Windows that is when taskkill.exe exits:
+        # after the killed tree has ended the launcher's wait. Reading the
+        # label from that flag made a hang `installer_failed` or
+        # `installer_timeout` by thread scheduling. The killer here returns
+        # only once this test says so, after the launcher has already reported.
+        version, files = release_files()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        reported, children = threading.Event(), []
+
+        def spawn(argv, **kwargs):
+            children.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs))
+            return children[-1]
+
+        def taskkill(argv, **kwargs):
+            children[0].kill()
+            reported.wait(10)
+            return subprocess.CompletedProcess(argv, 0)
+        self.addCleanup(reported.set)
+        out = io.StringIO()
+        with patch.object(windows_host, 'state_root', return_value=Path(directory.name)), \
+                patch.object(windows_host, 'host_release', return_value=('c' * 40, 1)), \
+                patch.object(windows_host, 'installed_host_version', return_value='c' * 40), \
+                patch.object(windows_host, 'INSTALL_TIMEOUT_S', 0.1), \
+                patch.object(windows_host.subprocess, 'run', taskkill):
+            code = windows_host.windows_self_update('https://hub.example/', opener=opener_for(files), spawn=spawn,
+                                                    out=out)
+        report = json.loads(out.getvalue())
+        self.assertNotEqual(code, 0)
+        self.assertEqual((report['updated'], report['reason'], report['exit_code']), (False, 'installer_timeout', code))
+        self.assertIn(f'self-update exit code={code} reason=installer_timeout',
+                      (Path(directory.name) / 'self-update.log').read_text())
 
     def test_self_update_is_a_no_op_when_current(self):
         version, files = release_files()
@@ -212,6 +311,9 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn('New-Venv $Path -Clear', text)
         # A failure after serve was stopped restarts it.
         self.assertIn('Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue', text)
+        # Only the launcher that waits for this script is not waited for.
+        self.assertIn("while (-not $foregroundLauncher -and", text)
+        self.assertIn("$env:HUB2_UPDATE_FOREGROUND -eq '1'", text)
 
     def test_survivor_controller_session_is_escalated_and_fatal(self):
         text = self.SCRIPT.read_text(encoding='utf-8')
